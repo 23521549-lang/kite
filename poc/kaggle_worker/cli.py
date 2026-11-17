@@ -10,15 +10,17 @@ import json
 import os
 from pathlib import Path
 import secrets as token_secrets
+import shutil
 import sys
 import time
 import uuid
 
 from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers, load_config,
                      model_policy_from_config, redact_config, refresh_configured_providers,
-                     sync_config_to_store)
+                     sandbox_settings_from_config, sync_config_to_store)
 from .integration import StaleWorkerResult, build_review_bundle
 from .protocol import ScheduledTask, WorkerResult
+from .sandbox import SandboxError
 from .scheduler import WorkerScheduler
 from .store import SQLiteSchedulerStore, StoreError
 from .workspace import (
@@ -27,6 +29,8 @@ from .workspace import (
     inspect_task_workspace,
     prepare_task_workspace,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -111,6 +115,16 @@ def _parser() -> argparse.ArgumentParser:
     token = worker_commands.add_parser("token", help="create a worker token (printed once)")
     token.add_argument("worker_id")
     token.add_argument("--force", action="store_true", help="replace an existing token (rotation)")
+    sandbox = commands.add_parser("sandbox", help="run the coding agent in an isolated Docker sandbox")
+    sandbox_commands = sandbox.add_subparsers(dest="sandbox_command", required=True)
+    sandbox_commands.add_parser("build", help="create the internal network and build the sandbox image")
+    sandbox_commands.add_parser("doctor", help="check sandbox isolation (no Internet, gateway reachable, no secrets)")
+    sandbox_run = sandbox_commands.add_parser("run", help="run one task in a sandbox and produce a verified patch")
+    sandbox_run.add_argument("--repo", type=Path, required=True, help="Git repository (committed state is used)")
+    sandbox_run.add_argument("--goal", required=True, help="what the agent should do")
+    sandbox_run.add_argument("--model", help="gateway model (default: first model of the first pull worker)")
+    sandbox_run.add_argument("--task-id", help="lowercase id (default: generated)")
+    sandbox_run.add_argument("--test-cmd", help="override sandbox.test_command; pass '' to skip tests")
     return parser
 
 
@@ -186,9 +200,19 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
     )
     runner = web.AppRunner(create_app(gateway))
     await runner.setup()
-    site = web.TCPSite(runner, config.gateway.host, config.gateway.port)
-    await site.start()
-    _emit({"gateway": f"http://{config.gateway.host}:{config.gateway.port}",
+    hosts = [config.gateway.host]
+    if config.sandbox is not None:
+        hosts.append(config.sandbox.gateway_host)   # reachable only from the internal sandbox network
+    for host in hosts:
+        try:
+            await web.TCPSite(runner, host, config.gateway.port).start()
+        except OSError as exc:
+            await runner.cleanup()
+            store.close()
+            raise ConfigError(
+                f"cannot listen on {host}:{config.gateway.port} ({exc}); for the sandbox address run "
+                "`kite sandbox build` first (it creates the Docker network)") from exc
+    _emit({"listening": [f"http://{h}:{config.gateway.port}" for h in hosts],
            "public_url": config.gateway.public_url,
            "workers": [w.worker_id for w in workers], "models": gateway.served_models()})
     sys.stdout.flush()
@@ -197,6 +221,45 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
     finally:
         await runner.cleanup()
         store.close()
+
+
+def _sandbox_command(args: argparse.Namespace) -> int:
+    from . import sandbox as sbx
+
+    config = _load_operator_config(args)
+    settings = sandbox_settings_from_config(config)
+    if args.sandbox_command == "build":
+        opencode = shutil.which("opencode") or str(Path.home() / ".opencode" / "bin" / "opencode")
+        if not Path(opencode).is_file():
+            raise ConfigError("opencode binary not found on the host; run the bootstrap first")
+        network_gateway = sbx.ensure_network(settings)
+        image = sbx.build_image(settings, dockerfile=REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",
+                                opencode_binary=Path(opencode).resolve(),
+                                opencode_cache=Path.home() / ".cache" / "opencode")
+        _emit({"image": image, "network": settings.network, "network_gateway": network_gateway,
+               "configured_gateway_host": config.sandbox.gateway_host,
+               "gateway_host_matches": network_gateway == config.sandbox.gateway_host})
+        return 0
+    if args.sandbox_command == "doctor":
+        checks = sbx.doctor(settings)
+        _emit(checks)
+        return 0 if checks and all(check["ok"] for check in checks.values()) else 1
+    if args.sandbox_command == "run":
+        models = gateway_models(config)
+        base_models = [m for m in models if m not in config.gateway.aliases]
+        if not base_models:
+            raise ConfigError("no enabled pull worker serves a model")
+        model = args.model or base_models[0]
+        small = next((name for name, spec in config.gateway.aliases.items() if spec["model"] == model), None)
+        result = sbx.run_task(
+            settings, repo=args.repo, goal=args.goal, model=model, models=models,
+            state_dir=args.config.parent / "sandbox", task_id=args.task_id, small_model=small,
+            test_command=args.test_cmd, log=lambda message: print(message, file=sys.stderr))
+        summary = result.to_dict()
+        summary["apply_with"] = f"git -C {result.repo} apply {result.patch_path}"
+        _emit(summary)
+        return 0 if result.verified else 2
+    return -1
 
 
 def _operator_command(args: argparse.Namespace) -> int:
@@ -300,6 +363,8 @@ def _operator_command(args: argparse.Namespace) -> int:
             except KeyboardInterrupt:
                 pass
             return 0
+    if args.command == "sandbox":
+        return _sandbox_command(args)
     if args.command == "worker":
         config = _load_operator_config(args)
         provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)
@@ -390,7 +455,7 @@ def _run(args: argparse.Namespace) -> int:
         _emit(asdict(bundle))
         return 0
 
-    if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker"}:
+    if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:
@@ -443,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as error:
         return int(error.code)
     except (OSError, json.JSONDecodeError, TypeError, ValueError, StoreError, ConfigError,
-            StaleWorkerResult, WorkspaceError) as error:
+            StaleWorkerResult, WorkspaceError, SandboxError) as error:
         print(f"kite: {error}", file=sys.stderr)
         return 1
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,9 @@ _ID = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 _CAPABILITY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ENV_REF = re.compile(r"^env:[A-Z][A-Z0-9_]{0,127}$")
+_IMAGE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,199}$")
+_NETWORK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_MEMORY = re.compile(r"^[1-9][0-9]*[kmg]$")
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -71,6 +75,22 @@ class GatewayConfig:
 
 
 @dataclass(frozen=True)
+class SandboxConfig:
+    """Per-task Docker sandbox. The gateway also listens on ``gateway_host`` (the host's address
+    on the internal sandbox network) so sandboxed agents can reach it without Internet access."""
+    image: str = "kite-sandbox:latest"
+    network: str = "kite-sandbox-net"
+    gateway_host: str = "172.19.0.1"
+    memory: str = "1g"
+    cpus: float = 1.0
+    pids_limit: int = 512
+    agent_timeout_seconds: int = 3600
+    test_timeout_seconds: int = 900
+    test_command: str = "python -m pytest -q"
+    docker_command: tuple[str, ...] = ("docker",)
+
+
+@dataclass(frozen=True)
 class KiteConfig:
     schema_version: int
     temporal_endpoint: str
@@ -84,6 +104,7 @@ class KiteConfig:
     source_path: Path | None = None
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
+    sandbox: SandboxConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -220,8 +241,9 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
         raise ConfigError("provider worker IDs must be unique")
     routing = _validate_routing(root.get("routing", {}))
     gateway = _validate_gateway(root.get("gateway", {}))
+    sandbox = _validate_sandbox(root.get("sandbox"))
     return KiteConfig(1, endpoint, queue, executable, host, port, checkout, harness_cli,
-                      tuple(providers), routing=routing, gateway=gateway)
+                      tuple(providers), routing=routing, gateway=gateway, sandbox=sandbox)
 
 
 def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
@@ -230,6 +252,12 @@ def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
     if minimum is not None and value < minimum:
         raise ConfigError(f"{label} must be at least {minimum}")
     return float(value)
+
+
+def _int(value: Any, label: str, *, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigError(f"{label} must be an integer of at least {minimum}")
+    return value
 
 
 def _validate_routing(raw: Any) -> RoutingConfig:
@@ -300,6 +328,47 @@ def _validate_gateway(raw: Any) -> GatewayConfig:
     )
 
 
+def _validate_sandbox(raw: Any) -> SandboxConfig | None:
+    if raw is None:
+        return None
+    sb = _mapping(raw, "sandbox")
+    unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
+                         "agent_timeout_seconds", "test_timeout_seconds", "test_command", "docker_command"}
+    if unknown:
+        raise ConfigError("sandbox has unsupported fields")
+    image = sb.get("image", "kite-sandbox:latest")
+    if not isinstance(image, str) or not _IMAGE.fullmatch(image):
+        raise ConfigError("sandbox.image is malformed")
+    network = sb.get("network", "kite-sandbox-net")
+    if not isinstance(network, str) or not _NETWORK.fullmatch(network) or network in {"host", "bridge", "none"}:
+        raise ConfigError("sandbox.network must name a dedicated internal Docker network")
+    host = sb.get("gateway_host", "172.19.0.1")
+    try:
+        address = ipaddress.ip_address(host)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("sandbox.gateway_host must be an IP address") from exc
+    if address.version != 4 or not address.is_private or address.is_loopback:
+        raise ConfigError("sandbox.gateway_host must be the host's private IPv4 address on the sandbox network")
+    memory = sb.get("memory", "1g")
+    if not isinstance(memory, str) or not _MEMORY.fullmatch(memory):
+        raise ConfigError("sandbox.memory must look like 512m or 1g")
+    test_command = sb.get("test_command", "python -m pytest -q")
+    if not isinstance(test_command, str):
+        raise ConfigError("sandbox.test_command must be a string ('' to skip tests)")
+    docker_command = sb.get("docker_command", ["docker"])
+    if not isinstance(docker_command, list) or not docker_command or any(
+            not isinstance(x, str) or not x.strip() for x in docker_command):
+        raise ConfigError("sandbox.docker_command must be a non-empty list such as [docker] or [sudo, docker]")
+    return SandboxConfig(
+        image=image, network=network, gateway_host=str(address), memory=memory,
+        cpus=_number(sb.get("cpus", 1.0), "sandbox.cpus", minimum=0.1),
+        pids_limit=_int(sb.get("pids_limit", 512), "sandbox.pids_limit", minimum=64),
+        agent_timeout_seconds=_int(sb.get("agent_timeout_seconds", 3600), "sandbox.agent_timeout_seconds", minimum=60),
+        test_timeout_seconds=_int(sb.get("test_timeout_seconds", 900), "sandbox.test_timeout_seconds", minimum=10),
+        test_command=test_command, docker_command=tuple(docker_command),
+    )
+
+
 def resolve_secret(reference: str) -> str:
     """Read an ``env:NAME`` or ``file:PATH`` secret reference. Never log the result."""
     if reference.startswith("env:"):
@@ -334,6 +403,22 @@ def gateway_models(config: KiteConfig) -> list[str]:
         if p.adapter == "pull" and p.enabled:
             base.extend(m for m in p.model_ids if m not in base)
     return base + [name for name, spec in config.gateway.aliases.items() if spec["model"] in base]
+
+
+def sandbox_settings_from_config(config: KiteConfig):
+    """SandboxSettings for ``kite sandbox ...``; the agent reaches the gateway on the sandbox network."""
+    from .sandbox import SandboxSettings
+
+    if config.sandbox is None:
+        raise ConfigError("config has no sandbox block")
+    sb = config.sandbox
+    return SandboxSettings(
+        image=sb.image, network=sb.network,
+        gateway_url=f"http://{sb.gateway_host}:{config.gateway.port}/v1",
+        memory=sb.memory, cpus=sb.cpus, pids_limit=sb.pids_limit,
+        agent_timeout_seconds=sb.agent_timeout_seconds, test_timeout_seconds=sb.test_timeout_seconds,
+        test_command=sb.test_command, docker_command=sb.docker_command,
+    )
 
 
 def model_policy_from_config(config: KiteConfig):
@@ -417,6 +502,14 @@ def load_config(path: Path) -> KiteConfig:
 
 def redact_config(config: KiteConfig) -> dict[str, Any]:
     """Return operator-safe metadata; secret values are never resolved here."""
+    sandbox = None
+    if config.sandbox is not None:
+        sb = config.sandbox
+        sandbox = {"image": sb.image, "network": sb.network, "gateway_host": sb.gateway_host,
+                   "memory": sb.memory, "cpus": sb.cpus, "pids_limit": sb.pids_limit,
+                   "agent_timeout_seconds": sb.agent_timeout_seconds,
+                   "test_timeout_seconds": sb.test_timeout_seconds,
+                   "test_command": sb.test_command, "docker_command": list(sb.docker_command)}
     return {
         "schema_version": config.schema_version,
         "temporal": {"endpoint": config.temporal_endpoint, "task_queue": config.temporal_task_queue},
@@ -437,4 +530,5 @@ def redact_config(config: KiteConfig) -> dict[str, Any]:
                     "job_timeout_seconds": config.gateway.job_timeout_seconds,
                     "heartbeat_timeout_seconds": config.gateway.heartbeat_timeout_seconds,
                     "aliases": config.gateway.aliases},
+        "sandbox": sandbox,
     }

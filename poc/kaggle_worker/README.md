@@ -185,6 +185,27 @@ KITE_GATEWAY_DOMAIN=1-2-3-4.sslip.io sudo -E docker compose -f deploy/gateway.co
 
 `qwen3.6-fast` is the same model with thinking disabled, for chat and simple tool steps. The gateway currently replays each finished answer as one SSE stream (no token-by-token streaming yet).
 
+## Sandboxed runs
+
+`kite sandbox run` executes one task end to end without Temporal: Kite clones the repository's committed state, runs OpenCode (`opencode run`) in a throw-away container, collects the patch itself and runs the test command in a second container with no network. The agent container drops all capabilities, cannot gain privileges, runs as an unprivileged user with CPU/memory/process limits, and sits on an internal Docker network: no Internet (so no `git push`), only the gateway, which also listens on the host's address on that network. Secrets are never mounted.
+
+```yaml
+sandbox:
+  gateway_host: 172.19.0.1        # host address on kite-sandbox-net (printed by `kite sandbox build`)
+  memory: 1g
+  cpus: 1
+  test_command: python -m pytest -q
+```
+
+```sh
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml sandbox build    # network + image
+sudo systemctl restart kite-gateway                                       # also listen on gateway_host
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml sandbox doctor   # isolation checks
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml sandbox run --repo ~/project --goal "..."
+```
+
+Results are written to `/var/lib/kite/kite/sandbox/<task-id>/` (`result.json`, `result.patch`, `agent.log`, `test.log`). `verified` is true only when the agent finished, changed files, and Kite's own test run passed. Review the patch, then apply it with `git apply`. The sandbox has no Internet, so dependencies the tests need must already be in the image.
+
 ## Not enabled
 
 - No Kaggle API/session adapter is implemented.
