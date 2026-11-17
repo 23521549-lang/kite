@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 
 from temporalio import workflow
@@ -23,6 +23,12 @@ class CodingTaskInput:
     required_capabilities: tuple[str, ...]
     preferred_model_id: str | None
     estimated_gpu_seconds: int
+    task_type: str = "coding"
+    role: str = "coder"
+    # Set only when a long wait for a worker continues the workflow as new: the workspace was
+    # already validated and prepared by the earlier run, so the new run reuses it.
+    prepared_workspace: str | None = None
+    route_wait_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,14 @@ class CodingTaskOutcome:
     review_bundle: ReviewBundle | None
 
 
+# A waiting workflow re-checks for a worker with backoff (15 s doubling to 5 min) or as soon as
+# the ``worker_available`` signal arrives. Each check adds history events, so after this many
+# checks the workflow continues as new to stay far below Temporal's 51,200-event limit.
+MAX_ROUTE_CHECKS_PER_RUN = 200
+ROUTE_RECHECK_BASE_SECONDS = 15
+ROUTE_RECHECK_MAX_SECONDS = 300
+
+
 @workflow.defn(name="KiteCodingTaskWorkflow")
 class CodingTaskWorkflow:
     """Route, execute, checkpoint, and return a review-only result."""
@@ -66,6 +80,7 @@ class CodingTaskWorkflow:
         self._pending_instruction = ""
         self._status = "CREATED"
         self._checkpoint_path: str | None = None
+        self._worker_hint = False
 
     @workflow.signal
     def pause(self) -> None:
@@ -88,6 +103,11 @@ class CodingTaskWorkflow:
         """Stop this coding attempt after its current checkpoint is durable."""
         self._rejected = True
         self._paused = False
+
+    @workflow.signal
+    def worker_available(self) -> None:
+        """Wake a task that is waiting for a worker (sent when a worker heartbeats as ready)."""
+        self._worker_hint = True
 
     @workflow.query
     def current_status(self) -> str:
@@ -170,10 +190,13 @@ class CodingTaskWorkflow:
             self._status = "REJECTED"
             return CodingTaskOutcome(task.task_id, "REJECTED", None, None)
 
-        await self._execute("kite_validate_task", task, timeout=timedelta(minutes=1))
-        workspace_path = await self._execute(
-            "kite_prepare_workspace", task, timeout=timedelta(minutes=2)
-        )
+        if task.prepared_workspace:
+            workspace_path = task.prepared_workspace
+        else:
+            await self._execute("kite_validate_task", task, timeout=timedelta(minutes=1))
+            workspace_path = await self._execute(
+                "kite_prepare_workspace", task, timeout=timedelta(minutes=2)
+            )
 
         route_attempt = 0
         route: RouteLease | None = None
@@ -195,7 +218,25 @@ class CodingTaskWorkflow:
             )
             if route is None:
                 route_attempt += 1
-                await workflow.sleep(timedelta(seconds=15))
+                if (route_attempt >= MAX_ROUTE_CHECKS_PER_RUN
+                        or workflow.info().is_continue_as_new_suggested()):
+                    workflow.continue_as_new(replace(
+                        task,
+                        prepared_workspace=workspace_path,
+                        route_wait_count=task.route_wait_count + route_attempt,
+                    ))
+                self._worker_hint = False
+                delay = min(
+                    ROUTE_RECHECK_MAX_SECONDS,
+                    ROUTE_RECHECK_BASE_SECONDS * 2 ** min(route_attempt - 1, 5),
+                )
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._worker_hint or self._paused or self._cancelled or self._rejected,
+                        timeout=timedelta(seconds=delay),
+                    )
+                except asyncio.TimeoutError:
+                    pass
 
         previous_session_id: str | None = None
         run_result: CodingRunResult | None = None
