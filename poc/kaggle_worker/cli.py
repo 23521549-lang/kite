@@ -1,0 +1,300 @@
+"""Local queue and patch-review CLI for the worker-scheduler prototype."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from dataclasses import asdict
+import getpass
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+from .config import (ConfigError, LIVE_ADAPTERS, load_config, redact_config,
+                     refresh_configured_providers)
+from .integration import StaleWorkerResult, build_review_bundle
+from .protocol import ScheduledTask, WorkerResult
+from .scheduler import WorkerScheduler
+from .store import SQLiteSchedulerStore, StoreError
+from .workspace import (
+    WorkspaceError,
+    checkpoint_path_for_task,
+    inspect_task_workspace,
+    prepare_task_workspace,
+)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="kite", description="Kite provider-neutral coding control plane")
+    parser.add_argument("--db", type=Path, default=None,
+                        help="SQLite state file (default: scheduler.sqlite3 beside --config)")
+    parser.add_argument("--config", type=Path, default=Path(".kite/config.yaml"), help="Kite YAML/JSON configuration")
+    commands = parser.add_subparsers(dest="command", required=True)
+    task = commands.add_parser("task", help="manage queued tasks")
+    task_commands = task.add_subparsers(dest="task_command", required=True)
+
+    add = task_commands.add_parser("add", help="queue a task without starting a model worker")
+    add.add_argument("--task-id", help="stable task ID (generated when omitted)")
+    add.add_argument("--goal", required=True)
+    add.add_argument("--repo-head", required=True, help="pinned Git HEAD for review safety")
+    add.add_argument("--branch", help="isolated task branch (default: agent/<task-id>)")
+    add.add_argument("--role", default="coder")
+    add.add_argument("--model")
+    add.add_argument("--estimate-gpu-seconds", type=int, default=900)
+    add.add_argument("--priority", type=int, default=0)
+
+    task_commands.add_parser("list", help="list persisted tasks")
+    show = task_commands.add_parser("show", help="show a task and its checkpoint coordinates")
+    show.add_argument("task_id")
+    cancel = task_commands.add_parser("cancel", help="cancel a queued or leased task")
+    cancel.add_argument("task_id")
+    prepare = task_commands.add_parser("prepare", help="create an isolated worktree and checkpoint")
+    prepare.add_argument("task_id")
+    prepare.add_argument("--repo", type=Path, required=True, help="clean local Git repository at the pinned HEAD")
+    inspect = task_commands.add_parser("inspect", help="read repo orientation files and checkpoint context")
+    inspect.add_argument("task_id")
+
+    review = commands.add_parser("review", help="validate a worker result for human review")
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+    result = review_sub.add_parser("result", help="build a review bundle from result JSON")
+    result.add_argument("result_json", type=Path)
+    result.add_argument("--expected-head", required=True)
+    result.add_argument("--expected-task", required=True)
+    result.add_argument("--expected-lease", required=True)
+    result.add_argument("--expected-worker", required=True)
+    commands.add_parser("doctor", help="check local configuration and installation prerequisites")
+    setup = commands.add_parser("setup", help="prepare local secret reference files without printing values")
+    setup.add_argument("--secret-name", help="optional secret to capture without echo, e.g. KAGGLE_TOKEN")
+    provider = commands.add_parser("provider", help="validate and manage configured providers")
+    provider_commands = provider.add_subparsers(dest="provider_command", required=True)
+    provider_commands.add_parser("validate", help="validate configuration without contacting providers")
+    provider_commands.add_parser("refresh", help="refresh configured adapters (read-only; never enables providers)")
+    enable = provider_commands.add_parser("enable", help="enable a configured provider adapter")
+    enable.add_argument("provider_id")
+    workflow = commands.add_parser("workflow", help="operate Temporal coding workflows")
+    workflow_commands = workflow.add_subparsers(dest="workflow_command", required=True)
+    start = workflow_commands.add_parser("start", help="start a coding workflow")
+    start.add_argument("--task-id", required=True)
+    start.add_argument("--goal", required=True)
+    start.add_argument("--repo", type=Path, required=True)
+    start.add_argument("--repo-head", required=True)
+    start.add_argument("--branch", required=True)
+    start.add_argument("--capability", action="append", default=[])
+    start.add_argument("--model")
+    start.add_argument("--estimate-gpu-seconds", type=int, default=900)
+    for action in ("status", "pause", "resume", "cancel"):
+        sub = workflow_commands.add_parser(action)
+        sub.add_argument("workflow_id")
+        if action == "resume":
+            sub.add_argument("--instruction", default="")
+    return parser
+
+
+def _load_operator_config(args: argparse.Namespace):
+    return load_config(args.config)
+
+
+def _operator_command(args: argparse.Namespace) -> int:
+    if args.command == "setup":
+        secrets_dir = args.config.parent / "secrets"
+        secrets_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(secrets_dir, 0o700)
+        if args.secret_name:
+            if not args.secret_name.replace("_", "").isalnum() or not args.secret_name[0].isalpha():
+                raise ConfigError("secret name must contain only letters, digits, and underscores")
+            secret_path = secrets_dir / args.secret_name.lower()
+            if secret_path.exists():
+                raise ConfigError("secret file already exists; refusing to overwrite it")
+            value = getpass.getpass(f"Enter value for {args.secret_name} (input hidden): ")
+            if not value:
+                raise ConfigError("secret value cannot be empty")
+            fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(value)
+                stream.write("\n")
+            _emit({"secret_reference": f"file:{secret_path.resolve()}", "mode": "0600", "value": "<redacted>"})
+        else:
+            _emit({"secrets_directory": str(secrets_dir.resolve()), "created": True})
+        return 0
+    if args.command == "doctor":
+        config = _load_operator_config(args)
+        checks = {
+            "config": "ok",
+            "temporal_endpoint": config.temporal_endpoint,
+            "task_queue": config.temporal_task_queue,
+            "opencode_executable": config.opencode_executable,
+            "harness2_checkout_exists": Path(config.harness2_checkout).exists(),
+            "providers_enabled": [p.id for p in config.providers if p.enabled],
+        }
+        _emit({"status": "ok" if checks["harness2_checkout_exists"] else "needs_setup", "checks": checks})
+        return 0
+    if args.command == "provider":
+        config = _load_operator_config(args)
+        if args.provider_command == "validate":
+            for provider in config.providers:
+                adapter = LIVE_ADAPTERS.get(provider.adapter)
+                if adapter:
+                    try:
+                        adapter.validate(provider)
+                    except Exception as error:
+                        raise ConfigError(f"provider validation failed for {provider.id}") from error
+            _emit({"valid": True, "config": redact_config(config), "provider_count": len(config.providers)})
+            return 0
+        if args.provider_command == "refresh":
+            refreshed, unknown = refresh_configured_providers(config)
+            _emit({"refreshed": refreshed, "unknown": unknown,
+                   "enabled": [p.id for p in config.providers if p.enabled]})
+            return 0
+        if args.provider_command == "enable":
+            provider = next((p for p in config.providers if p.id == args.provider_id), None)
+            if provider is None:
+                raise ConfigError("provider ID is not configured")
+            if provider.adapter == "kaggle":
+                raise ConfigError("Kaggle adapter is validation-only and cannot be enabled")
+            if provider.adapter not in LIVE_ADAPTERS:
+                raise ConfigError("provider adapter has no registered live implementation")
+            try:
+                LIVE_ADAPTERS[provider.adapter].validate(provider)
+            except Exception as error:
+                raise ConfigError(f"provider validation failed for {provider.id}") from error
+            raw_text = args.config.read_text(encoding="utf-8")
+            if args.config.suffix.lower() == ".json":
+                raw_config = json.loads(raw_text)
+            else:
+                import yaml
+                raw_config = yaml.safe_load(raw_text)
+            for item in raw_config["providers"]:
+                if item["id"] == provider.id:
+                    item["enabled"] = True
+                    break
+            temp_path = args.config.with_suffix(args.config.suffix + ".tmp")
+            if args.config.suffix.lower() == ".json":
+                temp_path.write_text(json.dumps(raw_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            else:
+                import yaml
+                temp_path.write_text(yaml.safe_dump(raw_config, sort_keys=False), encoding="utf-8")
+            temp_path.replace(args.config)
+            _emit({"provider_id": provider.id, "enabled": True})
+            return 0
+    if args.command == "workflow":
+        config = _load_operator_config(args)
+        from temporalio.client import Client
+        from .temporal_workflow import CodingTaskInput, CodingTaskWorkflow
+
+        async def operate():
+            client = await Client.connect(config.temporal_endpoint)
+            action = args.workflow_command
+            if action == "start":
+                task_input = CodingTaskInput(args.task_id, args.goal, str(args.repo.resolve()), args.repo_head,
+                                             args.branch, tuple(args.capability), args.model, args.estimate_gpu_seconds)
+                handle = await client.start_workflow(CodingTaskWorkflow.run, task_input,
+                                                     id=args.task_id, task_queue=config.temporal_task_queue)
+                return {"workflow_id": handle.id, "run_id": handle.result_run_id}
+            handle = client.get_workflow_handle(args.workflow_id)
+            if action == "status":
+                return {"workflow_id": args.workflow_id, "status": await handle.query(CodingTaskWorkflow.current_status)}
+            signal = {"pause": CodingTaskWorkflow.pause, "resume": CodingTaskWorkflow.resume_with_instruction,
+                      "cancel": CodingTaskWorkflow.cancel}[action]
+            if action == "resume":
+                await handle.signal(signal, args.instruction)
+            else:
+                await handle.signal(signal)
+            return {"workflow_id": args.workflow_id, "signal": action, "sent": True}
+        _emit(asyncio.run(operate()))
+        return 0
+    return -1
+
+
+def _emit(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _run(args: argparse.Namespace) -> int:
+    if args.db is None:
+        args.db = args.config.parent / "scheduler.sqlite3"
+    if args.command == "review":
+        raw = json.loads(args.result_json.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("result JSON must contain an object")
+        result = WorkerResult(**raw)
+        bundle = build_review_bundle(
+            result,
+            expected_repo_head=args.expected_head,
+            expected_task_id=args.expected_task,
+            expected_lease_id=args.expected_lease,
+            expected_worker_id=args.expected_worker,
+        )
+        _emit(asdict(bundle))
+        return 0
+
+    if args.command in {"doctor", "setup", "provider", "workflow"}:
+        return _operator_command(args)
+
+    with SQLiteSchedulerStore(args.db) as store:
+        scheduler = WorkerScheduler(store)
+        if args.task_command == "add":
+            task_id = args.task_id or uuid.uuid4().hex
+            task = ScheduledTask(
+                task_id=task_id,
+                role=args.role,
+                model_id=args.model,
+                repo_head=args.repo_head,
+                branch=args.branch or f"agent/{task_id}",
+                payload_json=json.dumps({"goal": args.goal}, ensure_ascii=False, sort_keys=True),
+                estimated_gpu_seconds=args.estimate_gpu_seconds,
+                priority=args.priority,
+                created_at=time.time(),
+            )
+            store.enqueue(task)
+            _emit(store.get_task(task.task_id))
+        elif args.task_command == "list":
+            _emit(store.list_tasks())
+        elif args.task_command == "show":
+            _emit(store.get_task(args.task_id))
+        elif args.task_command == "cancel":
+            scheduler.cancel(args.task_id, now=time.time())
+            _emit(store.get_task(args.task_id))
+        elif args.task_command == "prepare":
+            task = store.get_task(args.task_id)
+            scheduled_task = ScheduledTask(
+                task_id=str(task["task_id"]), role=str(task["role"]),
+                model_id=task["model_id"], repo_head=str(task["repo_head"]),
+                branch=str(task["branch"]), payload_json=str(task["payload_json"]),
+                estimated_gpu_seconds=int(task["estimated_gpu_seconds"]),
+                priority=int(task["priority"]), created_at=float(task["created_at"]),
+            )
+            prepared = prepare_task_workspace(scheduled_task, args.repo, state_dir=args.db.parent)
+            _emit({
+                "task_id": prepared.task_id,
+                "repo_path": str(prepared.repo_path),
+                "workspace_path": str(prepared.workspace_path),
+                "checkpoint_path": str(prepared.checkpoint_path),
+                "branch": prepared.branch,
+                "repo_head": prepared.repo_head,
+                "provider_started": False,
+            })
+        elif args.task_command == "inspect":
+            store.get_task(args.task_id)
+            checkpoint_path = checkpoint_path_for_task(args.db.parent, args.task_id)
+            _emit(asdict(inspect_task_workspace(checkpoint_path)))
+        return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    try:
+        args = parser.parse_args(argv)
+        return _run(args)
+    except SystemExit as error:
+        return int(error.code)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, StoreError, ConfigError,
+            StaleWorkerResult, WorkspaceError) as error:
+        print(f"kite: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,9 @@
+--- a/src/shop/quote.py
++++ b/src/shop/quote.py
+@@ -1,6 +1,7 @@
+ from decimal import Decimal, ROUND_HALF_UP
+ from typing import Mapping, Sequence
++from shop.shipping import CENT, shipping_for
+ ZERO = Decimal("0.00")
+ DEFAULT_TAX_RATE = Decimal("0.10")
+ def build_quote(items: Sequence[Mapping[str, object]], shipping_method: str = "standard", discount: Decimal = ZERO) -> dict[str, Decimal]:

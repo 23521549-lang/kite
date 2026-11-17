@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75,<82"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kite-coding-agent"
+version = "0.1.0"
+description = "Kite control plane for durable, provider-neutral coding tasks"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "temporalio==1.36.0",
+    "PyYAML==6.0.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.3,<10",
+    "PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+kite = "poc.kaggle_worker.cli:main"
+kite-worker = "poc.kaggle_worker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["poc*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -1,0 +1,2 @@
+limit.maxIDLength:
+  - value: 255

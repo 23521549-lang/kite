@@ -1,0 +1,22 @@
+src/shop/quote.py
+--- a/src/shop/quote.py
++++ b/src/shop/quote.py
+@@ -1,13 +1,17 @@
+ from decimal import Decimal, ROUND_HALF_UP
+ from typing import Mapping, Sequence
+ from shop.shipping import CENT, shipping_for
+ ZERO = Decimal("0.00")
+ DEFAULT_TAX_RATE = Decimal("0.10")
++
++def _validate_discount(discount: Decimal, subtotal: Decimal) -> None:
++    if discount < ZERO or discount > subtotal:
++        raise ValueError("Discount must be between zero and subtotal inclusive.")
++
+ def build_quote(items: Sequence[Mapping[str, object]], shipping_method: str = "standard", discount: Decimal = ZERO) -> dict[str, Decimal]:
+     # Build an order quote. Prices and discounts are decimal currency amounts.
+     subtotal = sum((Decimal(str(item["price"])) * int(item["quantity"]) for item in items), start=ZERO).quantize(CENT, rounding=ROUND_HALF_UP)
+     discount = Decimal(str(discount)).quantize(CENT, rounding=ROUND_HALF_UP)
++    _validate_discount(discount, subtotal)
+     shipping = shipping_for(subtotal, shipping_method)
+     taxable = subtotal - discount + shipping
+     tax = (taxable * DEFAULT_TAX_RATE).quantize(CENT, rounding=ROUND_HALF_UP)

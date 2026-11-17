@@ -1,0 +1,24 @@
+schema_version: 1
+temporal:
+  endpoint: 127.0.0.1:7233
+  task_queue: kite-coding-tasks
+opencode:
+  executable: opencode
+  server:
+    host: 127.0.0.1
+    port: 4096
+harness2:
+  checkout: /var/lib/kite/kite/harness2
+  cli: /opt/kite/.venv/bin/harness2
+providers:
+  # Kaggle is a disabled config stub until its supported request/response path is verified.
+  - id: kaggle-primary
+    adapter: kaggle
+    enabled: false
+    model: qwen/coder-7b
+    capabilities: [coding, python]
+    quota:
+      gpu_seconds: 0
+      concurrency: 1
+    secrets:
+      token: file:/var/lib/kite/kite/secrets/kaggle_token
