@@ -1,5 +1,7 @@
 # HTTPS front for the Kite gateway. Caddy gets a Let's Encrypt certificate for
 # KITE_GATEWAY_DOMAIN automatically (needs ports 80 and 443 open in the EC2 security group).
+# Own project name: never share a compose project with the Temporal stack in compose.yaml.
+name: kite-gateway
 services:
   caddy:
     image: caddy:2
