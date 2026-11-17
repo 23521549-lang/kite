@@ -1,0 +1,24 @@
+# systemd unit for the Kite model gateway (serves pull workers such as Kaggle).
+# Install: sudo cp deploy/kite-gateway.service /etc/systemd/system/ && sudo systemctl enable --now kite-gateway
+[Unit]
+Description=Kite model gateway (pull workers)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kite
+ExecStart=/home/ubuntu/kite/.venv/bin/kite --config /var/lib/kite/kite/config.yaml gateway serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Hardening: the gateway only needs to read the code/venv and write the scheduler store.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/kite/kite
+
+[Install]
+WantedBy=multi-user.target
