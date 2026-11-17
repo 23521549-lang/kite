@@ -1,0 +1,15 @@
+# Publishes only /worker/* of the Kite gateway. /v1/* (the OpenCode side) stays on loopback.
+{$KITE_GATEWAY_DOMAIN} {
+	@worker path /worker/*
+	handle @worker {
+		reverse_proxy 127.0.0.1:{$KITE_GATEWAY_PORT:8787} {
+			flush_interval -1
+			transport http {
+				read_timeout 120s
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

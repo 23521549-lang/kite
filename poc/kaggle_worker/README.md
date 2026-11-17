@@ -142,6 +142,49 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml down
 
 To roll back, stop the services with the command above and restore the previous Kite checkout/config from your own backup. The PostgreSQL named bind path and `/var/lib/kite` are left in place; never use `docker compose down --volumes` for rollback.
 
+## Kaggle pull workers (gateway)
+
+Kaggle cannot accept inbound connections, so workers pull work. `kite gateway serve` exposes an OpenAI-compatible API on loopback (`http://127.0.0.1:8787/v1`, used by OpenCode) and a worker API (`/worker/*`). Caddy publishes only `/worker/*` over HTTPS; every worker authenticates with its own token.
+
+1. Open ports **80 and 443** in the EC2 security group (80 is used once by Let's Encrypt).
+2. Add a provider with `adapter: pull` and a gateway block to `/var/lib/kite/kite/config.yaml`:
+
+```yaml
+providers:
+  - id: kaggle-han
+    adapter: pull
+    enabled: true
+    owner: han
+    model: qwen3.6
+    models: [devstral]
+    capabilities: [coding, vision]
+    quota: {gpu_seconds: 108000, concurrency: 1}
+    secrets:
+      worker_token: file:/var/lib/kite/kite/secrets/worker_token_kaggle-han
+gateway:
+  public_url: https://1-2-3-4.sslip.io      # EC2 public IP with dashes
+  aliases:
+    qwen3.6-fast: {model: qwen3.6, params: {chat_template_kwargs: {enable_thinking: false}}}
+routing:
+  swap_penalty_per_second: 0.0005
+  load_seconds_cached: 100     # measured on Kaggle 2xT4
+  load_seconds_cold: 200       # download (~90 s) + load
+```
+
+3. Create the worker token (printed once; store it as the Kaggle secret `KITE_WORKER_TOKEN`), sync the store, start HTTPS and the gateway:
+
+```sh
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml worker token kaggle-han
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml provider sync
+KITE_GATEWAY_DOMAIN=1-2-3-4.sslip.io sudo -E docker compose -f deploy/gateway.compose.yaml up -d
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml gateway serve
+```
+
+4. In the Kaggle notebook run everything up to "Worker mode"; it heartbeats and waits for jobs. Check from EC2 with `curl -s 127.0.0.1:8787/status`.
+5. Point OpenCode at the gateway: `kite gateway opencode-config` prints the block for `opencode.json`.
+
+`qwen3.6-fast` is the same model with thinking disabled, for chat and simple tool steps. The gateway currently replays each finished answer as one SSE stream (no token-by-token streaming yet).
+
 ## Not enabled
 
 - No Kaggle API/session adapter is implemented.

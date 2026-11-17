@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any, Callable
@@ -12,11 +13,14 @@ class ConfigError(ValueError):
     pass
 
 
-ADAPTERS = {"opencode", "harness2", "kaggle"}
+# "pull" = a worker that long-polls the Kite gateway (for example a Kaggle notebook).
+ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
+_BUILTIN_ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
 _ID = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 _CAPABILITY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ENV_REF = re.compile(r"^env:[A-Z][A-Z0-9_]{0,127}$")
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,19 @@ class RoutingConfig:
 
 
 @dataclass(frozen=True)
+class GatewayConfig:
+    """Model gateway for pull workers. The client API stays on loopback; only /worker/* is
+    published (through Caddy) at ``public_url``."""
+    host: str = "127.0.0.1"
+    port: int = 8787
+    public_url: str | None = None
+    job_timeout_seconds: float = 1800.0
+    heartbeat_timeout_seconds: float = 90.0
+    # alias name -> {"model": base model, "params": extra request fields}
+    aliases: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class KiteConfig:
     schema_version: int
     temporal_endpoint: str
@@ -66,6 +83,7 @@ class KiteConfig:
     providers: tuple[ProviderConfig, ...]
     source_path: Path | None = None
     routing: RoutingConfig = field(default_factory=RoutingConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
 
 
 @dataclass(frozen=True)
@@ -90,7 +108,7 @@ def register_provider_adapter(adapter: ProviderAdapter) -> None:
 
 def unregister_provider_adapter(adapter_id: str) -> None:
     LIVE_ADAPTERS.pop(adapter_id, None)
-    if adapter_id not in {"opencode", "harness2", "kaggle"}:
+    if adapter_id not in _BUILTIN_ADAPTERS:
         ADAPTERS.discard(adapter_id)
 
 
@@ -179,6 +197,8 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
             raise ConfigError("Kaggle requires a token secret reference, even while disabled")
         if adapter == "kaggle" and enabled:
             raise ConfigError("Kaggle adapter is a disabled schema stub and cannot be enabled")
+        if adapter == "pull" and not secrets.get("worker_token"):
+            raise ConfigError(f"providers[{i}] uses adapter 'pull' and needs secrets.worker_token")
         owner = p.get("owner", "self")
         if not isinstance(owner, str) or not _ID.fullmatch(owner):
             raise ConfigError(f"providers[{i}].owner is malformed")
@@ -199,8 +219,9 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
     if len(set(worker_ids)) != len(worker_ids):
         raise ConfigError("provider worker IDs must be unique")
     routing = _validate_routing(root.get("routing", {}))
+    gateway = _validate_gateway(root.get("gateway", {}))
     return KiteConfig(1, endpoint, queue, executable, host, port, checkout, harness_cli,
-                      tuple(providers), routing=routing)
+                      tuple(providers), routing=routing, gateway=gateway)
 
 
 def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
@@ -239,6 +260,80 @@ def _validate_routing(raw: Any) -> RoutingConfig:
         default_skill=_number(routing.get("default_skill", 0.0), "routing.default_skill"),
         model_skill=skill,
     )
+
+
+def _validate_gateway(raw: Any) -> GatewayConfig:
+    gw = _mapping(raw, "gateway")
+    unknown = set(gw) - {"host", "port", "public_url", "job_timeout_seconds",
+                         "heartbeat_timeout_seconds", "aliases"}
+    if unknown:
+        raise ConfigError("gateway has unsupported fields")
+    host = gw.get("host", "127.0.0.1")
+    if host not in _LOOPBACK:
+        # /v1/* has no client authentication: it must never listen on a public interface.
+        raise ConfigError("gateway.host must be a loopback address; publish /worker/* through Caddy")
+    port = gw.get("port", 8787)
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ConfigError("gateway.port must be between 1 and 65535")
+    public_url = gw.get("public_url")
+    if public_url is not None and (not isinstance(public_url, str) or not public_url.startswith("https://")):
+        raise ConfigError("gateway.public_url must be an https:// URL")
+    aliases: dict[str, dict[str, Any]] = {}
+    for name, spec in _mapping(gw.get("aliases", {}), "gateway.aliases").items():
+        if not isinstance(name, str) or not _MODEL.fullmatch(name):
+            raise ConfigError("gateway.aliases has a malformed alias name")
+        spec = _mapping(spec, f"gateway.aliases.{name}")
+        base = spec.get("model")
+        if not isinstance(base, str) or not _MODEL.fullmatch(base):
+            raise ConfigError(f"gateway.aliases.{name}.model is malformed")
+        params = _mapping(spec.get("params", {}), f"gateway.aliases.{name}.params")
+        if {"model", "messages", "stream"} & set(params):
+            raise ConfigError(f"gateway.aliases.{name}.params cannot override model, messages or stream")
+        aliases[name] = {"model": base, "params": dict(params)}
+    return GatewayConfig(
+        host=host, port=port, public_url=public_url,
+        job_timeout_seconds=_number(gw.get("job_timeout_seconds", 1800.0),
+                                    "gateway.job_timeout_seconds", minimum=1),
+        heartbeat_timeout_seconds=_number(gw.get("heartbeat_timeout_seconds", 90.0),
+                                          "gateway.heartbeat_timeout_seconds", minimum=10),
+        aliases=aliases,
+    )
+
+
+def resolve_secret(reference: str) -> str:
+    """Read an ``env:NAME`` or ``file:PATH`` secret reference. Never log the result."""
+    if reference.startswith("env:"):
+        value = os.environ.get(reference[4:], "")
+    elif reference.startswith("file:"):
+        try:
+            value = Path(reference[5:]).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"cannot read secret file {reference[5:]}") from exc
+    else:
+        raise ConfigError("secret reference must be env:NAME or file:PATH")
+    value = value.strip()
+    if not value:
+        raise ConfigError("secret reference resolved to an empty value")
+    return value
+
+
+def gateway_workers(config: KiteConfig) -> list:
+    """WorkerAuth entries for every enabled provider that uses adapter ``pull``."""
+    from .gateway import WorkerAuth
+
+    return [
+        WorkerAuth(p.effective_worker_id, resolve_secret(p.secrets["worker_token"]), p.model_ids)
+        for p in config.providers if p.adapter == "pull" and p.enabled
+    ]
+
+
+def gateway_models(config: KiteConfig) -> list[str]:
+    """Model names the gateway serves: base models of enabled pull workers, then usable aliases."""
+    base: list[str] = []
+    for p in config.providers:
+        if p.adapter == "pull" and p.enabled:
+            base.extend(m for m in p.model_ids if m not in base)
+    return base + [name for name, spec in config.gateway.aliases.items() if spec["model"] in base]
 
 
 def model_policy_from_config(config: KiteConfig):
@@ -337,4 +432,9 @@ def redact_config(config: KiteConfig) -> dict[str, Any]:
                     "load_seconds_cold": config.routing.load_seconds_cold,
                     "default_skill": config.routing.default_skill,
                     "model_skill": config.routing.model_skill},
+        "gateway": {"host": config.gateway.host, "port": config.gateway.port,
+                    "public_url": config.gateway.public_url,
+                    "job_timeout_seconds": config.gateway.job_timeout_seconds,
+                    "heartbeat_timeout_seconds": config.gateway.heartbeat_timeout_seconds,
+                    "aliases": config.gateway.aliases},
     }

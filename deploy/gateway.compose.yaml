@@ -1,0 +1,14 @@
+# HTTPS front for the Kite gateway. Caddy gets a Let's Encrypt certificate for
+# KITE_GATEWAY_DOMAIN automatically (needs ports 80 and 443 open in the EC2 security group).
+services:
+  caddy:
+    image: caddy:2
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      KITE_GATEWAY_DOMAIN: ${KITE_GATEWAY_DOMAIN:?set to <ec2-public-ip-with-dashes>.sslip.io}
+      KITE_GATEWAY_PORT: ${KITE_GATEWAY_PORT:-8787}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${KITE_DATA_DIR:-/var/lib/kite}/caddy/data:/data
+      - ${KITE_DATA_DIR:-/var/lib/kite}/caddy/config:/config

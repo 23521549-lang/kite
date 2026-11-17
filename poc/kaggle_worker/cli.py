@@ -9,12 +9,14 @@ import getpass
 import json
 import os
 from pathlib import Path
+import secrets as token_secrets
 import sys
 import time
 import uuid
 
-from .config import (ConfigError, LIVE_ADAPTERS, load_config, model_policy_from_config,
-                     redact_config, refresh_configured_providers, sync_config_to_store)
+from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers, load_config,
+                     model_policy_from_config, redact_config, refresh_configured_providers,
+                     sync_config_to_store)
 from .integration import StaleWorkerResult, build_review_bundle
 from .protocol import ScheduledTask, WorkerResult
 from .scheduler import WorkerScheduler
@@ -99,6 +101,16 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("workflow_id")
         if action == "resume":
             sub.add_argument("--instruction", default="")
+    gateway = commands.add_parser("gateway", help="model gateway that pull workers (Kaggle) serve")
+    gateway_commands = gateway.add_subparsers(dest="gateway_command", required=True)
+    gateway_commands.add_parser("serve", help="run the gateway on loopback; publish /worker/* through Caddy")
+    oc = gateway_commands.add_parser("opencode-config", help="print the opencode.json block for the gateway")
+    oc.add_argument("--context", type=int, default=32768, help="context limit to declare per model")
+    worker = commands.add_parser("worker", help="manage pull workers")
+    worker_commands = worker.add_subparsers(dest="worker_command", required=True)
+    token = worker_commands.add_parser("token", help="create a worker token (printed once)")
+    token.add_argument("worker_id")
+    token.add_argument("--force", action="store_true", help="replace an existing token (rotation)")
     return parser
 
 
@@ -124,6 +136,67 @@ def _scheduled_task(args: argparse.Namespace, task_id: str) -> ScheduledTask:
         task_type=args.task_type,
         required_capabilities=tuple(args.capability),
     )
+
+
+async def _serve_gateway(args: argparse.Namespace, config) -> None:
+    from aiohttp import web
+
+    from .gateway import ModelAlias, ModelGateway, create_app
+
+    workers = gateway_workers(config)
+    if not workers:
+        raise ConfigError("no enabled provider uses adapter 'pull'")
+    store = SQLiteSchedulerStore(_db_path(args), model_policy=model_policy_from_config(config))
+    temporal: dict[str, object] = {"client": None}
+
+    async def on_status(worker, became_ready: bool) -> None:
+        try:
+            store.update_worker_status(
+                worker.worker_id, provider_ready=worker.ready and not worker.draining,
+                observed_at=time.time(), loaded_model=worker.loaded_model,
+                cached_models=tuple(worker.cached_models))
+        except StoreError:
+            pass   # worker not in the scheduler store yet: run `kite provider sync`
+        if not became_ready:
+            return
+        # A worker just came online: wake workflows that are waiting for one.
+        try:
+            from temporalio.client import Client
+            from .temporal_workflow import CodingTaskWorkflow
+
+            if temporal["client"] is None:
+                temporal["client"] = await Client.connect(config.temporal_endpoint)
+            for task in store.list_tasks():
+                if task["state"] == "QUEUED":
+                    try:
+                        await temporal["client"].get_workflow_handle(str(task["task_id"])).signal(
+                            CodingTaskWorkflow.worker_available)
+                    except Exception:
+                        pass   # task queued without a workflow, or the workflow already finished
+        except Exception as exc:
+            print(f"kite gateway: could not wake waiting workflows: {exc}", file=sys.stderr)
+
+    gateway = ModelGateway(
+        workers,
+        aliases=[ModelAlias(name, spec["model"], spec["params"])
+                 for name, spec in config.gateway.aliases.items()],
+        job_timeout_seconds=config.gateway.job_timeout_seconds,
+        heartbeat_timeout_seconds=config.gateway.heartbeat_timeout_seconds,
+        on_worker_status=on_status,
+    )
+    runner = web.AppRunner(create_app(gateway))
+    await runner.setup()
+    site = web.TCPSite(runner, config.gateway.host, config.gateway.port)
+    await site.start()
+    _emit({"gateway": f"http://{config.gateway.host}:{config.gateway.port}",
+           "public_url": config.gateway.public_url,
+           "workers": [w.worker_id for w in workers], "models": gateway.served_models()})
+    sys.stdout.flush()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+        store.close()
 
 
 def _operator_command(args: argparse.Namespace) -> int:
@@ -213,6 +286,47 @@ def _operator_command(args: argparse.Namespace) -> int:
                 synced = sync_config_to_store(config, store, now=time.time())
             _emit({"synced": synced, "db": str(_db_path(args))})
             return 0
+    if args.command == "gateway":
+        config = _load_operator_config(args)
+        if args.gateway_command == "opencode-config":
+            from .gateway import opencode_provider_config
+
+            url = f"http://{config.gateway.host}:{config.gateway.port}"
+            _emit(opencode_provider_config(url, gateway_models(config), context=args.context))
+            return 0
+        if args.gateway_command == "serve":
+            try:
+                asyncio.run(_serve_gateway(args, config))
+            except KeyboardInterrupt:
+                pass
+            return 0
+    if args.command == "worker":
+        config = _load_operator_config(args)
+        provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)
+        if provider is None:
+            raise ConfigError("worker ID is not configured in providers")
+        reference = provider.secrets.get("worker_token")
+        if reference and reference.startswith("file:"):
+            token_path = Path(reference[5:])
+        elif reference:
+            raise ConfigError("secrets.worker_token must be a file: reference for kite to write it")
+        else:
+            token_path = args.config.parent / "secrets" / f"worker_token_{args.worker_id}"
+        if token_path.exists() and not args.force:
+            raise ConfigError("token file already exists; pass --force to rotate it")
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(token_path.parent, 0o700)
+        token = token_secrets.token_urlsafe(32)
+        temp_path = token_path.with_name(token_path.name + ".tmp")
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(token + "\n")
+        os.replace(temp_path, token_path)
+        _emit({"worker_id": args.worker_id, "secret_reference": f"file:{token_path.resolve()}",
+               "token": token,
+               "next": "Lưu token này vào Kaggle Secrets với tên KITE_WORKER_TOKEN. Token chỉ in một lần; "
+                       "restart `kite gateway serve` để gateway nhận token mới."})
+        return 0
     if args.command == "workflow":
         config = _load_operator_config(args)
         from temporalio.client import Client
@@ -276,7 +390,7 @@ def _run(args: argparse.Namespace) -> int:
         _emit(asdict(bundle))
         return 0
 
-    if args.command in {"doctor", "setup", "provider", "workflow"}:
+    if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:
