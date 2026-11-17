@@ -1,5 +1,6 @@
 # Publishes only /worker/* of the Kite gateway. /v1/* (the OpenCode side) stays on loopback.
-{$KITE_GATEWAY_DOMAIN} {
+# HTTPS port defaults to 8443 because 443 may already be used (for example by SSH).
+{$KITE_GATEWAY_DOMAIN}:{$KITE_GATEWAY_HTTPS_PORT:8443} {
 	@worker path /worker/*
 	handle @worker {
 		reverse_proxy 127.0.0.1:{$KITE_GATEWAY_PORT:8787} {
