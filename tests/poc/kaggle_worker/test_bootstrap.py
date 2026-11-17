@@ -10,6 +10,7 @@ def repo_fixture(tmp_path):
     repo = tmp_path / "repo"
     (repo / "deploy").mkdir(parents=True)
     (repo / "pyproject.toml").write_text("[project]\nname='kite'\n", encoding="utf-8")
+    (repo / "requirements.txt").write_text("-e .\n", encoding="utf-8")
     (repo / "deploy" / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
     return repo
 
@@ -65,10 +66,30 @@ def test_dry_run_has_no_filesystem_or_provider_side_effects(tmp_path):
     assert not (repo / "deploy" / ".env").exists()
     assert any("opencode.ai/v2/install" in " ".join(c) for c in commands) is False
     assert not any("kaggle" in " ".join(c).lower() for c in commands)
-    compose = next(c for c in commands if c[:3] == ["docker", "compose", "--env-file"])
+    compose = next(c for c in commands if c[:4] == ["sudo", "docker", "compose", "--env-file"])
     assert compose[-3:] == ["postgres", "admin-tools", "temporal"]
     uninstalled = bootstrap(repo, data, **bootstrap_args(repo, data, opencode_installed=False))
     assert any("https://opencode.ai/v2/install" in " ".join(c) for c in uninstalled)
+
+
+def test_bootstrap_installs_runtime_from_requirements_manifest(tmp_path):
+    repo = repo_fixture(tmp_path)
+    data = tmp_path / "ebs"
+    commands = bootstrap(repo, data, **bootstrap_args(repo, data))
+    assert any("requirements.txt" in " ".join(c) for c in commands)
+    assert any(c[:3] == ["sudo", "docker", "compose"] for c in commands)
+
+
+def test_source_has_single_make_bootstrap_entry_and_self_installs_prerequisites():
+    root = Path(__file__).resolve().parents[3]
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+    script = (root / "poc" / "kaggle_worker" / "bootstrap.sh").read_text(encoding="utf-8")
+    assert "bootstrap:" in makefile and "poc/kaggle_worker/bootstrap.sh" in makefile
+    assert "-e ." in requirements
+    assert "docker-compose-plugin" in script
+    assert 'python install 3.12' in script
+    assert "apt-get install" in script
 
 
 def test_bootstrap_is_idempotent_and_keeps_provider_disabled(tmp_path):
@@ -97,5 +118,5 @@ def test_bootstrap_is_idempotent_and_keeps_provider_disabled(tmp_path):
     bootstrap(repo, data, command_runner=fake_runner, **args)
     assert config_path.read_text(encoding="utf-8") == original
     assert not any(c[:2] == ["git", "clone"] for c in seen)
-    assert sum(c[:2] == ["docker", "compose"] for c in seen) == 1
+    assert sum(c[:3] == ["sudo", "docker", "compose"] for c in seen) == 1
 

@@ -46,7 +46,7 @@ Tests use fake clocks, fake providers, and temporary local SQLite/checkpoint fil
 
 ## Ubuntu EC2 bootstrap
 
-Prepare a fresh Ubuntu 22.04/24.04 EC2 host with Python 3.12 or 3.13, Git, Docker Engine and the Compose v2 plugin already installed. Attach/mount the persistent EBS filesystem at `/var/lib/kite`; allow at least 20 GiB free. Configure the host's Git credential helper with a read-only credential for the private repository before cloning. No AWS resources or permissions are changed by this repository.
+Use a fresh Ubuntu 22.04/24.04 EC2 host. Attach/mount persistent EBS storage at `/var/lib/kite` (or set `KITE_DATA_DIR` to its mount path) with at least 20 GiB free. Configure Git access to the private repository before cloning. The bootstrap installs missing system prerequisites, Docker Engine/Compose from Docker's official apt repository, uv with Python 3.12, the project dependencies from `requirements.txt`, OpenCode, and the pinned Harness² checkout. No AWS resources or permissions are changed by this repository.
 
 ```sh
 git clone https://github.com/<OWNER>/<PRIVATE_REPOSITORY>.git kite-coding-agent
@@ -56,7 +56,9 @@ KITE_DATA_DIR=/var/lib/kite bash poc/kaggle_worker/bootstrap.sh
 ./.venv/bin/kite --config /var/lib/kite/kite/config.yaml doctor
 ```
 
-The bootstrap rejects unsupported OS versions, missing prerequisites, low free disk space, and conflicting Harness² state. It installs the project in `.venv`, installs OpenCode through its official installer if absent, checks out Harness² at a fixed Git commit, creates an empty-provider config and EBS-backed scheduler/checkpoint/evaluation/log directories without overwriting existing config, writes a fresh PostgreSQL password to `deploy/.env` with mode `0600`, and starts only PostgreSQL, its one-shot Temporal schema initializer, and Temporal. The optional Temporal UI is not started. Rerunning the bootstrap preserves the config, secret file and database volume. It never provisions AWS, changes IAM/firewall settings, runs Kaggle or pushes to GitHub.
+The first command is used on a clean Ubuntu image because `make` itself may not be installed yet. After bootstrap installs it, `make bootstrap` is the convenient repeatable entry point; it runs the same script. The only interactive follow-up is `kite setup` when entering a provider secret.
+
+The bootstrap rejects unsupported OS versions, low free disk space, and conflicting Harness² state. It creates an isolated `.venv`, checks out Harness² at a fixed Git commit, creates an empty-provider config and EBS-backed scheduler/checkpoint/evaluation/log directories without overwriting existing config, writes a fresh PostgreSQL password to `deploy/.env` with mode `0600`, and starts only PostgreSQL, its one-shot Temporal schema initializer, and Temporal. The optional Temporal UI is not started. Rerunning the bootstrap preserves the config, secret file and database volume. It never provisions AWS, changes IAM/firewall settings, runs Kaggle or pushes to GitHub.
 
 When a local credential is ready, capture it without terminal echo and keep the returned `file:` reference for the provider config:
 

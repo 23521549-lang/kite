@@ -49,8 +49,10 @@ def bootstrap(repo: Path, data_dir: Path, *, dry_run: bool = False,
     repo, data_dir = repo.resolve(), data_dir.resolve()
     if distro.lower() != "ubuntu":
         raise BootstrapError("supported host distribution is Ubuntu LTS")
-    if not (repo / "pyproject.toml").is_file() or not (repo / "deploy" / "compose.yaml").is_file():
-        raise BootstrapError("run bootstrap from a cloned Kite repository root")
+    if (not (repo / "pyproject.toml").is_file()
+            or not (repo / "requirements.txt").is_file()
+            or not (repo / "deploy" / "compose.yaml").is_file()):
+        raise BootstrapError("run bootstrap from the root of a cloned Kite repository")
     state = data_dir / "kite"
     harness_dir = state / "harness2"
     for path in (state, state / "checkpoints", state / "evaluations", state / "logs"):
@@ -62,13 +64,13 @@ def bootstrap(repo: Path, data_dir: Path, *, dry_run: bool = False,
         if any(harness_dir.iterdir()):
             raise BootstrapError("Harness² target exists and is not a Git checkout; refusing to overwrite")
     commands: list[list[str]] = []
+    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
     venv_python = str(repo / ".venv" / "bin" / "python")
     if not opencode_installed:
         commands.append(["bash", "-lc", f"curl -fsSL {OPENCODE_INSTALLER} | bash"])
     commands.extend([
-        [python_executable, "-m", "venv", str(repo / ".venv")],
-        [venv_python, "-m", "pip", "install", "--upgrade", "pip==25.3"],
-        [venv_python, "-m", "pip", "install", "-e", str(repo)],
+        [uv, "venv", "--python", python_executable, str(repo / ".venv")],
+        [uv, "pip", "install", "--python", venv_python, "-r", str(repo / "requirements.txt")],
     ])
     if not (harness_dir / ".git").is_dir():
         commands.extend([
@@ -78,8 +80,8 @@ def bootstrap(repo: Path, data_dir: Path, *, dry_run: bool = False,
     else:
         commands.append(["git", "-C", str(harness_dir), "checkout", "--detach", HARNESS2_REVISION])
     commands.extend([
-        [venv_python, "-m", "pip", "install", "-e", str(harness_dir)],
-        ["docker", "compose", "--env-file", str(repo / "deploy" / ".env"), "-f",
+        [uv, "pip", "install", "--python", venv_python, "-e", str(harness_dir)],
+        ["sudo", "docker", "compose", "--env-file", str(repo / "deploy" / ".env"), "-f",
          str(repo / "deploy" / "compose.yaml"), "up", "-d", "postgres", "admin-tools", "temporal"],
     ])
     if dry_run:
@@ -89,7 +91,6 @@ def bootstrap(repo: Path, data_dir: Path, *, dry_run: bool = False,
         (state / name).mkdir(exist_ok=True)
     config_path = state / "config.yaml"
     if not config_path.exists():
-        import yaml
         config = {
             "schema_version": 1,
             "temporal": {"endpoint": "127.0.0.1:7233", "task_queue": "kite-coding-tasks"},
@@ -97,8 +98,25 @@ def bootstrap(repo: Path, data_dir: Path, *, dry_run: bool = False,
             "harness2": {"checkout": str(harness_dir), "cli": str(Path(venv_python).parent / "harness2")},
             "providers": [],
         }
+        # JSON string quoting is valid YAML scalar syntax and keeps bootstrap
+        # usable before the virtualenv/YAML dependency has been installed.
+        yaml_text = (
+            "schema_version: 1\n"
+            "temporal:\n"
+            f"  endpoint: {json.dumps(config['temporal']['endpoint'])}\n"
+            f"  task_queue: {json.dumps(config['temporal']['task_queue'])}\n"
+            "opencode:\n"
+            f"  executable: {json.dumps(config['opencode']['executable'])}\n"
+            "  server:\n"
+            f"    host: {json.dumps(config['opencode']['server']['host'])}\n"
+            f"    port: {config['opencode']['server']['port']}\n"
+            "harness2:\n"
+            f"  checkout: {json.dumps(config['harness2']['checkout'])}\n"
+            f"  cli: {json.dumps(config['harness2']['cli'])}\n"
+            "providers: []\n"
+        )
         temp = config_path.with_suffix(".yaml.tmp")
-        temp.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        temp.write_text(yaml_text, encoding="utf-8")
         temp.replace(config_path)
     env_path = repo / "deploy" / ".env"
     if not env_path.exists():
@@ -137,16 +155,20 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
+        python_executable = os.environ.get("KITE_BOOTSTRAP_PYTHON", sys.executable)
+        python_version = _python_version(python_executable)
+        dry_run = args.dry_run
         cmds = bootstrap(args.repo, args.data_dir, dry_run=args.dry_run,
-                         system=platform.system(), version=_host_version(),
-                         git=shutil.which("git") is not None,
-                         python312=(3, 12) <= sys.version_info < (3, 14),
-                         python_executable=sys.executable,
-                         docker=shutil.which("docker") is not None,
-                         compose=_compose_available(),
-                         distro=_host_distro(),
+                         system="Linux" if dry_run else platform.system(),
+                         version="24.04" if dry_run else _host_version(),
+                         git=dry_run or shutil.which("git") is not None,
+                         python312=dry_run or (3, 12) <= python_version < (3, 14),
+                         python_executable=python_executable,
+                         docker=dry_run or shutil.which("docker") is not None,
+                         compose=dry_run or _compose_available(),
+                         distro="ubuntu" if dry_run else _host_distro(),
                          available_bytes=shutil.disk_usage(_disk_check_path(args.data_dir)).free,
-                         opencode_installed=shutil.which("opencode") is not None)
+                         opencode_installed=dry_run or shutil.which("opencode") is not None)
         print(json.dumps({"dry_run": args.dry_run, "commands": cmds}, indent=2))
         return 0
     except (OSError, BootstrapError, subprocess.CalledProcessError) as exc:
@@ -155,12 +177,27 @@ def main() -> int:
 
 
 def _compose_available() -> bool:
+    command = ["docker", "compose", "version"]
+    if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0:
+        command.insert(0, "sudo")
     try:
-        subprocess.run(["docker", "compose", "version"], check=True, stdout=subprocess.DEVNULL,
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
         return True
     except (OSError, subprocess.CalledProcessError):
         return False
+
+
+def _python_version(executable: str) -> tuple[int, int]:
+    try:
+        result = subprocess.run(
+            [executable, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+            check=True, capture_output=True, text=True,
+        )
+        major, minor = result.stdout.strip().split(".", 1)
+        return int(major), int(minor)
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0, 0
 
 
 def _host_distro() -> str:
