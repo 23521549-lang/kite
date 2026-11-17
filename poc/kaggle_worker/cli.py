@@ -13,8 +13,8 @@ import sys
 import time
 import uuid
 
-from .config import (ConfigError, LIVE_ADAPTERS, load_config, redact_config,
-                     refresh_configured_providers)
+from .config import (ConfigError, LIVE_ADAPTERS, load_config, model_policy_from_config,
+                     redact_config, refresh_configured_providers, sync_config_to_store)
 from .integration import StaleWorkerResult, build_review_bundle
 from .protocol import ScheduledTask, WorkerResult
 from .scheduler import WorkerScheduler
@@ -42,6 +42,10 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--repo-head", required=True, help="pinned Git HEAD for review safety")
     add.add_argument("--branch", help="isolated task branch (default: agent/<task-id>)")
     add.add_argument("--role", default="coder")
+    add.add_argument("--task-type", default="coding",
+                     help="kind of work (coding, analysis, review, vision, docs) used to pick a model")
+    add.add_argument("--capability", action="append", default=[],
+                     help="capability a worker must have; repeat for several")
     add.add_argument("--model")
     add.add_argument("--estimate-gpu-seconds", type=int, default=900)
     add.add_argument("--priority", type=int, default=0)
@@ -74,6 +78,8 @@ def _parser() -> argparse.ArgumentParser:
     provider_commands.add_parser("refresh", help="refresh configured adapters (read-only; never enables providers)")
     enable = provider_commands.add_parser("enable", help="enable a configured provider adapter")
     enable.add_argument("provider_id")
+    provider_commands.add_parser(
+        "sync", help="register configured providers as owners/workers in the scheduler store")
     workflow = commands.add_parser("workflow", help="operate Temporal coding workflows")
     workflow_commands = workflow.add_subparsers(dest="workflow_command", required=True)
     start = workflow_commands.add_parser("start", help="start a coding workflow")
@@ -83,9 +89,12 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--repo-head", required=True)
     start.add_argument("--branch", required=True)
     start.add_argument("--capability", action="append", default=[])
+    start.add_argument("--role", default="coder")
+    start.add_argument("--task-type", default="coding")
     start.add_argument("--model")
     start.add_argument("--estimate-gpu-seconds", type=int, default=900)
-    for action in ("status", "pause", "resume", "cancel"):
+    start.add_argument("--priority", type=int, default=0)
+    for action in ("status", "pause", "resume", "cancel", "wake"):
         sub = workflow_commands.add_parser(action)
         sub.add_argument("workflow_id")
         if action == "resume":
@@ -95,6 +104,26 @@ def _parser() -> argparse.ArgumentParser:
 
 def _load_operator_config(args: argparse.Namespace):
     return load_config(args.config)
+
+
+def _db_path(args: argparse.Namespace) -> Path:
+    return args.db if args.db is not None else args.config.parent / "scheduler.sqlite3"
+
+
+def _scheduled_task(args: argparse.Namespace, task_id: str) -> ScheduledTask:
+    return ScheduledTask(
+        task_id=task_id,
+        role=args.role,
+        model_id=args.model,
+        repo_head=args.repo_head,
+        branch=args.branch or f"agent/{task_id}",
+        payload_json=json.dumps({"goal": args.goal}, ensure_ascii=False, sort_keys=True),
+        estimated_gpu_seconds=args.estimate_gpu_seconds,
+        priority=args.priority,
+        created_at=time.time(),
+        task_type=args.task_type,
+        required_capabilities=tuple(args.capability),
+    )
 
 
 def _operator_command(args: argparse.Namespace) -> int:
@@ -179,6 +208,11 @@ def _operator_command(args: argparse.Namespace) -> int:
             temp_path.replace(args.config)
             _emit({"provider_id": provider.id, "enabled": True})
             return 0
+        if args.provider_command == "sync":
+            with SQLiteSchedulerStore(_db_path(args)) as store:
+                synced = sync_config_to_store(config, store, now=time.time())
+            _emit({"synced": synced, "db": str(_db_path(args))})
+            return 0
     if args.command == "workflow":
         config = _load_operator_config(args)
         from temporalio.client import Client
@@ -188,16 +222,28 @@ def _operator_command(args: argparse.Namespace) -> int:
             client = await Client.connect(config.temporal_endpoint)
             action = args.workflow_command
             if action == "start":
+                # The workflow reserves a route from the scheduler store, so the task must be
+                # queued there first. Enqueue is idempotent for identical task content.
+                with SQLiteSchedulerStore(_db_path(args), model_policy=model_policy_from_config(config)) as store:
+                    existing = None
+                    try:
+                        existing = store.get_task(args.task_id)
+                    except StoreError:
+                        store.enqueue(_scheduled_task(args, args.task_id))
+                    if existing is not None and existing["repo_head"] != args.repo_head:
+                        raise StoreError(f"task {args.task_id} already exists with a different repo HEAD")
                 task_input = CodingTaskInput(args.task_id, args.goal, str(args.repo.resolve()), args.repo_head,
-                                             args.branch, tuple(args.capability), args.model, args.estimate_gpu_seconds)
+                                             args.branch, tuple(args.capability), args.model, args.estimate_gpu_seconds,
+                                             task_type=args.task_type, role=args.role)
                 handle = await client.start_workflow(CodingTaskWorkflow.run, task_input,
                                                      id=args.task_id, task_queue=config.temporal_task_queue)
-                return {"workflow_id": handle.id, "run_id": handle.result_run_id}
+                return {"workflow_id": handle.id, "run_id": handle.result_run_id, "queued": True}
             handle = client.get_workflow_handle(args.workflow_id)
             if action == "status":
                 return {"workflow_id": args.workflow_id, "status": await handle.query(CodingTaskWorkflow.current_status)}
             signal = {"pause": CodingTaskWorkflow.pause, "resume": CodingTaskWorkflow.resume_with_instruction,
-                      "cancel": CodingTaskWorkflow.cancel}[action]
+                      "cancel": CodingTaskWorkflow.cancel,
+                      "wake": CodingTaskWorkflow.worker_available}[action]
             if action == "resume":
                 await handle.signal(signal, args.instruction)
             else:
@@ -214,7 +260,7 @@ def _emit(value: object) -> None:
 
 def _run(args: argparse.Namespace) -> int:
     if args.db is None:
-        args.db = args.config.parent / "scheduler.sqlite3"
+        args.db = _db_path(args)
     if args.command == "review":
         raw = json.loads(args.result_json.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
@@ -237,17 +283,7 @@ def _run(args: argparse.Namespace) -> int:
         scheduler = WorkerScheduler(store)
         if args.task_command == "add":
             task_id = args.task_id or uuid.uuid4().hex
-            task = ScheduledTask(
-                task_id=task_id,
-                role=args.role,
-                model_id=args.model,
-                repo_head=args.repo_head,
-                branch=args.branch or f"agent/{task_id}",
-                payload_json=json.dumps({"goal": args.goal}, ensure_ascii=False, sort_keys=True),
-                estimated_gpu_seconds=args.estimate_gpu_seconds,
-                priority=args.priority,
-                created_at=time.time(),
-            )
+            task = _scheduled_task(args, task_id)
             store.enqueue(task)
             _emit(store.get_task(task.task_id))
         elif args.task_command == "list":
@@ -265,6 +301,8 @@ def _run(args: argparse.Namespace) -> int:
                 branch=str(task["branch"]), payload_json=str(task["payload_json"]),
                 estimated_gpu_seconds=int(task["estimated_gpu_seconds"]),
                 priority=int(task["priority"]), created_at=float(task["created_at"]),
+                task_type=str(task["task_type"]),
+                required_capabilities=tuple(task["required_capabilities"]),
             )
             prepared = prepare_task_workspace(scheduled_task, args.repo, state_dir=args.db.parent)
             _emit({

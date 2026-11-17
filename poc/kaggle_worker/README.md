@@ -73,6 +73,45 @@ This only stores the value locally with mode `0600`; it does not configure or en
 ./.venv/bin/kite --config /var/lib/kite/kite/config.yaml provider refresh
 ./.venv/bin/kite --config /var/lib/kite/kite/config.yaml provider enable <provider-id>
 ```
+## Task-type dispatcher
+
+Each task carries a `task_type` (`coding`, `analysis`, `review`, `vision`, `docs`, …) and optional required capabilities. The dispatcher keeps only eligible workers (idle capacity, owner policy, fresh heartbeat, quota, every required capability), then scores each (worker, model) pair:
+
+```text
+score = quality(task_type, model) - swap_penalty_per_second * load_seconds(worker, model)
+```
+
+`load_seconds` is 0 when the worker already has the model loaded, `load_seconds_cached` when the model is on the worker's disk, and `load_seconds_cold` otherwise. Ties go to the less-loaded worker. A pinned `--model` skips scoring. Configure it in `config.yaml`:
+
+```yaml
+providers:
+  - id: kaggle-han
+    adapter: opencode          # until the Kaggle pull-worker lands (phase 2)
+    enabled: true
+    owner: han
+    model: qwen3.6
+    models: [devstral]
+    capabilities: [coding, vision]
+    quota: {gpu_seconds: 108000, concurrency: 1}
+routing:
+  swap_penalty_per_second: 0.0005
+  load_seconds_cached: 60
+  load_seconds_cold: 600
+  model_skill:               # replace with scores measured on your own tasks (Harness²)
+    coding:   {qwen3.6: 0.75, devstral: 0.65}
+    analysis: {qwen3.6: 0.70, devstral: 0.60}
+```
+
+Register configured providers in the scheduler store (safe to rerun; consumed quota and heartbeat state are kept), then queue work with a type:
+
+```sh
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml provider sync
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml workflow start --task-id a-1 --goal "Analyse the parser" \
+  --repo "$PWD" --repo-head "$HEAD" --branch agent/a-1 --task-type analysis
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml workflow wake a-1   # re-check for a worker now
+```
+
+`workflow start` now queues the task in the scheduler store before starting the workflow. A waiting workflow re-checks for a worker with backoff (15 s doubling to 5 min) or immediately on `workflow wake`, and continues as new every 200 checks so its Temporal history stays bounded. A completed task is charged at least its lease's wall time, because Kaggle bills session time.
 
 Kaggle activation requires, at minimum, a verified supported interactive notebook request/response path, result retrieval, cancellation, one-account quota accounting, and documented credential ownership. Each gate needs a local fake-backed integration test and a policy review before the hard disable can be removed. Adding a token alone does not pass this gate.
 

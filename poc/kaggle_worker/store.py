@@ -13,7 +13,7 @@ import uuid
 from typing import Iterator, Protocol
 
 from .protocol import OwnerPolicy, ScheduledTask, TaskLease, TaskState, WorkerProfile, WorkerResult
-from .routing import RoutingRequest, WorkerLoad, select_worker
+from .routing import ModelPolicy, RoutingRequest, WorkerLoad, select_worker
 
 
 class StoreError(RuntimeError):
@@ -57,8 +57,9 @@ class SchedulerStore(Protocol):
 class SQLiteSchedulerStore:
     """Thread-safe SQLite store with one transaction per state transition."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, model_policy: ModelPolicy | None = None) -> None:
         self.path = Path(path)
+        self.model_policy = model_policy
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(
@@ -149,6 +150,27 @@ class SQLiteSchedulerStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS leases_by_idempotency_key "
                 "ON leases(idempotency_key) WHERE idempotency_key IS NOT NULL"
             )
+            # Dispatcher columns (task type, capabilities, loaded/cached models).
+            for table, columns in {
+                "workers": {
+                    "capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "loaded_model": "TEXT",
+                    "cached_models_json": "TEXT NOT NULL DEFAULT '[]'",
+                },
+                "tasks": {
+                    "task_type": "TEXT NOT NULL DEFAULT 'coding'",
+                    "required_capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+                },
+            }.items():
+                existing = {
+                    row["name"]
+                    for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for name, column_type in columns.items():
+                    if name not in existing:
+                        self._connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"
+                        )
 
     def __enter__(self) -> SQLiteSchedulerStore:
         return self
@@ -185,6 +207,9 @@ class SQLiteSchedulerStore:
             roles=tuple(json.loads(row["roles_json"])), model_ids=tuple(json.loads(row["model_ids_json"])),
             enabled=bool(row["enabled"]), provider_ready=bool(row["provider_ready"]),
             status_observed_at=row["status_observed_at"], max_concurrency=row["max_concurrency"],
+            capabilities=tuple(json.loads(row["capabilities_json"] or "[]")),
+            loaded_model=row["loaded_model"],
+            cached_models=tuple(json.loads(row["cached_models_json"] or "[]")),
         )
 
     @staticmethod
@@ -225,15 +250,23 @@ class SQLiteSchedulerStore:
                 if previous is not None and previous["owner_id"] != profile.owner_id:
                     raise StoreError(f"worker {profile.worker_id} cannot change owner")
                 db.execute(
-                    """INSERT INTO workers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """INSERT INTO workers (
+                    worker_id, owner_id, provider_id, roles_json, model_ids_json, enabled,
+                    provider_ready, status_observed_at, max_concurrency,
+                    capabilities_json, loaded_model, cached_models_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(worker_id) DO UPDATE SET
                     provider_id=excluded.provider_id, roles_json=excluded.roles_json,
                     model_ids_json=excluded.model_ids_json, enabled=excluded.enabled,
                     provider_ready=excluded.provider_ready, status_observed_at=excluded.status_observed_at,
-                    max_concurrency=excluded.max_concurrency""",
+                    max_concurrency=excluded.max_concurrency,
+                    capabilities_json=excluded.capabilities_json, loaded_model=excluded.loaded_model,
+                    cached_models_json=excluded.cached_models_json""",
                     (profile.worker_id, profile.owner_id, profile.provider_id,
                      json.dumps(profile.roles), json.dumps(profile.model_ids), int(profile.enabled),
-                     int(profile.provider_ready), profile.status_observed_at, profile.max_concurrency),
+                     int(profile.provider_ready), profile.status_observed_at, profile.max_concurrency,
+                     json.dumps(profile.capabilities), profile.loaded_model,
+                     json.dumps(profile.cached_models)),
                 )
         except sqlite3.IntegrityError as error:
             raise StoreError(f"could not register worker {profile.worker_id}: owner must be registered first") from error
@@ -244,11 +277,13 @@ class SQLiteSchedulerStore:
         values = (
             task.task_id, task.role, task.model_id, task.repo_head, task.branch,
             task.payload_json, task.estimated_gpu_seconds, task.priority, task.created_at,
+            task.task_type, json.dumps(task.required_capabilities),
         )
         try:
             with self._transaction() as db:
                 previous = db.execute(
-                    "SELECT task_id, role, model_id, repo_head, branch, payload_json, estimated_gpu_seconds, priority, created_at FROM tasks WHERE task_id = ?",
+                    "SELECT task_id, role, model_id, repo_head, branch, payload_json, estimated_gpu_seconds, "
+                    "priority, created_at, task_type, required_capabilities_json FROM tasks WHERE task_id = ?",
                     (task.task_id,),
                 ).fetchone()
                 if previous is not None:
@@ -258,8 +293,8 @@ class SQLiteSchedulerStore:
                 db.execute(
                     """INSERT INTO tasks (
                     task_id, role, model_id, repo_head, branch, payload_json,
-                    estimated_gpu_seconds, priority, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", values,
+                    estimated_gpu_seconds, priority, created_at, task_type, required_capabilities_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values,
                 )
         except sqlite3.Error as error:
             raise StoreError(f"could not enqueue task {task.task_id}: {error}") from error
@@ -295,6 +330,8 @@ class SQLiteSchedulerStore:
             "payload_json": row["payload_json"], "estimated_gpu_seconds": row["estimated_gpu_seconds"],
             "priority": row["priority"], "created_at": row["created_at"],
             "state": row["state"], "attempts": row["attempts"], "last_error": row["last_error"],
+            "task_type": row["task_type"],
+            "required_capabilities": json.loads(row["required_capabilities_json"] or "[]"),
         }
 
     def get_task(self, task_id: str) -> dict[str, object]:
@@ -314,6 +351,49 @@ class SQLiteSchedulerStore:
                 "SELECT * FROM tasks ORDER BY created_at, task_id"
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
+
+    @staticmethod
+    def _routing_request(task: sqlite3.Row) -> RoutingRequest:
+        return RoutingRequest(
+            role=task["role"], model_id=task["model_id"],
+            estimated_gpu_seconds=task["estimated_gpu_seconds"],
+            task_type=task["task_type"] or "coding",
+            required_capabilities=tuple(json.loads(task["required_capabilities_json"] or "[]")),
+        )
+
+    def update_worker_status(
+        self,
+        worker_id: str,
+        *,
+        provider_ready: bool,
+        observed_at: float,
+        loaded_model: str | None = None,
+        cached_models: tuple[str, ...] = (),
+    ) -> WorkerProfile:
+        """Record a worker heartbeat without touching owner, roles, models, or enablement."""
+        self._validate_time(observed_at, "observed_at")
+        if type(provider_ready) is not bool:
+            raise ValueError("provider_ready must be a boolean")
+        with self._transaction() as db:
+            row = db.execute("SELECT * FROM workers WHERE worker_id=?", (worker_id,)).fetchone()
+            if row is None:
+                raise StoreError(f"worker {worker_id} is not registered")
+            current = self._worker_from_row(row)
+            updated = WorkerProfile(
+                worker_id=current.worker_id, owner_id=current.owner_id,
+                provider_id=current.provider_id, roles=current.roles, model_ids=current.model_ids,
+                enabled=current.enabled, provider_ready=provider_ready,
+                status_observed_at=float(observed_at), max_concurrency=current.max_concurrency,
+                capabilities=current.capabilities, loaded_model=loaded_model,
+                cached_models=tuple(cached_models),
+            )
+            db.execute(
+                "UPDATE workers SET provider_ready=?, status_observed_at=?, loaded_model=?, "
+                "cached_models_json=? WHERE worker_id=?",
+                (int(provider_ready), float(observed_at), loaded_model,
+                 json.dumps(list(cached_models)), worker_id),
+            )
+        return updated
 
     @staticmethod
     def _validate_time(value: float, name: str) -> None:
@@ -393,15 +473,13 @@ class SQLiteSchedulerStore:
             task = None
             for item in tasks:
                 decision = select_worker(
-                    RoutingRequest(
-                        role=item["role"], model_id=item["model_id"],
-                        estimated_gpu_seconds=item["estimated_gpu_seconds"],
-                    ),
+                    self._routing_request(item),
                     (worker,),
                     {owner.owner_id: owner},
                     {worker.worker_id: load},
                     now=now,
                     max_observation_age_seconds=max_observation_age_seconds,
+                    model_policy=self.model_policy,
                 )
                 if decision is not None:
                     task = item
@@ -546,12 +624,10 @@ class SQLiteSchedulerStore:
                 )
 
             decision = select_worker(
-                RoutingRequest(
-                    role=task["role"], model_id=task["model_id"],
-                    estimated_gpu_seconds=task["estimated_gpu_seconds"],
-                ),
+                self._routing_request(task),
                 workers, owners, loads, now=now,
                 max_observation_age_seconds=max_observation_age_seconds,
+                model_policy=self.model_policy,
             )
             if decision is None:
                 return None
@@ -645,12 +721,16 @@ class SQLiteSchedulerStore:
                     raise LeaseError("worker result identity does not match the active lease")
                 if result.base_repo_head != task["repo_head"]:
                     raise LeaseError("worker result repository HEAD does not match the task")
+                # Kaggle bills session wall time, not reported tokens. A worker that reports
+                # no usage (OpenCode reports 0) is charged at least the lease's elapsed time.
+                elapsed = max(0, math.ceil(now - float(row["created_at"])))
+                charged = max(result.usage_gpu_seconds, elapsed)
                 db.execute(
                     "UPDATE leases SET status='COMPLETED', actual_gpu_seconds=?, result_json=? WHERE lease_id=?",
-                    (result.usage_gpu_seconds, serialized, lease_id),
+                    (charged, serialized, lease_id),
                 )
                 db.execute("UPDATE tasks SET state='COMPLETED' WHERE task_id=?", (row["task_id"],))
-                self._charge_quota(db, row["owner_id"], result.usage_gpu_seconds)
+                self._charge_quota(db, row["owner_id"], charged)
         if expired:
             raise LeaseError(f"lease {lease_id} expired")
 
@@ -683,4 +763,3 @@ class SQLiteSchedulerStore:
                 db.execute("UPDATE tasks SET state=?, last_error=? WHERE task_id=?", (state, error, row["task_id"]))
         if expired:
             raise LeaseError(f"lease {lease_id} expired")
-

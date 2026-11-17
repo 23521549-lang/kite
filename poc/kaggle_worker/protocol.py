@@ -37,6 +37,13 @@ def _require_capabilities(field_name: str, values: object) -> None:
         raise ValueError(f"{field_name} must contain only non-empty strings")
 
 
+def _require_optional_names(field_name: str, values: object) -> None:
+    if not isinstance(values, tuple):
+        raise ValueError(f"{field_name} must be a tuple of strings")
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValueError(f"{field_name} must contain only non-empty strings")
+
+
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
@@ -88,6 +95,10 @@ class WorkerProfile:
     provider_ready: bool
     status_observed_at: float
     max_concurrency: int
+    # Dispatcher metadata. Defaults keep older callers and stored rows valid.
+    capabilities: tuple[str, ...] = ()
+    loaded_model: str | None = None
+    cached_models: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text("worker_id", self.worker_id)
@@ -95,6 +106,10 @@ class WorkerProfile:
         _require_text("provider_id", self.provider_id)
         _require_capabilities("roles", self.roles)
         _require_capabilities("model_ids", self.model_ids)
+        _require_optional_names("capabilities", self.capabilities)
+        _require_optional_names("cached_models", self.cached_models)
+        if self.loaded_model is not None:
+            _require_text("loaded_model", self.loaded_model)
         if type(self.enabled) is not bool:
             raise ValueError("enabled must be a boolean")
         if type(self.provider_ready) is not bool:
@@ -135,10 +150,14 @@ class ScheduledTask:
     estimated_gpu_seconds: int
     priority: int
     created_at: float
+    task_type: str = "coding"
+    required_capabilities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text("task_id", self.task_id)
         _require_text("role", self.role)
+        _require_text("task_type", self.task_type)
+        _require_optional_names("required_capabilities", self.required_capabilities)
         if self.model_id is not None:
             _require_text("model_id", self.model_id)
         _require_text("repo_head", self.repo_head)
