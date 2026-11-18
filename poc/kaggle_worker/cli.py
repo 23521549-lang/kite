@@ -9,6 +9,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import re
 import secrets as token_secrets
 import shutil
 import subprocess
@@ -146,6 +147,13 @@ def _parser() -> argparse.ArgumentParser:
     chat_setup.add_argument("--force", action="store_true", help="overwrite opencode.json and AGENTS.md")
     chat_commands.add_parser("reload", help="stop the OpenCode background server and old Kite MCP servers "
                                             "so the next `opencode` loads the current Kite tools")
+    bench = commands.add_parser("bench", help="measure the Kaggle models on Kite's jobs (lead agent, code, speed)")
+    bench_commands = bench.add_subparsers(dest="bench_command", required=True)
+    bench_run = bench_commands.add_parser("run", help="run the benchmark through the gateway (worker must be up)")
+    bench_run.add_argument("--models", default="", help="comma-separated; default: every base model")
+    bench_run.add_argument("--suites", default="speed,lead,code", help="comma-separated: speed, lead, code")
+    bench_run.add_argument("--only", default="", help="comma-separated scenario/task ids, e.g. L04,L16,C1-bugfix")
+    bench_run.add_argument("--out", type=Path, help="output folder (default: <state>/bench/<time>)")
     return parser
 
 
@@ -355,6 +363,52 @@ def _chat_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bench_command(args: argparse.Namespace) -> int:
+    from . import bench
+    from . import sandbox as sbx
+    from .mcp_server import KiteOps, build_server, chat_files
+
+    config = _load_operator_config(args)
+    served = gateway_models(config)
+    models = [m.strip() for m in args.models.split(",") if m.strip()] or \
+        [m for m in served if m not in config.gateway.aliases]
+    unknown = [m for m in models if m not in served]
+    if unknown:
+        raise ConfigError(f"model not served by the gateway: {', '.join(unknown)} (served: {', '.join(served)})")
+    suites = [s.strip() for s in args.suites.split(",") if s.strip()]
+    if not suites or set(suites) - {"speed", "lead", "code"}:
+        raise ConfigError("--suites takes speed, lead, code")
+    only = {x.strip() for x in args.only.split(",") if x.strip()}
+    scenarios = [s for s in bench.SCENARIOS if not only or s.id in only]
+    code_tasks = [t for t in bench.CODE_TASKS if not only or t.id in only]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = (args.out or args.config.parent / "bench" / stamp).expanduser().resolve()
+    post = bench.gateway_post(f"http://{config.gateway.host}:{config.gateway.port}/v1/chat/completions",
+                              timeout=config.gateway.job_timeout_seconds + 60)
+    ops = KiteOps(config, db_path=_db_path(args), state_dir=args.config.parent, allowed_roots=[Path.home()])
+    tools = bench.lead_tools(asyncio.run(build_server(ops).list_tools()))
+    system = chat_files(config, lead_model=models[0], kite_command=["kite"], allowed_roots=[Path.home()])["AGENTS.md"]
+    run_code = None
+    if "code" in suites:
+        settings = sandbox_settings_from_config(config)
+
+        def run_code(task, model, out_dir):
+            slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+            repo = bench.make_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
+            run = sbx.run_task(settings, repo=repo, goal=task.goal, model=model, models=served,
+                               state_dir=out_dir / "runs", task_id=f"bench-{slug}-{task.id.lower()}-{stamp[-6:]}",
+                               log=lambda line: print(line, file=sys.stderr))
+            return run.to_dict()
+
+    log = lambda line: print(line, file=sys.stderr, flush=True)
+    log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code")
+    results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
+                              run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log)
+    _emit({"out": str(out), "report": str(out / "README.md"),
+           "summary": {m: bench.summarize(entry) for m, entry in results["models"].items()}})
+    return 0
+
+
 def _sandbox_command(args: argparse.Namespace) -> int:
     from . import sandbox as sbx
 
@@ -507,6 +561,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _mcp_command(args)
     if args.command == "chat":
         return _chat_command(args)
+    if args.command == "bench":
+        return _bench_command(args)
     if args.command == "worker":
         config = _load_operator_config(args)
         provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)
@@ -626,7 +682,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
-                        "mcp", "chat"}:
+                        "mcp", "chat", "bench"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:
