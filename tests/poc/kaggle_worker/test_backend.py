@@ -39,9 +39,11 @@ def make_repo(tmp_path: Path) -> tuple[Path, str]:
 
 
 class FakeDocker:
-    def __init__(self, *, test_returncode: int = 0, setup_returncode: int = 0) -> None:
+    def __init__(self, *, test_returncode: int = 0, setup_returncode: int = 0,
+                 test_returncodes: list[int] | None = None) -> None:
         self.calls: list[list[str]] = []
         self.test_returncode = test_returncode
+        self.test_returncodes = list(test_returncodes or [])
         self.setup_returncode = setup_returncode
 
     def __call__(self, cmd, *, timeout=None):
@@ -54,11 +56,12 @@ class FakeDocker:
         if kind == "setup":
             (work / "generated_by_setup.txt").write_text("artefact\n")
             return CP(cmd, self.setup_returncode, "installed\n", "")
-        if kind == "agent":
+        if kind == "agent" or kind.startswith("fix"):
             (work / "calc.py").write_text("def average(xs):\n    return sum(xs) / len(xs) if xs else 0\n")
             return CP(cmd, 0, "\x1b[0mĐã sửa calc.py\n", "")
         if kind == "test":
-            return CP(cmd, self.test_returncode, "2 passed\n" if self.test_returncode == 0 else "1 failed\n", "")
+            code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
+            return CP(cmd, code, "2 passed\n" if code == 0 else "E   AssertionError: average\n1 failed\n", "")
         raise AssertionError(f"unexpected docker call: {cmd}")
 
     def kinds(self) -> list[str]:
@@ -264,3 +267,25 @@ def test_signal_to_a_finished_workflow_is_a_one_line_error(tmp_path, monkeypatch
     assert cli.main(["--config", str(config_path), "workflow", "wake", "demo-1"]) == 1
     err = capsys.readouterr().err
     assert "already completed" in err and "Traceback" not in err
+
+
+def test_failed_kite_tests_go_back_to_the_agent_with_the_output(tmp_path):
+    repo, head = make_repo(tmp_path)
+    store, fake = make_store(tmp_path), FakeDocker(test_returncodes=[1, 0])
+    backend = make_backend(tmp_path, store, fake)
+    task = make_task(store, repo, head, "task-fix")
+    beats: list[dict] = []
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        session = await backend.prepare_opencode_session(task, route, work, None, "k3")
+        return await backend.run_opencode(task, route, work, "", session, "k4", beats.append)
+
+    result = asyncio.run(scenario())
+    assert fake.kinds() == ["setup", "agent", "test", "fix1", "test"]
+    assert "1 vòng sửa" in result.summary and "PASSED" in result.summary
+    fix = next(c for c in fake.calls if c[1] == "run" and "kite-fix1-" in " ".join(c))
+    assert "THẤT BẠI" in fix[-1] and "AssertionError: average" in fix[-1]
+    first = next(c for c in fake.calls if c[1] == "run" and "kite-agent-" in " ".join(c))
+    assert "Cách làm:" in first[-1] and "calc.py" in first[-1]
