@@ -393,6 +393,11 @@ class SQLiteSchedulerStore:
                 (int(provider_ready), float(observed_at), loaded_model,
                  json.dumps(list(cached_models)), worker_id),
             )
+            # The owner's quota is Kite's own ledger (charged on complete/fail/expire/cancel), so a
+            # live worker heartbeat also confirms it is current. Without this, routing treats the
+            # quota as stale five minutes after `provider sync` and never routes a task again.
+            db.execute("UPDATE owners SET quota_observed_at=? WHERE owner_id=?",
+                       (float(observed_at), current.owner_id))
         return updated
 
     @staticmethod

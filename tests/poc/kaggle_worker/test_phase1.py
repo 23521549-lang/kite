@@ -255,3 +255,15 @@ def test_waiting_for_a_worker_cannot_exhaust_workflow_history():
     # Each recheck adds at most ~11 events (activity + timer + workflow tasks): one run stays
     # under Temporal's 10,240-event warning and far under the 51,200-event hard limit.
     assert tw.MAX_ROUTE_CHECKS_PER_RUN * 11 < 10_240
+
+
+def test_worker_heartbeat_keeps_the_owner_quota_fresh_for_routing(tmp_path):
+    with SQLiteSchedulerStore(tmp_path / "s.db") as store:
+        store.register_owner_policy(OwnerPolicy("han", True, True, 4, 3600, NOW - 10_000))
+        store.register_worker(worker("w1"))
+        store.enqueue(task("t1"))
+        assert store.reserve_for_task("t1", "k0", NOW, 600, 300) is None   # quota seen 10 000 s ago
+        store.update_worker_status("w1", provider_ready=True, observed_at=NOW)
+        assert store.get_owner_policy("han").quota_observed_at == NOW
+        assert store.get_owner_policy("han").quota_remaining_seconds == 3600   # the ledger is untouched
+        assert store.reserve_for_task("t1", "k1", NOW, 600, 300).lease.worker_id == "w1"
