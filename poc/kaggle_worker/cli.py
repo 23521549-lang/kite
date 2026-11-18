@@ -229,6 +229,27 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
         store.close()
 
 
+async def _ensure_temporal_namespace(client, *, retention_days: int = 7, settle_seconds: float = 15) -> bool:
+    """Create the client's namespace when the server does not have it yet; return True if created.
+
+    The bootstrap creates Temporal's schema but not the ``default`` namespace, and a worker cannot
+    start without it.
+    """
+    from google.protobuf.duration_pb2 import Duration
+    from temporalio.api.workflowservice.v1 import RegisterNamespaceRequest
+
+    try:
+        await client.workflow_service.register_namespace(RegisterNamespaceRequest(
+            namespace=client.namespace,
+            workflow_execution_retention_period=Duration(seconds=retention_days * 24 * 3600)))
+    except Exception as error:
+        if "already" in str(error).lower():
+            return False
+        raise
+    await asyncio.sleep(settle_seconds)   # the server caches namespaces; let it see the new one
+    return True
+
+
 def _run_workflow_worker(args: argparse.Namespace, config) -> int:
     """Serve the Temporal task queue with the sandbox backend (see deploy/kite-workflow-worker.service)."""
     from .backend import SandboxActivityBackend
@@ -257,6 +278,8 @@ def _run_workflow_worker(args: argparse.Namespace, config) -> int:
         from .temporal_workflow import CodingTaskWorkflow
 
         client = await Client.connect(config.temporal_endpoint)
+        if await _ensure_temporal_namespace(client):
+            print(f"kite: created Temporal namespace {client.namespace}", file=sys.stderr)
         await Worker(client, task_queue=config.temporal_task_queue,
                      workflows=[CodingTaskWorkflow], activities=methods).run()
 
@@ -463,7 +486,11 @@ def _operator_command(args: argparse.Namespace) -> int:
                 summary = asdict(outcome)
                 summary["patch_path"] = str(args.config.parent / "tasks" / task_slug(outcome.task_id)
                                             / "result.patch")
-                summary["apply_with"] = f"git apply {summary['patch_path']}"
+                repo_path = None
+                if outcome.checkpoint_path and Path(outcome.checkpoint_path).is_file():
+                    repo_path = json.loads(Path(outcome.checkpoint_path).read_text(encoding="utf-8")).get("repo_path")
+                summary["apply_with"] = (f"git -C {repo_path} apply {summary['patch_path']}" if repo_path
+                                         else f"git apply {summary['patch_path']}")
                 return summary
             if action == "start":
                 if not args.repo_head:
@@ -500,7 +527,12 @@ def _operator_command(args: argparse.Namespace) -> int:
             else:
                 await handle.signal(signal)
             return {"workflow_id": args.workflow_id, "signal": action, "sent": True}
-        _emit(asyncio.run(operate()))
+        from temporalio.service import RPCError
+
+        try:
+            _emit(asyncio.run(operate()))
+        except RPCError as error:
+            raise ConfigError(f"Temporal: {error}") from error
         return 0
     return -1
 
@@ -585,5 +617,19 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def console_main() -> None:
+    """Entry point of the installed `kite` command.
+
+    The Temporal SDK runs a Rust (tokio) runtime in background threads; when the interpreter shuts
+    down normally those threads can touch freed Python state and the process segfaults *after* the
+    command has finished and printed its result. Leaving with os._exit once output is flushed avoids
+    that shutdown race. Tests call main() directly and are not affected.
+    """
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    console_main()

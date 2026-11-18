@@ -20,8 +20,8 @@ test = [
 ]
 
 [project.scripts]
-kite = "poc.kaggle_worker.cli:main"
-kite-worker = "poc.kaggle_worker.cli:main"
+kite = "poc.kaggle_worker.cli:console_main"
+kite-worker = "poc.kaggle_worker.cli:console_main"
 
 [tool.setuptools.packages.find]
 include = ["poc*"]

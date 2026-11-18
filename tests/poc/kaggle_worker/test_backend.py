@@ -204,3 +204,63 @@ def test_temporal_workflow_runs_a_task_end_to_end_in_the_sandbox(tmp_path):
     assert "if xs else 0" in outcome.review_bundle.patch
     assert "PASSED" in outcome.review_bundle.summary
     assert store.get_task_state(task.task_id) == "COMPLETED"
+
+
+def test_ensure_namespace_creates_it_once_and_tolerates_an_existing_one():
+    from poc.kaggle_worker import cli
+
+    calls = []
+
+    class Service:
+        def __init__(self, error=None):
+            self.error = error
+
+        async def register_namespace(self, request):
+            calls.append(request.namespace)
+            if self.error:
+                raise self.error
+
+    class FakeClient:
+        namespace = "default"
+
+        def __init__(self, error=None):
+            self.workflow_service = Service(error)
+
+    assert asyncio.run(cli._ensure_temporal_namespace(FakeClient(), settle_seconds=0)) is True
+    assert asyncio.run(cli._ensure_temporal_namespace(
+        FakeClient(RuntimeError("Namespace already exists")), settle_seconds=0)) is False
+    with pytest.raises(RuntimeError):
+        asyncio.run(cli._ensure_temporal_namespace(FakeClient(RuntimeError("permission denied")), settle_seconds=0))
+    assert calls == ["default", "default", "default"]
+
+
+def test_signal_to_a_finished_workflow_is_a_one_line_error(tmp_path, monkeypatch, capsys):
+    import temporalio.client
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from poc.kaggle_worker import cli
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "schema_version": 1,
+        "temporal": {"endpoint": "127.0.0.1:7233", "task_queue": "q"},
+        "opencode": {"executable": "opencode", "server": {"host": "127.0.0.1", "port": 4096}},
+        "harness2": {"checkout": "/tmp/h2", "cli": "/tmp/h2/cli"},
+        "providers": [],
+    }))
+
+    class Handle:
+        async def signal(self, *_args):
+            raise RPCError("workflow execution already completed", RPCStatusCode.NOT_FOUND, b"")
+
+    class FakeClient:
+        def get_workflow_handle(self, _workflow_id):
+            return Handle()
+
+    async def fake_connect(_endpoint):
+        return FakeClient()
+
+    monkeypatch.setattr(temporalio.client.Client, "connect", staticmethod(fake_connect))
+    assert cli.main(["--config", str(config_path), "workflow", "wake", "demo-1"]) == 1
+    err = capsys.readouterr().err
+    assert "already completed" in err and "Traceback" not in err
