@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 from dataclasses import asdict
 import getpass
 import json
@@ -154,6 +155,8 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--suites", default="speed,lead,code", help="comma-separated: speed, lead, code")
     bench_run.add_argument("--only", default="", help="comma-separated scenario/task ids, e.g. L04,L16,C1-bugfix")
     bench_run.add_argument("--out", type=Path, help="output folder (default: <state>/bench/<time>)")
+    bench_run.add_argument("--no-harness", action="store_true",
+                           help="code suite without fix rounds and repo context (baseline to compare against)")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
                                                           "unless --write)")
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
@@ -412,19 +415,35 @@ def _bench_command(args: argparse.Namespace) -> int:
     run_code = None
     if "code" in suites:
         settings = sandbox_settings_from_config(config)
+        if args.no_harness:
+            settings = dataclasses.replace(settings, fix_rounds=0)
 
         def run_code(task, model, out_dir):
             slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
             repo = bench.make_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
+            task_id = f"bench-{slug}-{task.id.lower()}-{stamp[-6:]}"
             run = sbx.run_task(settings, repo=repo, goal=task.goal, model=model, models=served,
-                               state_dir=out_dir / "runs", task_id=f"bench-{slug}-{task.id.lower()}-{stamp[-6:]}",
+                               state_dir=out_dir / "runs", task_id=task_id, with_context=not args.no_harness,
                                log=lambda line: print(line, file=sys.stderr))
-            return run.to_dict()
+            result = run.to_dict()
+            if run.agent_status == "ok" and bench.add_hidden_tests(task, Path(run.workspace)):
+                # Hidden tests: written only now, run like Kite's own tests (no network).
+                name = sbx.container_name("hidden", task_id)
+                result["hidden_exit_code"], output = sbx._run_step(
+                    settings, sbx.default_runner, name=name, timeout=settings.test_timeout_seconds,
+                    args=sbx.docker_run_args(settings, name=name, workspace=Path(run.workspace), network="none")
+                    + ["sh", "-c", bench.HIDDEN_COMMAND])
+                result["hidden_output_tail"] = sbx._tail(output)
+            return result
 
     log = lambda line: print(line, file=sys.stderr, flush=True)
-    log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code")
+    harness = "tắt (không vòng sửa, không ngữ cảnh repo)" if args.no_harness else \
+        f"bật ({sandbox_settings_from_config(config).fix_rounds} vòng sửa, có ngữ cảnh repo)"
+    log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code"
+        f" | harness {harness}")
     results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
-                              run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log)
+                              run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log,
+                              meta={"harness": harness})
     _emit({"out": str(out), "report": str(out / "README.md"),
            "summary": {m: bench.summarize(entry) for m, entry in results["models"].items()}})
     return 0

@@ -1,568 +1,568 @@
-"""Validated, provider-neutral operator configuration for Kite."""
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-import ipaddress
-import json
-import os
-from pathlib import Path
-import re
-from typing import Any, Callable
-
-
-class ConfigError(ValueError):
-    pass
-
-
-# "pull" = a worker that long-polls the Kite gateway (for example a Kaggle notebook).
-ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
-_BUILTIN_ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
-_ID = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
-_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
-_CAPABILITY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-_ENV_REF = re.compile(r"^env:[A-Z][A-Z0-9_]{0,127}$")
-_IMAGE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,199}$")
-_NETWORK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
-_MEMORY = re.compile(r"^[1-9][0-9]*[kmg]$")
-_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
-
-
-@dataclass(frozen=True)
-class ProviderConfig:
-    id: str
-    adapter: str
-    enabled: bool
-    model: str
-    capabilities: tuple[str, ...]
-    quota_gpu_seconds: int
-    concurrency: int
-    secrets: dict[str, str]
-    owner: str = "self"
-    worker_id: str | None = None
-    roles: tuple[str, ...] = ("coder",)
-    models: tuple[str, ...] = ()
-
-    @property
-    def model_ids(self) -> tuple[str, ...]:
-        """All models this worker may serve; ``model`` is always first."""
-        return (self.model, *[m for m in self.models if m != self.model])
-
-    @property
-    def effective_worker_id(self) -> str:
-        return self.worker_id or self.id
-
-
-@dataclass(frozen=True)
-class RoutingConfig:
-    swap_penalty_per_second: float = 0.0
-    load_seconds_cached: float = 60.0
-    load_seconds_cold: float = 600.0
-    default_skill: float = 0.0
-    model_skill: dict[str, dict[str, float]] = field(default_factory=dict)
-    # Models without reliable tool calling: chat / Q&A through the gateway only, never a sandbox agent.
-    chat_only: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class GatewayConfig:
-    """Model gateway for pull workers. The client API stays on loopback; only /worker/* is
-    published (through Caddy) at ``public_url``."""
-    host: str = "127.0.0.1"
-    port: int = 8787
-    public_url: str | None = None
-    job_timeout_seconds: float = 1800.0
-    heartbeat_timeout_seconds: float = 90.0
-    # alias name -> {"model": base model, "params": extra request fields}
-    aliases: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class SandboxConfig:
-    """Per-task Docker sandbox. The gateway also listens on ``gateway_host`` (the host's address
-    on the internal sandbox network) so sandboxed agents can reach it without Internet access."""
-    image: str = "kite-sandbox:latest"
-    network: str = "kite-sandbox-net"
-    gateway_host: str = "172.19.0.1"
-    memory: str = "1g"
-    cpus: float = 1.0
-    pids_limit: int = 512
-    agent_timeout_seconds: int = 3600
-    test_timeout_seconds: int = 900
-    test_command: str = "python -m pytest -q"
-    setup_command: str = ""
-    setup_network: str = "bridge"
-    setup_timeout_seconds: int = 1800
-    docker_command: tuple[str, ...] = ("docker",)
-    fix_rounds: int = 2
-
-
-@dataclass(frozen=True)
-class KiteConfig:
-    schema_version: int
-    temporal_endpoint: str
-    temporal_task_queue: str
-    opencode_executable: str
-    opencode_host: str
-    opencode_port: int
-    harness2_checkout: str
-    harness2_cli: str
-    providers: tuple[ProviderConfig, ...]
-    source_path: Path | None = None
-    routing: RoutingConfig = field(default_factory=RoutingConfig)
-    gateway: GatewayConfig = field(default_factory=GatewayConfig)
-    sandbox: SandboxConfig | None = None
-
-
-@dataclass(frozen=True)
-class ProviderAdapter:
-    adapter_id: str
-    validate: Callable[[ProviderConfig], None]
-    refresh: Callable[[ProviderConfig], dict[str, Any]]
-
-
-LIVE_ADAPTERS: dict[str, ProviderAdapter] = {}
-
-
-def register_provider_adapter(adapter: ProviderAdapter) -> None:
-    """Register an implementation without changing the task/config schema."""
-    if not _ID.fullmatch(adapter.adapter_id):
-        raise ConfigError("adapter ID is malformed")
-    if adapter.adapter_id == "kaggle":
-        raise ConfigError("Kaggle is reserved as a disabled validation-only stub")
-    LIVE_ADAPTERS[adapter.adapter_id] = adapter
-    ADAPTERS.add(adapter.adapter_id)
-
-
-def unregister_provider_adapter(adapter_id: str) -> None:
-    LIVE_ADAPTERS.pop(adapter_id, None)
-    if adapter_id not in _BUILTIN_ADAPTERS:
-        ADAPTERS.discard(adapter_id)
-
-
-def refresh_configured_providers(config: KiteConfig) -> tuple[list[dict[str, Any]], list[str]]:
-    """Only invoke implementations named by this config; never mutate enablement."""
-    refreshed: list[dict[str, Any]] = []
-    unknown: list[str] = []
-    for provider in config.providers:
-        adapter = LIVE_ADAPTERS.get(provider.adapter)
-        if adapter is None:
-            unknown.append(provider.id)
-            continue
-        try:
-            adapter.validate(provider)
-            observation = adapter.refresh(provider)
-            if not isinstance(observation, dict):
-                raise ConfigError("adapter refresh must return an object")
-            refreshed.append({"provider_id": provider.id, "observation": observation})
-        except Exception:
-            # Adapter exception messages can contain credentials or endpoint data.
-            unknown.append(provider.id)
-    return refreshed, unknown
-
-
-def _mapping(value: Any, label: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ConfigError(f"{label} must be an object")
-    return value
-
-
-def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> KiteConfig:
-    root = _mapping(raw, "config")
-    if root.get("schema_version") != 1:
-        raise ConfigError("schema_version must be 1")
-    temporal = _mapping(root.get("temporal"), "temporal")
-    opencode = _mapping(root.get("opencode"), "opencode")
-    server = _mapping(opencode.get("server"), "opencode.server")
-    harness = _mapping(root.get("harness2"), "harness2")
-    endpoint = temporal.get("endpoint")
-    queue = temporal.get("task_queue")
-    executable = opencode.get("executable")
-    host = server.get("host")
-    port = server.get("port")
-    checkout, harness_cli = harness.get("checkout"), harness.get("cli")
-    if not all(isinstance(v, str) and v.strip() for v in (endpoint, queue, executable, host, checkout, harness_cli)):
-        raise ConfigError("Temporal, OpenCode and Harness² paths/endpoints must be non-empty strings")
-    if not isinstance(port, int) or not 1 <= port <= 65535:
-        raise ConfigError("opencode.server.port must be between 1 and 65535")
-    providers_raw = root.get("providers")
-    if not isinstance(providers_raw, list):
-        raise ConfigError("providers must be a list")
-    known = ADAPTERS if known_adapters is None else known_adapters
-    providers: list[ProviderConfig] = []
-    ids: set[str] = set()
-    for i, item in enumerate(providers_raw):
-        p = _mapping(item, f"providers[{i}]")
-        unknown_keys = set(p) - {"id", "adapter", "enabled", "model", "capabilities", "quota", "secrets",
-                                 "owner", "worker_id", "roles", "models"}
-        if unknown_keys:
-            raise ConfigError(f"providers[{i}] has unsupported fields")
-        pid, adapter, model = p.get("id"), p.get("adapter"), p.get("model")
-        enabled = p.get("enabled", False)
-        if not isinstance(pid, str) or not _ID.fullmatch(pid) or pid in ids:
-            raise ConfigError(f"providers[{i}].id is malformed or duplicated")
-        ids.add(pid)
-        if adapter not in known:
-            raise ConfigError(f"providers[{i}].adapter is unknown")
-        if not isinstance(model, str) or not _MODEL.fullmatch(model):
-            raise ConfigError(f"providers[{i}].model is malformed")
-        if not isinstance(enabled, bool):
-            raise ConfigError(f"providers[{i}].enabled must be boolean")
-        caps = p.get("capabilities")
-        if not isinstance(caps, list) or not caps or any(not isinstance(x, str) or not _CAPABILITY.fullmatch(x) for x in caps):
-            raise ConfigError(f"providers[{i}].capabilities contains malformed values")
-        quota = _mapping(p.get("quota"), f"providers[{i}].quota")
-        seconds, concurrency = quota.get("gpu_seconds"), quota.get("concurrency")
-        if not isinstance(seconds, int) or seconds < 0 or not isinstance(concurrency, int) or concurrency < 1:
-            raise ConfigError(f"providers[{i}].quota values are invalid")
-        secrets = _mapping(p.get("secrets", {}), f"providers[{i}].secrets")
-        for key, ref in secrets.items():
-            if not isinstance(key, str) or not _ID.fullmatch(key.replace("_", "-")):
-                raise ConfigError(f"providers[{i}].secrets has an invalid key")
-            if not isinstance(ref, str) or not (_ENV_REF.fullmatch(ref) or (ref.startswith("file:") and len(ref) > 5)):
-                raise ConfigError(f"providers[{i}].secrets.{key} must be an env:NAME or file:PATH reference")
-        if adapter == "kaggle" and not (secrets.get("token") or secrets.get("kaggle_token")):
-            raise ConfigError("Kaggle requires a token secret reference, even while disabled")
-        if adapter == "kaggle" and enabled:
-            raise ConfigError("Kaggle adapter is a disabled schema stub and cannot be enabled")
-        if adapter == "pull" and not secrets.get("worker_token"):
-            raise ConfigError(f"providers[{i}] uses adapter 'pull' and needs secrets.worker_token")
-        owner = p.get("owner", "self")
-        if not isinstance(owner, str) or not _ID.fullmatch(owner):
-            raise ConfigError(f"providers[{i}].owner is malformed")
-        worker_id = p.get("worker_id")
-        if worker_id is not None and (not isinstance(worker_id, str) or not _ID.fullmatch(worker_id)):
-            raise ConfigError(f"providers[{i}].worker_id is malformed")
-        roles = p.get("roles", ["coder"])
-        if not isinstance(roles, list) or not roles or any(not isinstance(x, str) or not _CAPABILITY.fullmatch(x) for x in roles):
-            raise ConfigError(f"providers[{i}].roles contains malformed values")
-        extra_models = p.get("models", [])
-        if not isinstance(extra_models, list) or any(not isinstance(x, str) or not _MODEL.fullmatch(x) for x in extra_models):
-            raise ConfigError(f"providers[{i}].models contains malformed values")
-        providers.append(ProviderConfig(
-            pid, adapter, enabled, model, tuple(caps), seconds, concurrency, dict(secrets),
-            owner=owner, worker_id=worker_id, roles=tuple(roles), models=tuple(extra_models),
-        ))
-    worker_ids = [p.effective_worker_id for p in providers]
-    if len(set(worker_ids)) != len(worker_ids):
-        raise ConfigError("provider worker IDs must be unique")
-    routing = _validate_routing(root.get("routing", {}))
-    gateway = _validate_gateway(root.get("gateway", {}))
-    sandbox = _validate_sandbox(root.get("sandbox"))
-    return KiteConfig(1, endpoint, queue, executable, host, port, checkout, harness_cli,
-                      tuple(providers), routing=routing, gateway=gateway, sandbox=sandbox)
-
-
-def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value in (float("inf"), float("-inf")):
-        raise ConfigError(f"{label} must be a finite number")
-    if minimum is not None and value < minimum:
-        raise ConfigError(f"{label} must be at least {minimum}")
-    return float(value)
-
-
-def _int(value: Any, label: str, *, minimum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ConfigError(f"{label} must be an integer of at least {minimum}")
-    return value
-
-
-def _validate_routing(raw: Any) -> RoutingConfig:
-    """Optional dispatcher settings: model quality per task type and model-switch cost."""
-    routing = _mapping(raw, "routing")
-    unknown = set(routing) - {"swap_penalty_per_second", "load_seconds_cached", "load_seconds_cold",
-                              "default_skill", "model_skill", "chat_only"}
-    if unknown:
-        raise ConfigError("routing has unsupported fields")
-    skill_raw = _mapping(routing.get("model_skill", {}), "routing.model_skill")
-    skill: dict[str, dict[str, float]] = {}
-    for task_type, scores in skill_raw.items():
-        if not isinstance(task_type, str) or not _CAPABILITY.fullmatch(task_type):
-            raise ConfigError("routing.model_skill task types must be lowercase identifiers")
-        per_model = _mapping(scores, f"routing.model_skill.{task_type}")
-        skill[task_type] = {}
-        for model, score in per_model.items():
-            if not isinstance(model, str) or not _MODEL.fullmatch(model):
-                raise ConfigError(f"routing.model_skill.{task_type} has a malformed model ID")
-            skill[task_type][model] = _number(score, f"routing.model_skill.{task_type}.{model}")
-    chat_only = routing.get("chat_only", [])
-    if not isinstance(chat_only, list) or not all(isinstance(m, str) and _MODEL.fullmatch(m) for m in chat_only):
-        raise ConfigError("routing.chat_only must be a list of model IDs")
-    return RoutingConfig(
-        swap_penalty_per_second=_number(routing.get("swap_penalty_per_second", 0.0),
-                                        "routing.swap_penalty_per_second", minimum=0),
-        load_seconds_cached=_number(routing.get("load_seconds_cached", 60.0),
-                                    "routing.load_seconds_cached", minimum=0),
-        load_seconds_cold=_number(routing.get("load_seconds_cold", 600.0),
-                                  "routing.load_seconds_cold", minimum=0),
-        default_skill=_number(routing.get("default_skill", 0.0), "routing.default_skill"),
-        model_skill=skill,
-        chat_only=tuple(dict.fromkeys(chat_only)),
-    )
-
-
-def _validate_gateway(raw: Any) -> GatewayConfig:
-    gw = _mapping(raw, "gateway")
-    unknown = set(gw) - {"host", "port", "public_url", "job_timeout_seconds",
-                         "heartbeat_timeout_seconds", "aliases"}
-    if unknown:
-        raise ConfigError("gateway has unsupported fields")
-    host = gw.get("host", "127.0.0.1")
-    if host not in _LOOPBACK:
-        # /v1/* has no client authentication: it must never listen on a public interface.
-        raise ConfigError("gateway.host must be a loopback address; publish /worker/* through Caddy")
-    port = gw.get("port", 8787)
-    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-        raise ConfigError("gateway.port must be between 1 and 65535")
-    public_url = gw.get("public_url")
-    if public_url is not None and (not isinstance(public_url, str) or not public_url.startswith("https://")):
-        raise ConfigError("gateway.public_url must be an https:// URL")
-    aliases: dict[str, dict[str, Any]] = {}
-    for name, spec in _mapping(gw.get("aliases", {}), "gateway.aliases").items():
-        if not isinstance(name, str) or not _MODEL.fullmatch(name):
-            raise ConfigError("gateway.aliases has a malformed alias name")
-        spec = _mapping(spec, f"gateway.aliases.{name}")
-        base = spec.get("model")
-        if not isinstance(base, str) or not _MODEL.fullmatch(base):
-            raise ConfigError(f"gateway.aliases.{name}.model is malformed")
-        params = _mapping(spec.get("params", {}), f"gateway.aliases.{name}.params")
-        if {"model", "messages", "stream"} & set(params):
-            raise ConfigError(f"gateway.aliases.{name}.params cannot override model, messages or stream")
-        aliases[name] = {"model": base, "params": dict(params)}
-    return GatewayConfig(
-        host=host, port=port, public_url=public_url,
-        job_timeout_seconds=_number(gw.get("job_timeout_seconds", 1800.0),
-                                    "gateway.job_timeout_seconds", minimum=1),
-        heartbeat_timeout_seconds=_number(gw.get("heartbeat_timeout_seconds", 90.0),
-                                          "gateway.heartbeat_timeout_seconds", minimum=10),
-        aliases=aliases,
-    )
-
-
-def _validate_sandbox(raw: Any) -> SandboxConfig | None:
-    if raw is None:
-        return None
-    sb = _mapping(raw, "sandbox")
-    unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
-                         "agent_timeout_seconds", "test_timeout_seconds", "test_command",
-                         "setup_command", "setup_network", "setup_timeout_seconds", "docker_command",
-                         "fix_rounds"}
-    if unknown:
-        raise ConfigError("sandbox has unsupported fields")
-    image = sb.get("image", "kite-sandbox:latest")
-    if not isinstance(image, str) or not _IMAGE.fullmatch(image):
-        raise ConfigError("sandbox.image is malformed")
-    network = sb.get("network", "kite-sandbox-net")
-    if not isinstance(network, str) or not _NETWORK.fullmatch(network) or network in {"host", "bridge", "none"}:
-        raise ConfigError("sandbox.network must name a dedicated internal Docker network")
-    host = sb.get("gateway_host", "172.19.0.1")
-    try:
-        address = ipaddress.ip_address(host)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError("sandbox.gateway_host must be an IP address") from exc
-    if address.version != 4 or not address.is_private or address.is_loopback:
-        raise ConfigError("sandbox.gateway_host must be the host's private IPv4 address on the sandbox network")
-    memory = sb.get("memory", "1g")
-    if not isinstance(memory, str) or not _MEMORY.fullmatch(memory):
-        raise ConfigError("sandbox.memory must look like 512m or 1g")
-    test_command = sb.get("test_command", "python -m pytest -q")
-    if not isinstance(test_command, str):
-        raise ConfigError("sandbox.test_command must be a string ('' to skip tests)")
-    setup_command = sb.get("setup_command", "")
-    if not isinstance(setup_command, str):
-        raise ConfigError("sandbox.setup_command must be a string ('' for no setup)")
-    setup_network = sb.get("setup_network", "bridge")
-    if not isinstance(setup_network, str) or not _NETWORK.fullmatch(setup_network) or setup_network == "host":
-        raise ConfigError("sandbox.setup_network must name a Docker network other than host")
-    docker_command = sb.get("docker_command", ["docker"])
-    if not isinstance(docker_command, list) or not docker_command or any(
-            not isinstance(x, str) or not x.strip() for x in docker_command):
-        raise ConfigError("sandbox.docker_command must be a non-empty list such as [docker] or [sudo, docker]")
-    return SandboxConfig(
-        image=image, network=network, gateway_host=str(address), memory=memory,
-        cpus=_number(sb.get("cpus", 1.0), "sandbox.cpus", minimum=0.1),
-        pids_limit=_int(sb.get("pids_limit", 512), "sandbox.pids_limit", minimum=64),
-        agent_timeout_seconds=_int(sb.get("agent_timeout_seconds", 3600), "sandbox.agent_timeout_seconds", minimum=60),
-        test_timeout_seconds=_int(sb.get("test_timeout_seconds", 900), "sandbox.test_timeout_seconds", minimum=10),
-        test_command=test_command, setup_command=setup_command, setup_network=setup_network,
-        setup_timeout_seconds=_int(sb.get("setup_timeout_seconds", 1800), "sandbox.setup_timeout_seconds", minimum=30),
-        docker_command=tuple(docker_command),
-        fix_rounds=_bounded_fix_rounds(sb.get("fix_rounds", 2)),
-    )
-
-
-def _bounded_fix_rounds(value: Any) -> int:
-    rounds = _int(value, "sandbox.fix_rounds", minimum=0)
-    if rounds > 5:
-        raise ConfigError("sandbox.fix_rounds must be between 0 and 5")
-    return rounds
-
-
-def resolve_secret(reference: str) -> str:
-    """Read an ``env:NAME`` or ``file:PATH`` secret reference. Never log the result."""
-    if reference.startswith("env:"):
-        value = os.environ.get(reference[4:], "")
-    elif reference.startswith("file:"):
-        try:
-            value = Path(reference[5:]).read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ConfigError(f"cannot read secret file {reference[5:]}") from exc
-    else:
-        raise ConfigError("secret reference must be env:NAME or file:PATH")
-    value = value.strip()
-    if not value:
-        raise ConfigError("secret reference resolved to an empty value")
-    return value
-
-
-def gateway_workers(config: KiteConfig) -> list:
-    """WorkerAuth entries for every enabled provider that uses adapter ``pull``."""
-    from .gateway import WorkerAuth
-
-    return [
-        WorkerAuth(p.effective_worker_id, resolve_secret(p.secrets["worker_token"]), p.model_ids)
-        for p in config.providers if p.adapter == "pull" and p.enabled
-    ]
-
-
-def gateway_models(config: KiteConfig) -> list[str]:
-    """Model names the gateway serves: base models of enabled pull workers, then usable aliases."""
-    base: list[str] = []
-    for p in config.providers:
-        if p.adapter == "pull" and p.enabled:
-            base.extend(m for m in p.model_ids if m not in base)
-    return base + [name for name, spec in config.gateway.aliases.items() if spec["model"] in base]
-
-
-def sandbox_settings_from_config(config: KiteConfig):
-    """SandboxSettings for ``kite sandbox ...``; the agent reaches the gateway on the sandbox network."""
-    from .sandbox import SandboxSettings
-
-    if config.sandbox is None:
-        raise ConfigError("config has no sandbox block")
-    sb = config.sandbox
-    return SandboxSettings(
-        image=sb.image, network=sb.network,
-        gateway_url=f"http://{sb.gateway_host}:{config.gateway.port}/v1",
-        memory=sb.memory, cpus=sb.cpus, pids_limit=sb.pids_limit,
-        agent_timeout_seconds=sb.agent_timeout_seconds, test_timeout_seconds=sb.test_timeout_seconds,
-        test_command=sb.test_command, setup_command=sb.setup_command,
-        setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
-        docker_command=sb.docker_command, fix_rounds=sb.fix_rounds,
-    )
-
-
-def model_policy_from_config(config: KiteConfig):
-    """Build the dispatcher's ModelPolicy from the operator config."""
-    from .routing import ModelPolicy
-
-    r = config.routing
-    return ModelPolicy(
-        skill={(task_type, model): score
-               for task_type, scores in r.model_skill.items() for model, score in scores.items()},
-        default_skill=r.default_skill,
-        swap_penalty_per_second=r.swap_penalty_per_second,
-        load_seconds_cached=r.load_seconds_cached,
-        load_seconds_cold=r.load_seconds_cold,
-        excluded=frozenset(r.chat_only),
-    )
-
-
-def sync_config_to_store(config: KiteConfig, store: Any, *, now: float) -> list[dict[str, Any]]:
-    """Register each configured provider as an owner + worker in the scheduler store.
-
-    Re-running is safe: an existing owner keeps its remaining quota (it is consumed by tasks
-    and must not be reset by a sync) and an existing worker keeps its heartbeat state
-    (readiness, loaded and cached models). A newly registered worker is not ready until its
-    first heartbeat.
-    """
-    from .protocol import OwnerPolicy, WorkerProfile
-
-    summary: list[dict[str, Any]] = []
-    owners: dict[str, list[ProviderConfig]] = {}
-    for provider in config.providers:
-        owners.setdefault(provider.owner, []).append(provider)
-    for owner_id, providers in owners.items():
-        existing = store.get_owner_policy(owner_id)
-        configured_quota = max(p.quota_gpu_seconds for p in providers)
-        store.register_owner_policy(OwnerPolicy(
-            owner_id=owner_id,
-            owner_authorized=True,
-            policy_approved=any(p.enabled for p in providers),
-            max_concurrent_sessions=max(p.concurrency for p in providers),
-            quota_remaining_seconds=(existing.quota_remaining_seconds if existing else configured_quota),
-            quota_observed_at=(existing.quota_observed_at if existing else float(now)),
-        ))
-    for provider in config.providers:
-        worker_id = provider.effective_worker_id
-        previous = store.get_worker(worker_id)
-        store.register_worker(WorkerProfile(
-            worker_id=worker_id,
-            owner_id=provider.owner,
-            provider_id=provider.id,
-            roles=provider.roles,
-            model_ids=provider.model_ids,
-            enabled=provider.enabled,
-            provider_ready=previous.provider_ready if previous else False,
-            status_observed_at=previous.status_observed_at if previous else float(now),
-            max_concurrency=provider.concurrency,
-            capabilities=provider.capabilities,
-            loaded_model=previous.loaded_model if previous else None,
-            cached_models=previous.cached_models if previous else (),
-        ))
-        summary.append({"worker_id": worker_id, "owner": provider.owner, "provider_id": provider.id,
-                        "enabled": provider.enabled, "models": list(provider.model_ids),
-                        "new": previous is None})
-    return summary
-
-
-def load_config(path: Path) -> KiteConfig:
-    try:
-        content = path.read_text(encoding="utf-8")
-        if path.suffix.lower() == ".json":
-            raw = json.loads(content)
-        else:
-            import yaml
-            raw = yaml.safe_load(content)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"cannot read config: {exc}") from exc
-    except ImportError as exc:
-        raise ConfigError("YAML support requires PyYAML; use JSON or install project test dependencies") from exc
-    cfg = validate_config(raw)
-    return KiteConfig(**{**cfg.__dict__, "source_path": path.resolve()})
-
-
-def redact_config(config: KiteConfig) -> dict[str, Any]:
-    """Return operator-safe metadata; secret values are never resolved here."""
-    sandbox = None
-    if config.sandbox is not None:
-        sb = config.sandbox
-        sandbox = {"image": sb.image, "network": sb.network, "gateway_host": sb.gateway_host,
-                   "memory": sb.memory, "cpus": sb.cpus, "pids_limit": sb.pids_limit,
-                   "agent_timeout_seconds": sb.agent_timeout_seconds,
-                   "test_timeout_seconds": sb.test_timeout_seconds,
-                   "test_command": sb.test_command, "setup_command": sb.setup_command,
-                   "setup_network": sb.setup_network, "setup_timeout_seconds": sb.setup_timeout_seconds,
-                   "docker_command": list(sb.docker_command)}
-    return {
-        "schema_version": config.schema_version,
-        "temporal": {"endpoint": config.temporal_endpoint, "task_queue": config.temporal_task_queue},
-        "opencode": {"executable": config.opencode_executable, "server": {"host": config.opencode_host, "port": config.opencode_port}},
-        "harness2": {"checkout": config.harness2_checkout, "cli": config.harness2_cli},
-        "providers": [{"id": p.id, "adapter": p.adapter, "enabled": p.enabled, "model": p.model,
-                       "models": list(p.model_ids), "owner": p.owner, "worker_id": p.effective_worker_id,
-                       "roles": list(p.roles),
-                       "capabilities": list(p.capabilities), "quota": {"gpu_seconds": p.quota_gpu_seconds, "concurrency": p.concurrency},
-                       "secrets": {k: "<reference-redacted>" for k in p.secrets}} for p in config.providers],
-        "routing": {"swap_penalty_per_second": config.routing.swap_penalty_per_second,
-                    "load_seconds_cached": config.routing.load_seconds_cached,
-                    "load_seconds_cold": config.routing.load_seconds_cold,
-                    "default_skill": config.routing.default_skill,
-                    "model_skill": config.routing.model_skill,
-                    "chat_only": list(config.routing.chat_only)},
-        "gateway": {"host": config.gateway.host, "port": config.gateway.port,
-                    "public_url": config.gateway.public_url,
-                    "job_timeout_seconds": config.gateway.job_timeout_seconds,
-                    "heartbeat_timeout_seconds": config.gateway.heartbeat_timeout_seconds,
-                    "aliases": config.gateway.aliases},
-        "sandbox": sandbox,
-    }
+"""Validated, provider-neutral operator configuration for Kite."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+from typing import Any, Callable
+
+
+class ConfigError(ValueError):
+    pass
+
+
+# "pull" = a worker that long-polls the Kite gateway (for example a Kaggle notebook).
+ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
+_BUILTIN_ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
+_ID = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
+_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+_CAPABILITY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_ENV_REF = re.compile(r"^env:[A-Z][A-Z0-9_]{0,127}$")
+_IMAGE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,199}$")
+_NETWORK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_MEMORY = re.compile(r"^[1-9][0-9]*[kmg]$")
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    id: str
+    adapter: str
+    enabled: bool
+    model: str
+    capabilities: tuple[str, ...]
+    quota_gpu_seconds: int
+    concurrency: int
+    secrets: dict[str, str]
+    owner: str = "self"
+    worker_id: str | None = None
+    roles: tuple[str, ...] = ("coder",)
+    models: tuple[str, ...] = ()
+
+    @property
+    def model_ids(self) -> tuple[str, ...]:
+        """All models this worker may serve; ``model`` is always first."""
+        return (self.model, *[m for m in self.models if m != self.model])
+
+    @property
+    def effective_worker_id(self) -> str:
+        return self.worker_id or self.id
+
+
+@dataclass(frozen=True)
+class RoutingConfig:
+    swap_penalty_per_second: float = 0.0
+    load_seconds_cached: float = 60.0
+    load_seconds_cold: float = 600.0
+    default_skill: float = 0.0
+    model_skill: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Models without reliable tool calling: chat / Q&A through the gateway only, never a sandbox agent.
+    chat_only: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    """Model gateway for pull workers. The client API stays on loopback; only /worker/* is
+    published (through Caddy) at ``public_url``."""
+    host: str = "127.0.0.1"
+    port: int = 8787
+    public_url: str | None = None
+    job_timeout_seconds: float = 1800.0
+    heartbeat_timeout_seconds: float = 90.0
+    # alias name -> {"model": base model, "params": extra request fields}
+    aliases: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SandboxConfig:
+    """Per-task Docker sandbox. The gateway also listens on ``gateway_host`` (the host's address
+    on the internal sandbox network) so sandboxed agents can reach it without Internet access."""
+    image: str = "kite-sandbox:latest"
+    network: str = "kite-sandbox-net"
+    gateway_host: str = "172.19.0.1"
+    memory: str = "1g"
+    cpus: float = 1.0
+    pids_limit: int = 512
+    agent_timeout_seconds: int = 3600
+    test_timeout_seconds: int = 900
+    test_command: str = "python -m pytest -q"
+    setup_command: str = ""
+    setup_network: str = "bridge"
+    setup_timeout_seconds: int = 1800
+    docker_command: tuple[str, ...] = ("docker",)
+    fix_rounds: int = 2
+
+
+@dataclass(frozen=True)
+class KiteConfig:
+    schema_version: int
+    temporal_endpoint: str
+    temporal_task_queue: str
+    opencode_executable: str
+    opencode_host: str
+    opencode_port: int
+    harness2_checkout: str
+    harness2_cli: str
+    providers: tuple[ProviderConfig, ...]
+    source_path: Path | None = None
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
+    gateway: GatewayConfig = field(default_factory=GatewayConfig)
+    sandbox: SandboxConfig | None = None
+
+
+@dataclass(frozen=True)
+class ProviderAdapter:
+    adapter_id: str
+    validate: Callable[[ProviderConfig], None]
+    refresh: Callable[[ProviderConfig], dict[str, Any]]
+
+
+LIVE_ADAPTERS: dict[str, ProviderAdapter] = {}
+
+
+def register_provider_adapter(adapter: ProviderAdapter) -> None:
+    """Register an implementation without changing the task/config schema."""
+    if not _ID.fullmatch(adapter.adapter_id):
+        raise ConfigError("adapter ID is malformed")
+    if adapter.adapter_id == "kaggle":
+        raise ConfigError("Kaggle is reserved as a disabled validation-only stub")
+    LIVE_ADAPTERS[adapter.adapter_id] = adapter
+    ADAPTERS.add(adapter.adapter_id)
+
+
+def unregister_provider_adapter(adapter_id: str) -> None:
+    LIVE_ADAPTERS.pop(adapter_id, None)
+    if adapter_id not in _BUILTIN_ADAPTERS:
+        ADAPTERS.discard(adapter_id)
+
+
+def refresh_configured_providers(config: KiteConfig) -> tuple[list[dict[str, Any]], list[str]]:
+    """Only invoke implementations named by this config; never mutate enablement."""
+    refreshed: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    for provider in config.providers:
+        adapter = LIVE_ADAPTERS.get(provider.adapter)
+        if adapter is None:
+            unknown.append(provider.id)
+            continue
+        try:
+            adapter.validate(provider)
+            observation = adapter.refresh(provider)
+            if not isinstance(observation, dict):
+                raise ConfigError("adapter refresh must return an object")
+            refreshed.append({"provider_id": provider.id, "observation": observation})
+        except Exception:
+            # Adapter exception messages can contain credentials or endpoint data.
+            unknown.append(provider.id)
+    return refreshed, unknown
+
+
+def _mapping(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{label} must be an object")
+    return value
+
+
+def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> KiteConfig:
+    root = _mapping(raw, "config")
+    if root.get("schema_version") != 1:
+        raise ConfigError("schema_version must be 1")
+    temporal = _mapping(root.get("temporal"), "temporal")
+    opencode = _mapping(root.get("opencode"), "opencode")
+    server = _mapping(opencode.get("server"), "opencode.server")
+    harness = _mapping(root.get("harness2"), "harness2")
+    endpoint = temporal.get("endpoint")
+    queue = temporal.get("task_queue")
+    executable = opencode.get("executable")
+    host = server.get("host")
+    port = server.get("port")
+    checkout, harness_cli = harness.get("checkout"), harness.get("cli")
+    if not all(isinstance(v, str) and v.strip() for v in (endpoint, queue, executable, host, checkout, harness_cli)):
+        raise ConfigError("Temporal, OpenCode and Harness² paths/endpoints must be non-empty strings")
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ConfigError("opencode.server.port must be between 1 and 65535")
+    providers_raw = root.get("providers")
+    if not isinstance(providers_raw, list):
+        raise ConfigError("providers must be a list")
+    known = ADAPTERS if known_adapters is None else known_adapters
+    providers: list[ProviderConfig] = []
+    ids: set[str] = set()
+    for i, item in enumerate(providers_raw):
+        p = _mapping(item, f"providers[{i}]")
+        unknown_keys = set(p) - {"id", "adapter", "enabled", "model", "capabilities", "quota", "secrets",
+                                 "owner", "worker_id", "roles", "models"}
+        if unknown_keys:
+            raise ConfigError(f"providers[{i}] has unsupported fields")
+        pid, adapter, model = p.get("id"), p.get("adapter"), p.get("model")
+        enabled = p.get("enabled", False)
+        if not isinstance(pid, str) or not _ID.fullmatch(pid) or pid in ids:
+            raise ConfigError(f"providers[{i}].id is malformed or duplicated")
+        ids.add(pid)
+        if adapter not in known:
+            raise ConfigError(f"providers[{i}].adapter is unknown")
+        if not isinstance(model, str) or not _MODEL.fullmatch(model):
+            raise ConfigError(f"providers[{i}].model is malformed")
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"providers[{i}].enabled must be boolean")
+        caps = p.get("capabilities")
+        if not isinstance(caps, list) or not caps or any(not isinstance(x, str) or not _CAPABILITY.fullmatch(x) for x in caps):
+            raise ConfigError(f"providers[{i}].capabilities contains malformed values")
+        quota = _mapping(p.get("quota"), f"providers[{i}].quota")
+        seconds, concurrency = quota.get("gpu_seconds"), quota.get("concurrency")
+        if not isinstance(seconds, int) or seconds < 0 or not isinstance(concurrency, int) or concurrency < 1:
+            raise ConfigError(f"providers[{i}].quota values are invalid")
+        secrets = _mapping(p.get("secrets", {}), f"providers[{i}].secrets")
+        for key, ref in secrets.items():
+            if not isinstance(key, str) or not _ID.fullmatch(key.replace("_", "-")):
+                raise ConfigError(f"providers[{i}].secrets has an invalid key")
+            if not isinstance(ref, str) or not (_ENV_REF.fullmatch(ref) or (ref.startswith("file:") and len(ref) > 5)):
+                raise ConfigError(f"providers[{i}].secrets.{key} must be an env:NAME or file:PATH reference")
+        if adapter == "kaggle" and not (secrets.get("token") or secrets.get("kaggle_token")):
+            raise ConfigError("Kaggle requires a token secret reference, even while disabled")
+        if adapter == "kaggle" and enabled:
+            raise ConfigError("Kaggle adapter is a disabled schema stub and cannot be enabled")
+        if adapter == "pull" and not secrets.get("worker_token"):
+            raise ConfigError(f"providers[{i}] uses adapter 'pull' and needs secrets.worker_token")
+        owner = p.get("owner", "self")
+        if not isinstance(owner, str) or not _ID.fullmatch(owner):
+            raise ConfigError(f"providers[{i}].owner is malformed")
+        worker_id = p.get("worker_id")
+        if worker_id is not None and (not isinstance(worker_id, str) or not _ID.fullmatch(worker_id)):
+            raise ConfigError(f"providers[{i}].worker_id is malformed")
+        roles = p.get("roles", ["coder"])
+        if not isinstance(roles, list) or not roles or any(not isinstance(x, str) or not _CAPABILITY.fullmatch(x) for x in roles):
+            raise ConfigError(f"providers[{i}].roles contains malformed values")
+        extra_models = p.get("models", [])
+        if not isinstance(extra_models, list) or any(not isinstance(x, str) or not _MODEL.fullmatch(x) for x in extra_models):
+            raise ConfigError(f"providers[{i}].models contains malformed values")
+        providers.append(ProviderConfig(
+            pid, adapter, enabled, model, tuple(caps), seconds, concurrency, dict(secrets),
+            owner=owner, worker_id=worker_id, roles=tuple(roles), models=tuple(extra_models),
+        ))
+    worker_ids = [p.effective_worker_id for p in providers]
+    if len(set(worker_ids)) != len(worker_ids):
+        raise ConfigError("provider worker IDs must be unique")
+    routing = _validate_routing(root.get("routing", {}))
+    gateway = _validate_gateway(root.get("gateway", {}))
+    sandbox = _validate_sandbox(root.get("sandbox"))
+    return KiteConfig(1, endpoint, queue, executable, host, port, checkout, harness_cli,
+                      tuple(providers), routing=routing, gateway=gateway, sandbox=sandbox)
+
+
+def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value in (float("inf"), float("-inf")):
+        raise ConfigError(f"{label} must be a finite number")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{label} must be at least {minimum}")
+    return float(value)
+
+
+def _int(value: Any, label: str, *, minimum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigError(f"{label} must be an integer of at least {minimum}")
+    return value
+
+
+def _validate_routing(raw: Any) -> RoutingConfig:
+    """Optional dispatcher settings: model quality per task type and model-switch cost."""
+    routing = _mapping(raw, "routing")
+    unknown = set(routing) - {"swap_penalty_per_second", "load_seconds_cached", "load_seconds_cold",
+                              "default_skill", "model_skill", "chat_only"}
+    if unknown:
+        raise ConfigError("routing has unsupported fields")
+    skill_raw = _mapping(routing.get("model_skill", {}), "routing.model_skill")
+    skill: dict[str, dict[str, float]] = {}
+    for task_type, scores in skill_raw.items():
+        if not isinstance(task_type, str) or not _CAPABILITY.fullmatch(task_type):
+            raise ConfigError("routing.model_skill task types must be lowercase identifiers")
+        per_model = _mapping(scores, f"routing.model_skill.{task_type}")
+        skill[task_type] = {}
+        for model, score in per_model.items():
+            if not isinstance(model, str) or not _MODEL.fullmatch(model):
+                raise ConfigError(f"routing.model_skill.{task_type} has a malformed model ID")
+            skill[task_type][model] = _number(score, f"routing.model_skill.{task_type}.{model}")
+    chat_only = routing.get("chat_only", [])
+    if not isinstance(chat_only, list) or not all(isinstance(m, str) and _MODEL.fullmatch(m) for m in chat_only):
+        raise ConfigError("routing.chat_only must be a list of model IDs")
+    return RoutingConfig(
+        swap_penalty_per_second=_number(routing.get("swap_penalty_per_second", 0.0),
+                                        "routing.swap_penalty_per_second", minimum=0),
+        load_seconds_cached=_number(routing.get("load_seconds_cached", 60.0),
+                                    "routing.load_seconds_cached", minimum=0),
+        load_seconds_cold=_number(routing.get("load_seconds_cold", 600.0),
+                                  "routing.load_seconds_cold", minimum=0),
+        default_skill=_number(routing.get("default_skill", 0.0), "routing.default_skill"),
+        model_skill=skill,
+        chat_only=tuple(dict.fromkeys(chat_only)),
+    )
+
+
+def _validate_gateway(raw: Any) -> GatewayConfig:
+    gw = _mapping(raw, "gateway")
+    unknown = set(gw) - {"host", "port", "public_url", "job_timeout_seconds",
+                         "heartbeat_timeout_seconds", "aliases"}
+    if unknown:
+        raise ConfigError("gateway has unsupported fields")
+    host = gw.get("host", "127.0.0.1")
+    if host not in _LOOPBACK:
+        # /v1/* has no client authentication: it must never listen on a public interface.
+        raise ConfigError("gateway.host must be a loopback address; publish /worker/* through Caddy")
+    port = gw.get("port", 8787)
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ConfigError("gateway.port must be between 1 and 65535")
+    public_url = gw.get("public_url")
+    if public_url is not None and (not isinstance(public_url, str) or not public_url.startswith("https://")):
+        raise ConfigError("gateway.public_url must be an https:// URL")
+    aliases: dict[str, dict[str, Any]] = {}
+    for name, spec in _mapping(gw.get("aliases", {}), "gateway.aliases").items():
+        if not isinstance(name, str) or not _MODEL.fullmatch(name):
+            raise ConfigError("gateway.aliases has a malformed alias name")
+        spec = _mapping(spec, f"gateway.aliases.{name}")
+        base = spec.get("model")
+        if not isinstance(base, str) or not _MODEL.fullmatch(base):
+            raise ConfigError(f"gateway.aliases.{name}.model is malformed")
+        params = _mapping(spec.get("params", {}), f"gateway.aliases.{name}.params")
+        if {"model", "messages", "stream"} & set(params):
+            raise ConfigError(f"gateway.aliases.{name}.params cannot override model, messages or stream")
+        aliases[name] = {"model": base, "params": dict(params)}
+    return GatewayConfig(
+        host=host, port=port, public_url=public_url,
+        job_timeout_seconds=_number(gw.get("job_timeout_seconds", 1800.0),
+                                    "gateway.job_timeout_seconds", minimum=1),
+        heartbeat_timeout_seconds=_number(gw.get("heartbeat_timeout_seconds", 90.0),
+                                          "gateway.heartbeat_timeout_seconds", minimum=10),
+        aliases=aliases,
+    )
+
+
+def _validate_sandbox(raw: Any) -> SandboxConfig | None:
+    if raw is None:
+        return None
+    sb = _mapping(raw, "sandbox")
+    unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
+                         "agent_timeout_seconds", "test_timeout_seconds", "test_command",
+                         "setup_command", "setup_network", "setup_timeout_seconds", "docker_command",
+                         "fix_rounds"}
+    if unknown:
+        raise ConfigError("sandbox has unsupported fields")
+    image = sb.get("image", "kite-sandbox:latest")
+    if not isinstance(image, str) or not _IMAGE.fullmatch(image):
+        raise ConfigError("sandbox.image is malformed")
+    network = sb.get("network", "kite-sandbox-net")
+    if not isinstance(network, str) or not _NETWORK.fullmatch(network) or network in {"host", "bridge", "none"}:
+        raise ConfigError("sandbox.network must name a dedicated internal Docker network")
+    host = sb.get("gateway_host", "172.19.0.1")
+    try:
+        address = ipaddress.ip_address(host)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("sandbox.gateway_host must be an IP address") from exc
+    if address.version != 4 or not address.is_private or address.is_loopback:
+        raise ConfigError("sandbox.gateway_host must be the host's private IPv4 address on the sandbox network")
+    memory = sb.get("memory", "1g")
+    if not isinstance(memory, str) or not _MEMORY.fullmatch(memory):
+        raise ConfigError("sandbox.memory must look like 512m or 1g")
+    test_command = sb.get("test_command", "python -m pytest -q")
+    if not isinstance(test_command, str):
+        raise ConfigError("sandbox.test_command must be a string ('' to skip tests)")
+    setup_command = sb.get("setup_command", "")
+    if not isinstance(setup_command, str):
+        raise ConfigError("sandbox.setup_command must be a string ('' for no setup)")
+    setup_network = sb.get("setup_network", "bridge")
+    if not isinstance(setup_network, str) or not _NETWORK.fullmatch(setup_network) or setup_network == "host":
+        raise ConfigError("sandbox.setup_network must name a Docker network other than host")
+    docker_command = sb.get("docker_command", ["docker"])
+    if not isinstance(docker_command, list) or not docker_command or any(
+            not isinstance(x, str) or not x.strip() for x in docker_command):
+        raise ConfigError("sandbox.docker_command must be a non-empty list such as [docker] or [sudo, docker]")
+    return SandboxConfig(
+        image=image, network=network, gateway_host=str(address), memory=memory,
+        cpus=_number(sb.get("cpus", 1.0), "sandbox.cpus", minimum=0.1),
+        pids_limit=_int(sb.get("pids_limit", 512), "sandbox.pids_limit", minimum=64),
+        agent_timeout_seconds=_int(sb.get("agent_timeout_seconds", 3600), "sandbox.agent_timeout_seconds", minimum=60),
+        test_timeout_seconds=_int(sb.get("test_timeout_seconds", 900), "sandbox.test_timeout_seconds", minimum=10),
+        test_command=test_command, setup_command=setup_command, setup_network=setup_network,
+        setup_timeout_seconds=_int(sb.get("setup_timeout_seconds", 1800), "sandbox.setup_timeout_seconds", minimum=30),
+        docker_command=tuple(docker_command),
+        fix_rounds=_bounded_fix_rounds(sb.get("fix_rounds", 2)),
+    )
+
+
+def _bounded_fix_rounds(value: Any) -> int:
+    rounds = _int(value, "sandbox.fix_rounds", minimum=0)
+    if rounds > 5:
+        raise ConfigError("sandbox.fix_rounds must be between 0 and 5")
+    return rounds
+
+
+def resolve_secret(reference: str) -> str:
+    """Read an ``env:NAME`` or ``file:PATH`` secret reference. Never log the result."""
+    if reference.startswith("env:"):
+        value = os.environ.get(reference[4:], "")
+    elif reference.startswith("file:"):
+        try:
+            value = Path(reference[5:]).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"cannot read secret file {reference[5:]}") from exc
+    else:
+        raise ConfigError("secret reference must be env:NAME or file:PATH")
+    value = value.strip()
+    if not value:
+        raise ConfigError("secret reference resolved to an empty value")
+    return value
+
+
+def gateway_workers(config: KiteConfig) -> list:
+    """WorkerAuth entries for every enabled provider that uses adapter ``pull``."""
+    from .gateway import WorkerAuth
+
+    return [
+        WorkerAuth(p.effective_worker_id, resolve_secret(p.secrets["worker_token"]), p.model_ids)
+        for p in config.providers if p.adapter == "pull" and p.enabled
+    ]
+
+
+def gateway_models(config: KiteConfig) -> list[str]:
+    """Model names the gateway serves: base models of enabled pull workers, then usable aliases."""
+    base: list[str] = []
+    for p in config.providers:
+        if p.adapter == "pull" and p.enabled:
+            base.extend(m for m in p.model_ids if m not in base)
+    return base + [name for name, spec in config.gateway.aliases.items() if spec["model"] in base]
+
+
+def sandbox_settings_from_config(config: KiteConfig):
+    """SandboxSettings for ``kite sandbox ...``; the agent reaches the gateway on the sandbox network."""
+    from .sandbox import SandboxSettings
+
+    if config.sandbox is None:
+        raise ConfigError("config has no sandbox block")
+    sb = config.sandbox
+    return SandboxSettings(
+        image=sb.image, network=sb.network,
+        gateway_url=f"http://{sb.gateway_host}:{config.gateway.port}/v1",
+        memory=sb.memory, cpus=sb.cpus, pids_limit=sb.pids_limit,
+        agent_timeout_seconds=sb.agent_timeout_seconds, test_timeout_seconds=sb.test_timeout_seconds,
+        test_command=sb.test_command, setup_command=sb.setup_command,
+        setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
+        docker_command=sb.docker_command, fix_rounds=sb.fix_rounds,
+    )
+
+
+def model_policy_from_config(config: KiteConfig):
+    """Build the dispatcher's ModelPolicy from the operator config."""
+    from .routing import ModelPolicy
+
+    r = config.routing
+    return ModelPolicy(
+        skill={(task_type, model): score
+               for task_type, scores in r.model_skill.items() for model, score in scores.items()},
+        default_skill=r.default_skill,
+        swap_penalty_per_second=r.swap_penalty_per_second,
+        load_seconds_cached=r.load_seconds_cached,
+        load_seconds_cold=r.load_seconds_cold,
+        excluded=frozenset(r.chat_only),
+    )
+
+
+def sync_config_to_store(config: KiteConfig, store: Any, *, now: float) -> list[dict[str, Any]]:
+    """Register each configured provider as an owner + worker in the scheduler store.
+
+    Re-running is safe: an existing owner keeps its remaining quota (it is consumed by tasks
+    and must not be reset by a sync) and an existing worker keeps its heartbeat state
+    (readiness, loaded and cached models). A newly registered worker is not ready until its
+    first heartbeat.
+    """
+    from .protocol import OwnerPolicy, WorkerProfile
+
+    summary: list[dict[str, Any]] = []
+    owners: dict[str, list[ProviderConfig]] = {}
+    for provider in config.providers:
+        owners.setdefault(provider.owner, []).append(provider)
+    for owner_id, providers in owners.items():
+        existing = store.get_owner_policy(owner_id)
+        configured_quota = max(p.quota_gpu_seconds for p in providers)
+        store.register_owner_policy(OwnerPolicy(
+            owner_id=owner_id,
+            owner_authorized=True,
+            policy_approved=any(p.enabled for p in providers),
+            max_concurrent_sessions=max(p.concurrency for p in providers),
+            quota_remaining_seconds=(existing.quota_remaining_seconds if existing else configured_quota),
+            quota_observed_at=(existing.quota_observed_at if existing else float(now)),
+        ))
+    for provider in config.providers:
+        worker_id = provider.effective_worker_id
+        previous = store.get_worker(worker_id)
+        store.register_worker(WorkerProfile(
+            worker_id=worker_id,
+            owner_id=provider.owner,
+            provider_id=provider.id,
+            roles=provider.roles,
+            model_ids=provider.model_ids,
+            enabled=provider.enabled,
+            provider_ready=previous.provider_ready if previous else False,
+            status_observed_at=previous.status_observed_at if previous else float(now),
+            max_concurrency=provider.concurrency,
+            capabilities=provider.capabilities,
+            loaded_model=previous.loaded_model if previous else None,
+            cached_models=previous.cached_models if previous else (),
+        ))
+        summary.append({"worker_id": worker_id, "owner": provider.owner, "provider_id": provider.id,
+                        "enabled": provider.enabled, "models": list(provider.model_ids),
+                        "new": previous is None})
+    return summary
+
+
+def load_config(path: Path) -> KiteConfig:
+    try:
+        content = path.read_text(encoding="utf-8")
+        if path.suffix.lower() == ".json":
+            raw = json.loads(content)
+        else:
+            import yaml
+            raw = yaml.safe_load(content)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot read config: {exc}") from exc
+    except ImportError as exc:
+        raise ConfigError("YAML support requires PyYAML; use JSON or install project test dependencies") from exc
+    cfg = validate_config(raw)
+    return KiteConfig(**{**cfg.__dict__, "source_path": path.resolve()})
+
+
+def redact_config(config: KiteConfig) -> dict[str, Any]:
+    """Return operator-safe metadata; secret values are never resolved here."""
+    sandbox = None
+    if config.sandbox is not None:
+        sb = config.sandbox
+        sandbox = {"image": sb.image, "network": sb.network, "gateway_host": sb.gateway_host,
+                   "memory": sb.memory, "cpus": sb.cpus, "pids_limit": sb.pids_limit,
+                   "agent_timeout_seconds": sb.agent_timeout_seconds,
+                   "test_timeout_seconds": sb.test_timeout_seconds,
+                   "test_command": sb.test_command, "setup_command": sb.setup_command,
+                   "setup_network": sb.setup_network, "setup_timeout_seconds": sb.setup_timeout_seconds,
+                   "docker_command": list(sb.docker_command)}
+    return {
+        "schema_version": config.schema_version,
+        "temporal": {"endpoint": config.temporal_endpoint, "task_queue": config.temporal_task_queue},
+        "opencode": {"executable": config.opencode_executable, "server": {"host": config.opencode_host, "port": config.opencode_port}},
+        "harness2": {"checkout": config.harness2_checkout, "cli": config.harness2_cli},
+        "providers": [{"id": p.id, "adapter": p.adapter, "enabled": p.enabled, "model": p.model,
+                       "models": list(p.model_ids), "owner": p.owner, "worker_id": p.effective_worker_id,
+                       "roles": list(p.roles),
+                       "capabilities": list(p.capabilities), "quota": {"gpu_seconds": p.quota_gpu_seconds, "concurrency": p.concurrency},
+                       "secrets": {k: "<reference-redacted>" for k in p.secrets}} for p in config.providers],
+        "routing": {"swap_penalty_per_second": config.routing.swap_penalty_per_second,
+                    "load_seconds_cached": config.routing.load_seconds_cached,
+                    "load_seconds_cold": config.routing.load_seconds_cold,
+                    "default_skill": config.routing.default_skill,
+                    "model_skill": config.routing.model_skill,
+                    "chat_only": list(config.routing.chat_only)},
+        "gateway": {"host": config.gateway.host, "port": config.gateway.port,
+                    "public_url": config.gateway.public_url,
+                    "job_timeout_seconds": config.gateway.job_timeout_seconds,
+                    "heartbeat_timeout_seconds": config.gateway.heartbeat_timeout_seconds,
+                    "aliases": config.gateway.aliases},
+        "sandbox": sandbox,
+    }

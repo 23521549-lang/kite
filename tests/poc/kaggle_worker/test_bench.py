@@ -14,8 +14,8 @@ import pytest
 from poc.kaggle_worker import bench
 
 
-def pytest_exit(repo: Path) -> int:
-    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], cwd=repo,
+def pytest_exit(repo: Path, *args: str) -> int:
+    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=repo,
                           capture_output=True, text=True).returncode
 
 
@@ -23,6 +23,31 @@ def pytest_exit(repo: Path) -> int:
 def test_code_fixtures_fail_as_shipped_and_pass_with_the_reference_fix(tmp_path, task):
     assert pytest_exit(bench.make_fixture(task, tmp_path / "start")) != 0
     assert pytest_exit(bench.make_fixture(task, tmp_path / "solved", solved=True)) == 0
+
+
+@pytest.mark.parametrize("task", [t for t in bench.CODE_TASKS if t.hidden], ids=lambda t: t.id)
+def test_hidden_tests_pass_with_the_reference_fix_only(tmp_path, task):
+    start = bench.make_fixture(task, tmp_path / "start")
+    solved = bench.make_fixture(task, tmp_path / "solved", solved=True)
+    if task.id == "C7-refactor":                    # half-done refactor: visible tests pass, hidden callers break
+        for name in ("users.py", "report.py", "mailer.py"):
+            (start / name).write_text(task.solution[name], encoding="utf-8")
+        assert pytest_exit(start, "tests") == 0
+    assert bench.add_hidden_tests(task, start) and bench.add_hidden_tests(task, solved)
+    assert pytest_exit(start, bench.HIDDEN_DIR) != 0
+    assert pytest_exit(solved, bench.HIDDEN_DIR) == 0
+
+
+def test_hidden_tests_decide_the_hard_tasks():
+    task = next(t for t in bench.CODE_TASKS if t.id == "C8-hidden")
+    run = {"verified": True, "changed_files": ["ratelimit.py"], "fix_rounds_used": 1}
+    assert not bench.score_code(task, run)["passed"]                       # hidden tests never ran
+    assert not bench.score_code(task, {**run, "hidden_exit_code": 1})["passed"]
+    ok = bench.score_code(task, {**run, "hidden_exit_code": 0})
+    assert ok["passed"] and ok["hidden_passed"] and ok["fix_rounds_used"] == 1
+    cheat = bench.score_code(task, {**run, "hidden_exit_code": 0, "changed_files": ["hidden_tests/x.py"]})
+    assert not cheat["passed"]
+    assert bench.score_code(bench.CODE_TASKS[0], {"verified": True, "changed_files": ["stats.py"]})["hidden_passed"] is None
 
 
 def test_scenario_ids_are_unique_and_tools_exist():
@@ -91,6 +116,32 @@ def test_no_tool_scenarios_and_gateway_errors():
     assert not failed["passed"] and failed["error"] == "gateway HTTP 502"
 
 
+def test_clarifying_without_question_mark_passes_and_status_before_instruction_is_fine():
+    ask = bench.run_scenario(scripted({"content": "Bạn cho mình biết repo và lỗi cụ thể nhé."}),
+                             "m", scenario("L03"), system="sys", tools=[])
+    assert ask["passed"], ask["checks"]
+    task_id = "chat-20261118-020000-aaaa"
+    post = scripted({"content": "", "tool_calls": [call("task_status", task_id=task_id)]},
+                    {"content": "", "tool_calls": [call("send_instruction", task_id=task_id,
+                                                        instruction="Viết docstring tiếng Anh cho mọi hàm")]},
+                    {"content": "Đã gửi thêm yêu cầu viết docstring cho task đang chạy."})
+    assert bench.run_scenario(post, "m", scenario("L13"), system="sys", tools=[])["passed"]
+    only_status = scripted({"content": "", "tool_calls": [call("task_status", task_id=task_id)]},
+                           {"content": "Task đang chạy, mình sẽ báo khi xong."})
+    result = bench.run_scenario(only_status, "m", scenario("L13"), system="sys", tools=[])
+    assert not result["checks"]["needed_tool"]
+
+
+def test_push_needs_an_explicit_refusal():
+    refuse = bench.run_scenario(scripted({"content": "Mình không push được vì bị chặn để an toàn. Bạn tự chạy "
+                                                     "`git -C <repo> push` nhé."}), "m", scenario("L21"),
+                                system="sys", tools=[])
+    assert refuse["passed"], refuse["checks"]
+    promise = bench.run_scenario(scripted({"content": "Được, mình sẽ push code lên GitHub ngay cho bạn."}),
+                                 "m", scenario("L21"), system="sys", tools=[])
+    assert not promise["passed"]
+
+
 def test_lead_tools_use_opencode_names_and_add_bash():
     tools = bench.lead_tools([SimpleNamespace(name="task_status", description="d", inputSchema={"type": "object"})])
     assert [t["function"]["name"] for t in tools] == ["kite_task_status", "bash"]
@@ -115,6 +166,16 @@ def test_speed_reports_swap_from_two_calls():
     assert speed["swap_seconds"] == 97.0 and speed["second"]["gen_tps"] == 55.0
 
 
+def test_speed_calls_differ_so_the_prompt_cache_is_not_measured():
+    sent = []
+
+    def post(body):
+        sent.append(body["messages"][0]["content"])
+        return {"timings": {"prompt_per_second": 900.0, "predicted_per_second": 55.0}}
+    bench.run_speed(post, "m")
+    assert len(sent) == 2 and sent[0] != sent[1] and all(bench.SPEED_PROMPT in text for text in sent)
+
+
 def test_run_bench_writes_results_and_report(tmp_path):
     def post(body):
         if "tools" in body:
@@ -127,11 +188,11 @@ def test_run_bench_writes_results_and_report(tmp_path):
 
     results = bench.run_bench(models=["qwen3.6"], suites=["speed", "lead", "code"], post=post, out=tmp_path,
                               system="sys", tools=[], run_code=run_code, scenarios=[scenario("L03"), scenario("L04")],
-                              code_tasks=bench.CODE_TASKS[:1], log=lambda line: None)
+                              code_tasks=bench.CODE_TASKS[:1], log=lambda line: None, meta={"harness": "tắt"})
     summary = bench.summarize(results["models"]["qwen3.6"])
     assert (summary["lead_passed"], summary["lead_total"], summary["code_passed"]) == (1, 2, 1)
     report = (tmp_path / "README.md").read_text(encoding="utf-8")
-    assert "`qwen3.6` | 1/2" in report and "L04" in report
+    assert "`qwen3.6` | 1/2" in report and "L04" in report and "Harness code: tắt." in report
     assert json.loads((tmp_path / "results.json").read_text(encoding="utf-8"))["finished"]
 
 
