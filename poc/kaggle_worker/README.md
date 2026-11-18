@@ -187,7 +187,11 @@ KITE_GATEWAY_DOMAIN=1-2-3-4.sslip.io sudo -E docker compose -f deploy/gateway.co
 
 ## Sandboxed runs
 
-`kite sandbox run` executes one task end to end without Temporal: Kite clones the repository's committed state, runs OpenCode (`opencode run`) in a throw-away container, collects the patch itself and runs the test command in a second container with no network. The agent container drops all capabilities, cannot gain privileges, runs as an unprivileged user with CPU/memory/process limits, and sits on an internal Docker network: no Internet (so no `git push`), only the gateway, which also listens on the host's address on that network. Secrets are never mounted.
+`kite sandbox run` executes one task end to end without Temporal, in three throw-away containers that share a per-task clone of the repository's committed state:
+
+1. **setup** (optional, with network): runs only `sandbox.setup_command` / `--setup-cmd`, e.g. `pip install -r requirements.txt` or `npm ci`. Python packages are installed into a per-task `/deps` directory. Files this step creates in the repository are committed separately, so they never appear in the agent's patch. If setup fails, the agent is not started.
+2. **agent** (no Internet): OpenCode (`opencode run`) on an internal Docker network whose only reachable service is the gateway. All capabilities dropped, no privilege gain, unprivileged user, CPU/memory/process limits, no secrets, no Git remote.
+3. **test** (no network): Kite runs the test command itself.
 
 ```yaml
 sandbox:
@@ -195,16 +199,18 @@ sandbox:
   memory: 1g
   cpus: 1
   test_command: python -m pytest -q
+  setup_command: ""               # e.g. "pip install -r requirements.txt"; can be overridden per run
 ```
 
 ```sh
 ./.venv/bin/kite --config /var/lib/kite/kite/config.yaml sandbox build    # network + image
 sudo systemctl restart kite-gateway                                       # also listen on gateway_host
 ./.venv/bin/kite --config /var/lib/kite/kite/config.yaml sandbox doctor   # isolation checks
-./.venv/bin/kite --config /var/lib/kite/kite/config.yaml sandbox run --repo ~/project --goal "..."
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml sandbox run --repo ~/project \
+  --setup-cmd "pip install -r requirements.txt" --goal "..."
 ```
 
-Results are written to `/var/lib/kite/kite/sandbox/<task-id>/` (`result.json`, `result.patch`, `agent.log`, `test.log`). `verified` is true only when the agent finished, changed files, and Kite's own test run passed. Review the patch, then apply it with `git apply`. The sandbox has no Internet, so dependencies the tests need must already be in the image.
+Results are written to `/var/lib/kite/kite/sandbox/<task-id>/` (`result.json`, `result.patch`, `setup.log`, `agent.log`, `test.log`). `verified` is true only when setup (if any) succeeded, the agent finished and changed files, and Kite's own test run passed. Review the patch, then apply it with `git apply`. The setup step has network access while it installs, which carries the same supply-chain risk as installing those packages yourself; the agent never has network access.
 
 ## Not enabled
 

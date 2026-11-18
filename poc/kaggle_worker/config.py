@@ -87,6 +87,9 @@ class SandboxConfig:
     agent_timeout_seconds: int = 3600
     test_timeout_seconds: int = 900
     test_command: str = "python -m pytest -q"
+    setup_command: str = ""
+    setup_network: str = "bridge"
+    setup_timeout_seconds: int = 1800
     docker_command: tuple[str, ...] = ("docker",)
 
 
@@ -333,7 +336,8 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
         return None
     sb = _mapping(raw, "sandbox")
     unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
-                         "agent_timeout_seconds", "test_timeout_seconds", "test_command", "docker_command"}
+                         "agent_timeout_seconds", "test_timeout_seconds", "test_command",
+                         "setup_command", "setup_network", "setup_timeout_seconds", "docker_command"}
     if unknown:
         raise ConfigError("sandbox has unsupported fields")
     image = sb.get("image", "kite-sandbox:latest")
@@ -355,6 +359,12 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
     test_command = sb.get("test_command", "python -m pytest -q")
     if not isinstance(test_command, str):
         raise ConfigError("sandbox.test_command must be a string ('' to skip tests)")
+    setup_command = sb.get("setup_command", "")
+    if not isinstance(setup_command, str):
+        raise ConfigError("sandbox.setup_command must be a string ('' for no setup)")
+    setup_network = sb.get("setup_network", "bridge")
+    if not isinstance(setup_network, str) or not _NETWORK.fullmatch(setup_network) or setup_network == "host":
+        raise ConfigError("sandbox.setup_network must name a Docker network other than host")
     docker_command = sb.get("docker_command", ["docker"])
     if not isinstance(docker_command, list) or not docker_command or any(
             not isinstance(x, str) or not x.strip() for x in docker_command):
@@ -365,7 +375,9 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
         pids_limit=_int(sb.get("pids_limit", 512), "sandbox.pids_limit", minimum=64),
         agent_timeout_seconds=_int(sb.get("agent_timeout_seconds", 3600), "sandbox.agent_timeout_seconds", minimum=60),
         test_timeout_seconds=_int(sb.get("test_timeout_seconds", 900), "sandbox.test_timeout_seconds", minimum=10),
-        test_command=test_command, docker_command=tuple(docker_command),
+        test_command=test_command, setup_command=setup_command, setup_network=setup_network,
+        setup_timeout_seconds=_int(sb.get("setup_timeout_seconds", 1800), "sandbox.setup_timeout_seconds", minimum=30),
+        docker_command=tuple(docker_command),
     )
 
 
@@ -417,7 +429,9 @@ def sandbox_settings_from_config(config: KiteConfig):
         gateway_url=f"http://{sb.gateway_host}:{config.gateway.port}/v1",
         memory=sb.memory, cpus=sb.cpus, pids_limit=sb.pids_limit,
         agent_timeout_seconds=sb.agent_timeout_seconds, test_timeout_seconds=sb.test_timeout_seconds,
-        test_command=sb.test_command, docker_command=sb.docker_command,
+        test_command=sb.test_command, setup_command=sb.setup_command,
+        setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
+        docker_command=sb.docker_command,
     )
 
 
@@ -509,7 +523,9 @@ def redact_config(config: KiteConfig) -> dict[str, Any]:
                    "memory": sb.memory, "cpus": sb.cpus, "pids_limit": sb.pids_limit,
                    "agent_timeout_seconds": sb.agent_timeout_seconds,
                    "test_timeout_seconds": sb.test_timeout_seconds,
-                   "test_command": sb.test_command, "docker_command": list(sb.docker_command)}
+                   "test_command": sb.test_command, "setup_command": sb.setup_command,
+                   "setup_network": sb.setup_network, "setup_timeout_seconds": sb.setup_timeout_seconds,
+                   "docker_command": list(sb.docker_command)}
     return {
         "schema_version": config.schema_version,
         "temporal": {"endpoint": config.temporal_endpoint, "task_queue": config.temporal_task_queue},

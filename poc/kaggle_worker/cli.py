@@ -125,6 +125,8 @@ def _parser() -> argparse.ArgumentParser:
     sandbox_run.add_argument("--model", help="gateway model (default: first model of the first pull worker)")
     sandbox_run.add_argument("--task-id", help="lowercase id (default: generated)")
     sandbox_run.add_argument("--test-cmd", help="override sandbox.test_command; pass '' to skip tests")
+    sandbox_run.add_argument("--setup-cmd", help="override sandbox.setup_command (runs with network "
+                                                 "before the agent, e.g. 'pip install -r requirements.txt'); '' to skip")
     return parser
 
 
@@ -254,7 +256,8 @@ def _sandbox_command(args: argparse.Namespace) -> int:
         result = sbx.run_task(
             settings, repo=args.repo, goal=args.goal, model=model, models=models,
             state_dir=args.config.parent / "sandbox", task_id=args.task_id, small_model=small,
-            test_command=args.test_cmd, log=lambda message: print(message, file=sys.stderr))
+            test_command=args.test_cmd, setup_command=args.setup_cmd,
+            log=lambda message: print(message, file=sys.stderr))
         summary = result.to_dict()
         summary["apply_with"] = f"git -C {result.repo} apply {result.patch_path}"
         _emit(summary)

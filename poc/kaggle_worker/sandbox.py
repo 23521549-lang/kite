@@ -1,17 +1,16 @@
 """Per-task Docker sandbox for the coding agent.
 
-Each task gets its own clone of the repository, mounted into a throw-away container that runs
-OpenCode non-interactively (``opencode run``). The container:
+Each task gets its own clone of the repository, mounted into throw-away containers:
 
-* has no Linux capabilities, cannot gain privileges, runs as an unprivileged user and has CPU,
-  memory and process limits;
-* sits on an *internal* Docker network: no Internet and therefore no ``git push``; the only
-  reachable service is the Kite gateway, which also listens on the host's address there;
-* sees only the task clone and a generated OpenCode config, never the operator's secrets.
-
-After the agent finishes, Kite collects the patch itself and runs the test command in a second
-container with no network at all, so the result carries evidence instead of the model's claim
-that the tests pass.
+1. **setup** (optional, with network): runs the operator-declared install command, for example
+   ``pip install -r requirements.txt`` or ``npm ci``. Python packages go to ``/deps`` (a per-task
+   directory shared with the next steps). Files the setup step creates in the repository are
+   committed as a separate "setup" commit so they never end up in the agent's patch.
+2. **agent** (no Internet): OpenCode (``opencode run``) on an *internal* Docker network whose only
+   reachable service is the Kite gateway. No capabilities, no privilege gain, unprivileged user,
+   CPU/memory/process limits, no secrets mounted, no Git remote.
+3. **test** (no network at all): Kite runs the test command itself, so the result carries evidence
+   instead of the model's claim that the tests pass.
 """
 
 from __future__ import annotations
@@ -31,9 +30,18 @@ from typing import Callable
 Runner = Callable[..., subprocess.CompletedProcess]
 
 TASK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 JUNK_PATTERNS = ("__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
-                 ".coverage", "node_modules/", ".venv/", ".opencode/")
+                 ".coverage", "node_modules/", ".venv/", ".opencode/", "*.egg-info/")
 TAIL_CHARS = 4000
+# Shared by every step: pip installs into /deps (user site), caches stay out of the repository.
+DEPS_ENV = (
+    ("PYTHONUSERBASE", "/deps/python"),
+    ("PIP_USER", "1"),
+    ("PIP_CACHE_DIR", "/deps/cache/pip"),
+    ("NPM_CONFIG_CACHE", "/deps/cache/npm"),
+    ("PATH", "/deps/python/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"),
+)
 
 PROBE = r"""
 import json, os, urllib.error, urllib.request
@@ -73,6 +81,9 @@ class SandboxSettings:
     agent_timeout_seconds: int = 3600
     test_timeout_seconds: int = 900
     test_command: str = "python -m pytest -q"
+    setup_command: str = ""
+    setup_network: str = "bridge"
+    setup_timeout_seconds: int = 1800
     docker_command: tuple[str, ...] = ("docker",)
     uid: int = field(default_factory=_default_uid)
 
@@ -85,6 +96,11 @@ class SandboxRun:
     model: str
     goal: str
     workspace: str
+    patch_base: str = ""
+    setup_command: str = ""
+    setup_exit_code: int | None = None
+    setup_seconds: float = 0.0
+    setup_output_tail: str = ""
     agent_status: str = "not_started"
     agent_exit_code: int | None = None
     agent_seconds: float = 0.0
@@ -98,8 +114,9 @@ class SandboxRun:
 
     @property
     def verified(self) -> bool:
-        """The agent finished, changed something, and Kite's own test run passed."""
-        return self.agent_status == "ok" and self.test_exit_code == 0 and bool(self.changed_files)
+        """Setup (if any) worked, the agent finished and changed something, Kite's tests passed."""
+        return (self.setup_exit_code in (None, 0) and self.agent_status == "ok"
+                and self.test_exit_code == 0 and bool(self.changed_files))
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -111,12 +128,17 @@ def default_runner(cmd, *, timeout=None) -> subprocess.CompletedProcess:
     return subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
 
 
-def _tail(text, limit: int = TAIL_CHARS) -> str:
+def clean_output(text) -> str:
+    """Decode and strip terminal colour codes so logs and JSON stay readable."""
     if text is None:
         return ""
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
-    return text[-limit:]
+    return ANSI.sub("", text)
+
+
+def _tail(text, limit: int = TAIL_CHARS) -> str:
+    return clean_output(text)[-limit:]
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -131,7 +153,8 @@ def container_name(kind: str, task_id: str) -> str:
 
 
 def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, network: str,
-                    config_file: Path | None = None, extra_env=()) -> list[str]:
+                    config_file: Path | None = None, deps: Path | None = None,
+                    extra_env=()) -> list[str]:
     """``docker run`` prefix for a hardened, throw-away sandbox container (image name last)."""
     args = [
         *settings.docker_command, "run", "--rm", "--name", name,
@@ -142,6 +165,10 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
         "-e", "HOME=/home/kite", "-e", "OPENCODE_DISABLE_AUTOUPDATE=1",
         "-v", f"{Path(workspace).resolve()}:/work", "-w", "/work",
     ]
+    if deps is not None:
+        args += ["-v", f"{Path(deps).resolve()}:/deps"]
+        for key, value in DEPS_ENV:
+            args += ["-e", f"{key}={value}"]
     for key, value in extra_env:
         args += ["-e", f"{key}={value}"]
     if config_file is not None:
@@ -170,7 +197,7 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
 def agent_prompt(goal: str, test_command: str) -> str:
     lines = [goal.strip(), "",
              "Làm việc trong thư mục hiện tại (/work). Môi trường không có Internet: "
-             "không cài gói, không tải gì về."]
+             "không cài gói, không tải gì về; thư viện cần thiết đã được cài sẵn."]
     if test_command:
         lines.append(f"Kiểm tra lại bằng lệnh: {test_command}")
     lines.append("Không commit, không push: Kite sẽ tự lấy thay đổi để người dùng duyệt.")
@@ -203,11 +230,20 @@ def prepare_clone(repo: Path, workspace: Path) -> str:
     return head
 
 
-def collect_patch(workspace: Path, base_head: str, patch_path: Path) -> list[str]:
-    """Write every change since ``base_head`` (including new files) as a patch; return file names."""
+def commit_setup_changes(workspace: Path) -> str:
+    """Commit whatever the setup step created so the agent's patch excludes it; return HEAD."""
+    if _git(workspace, "status", "--porcelain"):
+        _git(workspace, "add", "-A")
+        _git(workspace, "-c", "user.name=Kite sandbox", "-c", "user.email=kite@sandbox.invalid",
+             "commit", "--quiet", "--no-verify", "-m", "kite: setup artefacts")
+    return _git(workspace, "rev-parse", "HEAD")
+
+
+def collect_patch(workspace: Path, base: str, patch_path: Path) -> list[str]:
+    """Write every change since ``base`` (including new files) as a patch; return file names."""
     _git(workspace, "add", "-A")
-    changed = [line for line in _git(workspace, "diff", "--cached", "--name-only", base_head).splitlines() if line]
-    patch = subprocess.run(["git", "-C", str(workspace), "diff", "--cached", "--binary", base_head],
+    changed = [line for line in _git(workspace, "diff", "--cached", "--name-only", base).splitlines() if line]
+    patch = subprocess.run(["git", "-C", str(workspace), "diff", "--cached", "--binary", base],
                            capture_output=True, text=True)
     if patch.returncode != 0:
         raise SandboxError(f"git diff failed: {patch.stderr.strip()[:500]}")
@@ -215,10 +251,27 @@ def collect_patch(workspace: Path, base_head: str, patch_path: Path) -> list[str
     return changed
 
 
+def _run_step(settings: SandboxSettings, runner: Runner, *, name: str, args: list[str],
+              timeout: int) -> tuple[int, str]:
+    """Run one container step; a timeout kills the container and returns exit code 124."""
+    try:
+        result = runner(args, timeout=timeout)
+        return result.returncode, clean_output(result.stdout) + clean_output(result.stderr)
+    except subprocess.TimeoutExpired as exc:
+        runner([*settings.docker_command, "kill", name], timeout=30)
+        return 124, clean_output(exc.stdout) + clean_output(exc.stderr) + "\n[kite] step timed out\n"
+
+
+def _write_result(root: Path, run: SandboxRun) -> SandboxRun:
+    (root / "result.json").write_text(json.dumps(run.to_dict(), indent=2, ensure_ascii=False),
+                                      encoding="utf-8")
+    return run
+
+
 def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, models,
              state_dir: Path, task_id: str | None = None, small_model: str | None = None,
-             test_command: str | None = None, runner: Runner = default_runner,
-             log: Callable[[str], None] = print) -> SandboxRun:
+             test_command: str | None = None, setup_command: str | None = None,
+             runner: Runner = default_runner, log: Callable[[str], None] = print) -> SandboxRun:
     task_id = task_id or f"sbx-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     if not TASK_ID.fullmatch(task_id):
         raise SandboxError("task id must use lowercase letters, digits and dashes")
@@ -229,56 +282,67 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     root = Path(state_dir) / task_id
     workspace = root / "work"
     base_head = prepare_clone(Path(repo), workspace)
-    run = SandboxRun(task_id, str(Path(repo).resolve()), base_head, model, goal, str(workspace),
-                     test_command=settings.test_command if test_command is None else test_command)
+    deps = root / "deps"
+    (deps / "cache").mkdir(parents=True, exist_ok=True)
+    run = SandboxRun(
+        task_id, str(Path(repo).resolve()), base_head, model, goal, str(workspace),
+        patch_base=base_head,
+        setup_command=settings.setup_command if setup_command is None else setup_command,
+        test_command=settings.test_command if test_command is None else test_command)
 
+    # 1. Setup: the only step with network access, and it runs only the declared command.
+    if run.setup_command:
+        log(f"[{task_id}] cài thư viện (có mạng): {run.setup_command}")
+        name = container_name("setup", task_id)
+        started = time.monotonic()
+        run.setup_exit_code, output = _run_step(
+            settings, runner, name=name, timeout=settings.setup_timeout_seconds,
+            args=docker_run_args(settings, name=name, workspace=workspace,
+                                 network=settings.setup_network, deps=deps)
+            + ["sh", "-c", run.setup_command])
+        run.setup_seconds = round(time.monotonic() - started, 1)
+        run.setup_output_tail = _tail(output)
+        (root / "setup.log").write_text(output, encoding="utf-8")
+        if run.setup_exit_code != 0:
+            run.agent_status = "skipped"
+            log(f"[{task_id}] setup lỗi (exit {run.setup_exit_code}); không chạy agent. Xem setup.log")
+            return _write_result(root, run)
+        run.patch_base = commit_setup_changes(workspace)
+
+    # 2. Agent: internal network, gateway only.
     config_file = root / "opencode.json"
     config_file.write_text(json.dumps(agent_config(settings, model=model, models=models,
                                                    small_model=small_model), indent=2), encoding="utf-8")
     log(f"[{task_id}] agent {model} đang làm trong sandbox (tối đa {settings.agent_timeout_seconds}s)...")
     name = container_name("agent", task_id)
     started = time.monotonic()
-    try:
-        result = runner(
-            docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
-                            config_file=config_file)
-            + ["opencode", "run", "-m", f"kite/{model}", agent_prompt(goal, run.test_command)],
-            timeout=settings.agent_timeout_seconds)
-        output = (result.stdout or "") + (result.stderr or "")
-        run.agent_exit_code = result.returncode
-        run.agent_status = "ok" if result.returncode == 0 else "failed"
-    except subprocess.TimeoutExpired as exc:
-        runner([*settings.docker_command, "kill", name], timeout=30)
-        output = _tail(exc.stdout) + _tail(exc.stderr)
-        run.agent_status = "timeout"
+    run.agent_exit_code, output = _run_step(
+        settings, runner, name=name, timeout=settings.agent_timeout_seconds,
+        args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
+                             config_file=config_file, deps=deps)
+        + ["opencode", "run", "-m", f"kite/{model}", agent_prompt(goal, run.test_command)])
+    run.agent_status = {0: "ok", 124: "timeout"}.get(run.agent_exit_code, "failed")
     run.agent_seconds = round(time.monotonic() - started, 1)
     run.agent_output_tail = _tail(output)
     (root / "agent.log").write_text(output, encoding="utf-8")
 
     patch_path = root / "result.patch"
-    run.changed_files = collect_patch(workspace, base_head, patch_path)
+    run.changed_files = collect_patch(workspace, run.patch_base, patch_path)
     run.patch_path = str(patch_path)
 
+    # 3. Tests: no network at all.
     if run.test_command:
         log(f"[{task_id}] Kite tự chạy test (không mạng): {run.test_command}")
         name = container_name("test", task_id)
         started = time.monotonic()
-        try:
-            result = runner(docker_run_args(settings, name=name, workspace=workspace, network="none")
-                            + ["sh", "-c", run.test_command], timeout=settings.test_timeout_seconds)
-            test_output = (result.stdout or "") + (result.stderr or "")
-            run.test_exit_code = result.returncode
-        except subprocess.TimeoutExpired:
-            runner([*settings.docker_command, "kill", name], timeout=30)
-            test_output = "test command timed out"
-            run.test_exit_code = 124
+        run.test_exit_code, output = _run_step(
+            settings, runner, name=name, timeout=settings.test_timeout_seconds,
+            args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
+            + ["sh", "-c", run.test_command])
         run.test_seconds = round(time.monotonic() - started, 1)
-        run.test_output_tail = _tail(test_output)
-        (root / "test.log").write_text(test_output, encoding="utf-8")
-
-    (root / "result.json").write_text(json.dumps(run.to_dict(), indent=2, ensure_ascii=False),
-                                      encoding="utf-8")
-    return run
+        run.test_output_tail = _tail(output)
+        (root / "test.log").write_text(output, encoding="utf-8")
+    return _write_result(root, run)
 
 
 def ensure_network(settings: SandboxSettings, runner: Runner = default_runner) -> str:
@@ -356,5 +420,5 @@ def doctor(settings: SandboxSettings, runner: Runner = default_runner) -> dict[s
     record("internet_blocked", not (isinstance(internet, int) and 200 <= internet < 400), internet)
     record("host_secrets_hidden", data.get("host_secrets_visible") is False, data.get("host_secrets_visible"))
     record("non_root", data.get("uid") not in (0, None), data.get("uid"))
-    record("opencode", opencode.returncode == 0, (opencode.stdout or opencode.stderr).strip())
+    record("opencode", opencode.returncode == 0, clean_output(opencode.stdout or opencode.stderr).strip())
     return checks
