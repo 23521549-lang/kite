@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -315,3 +316,33 @@ def test_mcp_server_exposes_every_tool(tmp_path):
     assert names == {"start_task", "task_status", "task_result", "apply_result", "commit_result", "repo_status",
                      "run_command", "send_instruction", "pause_task",
                      "resume_task", "cancel_task", "list_tasks", "worker_status"}
+
+
+def fake_process(proc: Path, pid: int, argv: list[str], namespace: str = "pid:[1]") -> None:
+    entry = proc / str(pid)
+    (entry / "ns").mkdir(parents=True)
+    (entry / "ns" / "pid").symlink_to(namespace)
+    (entry / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
+
+
+def test_reload_stops_the_opencode_daemon_and_old_mcp_servers_only(tmp_path):
+    from poc.kaggle_worker.mcp_server import stop_stale_chat_processes
+
+    proc, config = tmp_path / "proc", tmp_path / "config.yaml"
+    (proc / "self" / "ns").mkdir(parents=True)
+    (proc / "self" / "ns" / "pid").symlink_to("pid:[1]")
+    kite = "/home/u/kite/.venv/bin/kite"
+    fake_process(proc, 10, ["/home/u/.opencode/bin/opencode", "serve", "--service"])
+    fake_process(proc, 11, ["/usr/bin/python", kite, "--config", str(config), "mcp", "serve", "--allow-root", "/home/u"])
+    fake_process(proc, 12, ["/usr/bin/python", kite, "--config", "/other.yaml", "mcp", "serve"])  # another config
+    fake_process(proc, 13, ["/usr/local/bin/opencode", "run", "-m", "kite/qwen3.6", "fix"])      # TUI-less agent
+    fake_process(proc, 14, ["/usr/local/bin/opencode", "serve"], namespace="pid:[999]")         # inside a container
+    fake_process(proc, 15, ["/home/u/.opencode/bin/opencode"])                                   # the TUI itself
+    killed = []
+    stopped = stop_stale_chat_processes(config, proc=proc, uid=os.getuid(), kill=lambda pid, sig: killed.append(pid))
+    assert sorted(killed) == [10, 11] and sorted(item["pid"] for item in stopped) == [10, 11]
+
+    def gone(pid, sig):
+        raise ProcessLookupError
+    assert stop_stale_chat_processes(config, proc=proc, uid=os.getuid(), kill=gone) == []
+    assert stop_stale_chat_processes(config, proc=proc, uid=os.getuid() + 1, kill=gone) == []

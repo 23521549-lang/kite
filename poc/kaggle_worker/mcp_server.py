@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -461,3 +463,50 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
                     .replace("MODELS", ", ".join(f"`{m}`" for m in models)))
     return {"opencode.json": json.dumps(opencode, indent=2, ensure_ascii=False) + "\n",
             "AGENTS.md": instructions}
+
+
+def stale_chat_processes(config_path, *, proc: Path = Path("/proc"), uid: int | None = None) -> list[tuple[int, str]]:
+    """Long-lived processes that keep serving old Kite tools after an update.
+
+    OpenCode runs a background ``opencode serve`` that keeps its MCP servers alive across TUI
+    sessions, so a ``kite mcp serve`` started before ``git pull`` keeps answering with the old tool
+    list. Only this user's processes in this PID namespace are returned: agents running inside sandbox
+    containers (another namespace) are never touched.
+    """
+    uid = os.getuid() if uid is None else uid
+    config = str(Path(config_path).resolve())
+    try:
+        own_namespace = os.readlink(proc / "self" / "ns" / "pid")
+    except OSError:
+        own_namespace = None
+    found = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if entry.stat().st_uid != uid or os.readlink(entry / "ns" / "pid") != own_namespace:
+                continue
+            argv = [arg.decode("utf-8", "replace") for arg in (entry / "cmdline").read_bytes().split(b"\0") if arg]
+        except OSError:
+            continue
+        if not argv:
+            continue
+        kite_mcp = (any(argv[i:i + 2] == ["mcp", "serve"] for i in range(len(argv))) and "--config" in argv
+                    and argv[argv.index("--config") + 1:argv.index("--config") + 2] == [config])
+        opencode_daemon = Path(argv[0]).name == "opencode" and argv[1:2] == ["serve"]
+        if kite_mcp or opencode_daemon:
+            found.append((int(entry.name), " ".join(argv)))
+    return found
+
+
+def stop_stale_chat_processes(config_path, *, proc: Path = Path("/proc"), uid: int | None = None,
+                              kill: Callable[[int, int], None] = os.kill) -> list[dict]:
+    """SIGTERM the processes found by ``stale_chat_processes``; OpenCode restarts them on next launch."""
+    stopped = []
+    for pid, command in stale_chat_processes(config_path, proc=proc, uid=uid):
+        try:
+            kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+        stopped.append({"pid": pid, "command": command[:200]})
+    return stopped

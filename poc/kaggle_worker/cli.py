@@ -144,6 +144,8 @@ def _parser() -> argparse.ArgumentParser:
     chat_setup.add_argument("--allow-root", action="append", type=Path, default=[],
                             help="folder whose Git repositories tasks may use; repeat (default: home)")
     chat_setup.add_argument("--force", action="store_true", help="overwrite opencode.json and AGENTS.md")
+    chat_commands.add_parser("reload", help="stop the OpenCode background server and old Kite MCP servers "
+                                            "so the next `opencode` loads the current Kite tools")
     return parser
 
 
@@ -318,8 +320,12 @@ def _mcp_command(args: argparse.Namespace) -> int:
 
 
 def _chat_command(args: argparse.Namespace) -> int:
-    from .mcp_server import chat_files
+    from .mcp_server import chat_files, stop_stale_chat_processes
 
+    if args.chat_command == "reload":
+        stopped = stop_stale_chat_processes(args.config)
+        _emit({"stopped": stopped, "next": "mở lại opencode (session mới: /new) để nạp tool mới"})
+        return 0
     config = _load_operator_config(args)
     target = args.dir.expanduser().resolve()
     existing = [name for name in ("opencode.json", "AGENTS.md") if (target / name).exists()]
@@ -341,10 +347,11 @@ def _chat_command(args: argparse.Namespace) -> int:
         (target / name).write_text(content, encoding="utf-8")
     if not (target / ".git").exists():
         # OpenCode only reads a project's opencode.json inside a Git repository.
-        import subprocess
         subprocess.run(["git", "init", "-q", str(target)], check=True)
+    # A running OpenCode background server would keep the old config and the old Kite tools.
+    stopped = stop_stale_chat_processes(args.config)
     _emit({"chat_dir": str(target), "lead_model": lead, "allowed_roots": [str(r) for r in roots],
-           "next": f"cd {target} && opencode"})
+           "stopped": stopped, "next": f"cd {target} && opencode"})
     return 0
 
 
