@@ -180,6 +180,105 @@ def test_apply_result_applies_the_patch_without_committing(tmp_path):
         asyncio.run(ops.apply_result(task_id))
 
 
+def finished_task(tmp_path: Path, client: FakeClient, ops: KiteOps, repo: Path, head: str) -> str:
+    """A COMPLETED task whose patch changes calc.py and adds notes.md."""
+    from poc.kaggle_worker.backend import task_slug
+
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    (repo / "calc.py").write_text("x = 2\n")
+    (repo / "notes.md").write_text("hi\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    patch = subprocess.run(["git", "-C", str(repo), "diff", "--cached"], capture_output=True, text=True, check=True).stdout
+    subprocess.run(["git", "-C", str(repo), "reset", "-q", "--hard"], check=True)
+    patch_path = tmp_path / "state" / "tasks" / task_slug(task_id) / "result.patch"
+    patch_path.parent.mkdir(parents=True)
+    patch_path.write_text(patch)
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({"repo_path": str(repo)}))
+    client.state[task_id] = "COMPLETED"
+    client.outcomes[task_id] = CodingTaskOutcome(task_id, "READY_FOR_REVIEW", str(checkpoint), ReviewBundle(
+        task_id, "lease", "kaggle-han", head, patch, "Kite test run: PASSED", 20))
+    return task_id
+
+
+def git_out(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_commit_result_commits_only_the_applied_patch_files(tmp_path):
+    repo, head = make_repo(tmp_path)
+    for key, value in (("user.name", "t"), ("user.email", "t@e.com")):
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = finished_task(tmp_path, client, ops, repo, head)
+    with pytest.raises(KiteToolError, match="chưa được áp"):
+        asyncio.run(ops.commit_result(task_id, "Add median"))
+    asyncio.run(ops.apply_result(task_id))
+    (repo / "other.txt").write_text("not part of the patch\n")
+    with pytest.raises(KiteToolError, match="trống"):
+        asyncio.run(ops.commit_result(task_id, "  "))
+    committed = asyncio.run(ops.commit_result(task_id, "Add median"))
+    assert committed["committed"] and not committed["pushed"] and sorted(committed["files"]) == ["calc.py", "notes.md"]
+    assert git_out(repo, "log", "-1", "--format=%s") == "Add median"
+    assert sorted(git_out(repo, "show", "--name-only", "--format=", "HEAD").split()) == ["calc.py", "notes.md"]
+    assert git_out(repo, "status", "--short") == "?? other.txt"
+
+
+def test_commit_result_refuses_when_other_files_are_staged(tmp_path):
+    repo, head = make_repo(tmp_path)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = finished_task(tmp_path, client, ops, repo, head)
+    asyncio.run(ops.apply_result(task_id))
+    (repo / "staged.txt").write_text("x\n")
+    subprocess.run(["git", "-C", str(repo), "add", "staged.txt"], check=True)
+    with pytest.raises(KiteToolError, match="staged.txt"):
+        asyncio.run(ops.commit_result(task_id, "Add median"))
+    assert git_out(repo, "rev-parse", "HEAD") == head
+
+
+def test_repo_status_is_read_only(tmp_path):
+    repo, head = make_repo(tmp_path)
+    (repo / "calc.py").write_text("x = 3\n")
+    status = asyncio.run(make_ops(tmp_path, FakeClient()).repo_status(str(repo)))
+    assert status["head"] == head and "calc.py" in status["changes"] and "init" in status["recent_commits"]
+    assert (repo / "calc.py").read_text() == "x = 3\n"
+
+
+def test_run_command_uses_an_offline_container_on_a_copy(tmp_path):
+    from poc.kaggle_worker.sandbox import SandboxSettings
+
+    repo, _head = make_repo(tmp_path, "proj")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOKEN")
+    (repo / "link").symlink_to(secret)
+    (repo / "node_modules").mkdir()
+    seen = {}
+
+    def runner(args, *, timeout=None):
+        work = Path(args[args.index("-w") - 1].split(":")[0])
+        seen.update(args=args, timeout=timeout, files=sorted(p.name for p in work.iterdir()),
+                    link_is_link=(work / "link").is_symlink())
+        (work / "calc.py").write_text("changed in the container\n")
+        return subprocess.CompletedProcess(args, 0, "\x1b[32m1 passed\x1b[0m\n" + "y" * 9000, "")
+
+    ops = KiteOps(make_config(tmp_path), db_path=tmp_path / "db.sqlite3", state_dir=tmp_path / "state",
+                  allowed_roots=[tmp_path], runner=runner, sandbox_settings=SandboxSettings(uid=1000))
+    result = asyncio.run(ops.run_command(str(repo), "python -m pytest -q", timeout_seconds=99999))
+    args = seen["args"]
+    assert args[args.index("--network") + 1] == "none" and "--cap-drop" in args
+    assert args[-3:] == ["sh", "-c", "python -m pytest -q"] and seen["timeout"] == 600
+    assert "node_modules" not in seen["files"] and ".git" in seen["files"] and seen["link_is_link"]
+    assert result["exit_code"] == 0 and result["truncated"] and len(result["output"]) == 8000
+    assert (repo / "calc.py").read_text() == "x = 1\n"           # the real repository is untouched
+    assert list((tmp_path / "state" / "exec").iterdir()) == []    # the copy is deleted
+    with pytest.raises(KiteToolError):
+        asyncio.run(ops.run_command(str(repo), "   "))
+    with pytest.raises(KiteToolError, match="ngoài"):
+        asyncio.run(ops.run_command("/etc", "ls"))
+
+
 def test_list_tasks_newest_first_and_worker_status(tmp_path):
     repo, _head = make_repo(tmp_path)
     ops = make_ops(tmp_path, FakeClient(), status={"workers": [{"worker_id": "kaggle-han", "alive": True}]})
@@ -196,7 +295,12 @@ def test_chat_files_lock_the_lead_agent_down_and_speak_vietnamese(tmp_path):
                        kite_command=["/k/kite", "--config", "/c.yaml", "mcp", "serve"], allowed_roots=[Path("/home/u")])
     config = json.loads(files["opencode.json"])
     assert config["model"] == "kite/qwen3.6-fast"
-    assert config["permission"] == {"edit": "deny", "bash": "deny", "webfetch": "deny", "external_directory": "deny"}
+    permission = config["permission"]
+    assert (permission["edit"], permission["webfetch"], permission["external_directory"]) == ("deny",) * 3
+    assert permission["bash"]["*"] == "ask"
+    assert list(permission["bash"])[0] == "*"            # OpenCode: the last matching rule wins
+    for dangerous in ("sudo *", "docker *", "curl *", "git push*", "*secrets*"):
+        assert permission["bash"][dangerous] == "deny"
     assert config["mcp"]["kite"]["command"] == ["/k/kite", "--config", "/c.yaml", "mcp", "serve"]
     assert config["provider"]["kite"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
     assert "tiếng Việt" in files["AGENTS.md"] and "`/home/u`" in files["AGENTS.md"]
@@ -208,5 +312,6 @@ def test_mcp_server_exposes_every_tool(tmp_path):
 
     server = build_server(make_ops(tmp_path, FakeClient()))
     names = {tool.name for tool in asyncio.run(server.list_tools())}
-    assert names == {"start_task", "task_status", "task_result", "apply_result", "send_instruction", "pause_task",
+    assert names == {"start_task", "task_status", "task_result", "apply_result", "commit_result", "repo_status",
+                     "run_command", "send_instruction", "pause_task",
                      "resume_task", "cancel_task", "list_tasks", "worker_status"}
