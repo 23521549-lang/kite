@@ -152,8 +152,37 @@ class KiteOps:
         if outcome.checkpoint_path and Path(outcome.checkpoint_path).is_file():
             repo_path = json.loads(Path(outcome.checkpoint_path).read_text(encoding="utf-8")).get("repo_path")
         result["patch_path"] = str(patch_path)
+        result["repo_path"] = repo_path
         result["apply_with"] = f"git -C {repo_path} apply {patch_path}" if repo_path else f"git apply {patch_path}"
         return result
+
+    async def apply_result(self, task_id: str) -> dict:
+        """Apply a finished task's patch to the working tree of its own repository (never commits)."""
+        result = await self.task_result(task_id)
+        if not result.get("ready"):
+            raise KiteToolError("task chưa xong nên chưa có patch")
+        if result.get("status") != "READY_FOR_REVIEW":
+            raise KiteToolError(f"task kết thúc ở trạng thái {result.get('status')}, không có patch để áp")
+        patch = Path(result["patch_path"])
+        if not result.get("repo_path") or not patch.is_file() or patch.stat().st_size == 0:
+            raise KiteToolError("không tìm thấy patch hoặc repo gốc của task")
+        repo, _head = self._repo(result["repo_path"])
+
+        def git(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+        if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            raise KiteToolError(f"repo {repo} đang có thay đổi chưa commit; commit hoặc stash trước khi áp patch")
+        check = git("apply", "--check", str(patch))
+        if check.returncode != 0:
+            raise KiteToolError("patch không áp được (repo đã đổi so với lúc chạy task?): " + check.stderr.strip()[-500:])
+        files = [line.split("\t", 2)[2] for line in git("apply", "--numstat", str(patch)).stdout.splitlines()
+                 if line.count("\t") >= 2]
+        applied = git("apply", str(patch))
+        if applied.returncode != 0:
+            raise KiteToolError("git apply lỗi: " + applied.stderr.strip()[-500:])
+        return {"task_id": task_id, "applied": True, "repo": str(repo), "files": files, "committed": False,
+                "undo_with": f"git -C {repo} apply -R {patch}"}
 
     async def _signal(self, task_id: str, name: str, *args: str) -> dict:
         from .temporal_workflow import CodingTaskWorkflow
@@ -218,7 +247,7 @@ def build_server(ops: KiteOps):
     server = FastMCP("kite", instructions=(
         "Kite giao việc code cho agent chạy trong sandbox không Internet, trên GPU Kaggle. "
         "Tạo task bằng start_task, theo dõi bằng task_status, lấy kết quả bằng task_result. "
-        "Không bao giờ tự áp patch: đưa lệnh apply_with cho người dùng."))
+        "Chỉ áp patch bằng apply_result khi người dùng nói rõ muốn áp."))
 
     @server.tool(description="Giao một việc cho Kite trên một repo Git. goal phải cụ thể (file, hành vi mong muốn, "
                              "cách kiểm tra). task_type: coding | analysis | review | docs | vision. "
@@ -235,6 +264,11 @@ def build_server(ops: KiteOps):
                              "để người dùng tự áp.")
     async def task_result(task_id: str) -> dict:
         return await ops.task_result(task_id)
+
+    @server.tool(description="Áp patch của task ĐÃ XONG vào repo gốc (chỉ sửa working tree, không commit). "
+                             "CHỈ gọi khi người dùng nói rõ muốn áp patch. Trả về undo_with để hoàn tác.")
+    async def apply_result(task_id: str) -> dict:
+        return await ops.apply_result(task_id)
 
     @server.tool(description="Gửi thêm chỉ dẫn cho task CHƯA xong; agent sẽ làm tiếp trên cùng bản clone.")
     async def send_instruction(task_id: str, instruction: str) -> dict:
@@ -273,14 +307,15 @@ Bạn là agent trưởng của Kite. Luôn trả lời người dùng bằng **
 - Giao việc bằng tool `start_task`. Viết `goal` cụ thể: file/hàm liên quan, hành vi mong muốn, ràng buộc, cách kiểm tra.
 - Chọn `task_type`: `coding` (viết/sửa code), `analysis` (phân tích, không cần sửa), `review` (xem lại code), `docs` (tài liệu).
 - Báo cho người dùng `task_id`, rồi theo dõi bằng `task_status`. Khi người dùng hỏi tiến độ, gọi `task_status` thay vì đoán.
-- Khi task xong, gọi `task_result` và tóm tắt ngắn: đã đổi file nào, đổi gì, test do Kite tự chạy **PASSED** hay **FAILED**, kèm lệnh `apply_with` để người dùng tự áp patch.
+- Khi task xong, gọi `task_result` và tóm tắt ngắn: đã đổi file nào, đổi gì, test do Kite tự chạy **PASSED** hay **FAILED**, rồi hỏi người dùng có muốn áp patch không.
 - Muốn sửa thêm trên task CHƯA xong: `send_instruction`. Task đã xong: tạo task mới.
 - Hỏi về GPU/worker: `worker_status`. Nếu không có worker nào `alive`, nhắc người dùng bật notebook Kaggle (mục Worker mode); task vẫn được giữ và sẽ chạy khi worker kết nối.
 
 ## Bạn không làm
 
 - Không tự sửa file, không chạy lệnh shell, không tải web: bạn không có các quyền đó. Mọi thay đổi code đều phải qua task của Kite (chạy trong sandbox không Internet).
-- Không tự áp patch. Người dùng duyệt patch và tự chạy lệnh `apply_with`.
+- Chỉ gọi `apply_result` khi người dùng nói rõ muốn áp patch (ví dụ "áp đi", "apply giúp mình"). Nó chỉ sửa file, không commit; báo lại danh sách file đã đổi và lệnh hoàn tác `undo_with`. Nếu nó báo lỗi (repo có thay đổi chưa commit, patch không khớp), giải thích lỗi và đưa lệnh `apply_with`.
+- Không đọc file trong repo: bạn chỉ thấy thư mục chat. Muốn tìm hiểu code, tạo task `analysis`.
 - Không bịa kết quả: chỉ nói test PASSED khi `task_result` ghi như vậy.
 
 ## Thông tin
@@ -301,7 +336,7 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
     opencode["small_model"] = f"kite/{lead_model}"
     opencode["mcp"] = {"kite": {"type": "local", "command": list(kite_command), "enabled": True}}
     # The lead agent runs on the host, outside the sandbox: no shell, no edits, no web.
-    opencode["permission"] = {"edit": "deny", "bash": "deny", "webfetch": "deny"}
+    opencode["permission"] = {"edit": "deny", "bash": "deny", "webfetch": "deny", "external_directory": "deny"}
     instructions = (LEAD_INSTRUCTIONS
                     .replace("ROOTS", ", ".join(f"`{root}`" for root in allowed_roots))
                     .replace("MODELS", ", ".join(f"`{m}`" for m in models)))

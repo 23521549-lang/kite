@@ -151,6 +151,35 @@ def test_status_and_result_report_progress_then_the_review_bundle(tmp_path):
         asyncio.run(ops.task_status("unknown-task"))
 
 
+def test_apply_result_applies_the_patch_without_committing(tmp_path):
+    from poc.kaggle_worker.backend import task_slug
+
+    repo, head = make_repo(tmp_path)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    with pytest.raises(KiteToolError, match="chưa xong"):
+        asyncio.run(ops.apply_result(task_id))
+    (repo / "calc.py").write_text("x = 2\n")
+    patch = subprocess.run(["git", "-C", str(repo), "diff"], capture_output=True, text=True, check=True).stdout
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", "calc.py"], check=True)
+    patch_path = tmp_path / "state" / "tasks" / task_slug(task_id) / "result.patch"
+    patch_path.parent.mkdir(parents=True)
+    patch_path.write_text(patch)
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(json.dumps({"repo_path": str(repo)}))
+    client.state[task_id] = "COMPLETED"
+    client.outcomes[task_id] = CodingTaskOutcome(task_id, "READY_FOR_REVIEW", str(checkpoint), ReviewBundle(
+        task_id, "lease", "kaggle-han", head, patch, "Kite test run: PASSED", 20))
+    applied = asyncio.run(ops.apply_result(task_id))
+    assert applied["files"] == ["calc.py"] and applied["committed"] is False
+    assert (repo / "calc.py").read_text() == "x = 2\n"
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == head
+    with pytest.raises(KiteToolError, match="chưa commit"):
+        asyncio.run(ops.apply_result(task_id))
+
+
 def test_list_tasks_newest_first_and_worker_status(tmp_path):
     repo, _head = make_repo(tmp_path)
     ops = make_ops(tmp_path, FakeClient(), status={"workers": [{"worker_id": "kaggle-han", "alive": True}]})
@@ -167,7 +196,7 @@ def test_chat_files_lock_the_lead_agent_down_and_speak_vietnamese(tmp_path):
                        kite_command=["/k/kite", "--config", "/c.yaml", "mcp", "serve"], allowed_roots=[Path("/home/u")])
     config = json.loads(files["opencode.json"])
     assert config["model"] == "kite/qwen3.6-fast"
-    assert config["permission"] == {"edit": "deny", "bash": "deny", "webfetch": "deny"}
+    assert config["permission"] == {"edit": "deny", "bash": "deny", "webfetch": "deny", "external_directory": "deny"}
     assert config["mcp"]["kite"]["command"] == ["/k/kite", "--config", "/c.yaml", "mcp", "serve"]
     assert config["provider"]["kite"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
     assert "tiếng Việt" in files["AGENTS.md"] and "`/home/u`" in files["AGENTS.md"]
@@ -179,5 +208,5 @@ def test_mcp_server_exposes_every_tool(tmp_path):
 
     server = build_server(make_ops(tmp_path, FakeClient()))
     names = {tool.name for tool in asyncio.run(server.list_tools())}
-    assert names == {"start_task", "task_status", "task_result", "send_instruction", "pause_task",
+    assert names == {"start_task", "task_status", "task_result", "apply_result", "send_instruction", "pause_task",
                      "resume_task", "cancel_task", "list_tasks", "worker_status"}

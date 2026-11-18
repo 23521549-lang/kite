@@ -339,6 +339,10 @@ def _chat_command(args: argparse.Namespace) -> int:
     target.mkdir(parents=True, exist_ok=True)
     for name, content in chat_files(config, lead_model=lead, kite_command=command, allowed_roots=roots).items():
         (target / name).write_text(content, encoding="utf-8")
+    if not (target / ".git").exists():
+        # OpenCode only reads a project's opencode.json inside a Git repository.
+        import subprocess
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
     _emit({"chat_dir": str(target), "lead_model": lead, "allowed_roots": [str(r) for r in roots],
            "next": f"cd {target} && opencode"})
     return 0
