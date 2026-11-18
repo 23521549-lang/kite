@@ -234,7 +234,6 @@ def _run_workflow_worker(args: argparse.Namespace, config) -> int:
     from .backend import SandboxActivityBackend
     from .temporal_activities import TemporalKiteActivities
     from .temporal_state import TemporalActivityJournal
-    from .temporal_worker import run_worker
 
     settings = sandbox_settings_from_config(config)
     state_dir = args.config.parent
@@ -252,9 +251,17 @@ def _run_workflow_worker(args: argparse.Namespace, config) -> int:
     _emit({"temporal": config.temporal_endpoint, "task_queue": config.temporal_task_queue,
            "state_dir": str(state_dir), "sandbox_image": settings.image, "models": models})
     sys.stdout.flush()
+    async def serve() -> None:
+        from temporalio.client import Client
+        from temporalio.worker import Worker
+        from .temporal_workflow import CodingTaskWorkflow
+
+        client = await Client.connect(config.temporal_endpoint)
+        await Worker(client, task_queue=config.temporal_task_queue,
+                     workflows=[CodingTaskWorkflow], activities=methods).run()
+
     try:
-        asyncio.run(run_worker(methods, endpoint=config.temporal_endpoint,
-                               task_queue=config.temporal_task_queue))
+        asyncio.run(serve())
     except KeyboardInterrupt:
         pass
     finally:
