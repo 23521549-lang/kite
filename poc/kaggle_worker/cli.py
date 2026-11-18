@@ -131,6 +131,19 @@ def _parser() -> argparse.ArgumentParser:
     sandbox_run.add_argument("--test-cmd", help="override sandbox.test_command; pass '' to skip tests")
     sandbox_run.add_argument("--setup-cmd", help="override sandbox.setup_command (runs with network "
                                                  "before the agent, e.g. 'pip install -r requirements.txt'); '' to skip")
+    mcp = commands.add_parser("mcp", help="MCP server that lets a chat agent drive Kite")
+    mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_serve = mcp_commands.add_parser("serve", help="serve Kite tools over stdio (started by OpenCode)")
+    mcp_serve.add_argument("--allow-root", action="append", type=Path, default=[],
+                           help="folder whose Git repositories tasks may use; repeat (default: home)")
+    chat = commands.add_parser("chat", help="Vietnamese chat with the Kite lead agent (OpenCode)")
+    chat_commands = chat.add_subparsers(dest="chat_command", required=True)
+    chat_setup = chat_commands.add_parser("setup", help="create a chat folder with opencode.json and AGENTS.md")
+    chat_setup.add_argument("--dir", type=Path, default=Path.home() / "kite-chat")
+    chat_setup.add_argument("--model", help="lead model (default: qwen3.6-fast when configured)")
+    chat_setup.add_argument("--allow-root", action="append", type=Path, default=[],
+                            help="folder whose Git repositories tasks may use; repeat (default: home)")
+    chat_setup.add_argument("--force", action="store_true", help="overwrite opencode.json and AGENTS.md")
     return parser
 
 
@@ -293,6 +306,44 @@ def _run_workflow_worker(args: argparse.Namespace, config) -> int:
     return 0
 
 
+def _mcp_command(args: argparse.Namespace) -> int:
+    """Serve Kite's chat tools over stdio. stdout carries the MCP protocol: never print to it."""
+    from .mcp_server import KiteOps, build_server
+
+    config = _load_operator_config(args)
+    ops = KiteOps(config, db_path=_db_path(args), state_dir=args.config.parent,
+                  allowed_roots=args.allow_root or [Path.home()])
+    build_server(ops).run(transport="stdio")
+    return 0
+
+
+def _chat_command(args: argparse.Namespace) -> int:
+    from .mcp_server import chat_files
+
+    config = _load_operator_config(args)
+    target = args.dir.expanduser().resolve()
+    existing = [name for name in ("opencode.json", "AGENTS.md") if (target / name).exists()]
+    if existing and not args.force:
+        raise ConfigError(f"{target} already has {', '.join(existing)}; pass --force to overwrite")
+    models = gateway_models(config)
+    if not models:
+        raise ConfigError("no enabled pull worker serves a model")
+    lead = args.model or ("qwen3.6-fast" if "qwen3.6-fast" in models else models[0])
+    if lead not in models:
+        raise ConfigError(f"model {lead} is not served by the gateway ({', '.join(models)})")
+    roots = [Path(root).expanduser().resolve() for root in (args.allow_root or [Path.home()])]
+    kite = Path(sys.argv[0]).resolve() if Path(sys.argv[0]).exists() else Path(shutil.which("kite") or "kite")
+    command = [str(kite), "--config", str(args.config.resolve()), "mcp", "serve"]
+    for root in roots:
+        command += ["--allow-root", str(root)]
+    target.mkdir(parents=True, exist_ok=True)
+    for name, content in chat_files(config, lead_model=lead, kite_command=command, allowed_roots=roots).items():
+        (target / name).write_text(content, encoding="utf-8")
+    _emit({"chat_dir": str(target), "lead_model": lead, "allowed_roots": [str(r) for r in roots],
+           "next": f"cd {target} && opencode"})
+    return 0
+
+
 def _sandbox_command(args: argparse.Namespace) -> int:
     from . import sandbox as sbx
 
@@ -441,6 +492,10 @@ def _operator_command(args: argparse.Namespace) -> int:
             return 0
     if args.command == "sandbox":
         return _sandbox_command(args)
+    if args.command == "mcp":
+        return _mcp_command(args)
+    if args.command == "chat":
+        return _chat_command(args)
     if args.command == "worker":
         config = _load_operator_config(args)
         provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)
@@ -559,7 +614,8 @@ def _run(args: argparse.Namespace) -> int:
         _emit(asdict(bundle))
         return 0
 
-    if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox"}:
+    if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
+                        "mcp", "chat"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:
