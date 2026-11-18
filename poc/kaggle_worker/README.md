@@ -183,7 +183,9 @@ KITE_GATEWAY_DOMAIN=1-2-3-4.sslip.io sudo -E docker compose -f deploy/gateway.co
 4. In the Kaggle notebook run everything up to "Worker mode"; it heartbeats and waits for jobs. Check from EC2 with `curl -s 127.0.0.1:8787/status`.
 5. Point OpenCode at the gateway: `kite gateway opencode-config` prints the block for `opencode.json`.
 
-`qwen3.6-fast` is the same model with thinking disabled, for chat and simple tool steps. The gateway currently replays each finished answer as one SSE stream (no token-by-token streaming yet).
+`qwen3.6-fast` is the same model with thinking disabled, for chat and simple tool steps. `GET /status` lists each worker's models, whether it is alive, and what it has loaded; `kite sandbox run` checks it first and stops immediately when no live worker serves the model, instead of waiting for the job timeout.
+
+Known limitation: the gateway waits for the worker's complete answer and replays it as one SSE stream (no token-by-token streaming yet). Clients therefore see the whole answer at once, and throughput figures they display (OpenCode's `tok/s`) are not real generation speed; on 2×T4 qwen3.6 generates about 54–58 tokens/s.
 
 ## Sandboxed runs
 

@@ -280,6 +280,7 @@ class ModelGateway:
         return {
             "workers": [{
                 "worker_id": w.worker_id, "alive": self._alive(w, now), "draining": w.draining,
+                "models": list(w.model_ids),
                 "loaded_model": w.loaded_model, "cached_models": list(w.cached_models),
                 "busy": w.current_job is not None,
                 "seconds_since_heartbeat": round(now - w.last_seen, 1) if w.last_seen else None,
@@ -351,7 +352,8 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024)
             except asyncio.CancelledError:
                 gateway.cancel(job)
                 raise
-            return web.json_response(result)
+            # Answer with the model name the client asked for, not the worker's GGUF file path.
+            return web.json_response({**result, "model": body["model"]})
 
         stream = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                              "Cache-Control": "no-cache"})
@@ -371,7 +373,7 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024)
         except (asyncio.CancelledError, ConnectionResetError):
             gateway.cancel(job)
             raise
-        for chunk in completion_to_sse(result):
+        for chunk in completion_to_sse({**result, "model": body["model"]}):
             await stream.write(chunk)
         await stream.write_eof()
         return stream

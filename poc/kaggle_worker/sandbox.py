@@ -15,6 +15,7 @@ Each task gets its own clone of the repository, mounted into throw-away containe
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass, field
 import json
 import os
@@ -24,6 +25,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.request
 import uuid
 from typing import Callable
 
@@ -345,6 +347,50 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     return _write_result(root, run)
 
 
+def require_worker(settings: SandboxSettings, model: str, *, fetch=None) -> dict:
+    """Fail fast when no live worker serves ``model``.
+
+    Without this check the agent would sit on the gateway until the job timeout (30 minutes)
+    whenever the Kaggle notebook is not running.
+    """
+    base = settings.gateway_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = base + "/status"
+    if fetch is None:
+        def fetch(target: str) -> dict:
+            with urllib.request.urlopen(target, timeout=10) as response:
+                return json.loads(response.read())
+    try:
+        status = fetch(url)
+    except Exception as exc:
+        raise SandboxError(f"cannot reach the gateway at {url} ({exc}); is kite-gateway running?") from exc
+    for worker in status.get("workers", []):
+        if worker.get("alive") and not worker.get("draining") and model in worker.get("models", []):
+            return worker
+    raise SandboxError(
+        f"no live worker serves {model}: start the Kaggle notebook (Worker mode), wait for "
+        "'Worker đã kết nối', then retry")
+
+
+def _stream(cmd: list[str], timeout: int, log: Callable[[str], None]) -> tuple[int, str]:
+    """Run a long command, echo its output line by line, keep the last lines for errors."""
+    tail: deque[str] = deque(maxlen=200)
+    deadline = time.monotonic() + timeout
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, bufsize=1)
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = clean_output(line.rstrip("\n"))
+        tail.append(line)
+        log(line)
+        if time.monotonic() > deadline:
+            process.kill()
+            tail.append("[kite] build timed out")
+            break
+    return process.wait(), "\n".join(tail)
+
+
 def ensure_network(settings: SandboxSettings, runner: Runner = default_runner) -> str:
     """Create the internal sandbox network if needed; return the host's address on it."""
     docker = list(settings.docker_command)
@@ -362,8 +408,12 @@ def ensure_network(settings: SandboxSettings, runner: Runner = default_runner) -
 
 
 def build_image(settings: SandboxSettings, *, dockerfile: Path, opencode_binary: Path,
-                opencode_cache: Path | None, runner: Runner = default_runner) -> str:
-    """Build the sandbox image with the host's OpenCode binary and package cache baked in."""
+                opencode_cache: Path | None, runner: Runner = default_runner,
+                log: Callable[[str], None] | None = None) -> str:
+    """Build the sandbox image with the host's OpenCode binary and package cache baked in.
+
+    With ``log`` the build output is streamed line by line (the build takes several minutes).
+    """
     with tempfile.TemporaryDirectory(prefix="kite-sandbox-build-") as tmp:
         context = Path(tmp)
         shutil.copy2(dockerfile, context / "Dockerfile")
@@ -373,10 +423,15 @@ def build_image(settings: SandboxSettings, *, dockerfile: Path, opencode_binary:
             shutil.copytree(opencode_cache, cache, symlinks=True)
         else:
             cache.mkdir()
-        result = runner([*settings.docker_command, "build", "--build-arg", f"KITE_UID={settings.uid}",
-                         "-t", settings.image, str(context)], timeout=1800)
-        if result.returncode != 0:
-            raise SandboxError("docker build failed:\n" + _tail(result.stdout + result.stderr, 2000))
+        cmd = [*settings.docker_command, "build", "--progress=plain",
+               "--build-arg", f"KITE_UID={settings.uid}", "-t", settings.image, str(context)]
+        if log is not None and runner is default_runner:
+            returncode, output = _stream(cmd, 1800, log)
+        else:
+            result = runner(cmd, timeout=1800)
+            returncode, output = result.returncode, (result.stdout or "") + (result.stderr or "")
+        if returncode != 0:
+            raise SandboxError("docker build failed:\n" + _tail(output, 2000))
     return settings.image
 
 

@@ -226,3 +226,23 @@ def test_worker_token_and_opencode_config_commands(tmp_path, capsys):
     provider = json.loads(capsys.readouterr().out)["provider"]["kite"]
     assert provider["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
     assert set(provider["models"]) == {"qwen3.6", "devstral", "qwen3.6-fast"}
+
+
+def test_status_lists_models_and_answers_carry_the_requested_model_name():
+    async def scenario():
+        gateway = make_gateway()
+        async with TestClient(TestServer(create_app(gateway))) as client:
+            await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+            chat = asyncio.create_task(client.post("/v1/chat/completions", json={
+                "model": "qwen3.6-fast", "messages": []}))
+            job = await gateway.next_job("w1", 5)
+            gateway.complete("w1", job.job_id, {"status": "ok", "response": {
+                **COMPLETION, "model": "/kaggle/tmp/kite/models/x.gguf"}})
+            answer = await (await chat).json()
+            status = await (await client.get("/status")).json()
+        return answer, status
+
+    answer, status = asyncio.run(scenario())
+    assert answer["model"] == "qwen3.6-fast"
+    w1 = next(w for w in status["workers"] if w["worker_id"] == "w1")
+    assert w1["models"] == ["qwen3.6", "devstral"]

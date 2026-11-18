@@ -206,3 +206,30 @@ def test_sandbox_config_validation_and_settings():
                 {"setup_command": 3}):
         with pytest.raises(ConfigError):
             validate_config(_config(**bad))
+
+
+def test_require_worker_fails_fast_without_a_live_worker():
+    seen = []
+    status = {"workers": [{"worker_id": "kaggle-han", "alive": False, "draining": False,
+                           "models": ["qwen3.6", "devstral"]}]}
+
+    def fetch(url):
+        seen.append(url)
+        return status
+
+    with pytest.raises(sbx.SandboxError, match="no live worker"):
+        sbx.require_worker(SETTINGS, "qwen3.6", fetch=fetch)
+    assert seen[0] == "http://172.19.0.1:8787/status"
+    status["workers"][0]["alive"] = True
+    assert sbx.require_worker(SETTINGS, "qwen3.6", fetch=fetch)["worker_id"] == "kaggle-han"
+    with pytest.raises(sbx.SandboxError):
+        sbx.require_worker(SETTINGS, "gemma4", fetch=fetch)      # model nobody serves
+    status["workers"][0]["draining"] = True
+    with pytest.raises(sbx.SandboxError):
+        sbx.require_worker(SETTINGS, "qwen3.6", fetch=fetch)     # worker is shutting down
+
+    def unreachable(url):
+        raise OSError("connection refused")
+
+    with pytest.raises(sbx.SandboxError, match="cannot reach the gateway"):
+        sbx.require_worker(SETTINGS, "qwen3.6", fetch=unreachable)

@@ -235,9 +235,11 @@ def _sandbox_command(args: argparse.Namespace) -> int:
         if not Path(opencode).is_file():
             raise ConfigError("opencode binary not found on the host; run the bootstrap first")
         network_gateway = sbx.ensure_network(settings)
+        print("Đang build image sandbox (vài phút)...", file=sys.stderr)
         image = sbx.build_image(settings, dockerfile=REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",
                                 opencode_binary=Path(opencode).resolve(),
-                                opencode_cache=Path.home() / ".cache" / "opencode")
+                                opencode_cache=Path.home() / ".cache" / "opencode",
+                                log=lambda line: print(line, file=sys.stderr))
         _emit({"image": image, "network": settings.network, "network_gateway": network_gateway,
                "configured_gateway_host": config.sandbox.gateway_host,
                "gateway_host_matches": network_gateway == config.sandbox.gateway_host})
@@ -253,6 +255,9 @@ def _sandbox_command(args: argparse.Namespace) -> int:
             raise ConfigError("no enabled pull worker serves a model")
         model = args.model or base_models[0]
         small = next((name for name, spec in config.gateway.aliases.items() if spec["model"] == model), None)
+        worker = sbx.require_worker(settings, model)
+        print(f"Worker {worker['worker_id']} sẵn sàng (model đang nạp: {worker.get('loaded_model')})",
+              file=sys.stderr)
         result = sbx.run_task(
             settings, repo=args.repo, goal=args.goal, model=model, models=models,
             state_dir=args.config.parent / "sandbox", task_id=args.task_id, small_model=small,
