@@ -532,3 +532,67 @@ def render_report(results: dict) -> str:
               "(không mạng) qua và agent không sửa file test.",
               "- **Tốc độ**: `timings` của llama.cpp ở lần gọi thứ hai; thời gian đổi model = lần một trừ lần hai."]
     return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------------------- apply
+SKILL_TASK_TYPES = ("coding", "analysis", "review", "docs")
+
+
+def merge_results(paths) -> dict[str, dict]:
+    """Per-model entries from one or more results.json (later files add suites, they do not erase)."""
+    merged: dict[str, dict] = {}
+    for path in paths:
+        for model, entry in json.loads(Path(path).read_text(encoding="utf-8"))["models"].items():
+            merged.setdefault(model, {}).update({k: v for k, v in entry.items() if v})
+    return merged
+
+
+def suggest(models: dict[str, dict], *, aliases=()) -> dict:
+    """Routing scores in [0, 1] from measured results.
+
+    ``coding`` = code pass rate. ``analysis``/``review``/``docs`` run the same sandboxed agent but
+    are judged more on following instructions and honesty, so they average the code pass rate with
+    the lead-agent score. ``vision`` is not measured and is left alone. A model whose sandbox
+    tasks all failed (or that never used a tool correctly) is proposed as chat-only. Aliases share
+    their base model's weights, so they get no routing score; they only compete for the lead role.
+    """
+    skill: dict[str, dict[str, float]] = {t: {} for t in SKILL_TASK_TYPES}
+    chat_only, lead_rank = [], []
+    for model, entry in models.items():
+        s = summarize(entry)
+        lead = s["lead_score"]
+        code = s["code_passed"] / s["code_total"] if s["code_total"] else None
+        if lead is not None:
+            seconds = s["lead_seconds"] or 0.0
+            lead_rank.append((s["lead_passed"], lead, -seconds, model))
+        if model in aliases:
+            continue
+        if code is not None:
+            skill["coding"][model] = round(code, 2)
+        mixed = [x for x in (code, lead) if x is not None]
+        if mixed:
+            for task_type in ("analysis", "review", "docs"):
+                skill[task_type][model] = round(sum(mixed) / len(mixed), 2)
+        used_kite_tool = any(c["name"] != "bash" for item in entry.get("lead") or [] for c in item["calls"])
+        if (s["code_total"] and not s["code_passed"]) or (entry.get("lead") and not used_kite_tool):
+            chat_only.append(model)
+    lead_rank.sort(reverse=True)
+    return {"model_skill": {t: v for t, v in skill.items() if v}, "chat_only": chat_only,
+            "lead_model": lead_rank[0][3] if lead_rank else None,
+            "lead_ranking": [{"model": m, "passed": p, "score": sc, "seconds_per_scenario": -sec}
+                             for p, sc, sec, m in lead_rank]}
+
+
+def apply_suggestion(cfg: dict, suggestion: dict) -> dict:
+    """Write measured scores into a raw config dict; models not measured keep their old scores."""
+    routing = cfg.setdefault("routing", {})
+    skill = routing.setdefault("model_skill", {})
+    for task_type, scores in suggestion["model_skill"].items():
+        skill.setdefault(task_type, {}).update(scores)
+    for model in suggestion["model_skill"].get("coding", {}):
+        for task_type in skill:
+            skill[task_type].setdefault(model, 0.0)
+    routing["chat_only"] = sorted(set(routing.get("chat_only", [])) | set(suggestion["chat_only"]))
+    if not routing["chat_only"]:
+        routing.pop("chat_only")
+    return cfg

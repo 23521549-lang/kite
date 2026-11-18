@@ -19,7 +19,7 @@ import uuid
 
 from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers, load_config,
                      model_policy_from_config, redact_config, refresh_configured_providers,
-                     sandbox_settings_from_config, sync_config_to_store)
+                     sandbox_settings_from_config, sync_config_to_store, validate_config)
 from .integration import StaleWorkerResult, build_review_bundle
 from .protocol import ScheduledTask, WorkerResult
 from .sandbox import SandboxError
@@ -154,6 +154,11 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--suites", default="speed,lead,code", help="comma-separated: speed, lead, code")
     bench_run.add_argument("--only", default="", help="comma-separated scenario/task ids, e.g. L04,L16,C1-bugfix")
     bench_run.add_argument("--out", type=Path, help="output folder (default: <state>/bench/<time>)")
+    bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
+                                                          "unless --write)")
+    bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
+    bench_apply.add_argument("--write", action="store_true", help="write routing.model_skill / chat_only "
+                                                                  "into the config (a backup is kept)")
     return parser
 
 
@@ -369,6 +374,22 @@ def _bench_command(args: argparse.Namespace) -> int:
     from .mcp_server import KiteOps, build_server, chat_files
 
     config = _load_operator_config(args)
+    if args.bench_command == "apply":
+        import yaml
+
+        suggestion = bench.suggest(bench.merge_results(args.results), aliases=set(config.gateway.aliases))
+        result = {"suggestion": suggestion, "written": False}
+        if args.write:
+            raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+            updated = bench.apply_suggestion(raw, suggestion)
+            validate_config(updated)
+            backup = args.config.with_name(f"{args.config.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+            shutil.copy2(args.config, backup)
+            args.config.write_text(yaml.safe_dump(updated, sort_keys=False, allow_unicode=True), encoding="utf-8")
+            result.update(written=True, backup=str(backup),
+                          next="kite provider sync; sudo systemctl restart kite-gateway kite-workflow-worker")
+        _emit(result)
+        return 0
     served = gateway_models(config)
     models = [m.strip() for m in args.models.split(",") if m.strip()] or \
         [m for m in served if m not in config.gateway.aliases]

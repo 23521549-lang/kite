@@ -59,6 +59,8 @@ class RoutingConfig:
     load_seconds_cold: float = 600.0
     default_skill: float = 0.0
     model_skill: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Models without reliable tool calling: chat / Q&A through the gateway only, never a sandbox agent.
+    chat_only: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -267,7 +269,7 @@ def _validate_routing(raw: Any) -> RoutingConfig:
     """Optional dispatcher settings: model quality per task type and model-switch cost."""
     routing = _mapping(raw, "routing")
     unknown = set(routing) - {"swap_penalty_per_second", "load_seconds_cached", "load_seconds_cold",
-                              "default_skill", "model_skill"}
+                              "default_skill", "model_skill", "chat_only"}
     if unknown:
         raise ConfigError("routing has unsupported fields")
     skill_raw = _mapping(routing.get("model_skill", {}), "routing.model_skill")
@@ -281,6 +283,9 @@ def _validate_routing(raw: Any) -> RoutingConfig:
             if not isinstance(model, str) or not _MODEL.fullmatch(model):
                 raise ConfigError(f"routing.model_skill.{task_type} has a malformed model ID")
             skill[task_type][model] = _number(score, f"routing.model_skill.{task_type}.{model}")
+    chat_only = routing.get("chat_only", [])
+    if not isinstance(chat_only, list) or not all(isinstance(m, str) and _MODEL.fullmatch(m) for m in chat_only):
+        raise ConfigError("routing.chat_only must be a list of model IDs")
     return RoutingConfig(
         swap_penalty_per_second=_number(routing.get("swap_penalty_per_second", 0.0),
                                         "routing.swap_penalty_per_second", minimum=0),
@@ -290,6 +295,7 @@ def _validate_routing(raw: Any) -> RoutingConfig:
                                   "routing.load_seconds_cold", minimum=0),
         default_skill=_number(routing.get("default_skill", 0.0), "routing.default_skill"),
         model_skill=skill,
+        chat_only=tuple(dict.fromkeys(chat_only)),
     )
 
 
@@ -447,6 +453,7 @@ def model_policy_from_config(config: KiteConfig):
         swap_penalty_per_second=r.swap_penalty_per_second,
         load_seconds_cached=r.load_seconds_cached,
         load_seconds_cold=r.load_seconds_cold,
+        excluded=frozenset(r.chat_only),
     )
 
 
@@ -540,7 +547,8 @@ def redact_config(config: KiteConfig) -> dict[str, Any]:
                     "load_seconds_cached": config.routing.load_seconds_cached,
                     "load_seconds_cold": config.routing.load_seconds_cold,
                     "default_skill": config.routing.default_skill,
-                    "model_skill": config.routing.model_skill},
+                    "model_skill": config.routing.model_skill,
+                    "chat_only": list(config.routing.chat_only)},
         "gateway": {"host": config.gateway.host, "port": config.gateway.port,
                     "public_url": config.gateway.public_url,
                     "job_timeout_seconds": config.gateway.job_timeout_seconds,

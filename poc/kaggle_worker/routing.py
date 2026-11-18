@@ -67,6 +67,8 @@ class ModelPolicy:
     swap_penalty_per_second: float = 0.0
     load_seconds_cached: float = 60.0
     load_seconds_cold: float = 600.0
+    # Models that must never run a task (no reliable tool calling): Q&A through the gateway only.
+    excluded: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         for (task_type, model_id), score in self.skill.items():
@@ -181,6 +183,8 @@ def select_worker(
         else:
             models = worker.model_ids if model_policy is not None else worker.model_ids[:1]
         for model_id in models:
+            if model_policy is not None and model_id in model_policy.excluded:
+                continue
             if model_policy is None:
                 key = (*load_score, worker.worker_id, model_id)
                 candidates.append((key, worker, owner, model_id, None, "least-loaded eligible worker"))

@@ -118,6 +118,11 @@ class SandboxActivityBackend:
         if task.preferred_model_id and task.preferred_model_id not in self.models:
             raise ApplicationError(f"model {task.preferred_model_id} is not served by the gateway",
                                    non_retryable=True)
+        policy = getattr(self.store, "model_policy", None)
+        if task.preferred_model_id and policy is not None and \
+                self.aliases.get(task.preferred_model_id, task.preferred_model_id) in policy.excluded:
+            raise ApplicationError(f"model {task.preferred_model_id} is chat-only (routing.chat_only): it cannot "
+                                   "run a sandbox task", non_retryable=True)
         if not task.goal.strip():
             raise ApplicationError("task goal is empty", non_retryable=True)
 

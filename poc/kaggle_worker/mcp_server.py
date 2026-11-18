@@ -79,7 +79,9 @@ class KiteOps:
         return SQLiteSchedulerStore(self.db_path, model_policy=model_policy_from_config(self.config))
 
     def base_models(self) -> list[str]:
-        return [m for m in gateway_models(self.config) if m not in self.config.gateway.aliases]
+        """Models a task may name: served, not an alias, not chat-only."""
+        return [m for m in gateway_models(self.config)
+                if m not in self.config.gateway.aliases and m not in self.config.routing.chat_only]
 
     def _repo(self, repo: str) -> tuple[Path, str]:
         path = Path(repo).expanduser().resolve()

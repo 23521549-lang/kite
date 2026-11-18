@@ -18,8 +18,8 @@ from poc.kaggle_worker.store import SQLiteSchedulerStore
 from poc.kaggle_worker.temporal_workflow import CodingTaskOutcome
 
 
-def make_config(tmp_path: Path):
-    return validate_config({
+def _raw_config(tmp_path: Path) -> dict:
+    return {
         "schema_version": 1,
         "temporal": {"endpoint": "127.0.0.1:7233", "task_queue": "kite-coding-tasks"},
         "opencode": {"executable": "opencode", "server": {"host": "127.0.0.1", "port": 4096}},
@@ -31,7 +31,11 @@ def make_config(tmp_path: Path):
             "secrets": {"worker_token": f"file:{tmp_path / 'token'}"},
         }],
         "gateway": {"aliases": {"qwen3.6-fast": {"model": "qwen3.6", "params": {}}}},
-    })
+    }
+
+
+def make_config(tmp_path: Path):
+    return validate_config(_raw_config(tmp_path))
 
 
 def make_repo(root: Path, name: str = "repo") -> tuple[Path, str]:
@@ -346,3 +350,22 @@ def test_reload_stops_the_opencode_daemon_and_old_mcp_servers_only(tmp_path):
         raise ProcessLookupError
     assert stop_stale_chat_processes(config, proc=proc, uid=os.getuid(), kill=gone) == []
     assert stop_stale_chat_processes(config, proc=proc, uid=os.getuid() + 1, kill=gone) == []
+
+
+def test_chat_only_models_never_run_tasks(tmp_path):
+    from dataclasses import replace
+
+    from poc.kaggle_worker.config import model_policy_from_config, validate_config
+    from poc.kaggle_worker.routing import ModelPolicy
+
+    with pytest.raises(Exception):
+        validate_config({**_raw_config(tmp_path), "routing": {"chat_only": "devstral"}})
+    config = validate_config({**_raw_config(tmp_path), "routing": {"chat_only": ["devstral", "devstral"]}})
+    assert config.routing.chat_only == ("devstral",)
+    assert model_policy_from_config(config).excluded == frozenset({"devstral"})
+    ops = make_ops(tmp_path, FakeClient())
+    ops.config = config
+    repo, _head = make_repo(tmp_path)
+    assert "devstral" not in ops.base_models()
+    with pytest.raises(KiteToolError):
+        asyncio.run(ops.start_task(str(repo), "x", model="devstral"))

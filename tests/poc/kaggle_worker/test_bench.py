@@ -143,3 +143,35 @@ def test_real_tool_schemas_for_the_lead_agent(tmp_path):
     tools = bench.lead_tools(asyncio.run(build_server(make_ops(tmp_path, FakeClient())).list_tools()))
     names = {t["function"]["name"] for t in tools}
     assert "kite_apply_result" in names and "bash" in names and len(names) == 14
+
+
+def lead_item(passed, score, seconds, calls):
+    return {"category": "x", "passed": passed, "score": score, "seconds": seconds,
+            "checks": {"no_shell": True}, "calls": [{"name": n} for n in calls]}
+
+
+def test_suggest_turns_measurements_into_routing_scores():
+    models = {
+        "qwen3.6": {"lead": [lead_item(True, 1.0, 40, ["run_command"]), lead_item(True, 1.0, 40, [])],
+                    "code": [{"passed": True, "agent_seconds": 30}, {"passed": False, "agent_seconds": 50}]},
+        "qwen3.6-fast": {"lead": [lead_item(True, 1.0, 5, ["run_command"]), lead_item(True, 1.0, 5, [])]},
+        "deepseek-r1-32b": {"lead": [lead_item(False, 0.4, 90, []), lead_item(False, 0.5, 90, ["bash"])]},
+        "devstral": {"code": [{"passed": False, "agent_seconds": 10}]},
+    }
+    s = bench.suggest(models, aliases={"qwen3.6-fast"})
+    assert s["model_skill"]["coding"] == {"qwen3.6": 0.5, "devstral": 0.0}
+    assert s["model_skill"]["analysis"]["qwen3.6"] == 0.75 and "qwen3.6-fast" not in s["model_skill"]["analysis"]
+    assert sorted(s["chat_only"]) == ["deepseek-r1-32b", "devstral"]
+    assert s["lead_model"] == "qwen3.6-fast"            # same passes and score, 8x faster
+
+    cfg = {"routing": {"model_skill": {"coding": {"qwen3.6": 0.75, "old": 0.3}, "vision": {"qwen3.6": 0.7}}}}
+    out = bench.apply_suggestion(cfg, s)["routing"]
+    assert out["model_skill"]["coding"] == {"qwen3.6": 0.5, "old": 0.3, "devstral": 0.0}
+    assert out["model_skill"]["vision"]["qwen3.6"] == 0.7 and out["chat_only"] == ["deepseek-r1-32b", "devstral"]
+
+
+def test_merge_results_combines_lead_and_code_runs(tmp_path):
+    (tmp_path / "a.json").write_text(json.dumps({"models": {"m": {"speed": {"x": 1}, "lead": [1]}}}))
+    (tmp_path / "b.json").write_text(json.dumps({"models": {"m": {"code": [2]}, "n": {"code": [3]}}}))
+    merged = bench.merge_results([tmp_path / "a.json", tmp_path / "b.json"])
+    assert merged == {"m": {"speed": {"x": 1}, "lead": [1], "code": [2]}, "n": {"code": [3]}}
