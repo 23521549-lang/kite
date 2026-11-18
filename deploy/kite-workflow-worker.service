@@ -1,0 +1,24 @@
+# systemd unit for the Kite Temporal worker: runs coding tasks in the Docker sandbox.
+# Install: sudo cp deploy/kite-workflow-worker.service /etc/systemd/system/ && sudo systemctl enable --now kite-workflow-worker
+# Requires the ubuntu user to be in the docker group (sudo usermod -aG docker ubuntu).
+[Unit]
+Description=Kite Temporal worker (coding tasks in the sandbox)
+After=network-online.target docker.service kite-gateway.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kite
+ExecStart=/home/ubuntu/kite/.venv/bin/kite --config /var/lib/kite/kite/config.yaml workflow worker
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/kite/kite
+
+[Install]
+WantedBy=multi-user.target

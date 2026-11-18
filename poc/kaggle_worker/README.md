@@ -214,6 +214,26 @@ sudo systemctl restart kite-gateway                                       # also
 
 Results are written to `/var/lib/kite/kite/sandbox/<task-id>/` (`result.json`, `result.patch`, `setup.log`, `agent.log`, `test.log`). `verified` is true only when setup (if any) succeeded, the agent finished and changed files, and Kite's own test run passed. Review the patch, then apply it with `git apply`. The setup step has network access while it installs, which carries the same supply-chain risk as installing those packages yourself; the agent never has network access.
 
+## Temporal workflows in the sandbox
+
+`kite workflow worker` serves the Temporal task queue with `SandboxActivityBackend`: every workflow step runs through the sandbox above, and leases, the task-type dispatcher and GPU quota go through the scheduler store.
+
+- `prepare_workspace` clones the pinned commit into `/var/lib/kite/kite/tasks/<slug>/work` and runs the optional setup command (the only step with network). Re-running it reuses the clone.
+- `run_opencode` runs `opencode run` in the offline agent container with the routed model, then Kite runs the test command itself in a container with no network; the patch, changed files and test result go into the review bundle summary.
+- `workflow resume --instruction "..."` runs the agent again on the same clone; the patch is always computed against the original commit.
+- `pause`, `cancel` and `reject` kill the task's containers.
+
+The agent never talks to an OpenCode server on this path, so the unanswered permission prompt (E1) and the bypassable `git push` rule (E5) do not apply: the container has no network, no Git remote and no credentials.
+
+```sh
+sudo cp deploy/kite-workflow-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now kite-workflow-worker
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml workflow start --task-id demo-1 \
+  --repo ~/project --goal "..."            # --repo-head defaults to HEAD, --branch to agent/<id>
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml workflow status demo-1
+./.venv/bin/kite --config /var/lib/kite/kite/config.yaml workflow result demo-1
+```
+
 ## Not enabled
 
 - No Kaggle API/session adapter is implemented.

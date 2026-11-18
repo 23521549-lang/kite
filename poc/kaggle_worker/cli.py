@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import secrets as token_secrets
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -92,8 +93,8 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--task-id", required=True)
     start.add_argument("--goal", required=True)
     start.add_argument("--repo", type=Path, required=True)
-    start.add_argument("--repo-head", required=True)
-    start.add_argument("--branch", required=True)
+    start.add_argument("--repo-head", help="commit to work from (default: the repository's current HEAD)")
+    start.add_argument("--branch", help="review branch name (default: agent/<task-id>)")
     start.add_argument("--capability", action="append", default=[])
     start.add_argument("--role", default="coder")
     start.add_argument("--task-type", default="coding")
@@ -105,6 +106,9 @@ def _parser() -> argparse.ArgumentParser:
         sub.add_argument("workflow_id")
         if action == "resume":
             sub.add_argument("--instruction", default="")
+    workflow_commands.add_parser("worker", help="run the Temporal worker that executes tasks in the sandbox")
+    workflow_result = workflow_commands.add_parser("result", help="wait for a workflow and print its review bundle")
+    workflow_result.add_argument("workflow_id")
     gateway = commands.add_parser("gateway", help="model gateway that pull workers (Kaggle) serve")
     gateway_commands = gateway.add_subparsers(dest="gateway_command", required=True)
     gateway_commands.add_parser("serve", help="run the gateway on loopback; publish /worker/* through Caddy")
@@ -223,6 +227,40 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
     finally:
         await runner.cleanup()
         store.close()
+
+
+def _run_workflow_worker(args: argparse.Namespace, config) -> int:
+    """Serve the Temporal task queue with the sandbox backend (see deploy/kite-workflow-worker.service)."""
+    from .backend import SandboxActivityBackend
+    from .temporal_activities import TemporalKiteActivities
+    from .temporal_state import TemporalActivityJournal
+    from .temporal_worker import run_worker
+
+    settings = sandbox_settings_from_config(config)
+    state_dir = args.config.parent
+    models = gateway_models(config)
+    store = SQLiteSchedulerStore(_db_path(args), model_policy=model_policy_from_config(config))
+    journal = TemporalActivityJournal(state_dir / "activities.sqlite3")
+    backend = SandboxActivityBackend(
+        store, settings, state_dir=state_dir, models=models,
+        aliases={name: spec["model"] for name, spec in config.gateway.aliases.items()})
+    activities = TemporalKiteActivities(backend, journal)
+    methods = [activities.validate_task, activities.prepare_workspace, activities.reserve_route,
+               activities.prepare_opencode_session, activities.run_opencode,
+               activities.interrupt_opencode, activities.checkpoint_and_stop,
+               activities.build_review_bundle, activities.release_route]
+    _emit({"temporal": config.temporal_endpoint, "task_queue": config.temporal_task_queue,
+           "state_dir": str(state_dir), "sandbox_image": settings.image, "models": models})
+    sys.stdout.flush()
+    try:
+        asyncio.run(run_worker(methods, endpoint=config.temporal_endpoint,
+                               task_queue=config.temporal_task_queue))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        journal.close()
+        store.close()
+    return 0
 
 
 def _sandbox_command(args: argparse.Namespace) -> int:
@@ -402,13 +440,32 @@ def _operator_command(args: argparse.Namespace) -> int:
         return 0
     if args.command == "workflow":
         config = _load_operator_config(args)
+        if args.workflow_command == "worker":
+            return _run_workflow_worker(args, config)
         from temporalio.client import Client
         from .temporal_workflow import CodingTaskInput, CodingTaskWorkflow
 
         async def operate():
             client = await Client.connect(config.temporal_endpoint)
             action = args.workflow_command
+            if action == "result":
+                from .backend import task_slug
+
+                handle = client.get_workflow_handle_for(CodingTaskWorkflow.run, args.workflow_id)
+                outcome = await handle.result()
+                summary = asdict(outcome)
+                summary["patch_path"] = str(args.config.parent / "tasks" / task_slug(outcome.task_id)
+                                            / "result.patch")
+                summary["apply_with"] = f"git apply {summary['patch_path']}"
+                return summary
             if action == "start":
+                if not args.repo_head:
+                    head = subprocess.run(["git", "-C", str(args.repo), "rev-parse", "HEAD"],
+                                          capture_output=True, text=True)
+                    if head.returncode != 0:
+                        raise ConfigError(f"{args.repo} is not a Git repository")
+                    args.repo_head = head.stdout.strip()
+                args.branch = args.branch or f"agent/{args.task_id}"
                 # The workflow reserves a route from the scheduler store, so the task must be
                 # queued there first. Enqueue is idempotent for identical task content.
                 with SQLiteSchedulerStore(_db_path(args), model_policy=model_policy_from_config(config)) as store:

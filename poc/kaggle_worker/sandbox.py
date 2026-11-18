@@ -206,14 +206,21 @@ def agent_prompt(goal: str, test_command: str) -> str:
     return "\n".join(lines)
 
 
-def prepare_clone(repo: Path, workspace: Path) -> str:
-    """Clone the committed state of ``repo`` into ``workspace``; return the base commit."""
+def prepare_clone(repo: Path, workspace: Path, *, head: str | None = None,
+                  require_clean: bool = True) -> str:
+    """Clone the committed state of ``repo`` into ``workspace``; return the base commit.
+
+    ``head`` pins a specific commit (Temporal tasks pin it when they are created); by default the
+    repository's current HEAD is used and uncommitted changes are refused.
+    """
     repo = Path(repo).resolve()
     if _git(repo, "rev-parse", "--is-inside-work-tree", check=False) != "true":
         raise SandboxError(f"{repo} is not a Git repository")
-    if _git(repo, "status", "--porcelain", "--untracked-files=no"):
+    if require_clean and _git(repo, "status", "--porcelain", "--untracked-files=no"):
         raise SandboxError("repository has uncommitted changes; commit or stash them first")
-    head = _git(repo, "rev-parse", "HEAD")
+    head = head or _git(repo, "rev-parse", "HEAD")
+    if _git(repo, "cat-file", "-t", head, check=False) != "commit":
+        raise SandboxError(f"commit {head} does not exist in {repo}")
     if workspace.exists():
         raise SandboxError(f"workspace {workspace} already exists; use another --task-id")
     workspace.parent.mkdir(parents=True, exist_ok=True)
