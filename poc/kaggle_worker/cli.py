@@ -22,6 +22,7 @@ from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers
                      model_contexts, model_policy_from_config, redact_config, refresh_configured_providers,
                      sandbox_settings_from_config, sync_config_to_store, validate_config)
 from .integration import StaleWorkerResult, build_review_bundle
+from .journal import Journal, show_task, summarize
 from .protocol import ScheduledTask, WorkerResult
 from .sandbox import SandboxError
 from .scheduler import WorkerScheduler
@@ -163,11 +164,41 @@ def _parser() -> argparse.ArgumentParser:
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
     bench_apply.add_argument("--write", action="store_true", help="write routing.model_skill / chat_only "
                                                                   "into the config (a backup is kept)")
+    journal = commands.add_parser("journal", help="what Kite did: model requests, task runs, lead-agent "
+                                                  "actions, your notes (to trace and improve)")
+    journal_commands = journal.add_subparsers(dest="journal_command", required=True)
+    summary = journal_commands.add_parser("summary", help="success rates, time, tokens, failure reasons")
+    summary.add_argument("--days", type=float, default=14, help="look back this many days (0 = everything)")
+    show = journal_commands.add_parser("show", help="everything recorded about one task")
+    show.add_argument("task_id")
+    note = journal_commands.add_parser("note", help="record your own verdict on a task")
+    note.add_argument("task_id")
+    verdict = note.add_mutually_exclusive_group(required=True)
+    verdict.add_argument("--good", action="store_true", help="the result was right and useful")
+    verdict.add_argument("--bad", action="store_true", help="the result was wrong or not usable")
+    note.add_argument("text", nargs="?", default="", help="why (what was wrong, what you had to fix)")
     return parser
 
 
 def _load_operator_config(args: argparse.Namespace):
     return load_config(args.config)
+
+
+def _journal_command(args: argparse.Namespace) -> int:
+    state_dir = args.config.parent
+    journal = Journal(state_dir / "journal")
+    if args.journal_command == "summary":
+        since = time.time() - args.days * 86400 if args.days > 0 else None
+        _emit(summarize(journal, since=since))
+    elif args.journal_command == "show":
+        from .backend import task_slug
+
+        _emit(show_task(journal, args.task_id, state_dir / "tasks" / task_slug(args.task_id) / "trace.jsonl"))
+    else:
+        record = {"task_id": args.task_id, "verdict": "good" if args.good else "bad", "text": args.text}
+        journal.write("notes", record)
+        _emit({"saved": record, "file": str(journal.path("notes"))})
+    return 0
 
 
 def _db_path(args: argparse.Namespace) -> Path:
@@ -235,6 +266,7 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
         job_timeout_seconds=config.gateway.job_timeout_seconds,
         heartbeat_timeout_seconds=config.gateway.heartbeat_timeout_seconds,
         on_worker_status=on_status,
+        journal=lambda record: Journal(args.config.parent / "journal").write("gateway", record),
     )
     runner = web.AppRunner(create_app(gateway))
     await runner.setup()
@@ -605,6 +637,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _mcp_command(args)
     if args.command == "chat":
         return _chat_command(args)
+    if args.command == "journal":
+        return _journal_command(args)
     if args.command == "bench":
         return _bench_command(args)
     if args.command == "worker":
@@ -726,7 +760,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
-                        "mcp", "chat", "bench"}:
+                        "mcp", "chat", "bench", "journal"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

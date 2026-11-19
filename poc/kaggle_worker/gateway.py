@@ -18,11 +18,14 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
+import sys
 import time
 import uuid
 from typing import Any
 
 from aiohttp import web
+
+from .journal import clean_tag, request_record
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,8 @@ class Job:
     attempts: int = 0
     worker_id: str | None = None
     assigned_at: float | None = None
+    tag: str | None = None          # X-Kite-Task: which task (or "chat", "bench-...") asked
+    requested: str = ""             # model name as the client asked (alias included)
 
 
 StatusHook = Callable[[WorkerState, bool], Awaitable[None] | None]
@@ -90,6 +95,7 @@ class ModelGateway:
         keepalive_seconds: float = 15.0,
         clock: Callable[[], float] = time.time,
         on_worker_status: StatusHook | None = None,
+        journal: Callable[[dict], None] | None = None,
     ) -> None:
         if not workers:
             raise ValueError("at least one worker must be configured")
@@ -110,6 +116,7 @@ class ModelGateway:
         self.keepalive_seconds = keepalive_seconds
         self.clock = clock
         self.on_worker_status = on_worker_status
+        self.journal = journal            # receives one record per finished request (no prompt content)
         self.jobs: dict[str, Job] = {}
         self._queue: list[str] = []
         self._changed = asyncio.Event()
@@ -146,7 +153,7 @@ class ModelGateway:
         self._changed = asyncio.Event()
 
     # ------------------------------------------------------------------ client side
-    async def submit(self, body: dict[str, Any]) -> Job:
+    async def submit(self, body: dict[str, Any], *, tag: str | None = None) -> Job:
         requested = body.get("model")
         if not isinstance(requested, str) or not requested.strip():
             raise GatewayError("request must name a model")
@@ -156,7 +163,7 @@ class ModelGateway:
         forwarded = {**body, **params, "model": model, "stream": False}
         forwarded.pop("stream_options", None)
         job = Job(uuid.uuid4().hex, model, forwarded, self.clock(),
-                  asyncio.get_running_loop().create_future())
+                  asyncio.get_running_loop().create_future(), tag=tag, requested=requested)
         self.jobs[job.job_id] = job
         self._queue.append(job.job_id)
         self._notify()
@@ -169,6 +176,15 @@ class ModelGateway:
         if job.job_id in self._queue:
             self._queue.remove(job.job_id)
         self.jobs.pop(job.job_id, None)
+        if self.journal is not None and not job.future.done():
+            try:
+                self.journal(request_record(
+                    job_id=job.job_id, tag=job.tag, requested=job.requested, model=job.model,
+                    worker=job.worker_id, attempts=job.attempts, created_at=job.created_at,
+                    assigned_at=job.assigned_at, finished_at=self.clock(), body=job.body,
+                    result=result, error=error))
+            except Exception as exc:          # the journal must never break a request
+                print(f"kite gateway: journal error: {exc}", file=sys.stderr)
         if not job.future.done():
             if error is not None:
                 job.future.set_exception(GatewayError(error))
@@ -341,7 +357,7 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024)
         if not isinstance(body, dict):
             return _error(400, "body must be a JSON object")
         try:
-            job = await gateway.submit(body)
+            job = await gateway.submit(body, tag=clean_tag(request.headers.get("X-Kite-Task")))
         except GatewayError as exc:
             return _error(404, str(exc))
         if not body.get("stream"):

@@ -246,3 +246,36 @@ def test_status_lists_models_and_answers_carry_the_requested_model_name():
     assert answer["model"] == "qwen3.6-fast"
     w1 = next(w for w in status["workers"] if w["worker_id"] == "w1")
     assert w1["models"] == ["qwen3.6", "devstral"]
+
+
+def test_every_finished_request_is_journaled_with_its_task_tag_but_no_content():
+    records = []
+
+    async def scenario():
+        gateway = make_gateway(journal=records.append)
+        async with TestClient(TestServer(create_app(gateway))) as client:
+            headers = {"Authorization": f"Bearer {TOKEN_A}"}
+            await client.post("/worker/heartbeat", json={"ready": True, "loaded_model": "qwen3.6"}, headers=headers)
+            chat = asyncio.create_task(client.post(
+                "/v1/chat/completions", headers={"X-Kite-Task": "chat-20261119-aaaa"},
+                json={"model": "qwen3.6-fast", "messages": [{"role": "user", "content": "bí mật"}], "max_tokens": 64}))
+            job = await (await client.get("/worker/jobs?wait=5", headers=headers)).json()
+            answer = {**TOOL_COMPLETION, "usage": {"prompt_tokens": 900, "completion_tokens": 40},
+                      "timings": {"prompt_per_second": 1200.0, "predicted_per_second": 48.5, "cache_n": 512}}
+            await client.post(f"/worker/jobs/{job['job_id']}/result", json={"status": "ok", "response": answer},
+                              headers=headers)
+            await chat
+            bad = asyncio.create_task(client.post("/v1/chat/completions", headers={"X-Kite-Task": "bad tag!"},
+                                                  json={"model": "devstral", "messages": []}))
+            job = await (await client.get("/worker/jobs?wait=5", headers=headers)).json()
+            await client.post(f"/worker/jobs/{job['job_id']}/result", json={"status": "error", "error": "OOM"},
+                              headers=headers)
+            await bad
+    asyncio.run(scenario())
+    ok, failed = records
+    assert ok["tag"] == "chat-20261119-aaaa" and ok["requested"] == "qwen3.6-fast" and ok["model"] == "qwen3.6"
+    assert (ok["worker"], ok["outcome"], ok["prompt_tokens"], ok["completion_tokens"]) == ("w1", "ok", 900, 40)
+    assert (ok["prompt_tps"], ok["gen_tps"], ok["cached_tokens"]) == (1200.0, 48.5, 512)
+    assert ok["tool_calls"] == ["read"] and ok["max_tokens"] == 64 and ok["queue_s"] >= 0
+    assert "bí mật" not in json.dumps(ok, ensure_ascii=False)           # prompts are never stored
+    assert failed["tag"] is None and failed["outcome"] == "error" and "OOM" in failed["error"]

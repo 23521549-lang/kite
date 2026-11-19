@@ -32,6 +32,7 @@ from typing import Callable, Mapping
 from temporalio.exceptions import ApplicationError
 
 from . import sandbox as sbx
+from .journal import Journal, append_jsonl, clean_tag, short
 from .integration import ReviewBundle, build_review_bundle
 from .protocol import WorkerResult
 from .store import StoreError
@@ -71,10 +72,15 @@ class SandboxActivityBackend:
         self.runner = runner
         self.clock = clock
         self.heartbeat_seconds = heartbeat_seconds
+        self.journal = Journal(self.state_dir / "journal", clock=clock)
 
     # ------------------------------------------------------------------ helpers
     def task_dir(self, task_id: str) -> Path:
         return self.state_dir / "tasks" / task_slug(task_id)
+
+    def _trace(self, task_id: str, event: str, **fields) -> None:
+        """One line in the task's own trace.jsonl (every step, as it happens)."""
+        append_jsonl(self.task_dir(task_id) / "trace.jsonl", {"event": event, **fields}, clock=self.clock)
 
     def _small_model(self, model: str) -> str | None:
         return next((alias for alias, base in self.aliases.items() if base == model), None)
@@ -102,7 +108,11 @@ class SandboxActivityBackend:
             await asyncio.to_thread(self._docker, "kill", name)
             raise
         code, output = step.result()
-        return code, output, round(time.monotonic() - started, 1)
+        seconds = round(time.monotonic() - started, 1)
+        if task_id:
+            self._trace(task_id, "step", step=name.split("-")[1], state=state, seconds=seconds, exit=code,
+                        output_chars=len(output), tail=output[-400:] if code != 0 else None)
+        return code, output, seconds
 
     def _worker_result(self, task: CodingTaskInput, route: RouteLease, result: CodingRunResult) -> WorkerResult:
         return WorkerResult(task.task_id, route.lease_id, route.worker_id, result.base_repo_head,
@@ -159,7 +169,7 @@ class SandboxActivityBackend:
                 name, sbx.docker_run_args(self.settings, name=name, workspace=work,
                                           network=self.settings.setup_network, deps=deps)
                 + ["sh", "-c", self.settings.setup_command],
-                self.settings.setup_timeout_seconds)
+                self.settings.setup_timeout_seconds, task_id=task.task_id)
             (root / "setup.log").write_text(output, encoding="utf-8")
             if code != 0:
                 raise ApplicationError(f"setup command failed (exit {code}) after {seconds}s; "
@@ -194,12 +204,29 @@ class SandboxActivityBackend:
         config_file = root / "opencode.json"
         config_file.write_text(json.dumps(sbx.agent_config(
             self.settings, model=route.model_id, models=self.models,
-            small_model=self._small_model(route.model_id)), indent=2), encoding="utf-8")
+            small_model=self._small_model(route.model_id),
+            task_tag=clean_tag(task.task_id) or slug), indent=2), encoding="utf-8")
         goal = task.goal.strip()
         if instruction.strip():
             goal += f"\n\nChỉ dẫn bổ sung của người dùng (ưu tiên làm theo): {instruction.strip()}"
 
         context = await asyncio.to_thread(sbx.repo_context, work, goal)
+        self._trace(task.task_id, "run_start", model=route.model_id, worker=route.worker_id, lease=route.lease_id,
+                    task_type=task.task_type, instruction=short(instruction, 1000), context_chars=len(context))
+        try:
+            return await self._run_agent(task, route, work, root, slug, deps, patch_base, config_file, goal,
+                                         instruction, context, session_id, heartbeat)
+        except BaseException as exc:
+            # A crash (or cancel) mid-run still leaves a line saying how far it got.
+            self._trace(task.task_id, "run_error", error=short(f"{type(exc).__name__}: {exc}", 500))
+            self.journal.write("tasks", {"task_id": task.task_id, "task_type": task.task_type,
+                                         "model": route.model_id, "worker": route.worker_id, "status": "error",
+                                         "error": short(f"{type(exc).__name__}: {exc}", 500)})
+            raise
+
+    async def _run_agent(self, task: CodingTaskInput, route: RouteLease, work: Path, root: Path, slug: str,
+                         deps: Path, patch_base: str, config_file: Path, goal: str, instruction: str,
+                         context: str, session_id: str, heartbeat: Callable[[dict], None]) -> CodingRunResult:
         prompt = sbx.agent_prompt(goal, self.settings.test_command, task_type=task.task_type, context=context)
         test_command = self.settings.test_command
         attempt, seconds, test_code, test_output = 0, 0.0, None, ""
@@ -286,6 +313,18 @@ class SandboxActivityBackend:
             "review": review,
             "verified": status == "ok" and test_code == 0 and bool(changed),
         }, indent=2, ensure_ascii=False), encoding="utf-8")
+        added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+        removed = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
+        run = {"task_id": task.task_id, "task_type": task.task_type, "repo": task.repo_path,
+               "model": route.model_id, "worker": route.worker_id, "goal": short(task.goal, 500),
+               "instruction": short(instruction, 500), "status": "finished", "agent_status": status,
+               "agent_exit": code, "seconds": seconds, "fix_rounds": attempt, "review": review,
+               "test_command": test_command, "test_exit": test_code,
+               "verified": status == "ok" and test_code == 0 and bool(changed),
+               "changed_files": changed, "lines_added": added, "lines_removed": removed,
+               "context_chars": len(context)}
+        self._trace(task.task_id, "run_end", **{k: v for k, v in run.items() if k not in ("task_id", "goal")})
+        self.journal.write("tasks", run)
         return CodingRunResult(task.task_id, task.repo_head, session_id, patch, summary,
                                tuple(changed), int(seconds))
 

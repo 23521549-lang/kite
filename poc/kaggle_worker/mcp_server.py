@@ -23,6 +23,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from .config import KiteConfig, gateway_models, model_contexts, model_policy_from_config
+from .journal import Journal, short
 from .protocol import ScheduledTask
 from .store import SQLiteSchedulerStore, StoreError
 
@@ -63,6 +64,31 @@ class KiteOps:
         self.clock = clock
         self._runner = runner
         self._sandbox_settings = sandbox_settings
+        self.journal = Journal(self.state_dir / "journal", clock=clock)
+
+    async def logged(self, tool: str, method: Callable[..., Awaitable[Any]], *args, **kwargs):
+        """Call a tool and record it in journal/actions.jsonl: arguments, result or error, seconds."""
+        import inspect
+
+        try:
+            bound = inspect.signature(method).bind(*args, **kwargs).arguments
+        except TypeError:
+            bound = {"args": list(args), **kwargs}
+        started = self.clock()
+        record: dict[str, Any] = {"tool": tool, "args": short(dict(bound), 2000)}
+        try:
+            result = await method(*args, **kwargs)
+        except Exception as exc:
+            record.update(ok=False, error=short(f"{type(exc).__name__}: {exc}", 500),
+                          seconds=round(self.clock() - started, 2), task_id=bound.get("task_id"))
+            self.journal.write("actions", record)
+            raise
+        summary = result if isinstance(result, dict) else {"items": len(result) if isinstance(result, list) else None}
+        record.update(ok=True, seconds=round(self.clock() - started, 2),
+                      task_id=summary.get("task_id") or bound.get("task_id"),
+                      result=short({k: v for k, v in summary.items() if k not in ("patch", "summary", "output")}, 300))
+        self.journal.write("actions", record)
+        return result
 
     # ------------------------------------------------------------------ helpers
     async def client(self):
@@ -351,62 +377,62 @@ def build_server(ops: KiteOps):
                              "GIỜ thay đổi repo thật. Không dùng task để áp patch hay commit (dùng apply_result, "
                              "commit_result).")
     async def start_task(repo: str, goal: str, task_type: str = "coding", model: str | None = None) -> dict:
-        return await ops.start_task(repo, goal, task_type, model)
+        return await ops.logged("start_task", ops.start_task, repo, goal, task_type, model)
 
     @server.tool(description="Trạng thái một task: workflow (RUNNING/COMPLETED/...) và bước hiện tại "
                              "(WAITING_FOR_WORKER, CODING, READY_FOR_REVIEW...).")
     async def task_status(task_id: str) -> dict:
-        return await ops.task_status(task_id)
+        return await ops.logged("task_status", ops.task_status, task_id)
 
     @server.tool(description="Kết quả task đã xong: tóm tắt, kết quả test do Kite tự chạy, patch và lệnh apply_with "
                              "để người dùng tự áp.")
     async def task_result(task_id: str) -> dict:
-        return await ops.task_result(task_id)
+        return await ops.logged("task_result", ops.task_result, task_id)
 
     @server.tool(description="Áp patch của task ĐÃ XONG vào repo gốc (chỉ sửa working tree, không commit). "
                              "CHỈ gọi khi người dùng nói rõ muốn áp patch. Kite tự biết repo gốc của task: thư mục "
                              "hiện tại không cần là repo, chỉ cần task_id. Trả về undo_with để hoàn tác.")
     async def apply_result(task_id: str) -> dict:
-        return await ops.apply_result(task_id)
+        return await ops.logged("apply_result", ops.apply_result, task_id)
 
     @server.tool(description="Commit ĐÚNG các file của patch đã áp bằng apply_result (không push). CHỈ gọi khi "
                              "người dùng nói rõ muốn commit. message: commit message ngắn, tiếng Anh.")
     async def commit_result(task_id: str, message: str) -> dict:
-        return await ops.commit_result(task_id, message)
+        return await ops.logged("commit_result", ops.commit_result, task_id, message)
 
     @server.tool(description="Xem nhanh một repo (chỉ đọc): nhánh, file đang thay đổi, diff --stat, 8 commit gần nhất.")
     async def repo_status(repo: str) -> dict:
-        return await ops.repo_status(repo)
+        return await ops.logged("repo_status", ops.repo_status, repo)
 
     @server.tool(description="Chạy một lệnh shell ngắn (ls, cat, grep, git log, pytest, python ...) trong container "
                              "không mạng, trên BẢN COPY của repo; mọi thay đổi bị bỏ. Không cần GPU, vài giây là xong. "
                              "Dùng để xem code và chạy test. Muốn SỬA code thì dùng start_task.")
     async def run_command(repo: str, command: str, timeout_seconds: int = 120) -> dict:
-        return await ops.run_command(repo, command, timeout_seconds)
+        return await ops.logged("run_command", ops.run_command, repo, command, timeout_seconds)
 
     @server.tool(description="Gửi thêm chỉ dẫn cho task CHƯA xong; agent sẽ làm tiếp trên cùng bản clone.")
     async def send_instruction(task_id: str, instruction: str) -> dict:
-        return await ops.send_instruction(task_id, instruction)
+        return await ops.logged("send_instruction", ops.send_instruction, task_id, instruction)
 
     @server.tool(description="Tạm dừng task.")
     async def pause_task(task_id: str) -> dict:
-        return await ops.pause_task(task_id)
+        return await ops.logged("pause_task", ops.pause_task, task_id)
 
     @server.tool(description="Tiếp tục task đang tạm dừng.")
     async def resume_task(task_id: str) -> dict:
-        return await ops.resume_task(task_id)
+        return await ops.logged("resume_task", ops.resume_task, task_id)
 
     @server.tool(description="Hủy task.")
     async def cancel_task(task_id: str) -> dict:
-        return await ops.cancel_task(task_id)
+        return await ops.logged("cancel_task", ops.cancel_task, task_id)
 
     @server.tool(description="Các task gần đây (mới nhất trước).")
     async def list_tasks(limit: int = 10) -> list[dict]:
-        return await ops.list_tasks(limit)
+        return await ops.logged("list_tasks", ops.list_tasks, limit)
 
     @server.tool(description="Trạng thái worker GPU (Kaggle): còn sống không, đang nạp model nào.")
     async def worker_status() -> dict:
-        return await ops.worker_status()
+        return await ops.logged("worker_status", ops.worker_status)
 
     return server
 
@@ -459,6 +485,7 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
     opencode["model"] = f"kite/{lead_model}"
     opencode["small_model"] = f"kite/{lead_model}"
     opencode["mcp"] = {"kite": {"type": "local", "command": list(kite_command), "enabled": True}}
+    opencode["provider"]["kite"]["options"]["headers"] = {"X-Kite-Task": "chat"}    # gateway journal source
     # The lead agent runs on the host, outside the sandbox: no edits, no web, nothing outside the chat
     # folder, and every shell command waits for the user's approval (dangerous ones are refused).
     opencode["permission"] = {"edit": "deny", "bash": dict(LEAD_BASH_PERMISSION), "webfetch": "deny",

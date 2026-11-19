@@ -392,3 +392,28 @@ def test_chat_only_models_never_run_tasks(tmp_path):
     assert "devstral" not in ops.base_models()
     with pytest.raises(KiteToolError):
         asyncio.run(ops.start_task(str(repo), "x", model="devstral"))
+
+
+def test_lead_agent_tool_calls_are_journaled_with_results_and_errors(tmp_path):
+    from poc.kaggle_worker.journal import read_jsonl
+
+    repo, _head = make_repo(tmp_path)
+    ops = make_ops(tmp_path, FakeClient())
+    started = asyncio.run(ops.logged("start_task", ops.start_task, str(repo), "Sửa calc.py", "coding", None))
+    with pytest.raises(KiteToolError):
+        asyncio.run(ops.logged("commit_result", ops.commit_result, started["task_id"], ""))
+    ok, failed = read_jsonl(tmp_path / "state" / "journal" / "actions.jsonl")
+    assert ok["tool"] == "start_task" and ok["ok"] and ok["task_id"] == started["task_id"]
+    assert ok["args"]["goal"] == "Sửa calc.py" and ok["args"]["task_type"] == "coding"
+    assert failed["tool"] == "commit_result" and not failed["ok"] and "trống" in failed["error"]
+    assert failed["task_id"] == started["task_id"]
+
+
+def test_chat_and_sandbox_requests_carry_a_task_tag(tmp_path):
+    from poc.kaggle_worker.sandbox import SandboxSettings, agent_config
+
+    files = chat_files(make_config(tmp_path), lead_model="qwen3.6", kite_command=["kite"], allowed_roots=[tmp_path])
+    assert json.loads(files["opencode.json"])["provider"]["kite"]["options"]["headers"] == {"X-Kite-Task": "chat"}
+    config = agent_config(SandboxSettings(), model="qwen3.6", models=["qwen3.6"], task_tag="chat-1")
+    assert config["provider"]["kite"]["options"]["headers"] == {"X-Kite-Task": "chat-1"}
+    assert "headers" not in agent_config(SandboxSettings(), model="qwen3.6", models=["qwen3.6"])["provider"]["kite"]["options"]

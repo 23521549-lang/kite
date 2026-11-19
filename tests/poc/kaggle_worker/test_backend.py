@@ -327,3 +327,22 @@ def test_backend_self_review_keeps_good_changes_and_rolls_back_bad_ones(tmp_path
     backend, result = run_backend_task(tmp_path / "bad", bad, "task-review-bad")
     assert "1 / 0" not in result.patch and "if xs else 0" in result.patch
     assert "trả lại bản trước" in result.summary and "PASSED" in result.summary
+
+
+def test_backend_journals_each_run_and_traces_every_step(tmp_path):
+    from poc.kaggle_worker.journal import read_jsonl
+
+    fake = FakeDocker(test_returncodes=[1, 0], review="improve")
+    backend, result = run_backend_task(tmp_path, fake, "task-journal")
+    (run,) = read_jsonl(tmp_path / "state" / "journal" / "tasks.jsonl")
+    assert run["task_id"] == "task-journal" and run["status"] == "finished" and run["verified"] is True
+    assert (run["fix_rounds"], run["review"], run["test_exit"]) == (1, "kept", 0)
+    assert run["changed_files"] == ["calc.py"] and run["lines_added"] >= 1 and run["context_chars"] > 0
+    trace = read_jsonl(backend.task_dir("task-journal") / "trace.jsonl")
+    steps = [e["step"] for e in trace if e["event"] == "step"]
+    assert steps == ["setup", "agent", "test", "fix1", "test", "review", "test"]
+    assert trace[1]["event"] == "run_start" and trace[-1]["event"] == "run_end"
+    failed_test = next(e for e in trace if e["event"] == "step" and e["exit"] == 1)
+    assert "AssertionError" in failed_test["tail"]                    # failing output kept for tracing
+    config = json.loads((backend.task_dir("task-journal") / "opencode.json").read_text())
+    assert config["provider"]["kite"]["options"]["headers"] == {"X-Kite-Task": "task-journal"}

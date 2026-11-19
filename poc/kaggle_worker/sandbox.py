@@ -188,8 +188,13 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
     return args
 
 
-def agent_config(settings: SandboxSettings, *, model: str, models, small_model: str | None = None) -> dict:
-    """OpenCode config for the sandbox: gateway provider, default model, no permission prompts."""
+def agent_config(settings: SandboxSettings, *, model: str, models, small_model: str | None = None,
+                 task_tag: str | None = None) -> dict:
+    """OpenCode config for the sandbox: gateway provider, default model, no permission prompts.
+
+    ``task_tag`` is sent as ``X-Kite-Task`` on every model request, so the gateway journal can tell
+    which task each request belongs to.
+    """
     from .gateway import opencode_provider_config
 
     base_url = settings.gateway_url.rstrip("/")
@@ -197,6 +202,8 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
         base_url = base_url[:-3]
     config = opencode_provider_config(base_url, list(models), context=dict(settings.model_context))
     config["model"] = f"kite/{model}"
+    if task_tag:
+        config["provider"]["kite"]["options"]["headers"] = {"X-Kite-Task": task_tag}
     if small_model:
         config["small_model"] = f"kite/{small_model}"
     # The container is the safety boundary: inside it the agent may edit and run commands without
@@ -444,8 +451,8 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     # 2. Agent (internal network, gateway only), then 3. Kite's own tests (no network at all).
     #    When the tests fail, the agent gets the failing output and tries again (settings.fix_rounds).
     config_file = root / "opencode.json"
-    config_file.write_text(json.dumps(agent_config(settings, model=model, models=models,
-                                                   small_model=small_model), indent=2), encoding="utf-8")
+    config_file.write_text(json.dumps(agent_config(settings, model=model, models=models, small_model=small_model,
+                                                   task_tag=task_id), indent=2), encoding="utf-8")
     prompt = agent_prompt(goal, run.test_command, task_type=task_type, context=repo_context(workspace, goal) if with_context else "")
     agent_log, test_log = [], []
     attempt = 0
