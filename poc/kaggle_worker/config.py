@@ -520,7 +520,8 @@ def sync_config_to_store(config: KiteConfig, store: Any, *, now: float) -> list[
             owner_id=owner_id,
             owner_authorized=True,
             policy_approved=any(p.enabled for p in providers),
-            max_concurrent_sessions=max(p.concurrency for p in providers),
+            # Several accounts of one owner each run their own tasks: the owner's limit is the sum.
+            max_concurrent_sessions=sum(p.concurrency for p in providers),
             quota_remaining_seconds=(existing.quota_remaining_seconds if existing else configured_quota),
             quota_observed_at=(existing.quota_observed_at if existing else float(now)),
         ))

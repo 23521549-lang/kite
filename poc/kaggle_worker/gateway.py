@@ -71,6 +71,7 @@ class Job:
     worker_id: str | None = None
     assigned_at: float | None = None
     tag: str | None = None          # X-Kite-Task: which task (or "chat", "bench-...") asked
+    pinned: str | None = None       # X-Kite-Worker: the worker the task's route reserved
     requested: str = ""             # model name as the client asked (alias included)
 
 
@@ -153,7 +154,7 @@ class ModelGateway:
         self._changed = asyncio.Event()
 
     # ------------------------------------------------------------------ client side
-    async def submit(self, body: dict[str, Any], *, tag: str | None = None) -> Job:
+    async def submit(self, body: dict[str, Any], *, tag: str | None = None, pin: str | None = None) -> Job:
         requested = body.get("model")
         if not isinstance(requested, str) or not requested.strip():
             raise GatewayError("request must name a model")
@@ -163,7 +164,8 @@ class ModelGateway:
         forwarded = {**body, **params, "model": model, "stream": False}
         forwarded.pop("stream_options", None)
         job = Job(uuid.uuid4().hex, model, forwarded, self.clock(),
-                  asyncio.get_running_loop().create_future(), tag=tag, requested=requested)
+                  asyncio.get_running_loop().create_future(), tag=tag, requested=requested,
+                  pinned=pin if pin in self.workers else None)
         self.jobs[job.job_id] = job
         self._queue.append(job.job_id)
         self._notify()
@@ -179,7 +181,7 @@ class ModelGateway:
         if self.journal is not None and not job.future.done():
             try:
                 self.journal(request_record(
-                    job_id=job.job_id, tag=job.tag, requested=job.requested, model=job.model,
+                    job_id=job.job_id, tag=job.tag, pinned=job.pinned, requested=job.requested, model=job.model,
                     worker=job.worker_id, attempts=job.attempts, created_at=job.created_at,
                     assigned_at=job.assigned_at, finished_at=self.clock(), body=job.body,
                     result=result, error=error))
@@ -214,16 +216,32 @@ class ModelGateway:
         return worker
 
     def _pick_job(self, worker: WorkerState) -> Job | None:
-        """Prefer jobs for the model already loaded, then the oldest job this worker can serve."""
-        candidates = [self.jobs[j] for j in self._queue if self.jobs[j].model in worker.model_ids]
+        """Prefer jobs for the model already loaded, then the oldest job this worker can serve.
+
+        A job pinned to another worker (a task's requests go to the worker its route reserved) is
+        left alone while that worker is alive; if it is gone, any worker may take it so the task
+        does not hang.
+        """
+        now = self.clock()
+
+        def allowed(job: Job) -> bool:
+            if job.pinned is None or job.pinned == worker.worker_id:
+                return True
+            holder = self.workers.get(job.pinned)
+            return holder is None or holder.draining or not self._alive(holder, now)
+
+        candidates = [self.jobs[j] for j in self._queue
+                      if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j])]
         if not candidates:
             return None
         loaded = [j for j in candidates if j.model == worker.loaded_model]
         if loaded:
             return loaded[0]
-        # Do not make a worker switch models while another live worker already has that model loaded.
-        now = self.clock()
+        # Do not make a worker switch models while another live worker already has that model loaded
+        # (unless the job is pinned to this worker: then this worker is the one that must serve it).
         for job in candidates:
+            if job.pinned == worker.worker_id:
+                return job
             holder = any(
                 other.worker_id != worker.worker_id and self._alive(other, now)
                 and not other.draining and other.loaded_model == job.model
@@ -357,7 +375,8 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024)
         if not isinstance(body, dict):
             return _error(400, "body must be a JSON object")
         try:
-            job = await gateway.submit(body, tag=clean_tag(request.headers.get("X-Kite-Task")))
+            job = await gateway.submit(body, tag=clean_tag(request.headers.get("X-Kite-Task")),
+                                       pin=clean_tag(request.headers.get("X-Kite-Worker")))
         except GatewayError as exc:
             return _error(404, str(exc))
         if not body.get("stream"):

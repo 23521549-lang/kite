@@ -345,4 +345,6 @@ def test_backend_journals_each_run_and_traces_every_step(tmp_path):
     failed_test = next(e for e in trace if e["event"] == "step" and e["exit"] == 1)
     assert "AssertionError" in failed_test["tail"]                    # failing output kept for tracing
     config = json.loads((backend.task_dir("task-journal") / "opencode.json").read_text())
-    assert config["provider"]["kite"]["options"]["headers"] == {"X-Kite-Task": "task-journal"}
+    worker = next(e["worker"] for e in trace if e["event"] == "run_start")
+    assert worker and config["provider"]["kite"]["options"]["headers"] == {
+        "X-Kite-Task": "task-journal", "X-Kite-Worker": worker}

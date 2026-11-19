@@ -110,11 +110,12 @@ class Journal:
 
 # ---------------------------------------------------------------------- gateway records
 def request_record(*, job_id: str, tag: str | None, requested: str, model: str, worker: str | None,
+                   pinned: str | None = None,
                    attempts: int, created_at: float, assigned_at: float | None, finished_at: float,
                    body: dict, result: dict | None, error: str | None) -> dict:
     """One gateway line: everything about a model request except its content."""
     record: dict[str, Any] = {
-        "job_id": job_id, "tag": tag, "requested": requested, "model": model, "worker": worker,
+        "job_id": job_id, "tag": tag, "requested": requested, "model": model, "worker": worker, "pinned": pinned,
         "attempts": attempts, "outcome": "ok" if error is None else "error",
         "queue_s": round((assigned_at or finished_at) - created_at, 2),
         "run_s": round(finished_at - assigned_at, 2) if assigned_at else None,

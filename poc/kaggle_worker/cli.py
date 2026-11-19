@@ -123,6 +123,11 @@ def _parser() -> argparse.ArgumentParser:
     token = worker_commands.add_parser("token", help="create a worker token (printed once)")
     token.add_argument("worker_id")
     token.add_argument("--force", action="store_true", help="replace an existing token (rotation)")
+    add = worker_commands.add_parser("add", help="add a pull worker (e.g. another Kaggle account) to the config, "
+                                                 "copying an existing worker's models and settings")
+    add.add_argument("worker_id", help="new worker id, e.g. kaggle-an (lowercase, digits, '-')")
+    add.add_argument("--owner", required=True, help="who owns the account (its GPU quota is counted per owner)")
+    add.add_argument("--like", default=None, help="existing worker to copy (default: the first pull worker)")
     sandbox = commands.add_parser("sandbox", help="run the coding agent in an isolated Docker sandbox")
     sandbox_commands = sandbox.add_subparsers(dest="sandbox_command", required=True)
     sandbox_commands.add_parser("build", help="create the internal network and build the sandbox image")
@@ -182,6 +187,42 @@ def _parser() -> argparse.ArgumentParser:
 
 def _load_operator_config(args: argparse.Namespace):
     return load_config(args.config)
+
+
+def _worker_add(args: argparse.Namespace) -> int:
+    """Copy an existing pull provider into a new one (own id, owner and token file); backup + validate."""
+    import copy
+
+    import yaml
+
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    providers = raw.get("providers") or []
+    pulls = [p for p in providers if p.get("adapter") == "pull"]
+    if any(args.worker_id in (p.get("id"), p.get("worker_id")) for p in providers):
+        raise ConfigError(f"worker {args.worker_id} already exists")
+    template = next((p for p in pulls if args.like in (None, p.get("id"), p.get("worker_id"))), None)
+    if template is None:
+        raise ConfigError("no pull worker to copy" if args.like is None else f"no pull worker {args.like}")
+    new = copy.deepcopy(template)
+    new.pop("worker_id", None)
+    token_path = args.config.parent / "secrets" / f"worker_token_{args.worker_id}"
+    new.update(id=args.worker_id, owner=args.owner, enabled=True,
+               secrets={**(template.get("secrets") or {}), "worker_token": f"file:{token_path}"})
+    providers.append(new)
+    raw["providers"] = providers
+    validate_config(raw)
+    backup = args.config.with_name(f"{args.config.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(args.config, backup)
+    text = (json.dumps(raw, ensure_ascii=False, indent=2) + "\n" if args.config.suffix == ".json"
+            else yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    args.config.write_text(text, encoding="utf-8")
+    _emit({"added": args.worker_id, "owner": args.owner, "copied_from": template.get("id"),
+           "models": new.get("models") or [new.get("model")], "backup": str(backup),
+           "next": [f"kite worker token {args.worker_id}",
+                    "kite provider sync",
+                    "sudo systemctl restart kite-gateway kite-workflow-worker",
+                    "Kaggle account mới: chia sẻ 7 dataset, Secrets KITE_WORKER_TOKEN = token vừa in, chạy ô Worker"]})
+    return 0
 
 
 def _journal_command(args: argparse.Namespace) -> int:
@@ -641,6 +682,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _journal_command(args)
     if args.command == "bench":
         return _bench_command(args)
+    if args.command == "worker" and args.worker_command == "add":
+        return _worker_add(args)
     if args.command == "worker":
         config = _load_operator_config(args)
         provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)

@@ -279,3 +279,58 @@ def test_every_finished_request_is_journaled_with_its_task_tag_but_no_content():
     assert ok["tool_calls"] == ["read"] and ok["max_tokens"] == 64 and ok["queue_s"] >= 0
     assert "bí mật" not in json.dumps(ok, ensure_ascii=False)           # prompts are never stored
     assert failed["tag"] is None and failed["outcome"] == "error" and "OOM" in failed["error"]
+
+
+def test_a_task_pinned_to_a_worker_is_served_by_that_worker_even_if_another_has_the_model():
+    async def scenario():
+        gateway = make_gateway()
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+        await gateway.heartbeat("w2", {"ready": True, "loaded_model": "devstral"})
+        pinned = await gateway.submit({"model": "qwen3.6", "messages": []}, pin="w2")
+        assert await gateway.next_job("w1", 0) is None          # w1 has the model loaded but is not the route
+        assert (await gateway.next_job("w2", 0)).job_id == pinned.job_id   # w2 switches models for its task
+        free = await gateway.submit({"model": "qwen3.6", "messages": []}, pin="nobody")
+        assert free.pinned is None and (await gateway.next_job("w1", 0)).job_id == free.job_id
+    asyncio.run(scenario())
+
+
+def test_a_job_pinned_to_a_dead_worker_is_taken_by_another_so_the_task_does_not_hang():
+    now = [1000.0]
+
+    async def scenario():
+        gateway = make_gateway(clock=lambda: now[0], heartbeat_timeout_seconds=90)
+        await gateway.heartbeat("w2", {"ready": True, "loaded_model": "qwen3.6"})
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+        job = await gateway.submit({"model": "qwen3.6", "messages": []}, pin="w2")
+        assert await gateway.next_job("w1", 0) is None
+        now[0] += 100                                            # w2 goes silent
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+        assert (await gateway.next_job("w1", 0)).job_id == job.job_id
+    asyncio.run(scenario())
+
+
+def test_worker_add_copies_a_worker_for_another_kaggle_account(tmp_path, capsys):
+    from poc.kaggle_worker.config import load_config, sync_config_to_store
+    from poc.kaggle_worker.store import SQLiteSchedulerStore
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_base_config(tmp_path)))
+    assert cli.main(["--config", str(config_path), "worker", "add", "kaggle-an", "--owner", "an"]) == 0
+    added = json.loads(capsys.readouterr().out)
+    assert added["copied_from"] == "kaggle-han" and added["next"][0] == "kite worker token kaggle-an"
+    assert list(tmp_path.glob("config.json.bak-*"))
+    assert cli.main(["--config", str(config_path), "worker", "add", "kaggle-an", "--owner", "an"]) == 1
+    capsys.readouterr()
+    assert cli.main(["--config", str(config_path), "worker", "token", "kaggle-an"]) == 0
+    capsys.readouterr()
+    (tmp_path / "secrets" / "worker_token_kaggle-han").write_text("h" * 40 + "\n")
+    config = load_config(config_path)
+    workers = {w.worker_id: w for w in gateway_workers(config)}
+    assert set(workers) == {"kaggle-han", "kaggle-an"} and workers["kaggle-an"].model_ids == ("qwen3.6", "devstral")
+    assert workers["kaggle-an"].token != workers["kaggle-han"].token
+    # One owner with two accounts may run two tasks at once (limit = sum, not max).
+    raw = json.loads(config_path.read_text())
+    raw["providers"][1]["owner"] = raw["providers"][0].get("owner", "self")
+    with SQLiteSchedulerStore(tmp_path / "s.sqlite3") as store:
+        sync_config_to_store(validate_config(raw), store, now=1000.0)
+        assert store.get_owner_policy(raw["providers"][0].get("owner", "self")).max_concurrent_sessions == 2

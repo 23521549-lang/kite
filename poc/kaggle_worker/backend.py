@@ -205,7 +205,7 @@ class SandboxActivityBackend:
         config_file.write_text(json.dumps(sbx.agent_config(
             self.settings, model=route.model_id, models=self.models,
             small_model=self._small_model(route.model_id),
-            task_tag=clean_tag(task.task_id) or slug), indent=2), encoding="utf-8")
+            task_tag=clean_tag(task.task_id) or slug, worker_pin=route.worker_id), indent=2), encoding="utf-8")
         goal = task.goal.strip()
         if instruction.strip():
             goal += f"\n\nChỉ dẫn bổ sung của người dùng (ưu tiên làm theo): {instruction.strip()}"

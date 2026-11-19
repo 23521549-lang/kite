@@ -189,11 +189,12 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
 
 
 def agent_config(settings: SandboxSettings, *, model: str, models, small_model: str | None = None,
-                 task_tag: str | None = None) -> dict:
+                 task_tag: str | None = None, worker_pin: str | None = None) -> dict:
     """OpenCode config for the sandbox: gateway provider, default model, no permission prompts.
 
     ``task_tag`` is sent as ``X-Kite-Task`` on every model request, so the gateway journal can tell
-    which task each request belongs to.
+    which task each request belongs to. ``worker_pin`` (``X-Kite-Worker``) makes the gateway send
+    the requests to the worker the task's route reserved.
     """
     from .gateway import opencode_provider_config
 
@@ -202,8 +203,13 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
         base_url = base_url[:-3]
     config = opencode_provider_config(base_url, list(models), context=dict(settings.model_context))
     config["model"] = f"kite/{model}"
+    headers = {}
     if task_tag:
-        config["provider"]["kite"]["options"]["headers"] = {"X-Kite-Task": task_tag}
+        headers["X-Kite-Task"] = task_tag
+    if worker_pin:
+        headers["X-Kite-Worker"] = worker_pin
+    if headers:
+        config["provider"]["kite"]["options"]["headers"] = headers
     if small_model:
         config["small_model"] = f"kite/{small_model}"
     # The container is the safety boundary: inside it the agent may edit and run commands without
