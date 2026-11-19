@@ -94,6 +94,7 @@ class SandboxConfig:
     setup_timeout_seconds: int = 1800
     docker_command: tuple[str, ...] = ("docker",)
     fix_rounds: int = 2
+    self_review: bool = True
 
 
 @dataclass(frozen=True)
@@ -345,7 +346,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
     unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
                          "agent_timeout_seconds", "test_timeout_seconds", "test_command",
                          "setup_command", "setup_network", "setup_timeout_seconds", "docker_command",
-                         "fix_rounds"}
+                         "fix_rounds", "self_review"}
     if unknown:
         raise ConfigError("sandbox has unsupported fields")
     image = sb.get("image", "kite-sandbox:latest")
@@ -387,7 +388,14 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
         setup_timeout_seconds=_int(sb.get("setup_timeout_seconds", 1800), "sandbox.setup_timeout_seconds", minimum=30),
         docker_command=tuple(docker_command),
         fix_rounds=_bounded_fix_rounds(sb.get("fix_rounds", 2)),
+        self_review=_flag(sb.get("self_review", True), "sandbox.self_review"),
     )
+
+
+def _flag(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{name} must be true or false")
+    return value
 
 
 def _bounded_fix_rounds(value: Any) -> int:
@@ -447,7 +455,7 @@ def sandbox_settings_from_config(config: KiteConfig):
         agent_timeout_seconds=sb.agent_timeout_seconds, test_timeout_seconds=sb.test_timeout_seconds,
         test_command=sb.test_command, setup_command=sb.setup_command,
         setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
-        docker_command=sb.docker_command, fix_rounds=sb.fix_rounds,
+        docker_command=sb.docker_command, fix_rounds=sb.fix_rounds, self_review=sb.self_review,
     )
 
 

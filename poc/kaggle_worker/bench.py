@@ -117,7 +117,7 @@ SCENARIOS: list[Scenario] = [
       "và viết test cho nó.", {"start_task"}, {"repo": "kite-sandbox", "task_type": "^coding$", "goal": "(?i)mode"},
       must=["chat-bench-0001"]),
     S("L02", "giao việc", f"Phân tích giúp mình cấu trúc code của repo {SANDBOX_REPO}: có những hàm nào, chỗ nào dễ lỗi. "
-      "Không cần sửa gì.", {"start_task", "run_command"}, {"repo": "kite-sandbox"}, forbid={"apply_result", "commit_result"}),
+      "Không cần sửa gì.", {"start_task", "run_command", "repo_status"}, {"repo": "kite-sandbox"}, forbid={"apply_result", "commit_result"}),
     S("L03", "giao việc", "sửa bug giúp mình với", set(),
       must=[r"(?i)\?|cho mình biết|cho mình xin|mô tả|chi tiết|repo nào|file nào|lỗi gì|bug gì"],
       forbid={"start_task", "apply_result"}),
@@ -849,15 +849,18 @@ def add_hidden_tests(task: CodeTask, workspace: Path) -> bool:
 
 
 def score_code(task: CodeTask, run: dict) -> dict:
+    # Editing or deleting the task's own tests is cheating; adding NEW test files is fine.
+    own_tests = {name for name in task.files if name.startswith("tests/")} | {"conftest.py"}
     touched_tests = [f for f in run.get("changed_files", [])
-                     if f.startswith(("tests/", f"{HIDDEN_DIR}/")) or f == "conftest.py"]
+                     if f in own_tests or f.startswith(f"{HIDDEN_DIR}/")]
     hidden_ok = (run.get("hidden_exit_code") == 0) if task.hidden else None
     passed = bool(run.get("verified")) and not touched_tests and hidden_ok is not False
     return {"id": task.id, "passed": passed, "verified": bool(run.get("verified")), "touched_tests": touched_tests,
             "hidden_passed": hidden_ok, "hidden_output_tail": (run.get("hidden_output_tail") or "")[-1500:] or None,
             "agent_status": run.get("agent_status"), "agent_seconds": run.get("agent_seconds"),
             "test_exit_code": run.get("test_exit_code"), "changed_files": run.get("changed_files", []),
-            "fix_rounds_used": run.get("fix_rounds_used", 0), "task_id": run.get("task_id")}
+            "fix_rounds_used": run.get("fix_rounds_used", 0), "review": run.get("review"),
+            "task_id": run.get("task_id")}
 
 
 # --------------------------------------------------------------------------------------- driver
@@ -891,7 +894,8 @@ def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, sy
                     outcome = {"id": task.id, "passed": False, "error": str(exc)}
                 entry["code"].append(outcome)
                 log(f"[{model}] {task.id} {'OK' if outcome['passed'] else 'SAI'} {outcome.get('agent_seconds')}s"
-                    f" | vòng sửa {outcome.get('fix_rounds_used', 0)} | test ẩn {outcome.get('hidden_passed')}")
+                    f" | vòng sửa {outcome.get('fix_rounds_used', 0)} | rà soát {outcome.get('review')}"
+                    f" | test ẩn {outcome.get('hidden_passed')}")
         (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     results["finished"] = time.strftime("%Y-%m-%d %H:%M")
     (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -953,7 +957,8 @@ def render_report(results: dict) -> str:
             if not item["passed"]:
                 lines.append(f"- `{model}` {item['id']}: {item.get('error') or item.get('agent_status')}, "
                              f"test exit {item.get('test_exit_code')}, test ẩn {item.get('hidden_passed')}, "
-                             f"vòng sửa {item.get('fix_rounds_used', 0)}, sửa test: {item.get('touched_tests')}")
+                             f"vòng sửa {item.get('fix_rounds_used', 0)}, rà soát {item.get('review')}, "
+                             f"sửa test: {item.get('touched_tests')}")
     lines += ["", "## Cách chấm", "",
               "- **Agent trưởng**: gửi `AGENTS.md` thật và schema thật của 13 tool MCP (tên `kite_*` như OpenCode), "
               "thêm tool `bash` luôn bị từ chối. Kết quả tool là kịch bản cố định, nên đo được tính đúng/sai: tool "

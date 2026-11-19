@@ -40,8 +40,9 @@ def make_repo(tmp_path: Path) -> tuple[Path, str]:
 
 class FakeDocker:
     def __init__(self, *, test_returncode: int = 0, setup_returncode: int = 0,
-                 test_returncodes: list[int] | None = None) -> None:
+                 test_returncodes: list[int] | None = None, review: str = "none") -> None:
         self.calls: list[list[str]] = []
+        self.review = review
         self.test_returncode = test_returncode
         self.test_returncodes = list(test_returncodes or [])
         self.setup_returncode = setup_returncode
@@ -59,6 +60,12 @@ class FakeDocker:
         if kind == "agent" or kind.startswith("fix"):
             (work / "calc.py").write_text("def average(xs):\n    return sum(xs) / len(xs) if xs else 0\n")
             return CP(cmd, 0, "\x1b[0mĐã sửa calc.py\n", "")
+        if kind == "review":
+            if self.review == "improve":
+                (work / "calc.py").write_text("def average(xs):\n    return sum(xs) / len(xs) if xs else 0.0\n")
+            elif self.review == "break":
+                (work / "calc.py").write_text("def average(xs):\n    return 1 / 0\n")
+            return CP(cmd, 0, "Đã rà soát\n", "")
         if kind == "test":
             code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
             return CP(cmd, code, "2 passed\n" if code == 0 else "E   AssertionError: average\n1 failed\n", "")
@@ -112,7 +119,7 @@ def test_backend_runs_every_step_and_settles_the_lease(tmp_path):
         return work, route, result, checkpoint, bundle
 
     work, route, result, checkpoint, bundle = asyncio.run(scenario())
-    assert fake.kinds() == ["setup", "agent", "test"]
+    assert fake.kinds() == ["setup", "agent", "test", "review"]
     assert (route.worker_id, route.model_id) == ("kaggle-han", "qwen3.6")
     assert result.changed_files == ("calc.py",)
     assert "if xs else 0" in result.patch and "generated_by_setup" not in result.patch
@@ -283,9 +290,40 @@ def test_failed_kite_tests_go_back_to_the_agent_with_the_output(tmp_path):
         return await backend.run_opencode(task, route, work, "", session, "k4", beats.append)
 
     result = asyncio.run(scenario())
-    assert fake.kinds() == ["setup", "agent", "test", "fix1", "test"]
+    assert fake.kinds() == ["setup", "agent", "test", "fix1", "test", "review"]
     assert "1 vòng sửa" in result.summary and "PASSED" in result.summary
+    assert "rà soát: không cần sửa" in result.summary
     fix = next(c for c in fake.calls if c[1] == "run" and "kite-fix1-" in " ".join(c))
     assert "THẤT BẠI" in fix[-1] and "AssertionError: average" in fix[-1]
     first = next(c for c in fake.calls if c[1] == "run" and "kite-agent-" in " ".join(c))
     assert "Cách làm:" in first[-1] and "calc.py" in first[-1]
+
+
+def run_backend_task(tmp_path: Path, fake, task_id: str):
+    repo, head = make_repo(tmp_path)
+    store = make_store(tmp_path)
+    backend = make_backend(tmp_path, store, fake)
+    task = make_task(store, repo, head, task_id)
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        session = await backend.prepare_opencode_session(task, route, work, None, "k3")
+        return await backend.run_opencode(task, route, work, "", session, "k4", lambda beat: None)
+
+    return backend, asyncio.run(scenario())
+
+
+def test_backend_self_review_keeps_good_changes_and_rolls_back_bad_ones(tmp_path):
+    (tmp_path / "good").mkdir()
+    (tmp_path / "bad").mkdir()
+    good = FakeDocker(review="improve")
+    backend, result = run_backend_task(tmp_path / "good", good, "task-review-good")
+    assert good.kinds() == ["setup", "agent", "test", "review", "test"]
+    assert "else 0.0" in result.patch and "đã sửa thêm" in result.summary
+    saved = json.loads((backend.task_dir("task-review-good") / "result.json").read_text())
+    assert saved["review"] == "kept" and saved["verified"] is True
+    bad = FakeDocker(review="break", test_returncodes=[0, 1])
+    backend, result = run_backend_task(tmp_path / "bad", bad, "task-review-bad")
+    assert "1 / 0" not in result.patch and "if xs else 0" in result.patch
+    assert "trả lại bản trước" in result.summary and "PASSED" in result.summary

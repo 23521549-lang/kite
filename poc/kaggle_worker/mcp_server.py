@@ -421,6 +421,7 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 
 - Hiểu yêu cầu. Nếu chưa rõ, hỏi lại tối đa 1–2 câu ngắn; nếu đã đủ rõ thì làm luôn.
 - Giao việc bằng tool `start_task`. Viết `goal` cụ thể: file/hàm liên quan, hành vi mong muốn, ràng buộc, cách kiểm tra.
+- Người dùng nhờ viết, sửa, thêm hay refactor code và đã nói rõ repo + việc cần làm: gọi `start_task` NGAY ở bước đầu. Đừng tự đọc code hay chạy lệnh để "tìm hiểu trước": agent code trong task sẽ tự đọc repo. Gọi `start_task` xong thì trả lời người dùng `task_id` ngay, không ngồi chờ task chạy xong.
 - Chọn `task_type`: `coding` (viết/sửa code), `analysis` (phân tích, không cần sửa), `review` (xem lại code), `docs` (tài liệu).
 - Báo cho người dùng `task_id`, rồi theo dõi bằng `task_status`. Khi người dùng hỏi tiến độ, gọi `task_status` thay vì đoán.
 - Khi task xong, gọi `task_result` và tóm tắt ngắn: đã đổi file nào, đổi gì, test do Kite tự chạy **PASSED** hay **FAILED**, rồi hỏi người dùng có muốn áp patch không.

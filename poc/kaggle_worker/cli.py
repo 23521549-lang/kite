@@ -156,7 +156,7 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--only", default="", help="comma-separated scenario/task ids, e.g. L04,L16,C1-bugfix")
     bench_run.add_argument("--out", type=Path, help="output folder (default: <state>/bench/<time>)")
     bench_run.add_argument("--no-harness", action="store_true",
-                           help="code suite without fix rounds and repo context (baseline to compare against)")
+                           help="code suite without fix rounds, self-review and repo context (baseline)")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
                                                           "unless --write)")
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
@@ -416,7 +416,7 @@ def _bench_command(args: argparse.Namespace) -> int:
     if "code" in suites:
         settings = sandbox_settings_from_config(config)
         if args.no_harness:
-            settings = dataclasses.replace(settings, fix_rounds=0)
+            settings = dataclasses.replace(settings, fix_rounds=0, self_review=False)
 
         def run_code(task, model, out_dir):
             slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
@@ -437,8 +437,10 @@ def _bench_command(args: argparse.Namespace) -> int:
             return result
 
     log = lambda line: print(line, file=sys.stderr, flush=True)
-    harness = "tắt (không vòng sửa, không ngữ cảnh repo)" if args.no_harness else \
-        f"bật ({sandbox_settings_from_config(config).fix_rounds} vòng sửa, có ngữ cảnh repo)"
+    harness_settings = sandbox_settings_from_config(config)
+    harness = "tắt (không vòng sửa, không rà soát, không ngữ cảnh repo)" if args.no_harness else \
+        (f"bật ({harness_settings.fix_rounds} vòng sửa, rà soát {'bật' if harness_settings.self_review else 'tắt'}, "
+         "có ngữ cảnh repo)")
     log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code"
         f" | harness {harness}")
     results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,

@@ -37,12 +37,14 @@ class FakeDocker:
     """Stands in for `docker`: setup may create files, the agent edits the clone, tests return a code."""
 
     def __init__(self, *, test_returncode: int = 0, setup_returncode: int = 0,
-                 agent_timeout: bool = False, test_returncodes: list[int] | None = None) -> None:
+                 agent_timeout: bool = False, test_returncodes: list[int] | None = None,
+                 review: str = "none") -> None:
         self.calls: list[list[str]] = []
         self.test_returncode = test_returncode
         self.test_returncodes = list(test_returncodes or [])     # one per test run, then test_returncode
         self.setup_returncode = setup_returncode
         self.agent_timeout = agent_timeout
+        self.review = review          # what the self-review pass does: none | improve | break
 
     def kind(self, cmd: list[str]) -> str:
         return value_after(cmd, "--name").split("-")[1]          # kite-<kind>-<task>
@@ -64,6 +66,14 @@ class FakeDocker:
             (workspace / "__pycache__").mkdir(exist_ok=True)
             (workspace / "__pycache__" / "calc.cpython-312.pyc").write_bytes(b"junk")
             return subprocess.CompletedProcess(cmd, 0, "\x1b[0m→ \x1b[0mEdit calc.py\nĐã sửa\n", "")
+        if kind == "review":
+            if self.review == "improve":
+                (workspace / "calc.py").write_text("def average(xs):\n    return sum(xs) / len(xs) if xs else 0.0\n")
+                (workspace / "test_edge.py").write_text("def test_new_edge():\n    pass\n")
+            elif self.review == "break":
+                (workspace / "calc.py").write_text("def average(xs):\n    return 1 / 0\n")
+                (workspace / "scratch_review.py").write_text("print('tmp')\n")
+            return subprocess.CompletedProcess(cmd, 0, "Đã rà soát\n", "")
         if kind == "test":
             code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
             output = "2 passed\n" if code == 0 else "FAILED test_calc.py::test_empty - ZeroDivisionError\n1 failed\n"
@@ -120,7 +130,7 @@ def test_setup_runs_first_with_network_and_its_files_stay_out_of_the_patch(tmp_p
     fake = FakeDocker()
     _repo, run = run_task(tmp_path, fake, "t5", setup_command="pip install -r requirements.txt")
     kinds = [fake.kind(c) for c in fake.calls]
-    assert kinds == ["setup", "agent", "test"]
+    assert kinds == ["setup", "agent", "test", "review"]
     setup, agent, test = fake.call("setup"), fake.call("agent"), fake.call("test")
     assert value_after(setup, "--network") == "bridge"
     assert value_after(agent, "--network") == "kite-sandbox-net" and value_after(test, "--network") == "none"
@@ -177,6 +187,54 @@ def test_no_fix_rounds_when_disabled_or_when_the_agent_failed(tmp_path):
                        models=["qwen3.6"], state_dir=tmp_path / "state", task_id="t11", runner=timeout,
                        log=lambda _m: None)
     assert run.fix_rounds_used == 0 and run.agent_status == "timeout"
+
+
+def test_self_review_runs_only_after_tests_pass_and_unchanged_needs_no_retest(tmp_path):
+    fake = FakeDocker()
+    _repo, run = run_task(tmp_path, fake, "t13")
+    assert [fake.kind(c) for c in fake.calls] == ["agent", "test", "review"] and run.review == "unchanged"
+    prompt = fake.call("review")[-1]
+    assert "RÀ SOÁT" in prompt and "Sửa average" in prompt and "python -m pytest -q" in prompt
+    assert value_after(fake.call("review"), "--network") == "kite-sandbox-net"
+    failing = FakeDocker(test_returncode=1)
+    (tmp_path / "x").mkdir()
+    run_task(tmp_path / "x", failing, "t14")
+    assert "review" not in [failing.kind(c) for c in failing.calls]           # tests never passed
+
+
+def test_self_review_changes_are_kept_when_tests_still_pass(tmp_path):
+    fake = FakeDocker(review="improve")
+    _repo, run = run_task(tmp_path, fake, "t15")
+    assert [fake.kind(c) for c in fake.calls] == ["agent", "test", "review", "test"]
+    assert run.review == "kept" and run.verified
+    assert sorted(run.changed_files) == ["calc.py", "test_edge.py"]
+    assert "else 0.0" in Path(run.patch_path).read_text()
+
+
+def test_self_review_that_breaks_tests_is_rolled_back(tmp_path):
+    fake = FakeDocker(review="break", test_returncodes=[0, 1])
+    _repo, run = run_task(tmp_path, fake, "t16")
+    assert run.review == "reverted" and run.verified and run.test_exit_code == 0
+    assert run.changed_files == ["calc.py"]
+    patch = Path(run.patch_path).read_text()
+    assert "if xs else 0" in patch and "1 / 0" not in patch and "scratch_review" not in patch
+    assert "after review exit=1" in (tmp_path / "state" / "t16" / "test.log").read_text()
+
+
+def test_self_review_off_for_non_coding_tasks_and_when_disabled(tmp_path):
+    from dataclasses import replace
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+    fake = FakeDocker(review="improve")
+    sbx.run_task(SETTINGS, repo=make_repo(tmp_path / "a"), goal="Phân tích calc.py", model="qwen3.6",
+                 models=["qwen3.6"], state_dir=tmp_path / "state", task_id="t17", task_type="analysis",
+                 runner=fake, log=lambda _m: None)
+    off = FakeDocker(review="improve")
+    run = sbx.run_task(replace(SETTINGS, self_review=False), repo=make_repo(tmp_path / "b"), goal="Sửa average",
+                       model="qwen3.6", models=["qwen3.6"], state_dir=tmp_path / "state", task_id="t18",
+                       runner=off, log=lambda _m: None)
+    assert "review" not in [fake.kind(c) for c in fake.calls] + [off.kind(c) for c in off.calls]
+    assert run.review == "skipped"
 
 
 def test_run_without_context_for_the_baseline(tmp_path):
@@ -260,7 +318,7 @@ def test_sandbox_config_validation_and_settings():
     assert settings.setup_command == "pip install -r requirements.txt" and settings.setup_network == "bridge"
     for bad in ({"gateway_host": "127.0.0.1"}, {"gateway_host": "8.8.8.8"}, {"network": "host"},
                 {"memory": "lots"}, {"docker_command": []}, {"setup_network": "host"},
-                {"setup_command": 3}):
+                {"setup_command": 3}, {"self_review": "yes"}):
         with pytest.raises(ConfigError):
             validate_config(_config(**bad))
 

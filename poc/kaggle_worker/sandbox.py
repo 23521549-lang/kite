@@ -90,6 +90,9 @@ class SandboxSettings:
     uid: int = field(default_factory=_default_uid)
     # After Kite's own test run fails, the agent gets the failing output and tries again this many times.
     fix_rounds: int = 2
+    # After the tests pass (coding tasks): one more agent pass that re-checks the solution against the
+    # goal and docstrings (edge cases, every caller). Kept only if the tests still pass afterwards.
+    self_review: bool = True
 
 
 @dataclass
@@ -116,6 +119,7 @@ class SandboxRun:
     test_seconds: float = 0.0
     test_output_tail: str = ""
     fix_rounds_used: int = 0
+    review: str = "skipped"       # skipped | unchanged | kept | reverted
 
     @property
     def verified(self) -> bool:
@@ -232,6 +236,44 @@ TASK_GUIDES = {
         "3. Không đổi code, trừ khi yêu cầu nói vậy.",
     ],
 }
+
+
+def review_prompt(goal: str, test_command: str) -> str:
+    """Prompt for the self-review pass, after Kite's tests already passed."""
+    return "\n".join([
+        "Test của Kite đã QUA. Đây là vòng RÀ SOÁT lời giải trước khi bàn giao (không làm lại từ đầu).",
+        "",
+        "Yêu cầu gốc:",
+        goal.strip(),
+        "",
+        "Làm lần lượt:",
+        "1. Đọc lại yêu cầu và docstring/đặc tả của mọi hàm, class bạn đã sửa hoặc viết. Liệt kê TỪNG quy tắc "
+        "và ví dụ trong đó, kể cả trường hợp biên (số âm, 0, rỗng, ranh giới, kiểu đầu vào khác nhau, lỗi phải báo).",
+        "2. Kiểm tra từng quy tắc bằng cách chạy thật, ví dụ `python -c \"...\"`. Test hiện có thường chưa đủ: "
+        "qua test không có nghĩa là đúng đặc tả.",
+        "3. Tìm mọi chỗ khác trong repo dùng tới phần đã đổi (`grep -rn <tên> .`) và sửa cho nhất quán.",
+        "4. Nếu thấy sai thì sửa code. Không sửa hay xóa file test có sẵn và conftest.py; được THÊM file test mới "
+        "cho các trường hợp biên vừa kiểm tra.",
+        f"5. Chạy lại `{test_command}` và đảm bảo vẫn qua.",
+        "6. Kết thúc bằng: các quy tắc đã kiểm tra, chỗ đã sửa thêm (hoặc \"không cần sửa\").",
+    ])
+
+
+def snapshot_tree(workspace: Path) -> str:
+    """Git tree of the whole workspace right now (new files included), to compare or restore later."""
+    _git(workspace, "add", "-A")
+    return _git(workspace, "write-tree")
+
+
+def restore_tree(workspace: Path, tree: str) -> None:
+    """Put the workspace back exactly as it was at ``snapshot_tree`` (drops files created since)."""
+    _git(workspace, "read-tree", "-u", "--reset", tree)
+    _git(workspace, "clean", "-fdq")
+
+
+def wants_review(settings: SandboxSettings, task_type: str, test_command: str, status: str, test_code) -> bool:
+    return bool(settings.self_review and task_type == "coding" and test_command
+                and status == "ok" and test_code == 0)
 
 
 def repo_context(workspace: Path, goal: str, *, max_files: int = CONTEXT_FILES,
@@ -437,6 +479,37 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         attempt += 1
         run.fix_rounds_used = attempt
         prompt = fix_prompt(goal, run.test_command, test_output, attempt, settings.fix_rounds)
+
+    # 4. Self-review: tests pass, but passing tests is not the spec. Keep it only if tests still pass.
+    if wants_review(settings, task_type, run.test_command, run.agent_status, run.test_exit_code):
+        before = snapshot_tree(workspace)
+        log(f"[{task_id}] vòng rà soát: {model} kiểm tra lại lời giải theo yêu cầu và docstring...")
+        name = container_name("review", task_id)
+        started = time.monotonic()
+        review_code, output = _run_step(
+            settings, runner, name=name, timeout=settings.agent_timeout_seconds,
+            args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
+                                 config_file=config_file, deps=deps)
+            + ["opencode", "run", "-m", f"kite/{model}", review_prompt(goal, run.test_command)])
+        run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
+        agent_log.append(f"===== review exit={review_code} =====\n{output}")
+        if snapshot_tree(workspace) == before:
+            run.review = "unchanged"
+        else:
+            name = container_name("test", task_id)
+            started = time.monotonic()
+            code, test_output = _run_step(
+                settings, runner, name=name, timeout=settings.test_timeout_seconds,
+                args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
+                + ["sh", "-c", run.test_command])
+            run.test_seconds = round(run.test_seconds + time.monotonic() - started, 1)
+            test_log.append(f"===== after review exit={code} =====\n{test_output}")
+            if review_code == 0 and code == 0:
+                run.review, run.agent_output_tail, run.test_output_tail = "kept", _tail(output), _tail(test_output)
+            else:
+                restore_tree(workspace, before)
+                run.review = "reverted"
+                log(f"[{task_id}] rà soát làm hỏng (agent exit {review_code}, test exit {code}): trả lại bản trước")
     (root / "agent.log").write_text("\n".join(agent_log), encoding="utf-8")
     if test_log:
         (root / "test.log").write_text("\n".join(test_log), encoding="utf-8")

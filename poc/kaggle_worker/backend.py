@@ -48,6 +48,11 @@ def task_slug(task_id: str) -> str:
     return f"{base}-{hashlib.sha1(task_id.encode('utf-8')).hexdigest()[:8]}"
 
 
+# How the self-review pass ended, as shown in the task summary.
+REVIEW_NOTES = {"unchanged": "; rà soát: không cần sửa", "kept": "; rà soát: đã sửa thêm, test vẫn qua",
+                "reverted": "; rà soát: làm hỏng test nên đã trả lại bản trước"}
+
+
 class SandboxActivityBackend:
     """``KiteActivityBackend`` implementation used by ``kite workflow worker``."""
 
@@ -227,12 +232,43 @@ class SandboxActivityBackend:
             attempt += 1
             prompt = sbx.fix_prompt(goal, test_command, test_output, attempt, self.settings.fix_rounds)
 
+        review = "skipped"
+        if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code):
+            before = await asyncio.to_thread(sbx.snapshot_tree, work)
+            name = sbx.container_name("review", slug)
+            review_code, review_output, step_seconds = await self._run_container(
+                name, sbx.docker_run_args(self.settings, name=name, workspace=work, network=self.settings.network,
+                                          config_file=config_file, deps=deps)
+                + ["opencode", "run", "-m", f"kite/{route.model_id}", sbx.review_prompt(goal, test_command)],
+                self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id)
+            seconds = round(seconds + step_seconds, 1)
+            with (root / "agent.log").open("a", encoding="utf-8") as stream:
+                stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} review model={route.model_id} "
+                             f"exit={review_code} =====\n")
+                stream.write(review_output)
+            if await asyncio.to_thread(sbx.snapshot_tree, work) == before:
+                review = "unchanged"
+            else:
+                name = sbx.container_name("test", slug)
+                code_after, test_after, _ = await self._run_container(
+                    name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
+                    + ["sh", "-c", test_command],
+                    self.settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
+                with (root / "test.log").open("a", encoding="utf-8") as stream:
+                    stream.write(f"\n===== after review exit={code_after} =====\n{test_after}")
+                if review_code == 0 and code_after == 0:
+                    review, output, test_output = "kept", review_output, test_after
+                else:
+                    await asyncio.to_thread(sbx.restore_tree, work, before)
+                    review = "reverted"
+
         patch_path = root / "result.patch"
         changed = await asyncio.to_thread(sbx.collect_patch, work, patch_base, patch_path)
         patch = patch_path.read_text(encoding="utf-8")
 
         lines = [f"Agent {route.model_id} on {route.worker_id}: {status} (exit {code}, {seconds}s"
-                 f"{f', {attempt} vòng sửa sau test lỗi' if attempt else ''}).",
+                 f"{f', {attempt} vòng sửa sau test lỗi' if attempt else ''}"
+                 f"{REVIEW_NOTES.get(review, '')}).",
                  f"Files changed: {', '.join(changed) if changed else 'none'}."]
         if test_code is None:
             lines.append("Kite test run: skipped (no sandbox.test_command).")
@@ -247,6 +283,7 @@ class SandboxActivityBackend:
             "task_id": task.task_id, "model": route.model_id, "worker": route.worker_id,
             "agent_status": status, "agent_exit_code": code, "agent_seconds": seconds,
             "changed_files": changed, "test_exit_code": test_code, "fix_rounds_used": attempt,
+            "review": review,
             "verified": status == "ok" and test_code == 0 and bool(changed),
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         return CodingRunResult(task.task_id, task.repo_head, session_id, patch, summary,
@@ -254,7 +291,8 @@ class SandboxActivityBackend:
 
     async def interrupt_opencode(self, task: CodingTaskInput, route: RouteLease, session_id: str, key: str) -> None:
         slug = task_slug(task.task_id)
-        for kind in ("agent", "test", "setup", *(f"fix{i}" for i in range(1, self.settings.fix_rounds + 1))):
+        for kind in ("agent", "test", "setup", "review",
+                     *(f"fix{i}" for i in range(1, self.settings.fix_rounds + 1))):
             await asyncio.to_thread(self._docker, "kill", sbx.container_name(kind, slug))
 
     async def checkpoint_and_stop(self, task: CodingTaskInput, route: RouteLease,
