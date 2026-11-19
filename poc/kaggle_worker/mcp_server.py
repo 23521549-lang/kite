@@ -22,7 +22,7 @@ import urllib.request
 import uuid
 from typing import Any, Awaitable, Callable
 
-from .config import KiteConfig, gateway_models, model_policy_from_config
+from .config import KiteConfig, gateway_models, model_contexts, model_policy_from_config
 from .protocol import ScheduledTask
 from .store import SQLiteSchedulerStore, StoreError
 
@@ -454,7 +454,8 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
     from .gateway import opencode_provider_config
 
     models = gateway_models(config)
-    opencode = opencode_provider_config(f"http://{config.gateway.host}:{config.gateway.port}", models)
+    opencode = opencode_provider_config(f"http://{config.gateway.host}:{config.gateway.port}", models,
+                                        context=model_contexts(config, models))
     opencode["model"] = f"kite/{lead_model}"
     opencode["small_model"] = f"kite/{lead_model}"
     opencode["mcp"] = {"kite": {"type": "local", "command": list(kite_command), "enabled": True}}

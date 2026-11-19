@@ -424,9 +424,15 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024)
     return app
 
 
-def opencode_provider_config(gateway_url: str, models: list[str], *, context: int = 32768,
+def opencode_provider_config(gateway_url: str, models: list[str], *, context: int | dict[str, int] = 32768,
                              output: int = 8192) -> dict[str, Any]:
-    """The ``provider`` block to put in OpenCode's ``opencode.json`` so it talks to the gateway."""
+    """The ``provider`` block to put in OpenCode's ``opencode.json`` so it talks to the gateway.
+
+    ``context`` is one limit for every model or a per-model mapping (missing models: 32768). OpenCode
+    compacts the conversation before it reaches this limit, so it must match the worker's real window.
+    """
+    limits = context if isinstance(context, dict) else {}
+    default = context if isinstance(context, int) else 32768
     return {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
@@ -434,7 +440,8 @@ def opencode_provider_config(gateway_url: str, models: list[str], *, context: in
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Kite gateway",
                 "options": {"baseURL": gateway_url.rstrip("/") + "/v1"},
-                "models": {m: {"name": m, "tool_call": True, "limit": {"context": context, "output": output}}
+                "models": {m: {"name": m, "tool_call": True,
+                               "limit": {"context": limits.get(m, default), "output": output}}
                            for m in models},
             }
         },

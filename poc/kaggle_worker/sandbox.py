@@ -93,6 +93,8 @@ class SandboxSettings:
     # After the tests pass (coding tasks): one more agent pass that re-checks the solution against the
     # goal and docstrings (edge cases, every caller). Kept only if the tests still pass afterwards.
     self_review: bool = True
+    # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
+    model_context: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -193,7 +195,7 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
     base_url = settings.gateway_url.rstrip("/")
     if base_url.endswith("/v1"):
         base_url = base_url[:-3]
-    config = opencode_provider_config(base_url, list(models))
+    config = opencode_provider_config(base_url, list(models), context=dict(settings.model_context))
     config["model"] = f"kite/{model}"
     if small_model:
         config["small_model"] = f"kite/{small_model}"

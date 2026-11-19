@@ -311,6 +311,29 @@ def test_chat_files_lock_the_lead_agent_down_and_speak_vietnamese(tmp_path):
     assert "tiếng Việt" in files["AGENTS.md"] and "`/home/u`" in files["AGENTS.md"]
 
 
+def test_context_window_per_model_reaches_opencode(tmp_path):
+    from poc.kaggle_worker.config import ConfigError, model_contexts, sandbox_settings_from_config
+    from poc.kaggle_worker.sandbox import agent_config
+
+    raw = _raw_config(tmp_path)
+    raw["gateway"]["model_context"] = {"qwen3.6": 65536}
+    raw["sandbox"] = {"gateway_host": "172.19.0.1"}
+    config = validate_config(raw)
+    # Aliases follow their base model; models not listed keep 32768.
+    assert model_contexts(config, ["qwen3.6", "devstral", "qwen3.6-fast"]) == {
+        "qwen3.6": 65536, "devstral": 32768, "qwen3.6-fast": 65536}
+    files = chat_files(config, lead_model="qwen3.6", kite_command=["kite"], allowed_roots=[Path("/home/u")])
+    models = json.loads(files["opencode.json"])["provider"]["kite"]["models"]
+    assert models["qwen3.6"]["limit"]["context"] == 65536 and models["devstral"]["limit"]["context"] == 32768
+    sandbox = agent_config(sandbox_settings_from_config(config), model="qwen3.6", models=["qwen3.6", "devstral"])
+    limits = {m: spec["limit"]["context"] for m, spec in sandbox["provider"]["kite"]["models"].items()}
+    assert limits == {"qwen3.6": 65536, "devstral": 32768}
+    for bad in ({"qwen3.6": 1024}, {"qwen3.6": 10 ** 6}, {"qwen3.6": "64k"}, {"bad name!": 65536}):
+        raw["gateway"]["model_context"] = bad
+        with pytest.raises(ConfigError):
+            validate_config(raw)
+
+
 def test_mcp_server_exposes_every_tool(tmp_path):
     pytest.importorskip("mcp")
     from poc.kaggle_worker.mcp_server import build_server

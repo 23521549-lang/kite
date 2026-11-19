@@ -19,7 +19,7 @@ import time
 import uuid
 
 from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers, load_config,
-                     model_policy_from_config, redact_config, refresh_configured_providers,
+                     model_contexts, model_policy_from_config, redact_config, refresh_configured_providers,
                      sandbox_settings_from_config, sync_config_to_store, validate_config)
 from .integration import StaleWorkerResult, build_review_bundle
 from .protocol import ScheduledTask, WorkerResult
@@ -115,7 +115,8 @@ def _parser() -> argparse.ArgumentParser:
     gateway_commands = gateway.add_subparsers(dest="gateway_command", required=True)
     gateway_commands.add_parser("serve", help="run the gateway on loopback; publish /worker/* through Caddy")
     oc = gateway_commands.add_parser("opencode-config", help="print the opencode.json block for the gateway")
-    oc.add_argument("--context", type=int, default=32768, help="context limit to declare per model")
+    oc.add_argument("--context", type=int, default=None,
+                    help="one context limit for every model (default: gateway.model_context, else 32768)")
     worker = commands.add_parser("worker", help="manage pull workers")
     worker_commands = worker.add_subparsers(dest="worker_command", required=True)
     token = worker_commands.add_parser("token", help="create a worker token (printed once)")
@@ -589,7 +590,8 @@ def _operator_command(args: argparse.Namespace) -> int:
             from .gateway import opencode_provider_config
 
             url = f"http://{config.gateway.host}:{config.gateway.port}"
-            _emit(opencode_provider_config(url, gateway_models(config), context=args.context))
+            models = gateway_models(config)
+            _emit(opencode_provider_config(url, models, context=args.context or model_contexts(config, models)))
             return 0
         if args.gateway_command == "serve":
             try:

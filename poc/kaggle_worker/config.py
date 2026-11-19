@@ -74,6 +74,12 @@ class GatewayConfig:
     heartbeat_timeout_seconds: float = 90.0
     # alias name -> {"model": base model, "params": extra request fields}
     aliases: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Context window (tokens) per base model, as llama-server is started on the worker (the Kaggle
+    # notebook's ROSTER "ctx"). OpenCode is told this limit; models not listed get DEFAULT_CONTEXT.
+    model_context: dict[str, int] = field(default_factory=dict)
+
+
+DEFAULT_CONTEXT = 32768
 
 
 @dataclass(frozen=True)
@@ -304,7 +310,7 @@ def _validate_routing(raw: Any) -> RoutingConfig:
 def _validate_gateway(raw: Any) -> GatewayConfig:
     gw = _mapping(raw, "gateway")
     unknown = set(gw) - {"host", "port", "public_url", "job_timeout_seconds",
-                         "heartbeat_timeout_seconds", "aliases"}
+                         "heartbeat_timeout_seconds", "aliases", "model_context"}
     if unknown:
         raise ConfigError("gateway has unsupported fields")
     host = gw.get("host", "127.0.0.1")
@@ -329,14 +335,31 @@ def _validate_gateway(raw: Any) -> GatewayConfig:
         if {"model", "messages", "stream"} & set(params):
             raise ConfigError(f"gateway.aliases.{name}.params cannot override model, messages or stream")
         aliases[name] = {"model": base, "params": dict(params)}
+    model_context: dict[str, int] = {}
+    for name, tokens in _mapping(gw.get("model_context", {}), "gateway.model_context").items():
+        if not isinstance(name, str) or not _MODEL.fullmatch(name):
+            raise ConfigError("gateway.model_context has a malformed model name")
+        if not isinstance(tokens, int) or isinstance(tokens, bool) or not 8192 <= tokens <= 262144:
+            raise ConfigError(f"gateway.model_context.{name} must be a token count between 8192 and 262144")
+        model_context[name] = tokens
     return GatewayConfig(
         host=host, port=port, public_url=public_url,
         job_timeout_seconds=_number(gw.get("job_timeout_seconds", 1800.0),
                                     "gateway.job_timeout_seconds", minimum=1),
         heartbeat_timeout_seconds=_number(gw.get("heartbeat_timeout_seconds", 90.0),
                                           "gateway.heartbeat_timeout_seconds", minimum=10),
-        aliases=aliases,
+        aliases=aliases, model_context=model_context,
     )
+
+
+def model_contexts(config: KiteConfig, models) -> dict[str, int]:
+    """Context window of each served model; an alias has the context of its base model."""
+    gateway = config.gateway
+    result = {}
+    for name in models:
+        base = gateway.aliases.get(name, {}).get("model", name)
+        result[name] = gateway.model_context.get(base, DEFAULT_CONTEXT)
+    return result
 
 
 def _validate_sandbox(raw: Any) -> SandboxConfig | None:
@@ -456,6 +479,7 @@ def sandbox_settings_from_config(config: KiteConfig):
         test_command=sb.test_command, setup_command=sb.setup_command,
         setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
         docker_command=sb.docker_command, fix_rounds=sb.fix_rounds, self_review=sb.self_review,
+        model_context=model_contexts(config, gateway_models(config)),
     )
 
 
