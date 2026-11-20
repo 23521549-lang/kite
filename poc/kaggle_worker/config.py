@@ -101,6 +101,7 @@ class SandboxConfig:
     docker_command: tuple[str, ...] = ("docker",)
     fix_rounds: int = 2
     self_review: bool = True
+    code_map: bool = True
 
 
 @dataclass(frozen=True)
@@ -369,7 +370,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
     unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
                          "agent_timeout_seconds", "test_timeout_seconds", "test_command",
                          "setup_command", "setup_network", "setup_timeout_seconds", "docker_command",
-                         "fix_rounds", "self_review"}
+                         "fix_rounds", "self_review", "code_map"}
     if unknown:
         raise ConfigError("sandbox has unsupported fields")
     image = sb.get("image", "kite-sandbox:latest")
@@ -412,6 +413,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
         docker_command=tuple(docker_command),
         fix_rounds=_bounded_fix_rounds(sb.get("fix_rounds", 2)),
         self_review=_flag(sb.get("self_review", True), "sandbox.self_review"),
+        code_map=_flag(sb.get("code_map", True), "sandbox.code_map"),
     )
 
 
@@ -479,7 +481,7 @@ def sandbox_settings_from_config(config: KiteConfig):
         test_command=sb.test_command, setup_command=sb.setup_command,
         setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
         docker_command=sb.docker_command, fix_rounds=sb.fix_rounds, self_review=sb.self_review,
-        model_context=model_contexts(config, gateway_models(config)),
+        code_map=sb.code_map, model_context=model_contexts(config, gateway_models(config)),
     )
 
 

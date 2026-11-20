@@ -29,6 +29,8 @@ import urllib.request
 import uuid
 from typing import Callable
 
+from . import codemap
+
 Runner = Callable[..., subprocess.CompletedProcess]
 
 TASK_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -95,6 +97,9 @@ class SandboxSettings:
     self_review: bool = True
     # Let a repository declare its own setup/test commands in a committed `.kite.yml` (see repo_settings).
     repo_config: bool = True
+    # Build a graphify code map of the task's clone (if graphify is installed) and use it in the
+    # first prompt, the fix rounds and the self-review (see codemap.py).
+    code_map: bool = True
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
     model_context: dict[str, int] = field(default_factory=dict)
 
@@ -220,9 +225,15 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
     return config
 
 
-CONTEXT_FILES = 150          # paths listed from `git ls-files`
-CONTEXT_CHARS = 8000         # content of files named in the goal (+ README), in total
+CONTEXT_FILES = 150          # paths listed from `git ls-files` (fonts, images, lock files left out)
+CONTEXT_CHARS = 10000        # excerpts: symbols and files the goal names (+ README), in total
+CONTEXT_BLOCK_CHARS = 3000   # at most this much per excerpt
+CODE_MAP_CHARS = 3500        # the graphify code map (codemap.py)
 FIX_OUTPUT_CHARS = 3000      # failing test output handed back to the agent
+NOISE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp", ".bmp", ".woff", ".woff2", ".ttf",
+                  ".otf", ".eot", ".pdf", ".zip", ".gz", ".tgz", ".jar", ".whl", ".so", ".dll", ".exe", ".bin",
+                  ".pyc", ".map", ".min.js", ".min.css", ".lock", ".mp3", ".mp4", ".mov")
+NOISE_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "cargo.lock", "go.sum"}
 
 # How to work, per task type: the part of the harness that does not depend on the repository.
 TASK_GUIDES = {
@@ -302,9 +313,12 @@ def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings
     return replace(settings, **changes)
 
 
-def review_prompt(goal: str, test_command: str) -> str:
-    """Prompt for the self-review pass, after Kite's tests already passed."""
-    return "\n".join([
+def review_prompt(goal: str, test_command: str, impact: str = "") -> str:
+    """Prompt for the self-review pass, after Kite's tests already passed.
+
+    ``impact`` (codemap.impact): the callers of what the agent changed, found by the code map.
+    """
+    lines = [
         "Test của Kite đã QUA. Đây là vòng RÀ SOÁT lời giải trước khi bàn giao (không làm lại từ đầu).",
         "",
         "Yêu cầu gốc:",
@@ -315,12 +329,17 @@ def review_prompt(goal: str, test_command: str) -> str:
         "và ví dụ trong đó, kể cả trường hợp biên (số âm, 0, rỗng, ranh giới, kiểu đầu vào khác nhau, lỗi phải báo).",
         "2. Kiểm tra từng quy tắc bằng cách chạy thật, ví dụ `python -c \"...\"`. Test hiện có thường chưa đủ: "
         "qua test không có nghĩa là đúng đặc tả.",
-        "3. Tìm mọi chỗ khác trong repo dùng tới phần đã đổi (`grep -rn <tên> .`) và sửa cho nhất quán.",
+        "3. Tìm mọi chỗ khác trong repo dùng tới phần đã đổi (`grep -rn <tên> .`) và sửa cho nhất quán"
+        + (" (bắt đầu từ danh sách bên dưới)." if impact else "."),
         "4. Nếu thấy sai thì sửa code. Không sửa hay xóa file test có sẵn và conftest.py; được THÊM file test mới "
         "cho các trường hợp biên vừa kiểm tra.",
         f"5. Chạy lại `{test_command}` và đảm bảo vẫn qua.",
         "6. Kết thúc bằng: các quy tắc đã kiểm tra, chỗ đã sửa thêm (hoặc \"không cần sửa\").",
-    ])
+    ]
+    if impact:
+        lines += ["", "Phần bạn đã đổi và những chỗ đang dùng nó (bản đồ code của Kite; có thể thiếu, vẫn grep thêm):",
+                  impact]
+    return "\n".join(lines)
 
 
 def snapshot_tree(workspace: Path) -> str:
@@ -340,30 +359,179 @@ def wants_review(settings: SandboxSettings, task_type: str, test_command: str, s
                 and status == "ok" and test_code == 0)
 
 
+def _is_noise(path: str) -> bool:
+    low = path.lower()
+    return low.rsplit("/", 1)[-1] in NOISE_NAMES or low.endswith(NOISE_SUFFIXES)
+
+
+def _dir_summary(files: list[str], limit: int = 40) -> list[str]:
+    counts: dict[str, int] = {}
+    for f in files:
+        folder = f.rsplit("/", 1)[0] + "/" if "/" in f else "./"
+        counts[folder] = counts.get(folder, 0) + 1
+    entries = sorted(counts.items())
+    lines = [f"  {folder} ({count})" for folder, count in entries[:limit]]
+    if len(entries) > limit:
+        lines.append(f"  … và {len(entries) - limit} thư mục nữa")
+    return lines
+
+
+def _pick_files(files: list[str], keep: list[str], limit: int) -> list[str]:
+    """At most ``limit`` paths: the ones that matter for the goal and their folders first, then
+    top-level files, then source before tests and docs."""
+    folders = {f.rsplit("/", 1)[0] for f in keep if "/" in f}
+    first = [f for f in files if f in keep]
+    first += [f for f in files if "/" not in f and f not in first]
+    first += [f for f in files if "/" in f and f.rsplit("/", 1)[0] in folders and f not in first]
+    chosen = first[:limit]
+    taken = set(chosen)
+    rest = sorted((f for f in files if f not in taken),
+                  key=lambda f: (codemap.is_test_path(f), f.endswith((".md", ".rst", ".txt", ".html")), f))
+    return sorted(chosen + rest[:max(0, limit - len(chosen))])
+
+
+def _grep_definitions(workspace: Path, names: list[str], plain: list[str] = ()) -> list[tuple[str, str, int]]:
+    """(name, file, line) of ``def``/``class`` definitions of the names (when there is no graph).
+
+    ``Class.new_method`` falls back to the class; a ``plain`` word is tried only when nothing
+    code-like was found, and counts only with one or two definitions outside the tests.
+    """
+    def hits(word: str) -> list[tuple[str, int]]:
+        out = _git(Path(workspace), "grep", "-n", "-E",
+                   rf"^[[:space:]]*(async[[:space:]]+)?(def|class)[[:space:]]+{re.escape(word)}([^A-Za-z0-9_]|$)",
+                   "--", ":!*.md", ":!*.rst", ":!*.txt", ":!*.html", check=False)
+        rows = [line.split(":", 2) for line in out.splitlines() if line.count(":") >= 2]
+        return [(path, int(number)) for path, number, _ in rows if number.isdigit()]
+
+    found = []
+    for name in names:
+        rows = hits(name.rsplit(".", 1)[-1])
+        if not rows and "." in name:
+            rows = hits(name.rsplit(".", 1)[0].rsplit(".", 1)[-1])
+        if 0 < len(rows) <= 3:
+            found += [(name, path, line) for path, line in rows]
+    for word in plain:
+        if found:
+            break
+        rows = [(path, line) for path, line in hits(word) if not codemap.is_test_path(path)]
+        if 0 < len(rows) <= 2:
+            found += [(word, path, line) for path, line in rows]
+    return found
+
+
+def _numbered(lines: list[str], first: int) -> str:
+    return "\n".join(f"{first + i:>5}| {line}" for i, line in enumerate(lines))
+
+
+def _block(lines: list[str], line: int, max_lines: int = 60) -> tuple[int, list[str]]:
+    """The definition starting at 1-based ``line`` (decorators included), by indentation."""
+    i = max(0, min(line - 1, len(lines) - 1))
+    indent = len(lines[i]) - len(lines[i].lstrip())
+    if lines[i].lstrip().startswith("class "):
+        max_lines = min(max_lines, 30)      # a class: its head; the map and outline list its methods
+    start = i
+    while start > 0 and lines[start - 1].strip().startswith("@"):
+        start -= 1
+    end = i + 1
+    while end < len(lines) and end - start < max_lines:
+        text = lines[end]
+        if text.strip() and len(text) - len(text.lstrip()) <= indent and not text.lstrip().startswith((")", "]", "}")):
+            break
+        end += 1
+    return start + 1, lines[start:end]
+
+
 def repo_context(workspace: Path, goal: str, *, max_files: int = CONTEXT_FILES,
-                 max_chars: int = CONTEXT_CHARS) -> str:
-    """What the agent should see before its first step: the file list, then the content of the
-    files the goal names (by path or file name) and the README, within a character budget."""
-    files = [f for f in _git(Path(workspace), "ls-files", check=False).splitlines() if f]
+                 max_chars: int = CONTEXT_CHARS, graph: codemap.CodeGraph | None = None) -> str:
+    """What the agent should see before its first step.
+
+    * the files (fonts, images and lock files left out); a large repository gets a folder summary
+      and the files that matter for the goal first, instead of the first N paths alphabetically;
+    * with a graphify ``graph`` (codemap.py): where the symbols the goal names are defined, who
+      calls/imports/inherits them, and an outline of large files the goal names;
+    * excerpts with line numbers: the definitions of those symbols (a method, not the first 4000
+      characters of an 800-line file), the files the goal names, the README; within ``max_chars``.
+    """
+    workspace = Path(workspace)
+    files = [f for f in _git(workspace, "ls-files", check=False).splitlines() if f]
     if not files:
         return ""
-    shown = files[:max_files]
-    lines = [f"Các file trong repo ({len(shown)}/{len(files)}):", *shown]
-    mentioned = [f for f in files if f in goal or re.search(
+    listed = [f for f in files if not _is_noise(f)]
+    skipped = len(files) - len(listed)
+    mentioned = [f for f in listed if f in goal or re.search(
         rf"(?<![\w./-]){re.escape(Path(f).name)}(?![\w-])", goal)]
-    readme = next((f for f in files if f.lower() in ("readme.md", "readme.rst", "readme.txt", "readme")), None)
+    names = codemap.goal_names(goal)
+    code_map, symbols = codemap.goal_map(graph, goal, mentioned, max_chars=CODE_MAP_CHARS,
+                                         workspace=workspace) if graph is not None else ("", [])
+    if graph is not None:
+        definitions = [(graph.qualified(s), s.file, s.line) for s in symbols if s.kind != "module"]
+    else:
+        plain = [] if mentioned else [w for w in codemap.goal_words(goal) if w not in names]
+        definitions = _grep_definitions(workspace, names, plain)
+
+    lines = [f"Repo có {len(files)} file" + (f" ({skipped} file font/ảnh/lock không liệt kê)" if skipped else "") + "."]
+    if len(listed) > max_files:
+        keep = mentioned + [path for _, path, _ in definitions]
+        shown = _pick_files(listed, keep, max_files)
+        lines += ["Thư mục (số file):", *_dir_summary(listed),
+                  f"Các file trong repo ({len(shown)}/{len(listed)}, ưu tiên file liên quan; xem thêm: "
+                  "`git ls-files <thư mục>`):", *shown]
+    else:
+        lines += [f"Các file trong repo ({len(listed)}/{len(listed)}):", *listed]
+    if code_map:
+        lines += ["", "Bản đồ code (graphify phân tích AST, có thể thiếu lời gọi động; vẫn đọc file trước khi sửa):",
+                  code_map]
+
     budget = max_chars
-    for name in [*mentioned[:6], *([readme] if readme and readme not in mentioned else [])]:
-        if budget < 200:
-            break
-        try:
-            text = (Path(workspace) / name).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        chunk = text[:min(budget, 4000)]
-        lines += ["", f"----- {name}{' (đã cắt)' if len(chunk) < len(text) else ''} -----", chunk.rstrip()]
+    shown_files: set[str] = set()
+    cache: dict[str, list[str] | None] = {}
+
+    def read(path: str) -> list[str] | None:
+        if path not in cache:
+            try:
+                cache[path] = (workspace / path).read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                cache[path] = None
+        return cache[path]
+
+    def add(title: str, text: str) -> None:
+        nonlocal budget
+        chunk = text[:min(budget, CONTEXT_BLOCK_CHARS)]
+        lines.extend(["", f"----- {title}{' (đã cắt)' if len(chunk) < len(text) else ''} -----", chunk.rstrip()])
         budget -= len(chunk)
+
+    for name, path, line in definitions[:6]:
+        content = read(path)
+        if budget < 300 or content is None:
+            continue
+        first, block = _block(content, line)
+        add(f"{path} dòng {first}-{first + len(block) - 1}: {name}", _numbered(block, first))
+        shown_files.add(path)
+    readme = next((f for f in files if f.lower() in ("readme.md", "readme.rst", "readme.txt", "readme")), None)
+    for path in [*mentioned[:6], *([readme] if readme and readme not in mentioned else [])]:
+        content = read(path)
+        if budget < 300 or content is None or path in shown_files:
+            continue
+        text = "\n".join(content)
+        if path != readme and len(text) > CONTEXT_BLOCK_CHARS:
+            add(f"{path} (60 dòng đầu; file dài {len(content)} dòng)", _numbered(content[:60], 1))
+        else:
+            add(path, text if path == readme else _numbered(content, 1))
     return "\n".join(lines)
+
+
+def code_graph(settings: SandboxSettings, workspace: Path, out_dir: Path,
+               log: Callable[[str], None] = lambda _m: None) -> codemap.CodeGraph | None:
+    """The task's code map: graphify's graph of the clone, built once into ``out_dir``; None if off,
+    graphify is missing or it fails (Kite then works exactly as without it)."""
+    if not settings.code_map:
+        return None
+    started = time.monotonic()
+    path = codemap.build(workspace, out_dir)
+    graph = codemap.CodeGraph.load(path, workspace)
+    if graph is not None:
+        log(f"bản đồ code (graphify): {len(graph.symbols)} ký hiệu, {time.monotonic() - started:.1f}s")
+    return graph
 
 
 def agent_prompt(goal: str, test_command: str, *, task_type: str = "coding", context: str = "") -> str:
@@ -378,17 +546,42 @@ def agent_prompt(goal: str, test_command: str, *, task_type: str = "coding", con
     return "\n".join(lines)
 
 
-def fix_prompt(goal: str, test_command: str, test_output: str, attempt: int, rounds: int) -> str:
-    """The next round after Kite's own test run failed: same goal, plus the real failing output."""
-    return "\n".join([
+def failure_digest(output: str, limit: int = FIX_OUTPUT_CHARS) -> str:
+    """Failing pytest output for the agent: the first failure's traceback, then the summary of all.
+
+    The last N characters of a big suite are mostly the summary list (and the last traceback);
+    the first traceback with its assertion is what the agent needs to see.
+    """
+    text = clean_output(output)
+    failures = re.search(r"^=+ (FAILURES|ERRORS) =+$", text, re.M)
+    if failures is None:
+        return text[-limit:]
+    summary = re.search(r"^=+ short test summary info =+$", text, re.M)
+    tail = text[summary.start():] if summary and summary.start() > failures.start() else ""
+    tail = tail[-(limit // 3):] if tail else text[-(limit // 4):]
+    body = text[failures.start():summary.start() if tail and summary else len(text)]
+    head = body[:max(0, limit - len(tail))]
+    return head.rstrip() + ("\n…\n" if len(head) < len(body) else "\n") + tail.lstrip()
+
+
+def fix_prompt(goal: str, test_command: str, test_output: str, attempt: int, rounds: int,
+               targets: str = "") -> str:
+    """The next round after Kite's own test run failed: same goal, plus the real failing output.
+
+    ``targets`` (codemap.failing_targets): what each failing test calls, from the code map.
+    """
+    lines = [
         goal.strip(), "",
         f"Kite đã tự chạy `{test_command}` (không mạng) sau lần làm trước và test THẤT BẠI "
         f"(vòng sửa {attempt}/{rounds}). Phần cuối output:",
-        "```", _tail(test_output, FIX_OUTPUT_CHARS).strip(), "```",
+        "```", failure_digest(test_output, FIX_OUTPUT_CHARS).strip(), "```",
         "Các thay đổi lần trước vẫn còn trong /work. Đọc lỗi, tìm nguyên nhân gốc trong code, sửa, rồi chạy lại "
         f"`{test_command}` cho tới khi qua. Không sửa, xóa hay bỏ qua test để cho qua, trừ khi yêu cầu nói vậy.",
         "Môi trường không có Internet. Không commit, không push.",
-    ])
+    ]
+    if targets:
+        lines[-2:-2] = ["Test thất bại gọi tới (bản đồ code của Kite, để biết nên đọc chỗ nào trước):", targets]
+    return "\n".join(lines)
 
 
 def prepare_clone(repo: Path, workspace: Path, *, head: str | None = None,
@@ -509,7 +702,9 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     config_file = root / "opencode.json"
     config_file.write_text(json.dumps(agent_config(settings, model=model, models=models, small_model=small_model,
                                                    task_tag=task_id), indent=2), encoding="utf-8")
-    prompt = agent_prompt(goal, run.test_command, task_type=task_type, context=repo_context(workspace, goal) if with_context else "")
+    graph = code_graph(settings, workspace, root / "graph", lambda m: log(f"[{task_id}] {m}")) if with_context else None
+    prompt = agent_prompt(goal, run.test_command, task_type=task_type,
+                          context=repo_context(workspace, goal, graph=graph) if with_context else "")
     agent_log, test_log = [], []
     attempt = 0
     while True:
@@ -543,7 +738,8 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             break
         attempt += 1
         run.fix_rounds_used = attempt
-        prompt = fix_prompt(goal, run.test_command, test_output, attempt, settings.fix_rounds)
+        prompt = fix_prompt(goal, run.test_command, test_output, attempt, settings.fix_rounds,
+                            codemap.failing_targets(graph, test_output) if graph is not None else "")
 
     # 4. Self-review: tests pass, but passing tests is not the spec. Keep it only if tests still pass.
     if wants_review(settings, task_type, run.test_command, run.agent_status, run.test_exit_code):
@@ -555,7 +751,9 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             settings, runner, name=name, timeout=settings.agent_timeout_seconds,
             args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
                                  config_file=config_file, deps=deps)
-            + ["opencode", "run", "-m", f"kite/{model}", review_prompt(goal, run.test_command)])
+            + ["opencode", "run", "-m", f"kite/{model}",
+               review_prompt(goal, run.test_command,
+                             codemap.impact(graph, workspace, run.patch_base) if graph is not None else "")])
         run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
         agent_log.append(f"===== review exit={review_code} =====\n{output}")
         if snapshot_tree(workspace) == before:

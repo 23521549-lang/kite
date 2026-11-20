@@ -384,3 +384,28 @@ def test_backend_uses_the_repository_kite_yml_and_rejects_a_broken_one(tmp_path)
     broken = make_task(store, repo, head, "task-kite-yml-broken")
     with pytest.raises(ApplicationError, match="test_timeout"):
         asyncio.run(backend.prepare_workspace(broken, "k1"))
+
+
+def test_backend_builds_the_code_map_and_uses_it_in_the_prompts(tmp_path, monkeypatch):
+    from poc.kaggle_worker import codemap
+    from poc.kaggle_worker.journal import read_jsonl
+    from test_codemap import graph_data
+
+    built = []
+
+    def build(workspace, out_dir, **kwargs):
+        path = Path(out_dir) / "graphify-out" / "graph.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(graph_data()))
+        built.append(Path(workspace))
+        return path
+
+    monkeypatch.setattr(codemap, "build", build)
+    fake = FakeDocker(review="improve")
+    backend, result = run_backend_task(tmp_path, fake, "task-map")
+    first, review = fake.agent_calls()[0][-1], fake.agent_calls()[-1][-1]
+    assert "Bản đồ code" in first and "main.py:4 (report())" in first
+    assert "RÀ SOÁT" in review and "những chỗ đang dùng nó" in review and "main.py:4 (report())" in review
+    assert built and built[0].name == "work" and "else 0.0" in result.patch
+    trace = read_jsonl(backend.task_dir("task-map") / "trace.jsonl")
+    assert next(e for e in trace if e["event"] == "run_start")["code_map"] == 8

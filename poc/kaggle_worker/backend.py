@@ -216,12 +216,14 @@ class SandboxActivityBackend:
         if instruction.strip():
             goal += f"\n\nChỉ dẫn bổ sung của người dùng (ưu tiên làm theo): {instruction.strip()}"
 
-        context = await asyncio.to_thread(sbx.repo_context, work, goal)
+        graph = await asyncio.to_thread(sbx.code_graph, self.settings, work, root / "graph")
+        context = await asyncio.to_thread(sbx.repo_context, work, goal, graph=graph)
         self._trace(task.task_id, "run_start", model=route.model_id, worker=route.worker_id, lease=route.lease_id,
-                    task_type=task.task_type, instruction=short(instruction, 1000), context_chars=len(context))
+                    task_type=task.task_type, instruction=short(instruction, 1000), context_chars=len(context),
+                    code_map=len(graph.symbols) if graph is not None else None)
         try:
             return await self._run_agent(task, route, work, root, slug, deps, patch_base, config_file, goal,
-                                         instruction, context, session_id, heartbeat)
+                                         instruction, context, session_id, heartbeat, graph)
         except BaseException as exc:
             # A crash (or cancel) mid-run still leaves a line saying how far it got.
             self._trace(task.task_id, "run_error", error=short(f"{type(exc).__name__}: {exc}", 500))
@@ -232,7 +234,8 @@ class SandboxActivityBackend:
 
     async def _run_agent(self, task: CodingTaskInput, route: RouteLease, work: Path, root: Path, slug: str,
                          deps: Path, patch_base: str, config_file: Path, goal: str, instruction: str,
-                         context: str, session_id: str, heartbeat: Callable[[dict], None]) -> CodingRunResult:
+                         context: str, session_id: str, heartbeat: Callable[[dict], None],
+                         graph: sbx.codemap.CodeGraph | None = None) -> CodingRunResult:
         settings = sbx.repo_settings(self.settings, work)   # the repo's .kite.yml (already validated in setup)
         prompt = sbx.agent_prompt(goal, settings.test_command, task_type=task.task_type, context=context)
         test_command = settings.test_command
@@ -264,7 +267,8 @@ class SandboxActivityBackend:
             if test_code == 0 or status != "ok" or attempt >= self.settings.fix_rounds:
                 break
             attempt += 1
-            prompt = sbx.fix_prompt(goal, test_command, test_output, attempt, self.settings.fix_rounds)
+            prompt = sbx.fix_prompt(goal, test_command, test_output, attempt, self.settings.fix_rounds,
+                                    sbx.codemap.failing_targets(graph, test_output) if graph is not None else "")
 
         review = "skipped"
         if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code):
@@ -273,7 +277,9 @@ class SandboxActivityBackend:
             review_code, review_output, step_seconds = await self._run_container(
                 name, sbx.docker_run_args(self.settings, name=name, workspace=work, network=self.settings.network,
                                           config_file=config_file, deps=deps)
-                + ["opencode", "run", "-m", f"kite/{route.model_id}", sbx.review_prompt(goal, test_command)],
+                + ["opencode", "run", "-m", f"kite/{route.model_id}",
+                   sbx.review_prompt(goal, test_command, await asyncio.to_thread(
+                       sbx.codemap.impact, graph, work, patch_base) if graph is not None else "")],
                 self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id)
             seconds = round(seconds + step_seconds, 1)
             with (root / "agent.log").open("a", encoding="utf-8") as stream:

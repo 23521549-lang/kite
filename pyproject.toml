@@ -19,6 +19,10 @@ test = [
     "pytest>=8.3,<10",
     "PyYAML>=6.0,<7",
 ]
+# The code map (codemap.py): graphify's local tree-sitter graph of the task's repository.
+codemap = [
+    "graphifyy==0.9.113",
+]
 
 [project.scripts]
 kite = "poc.kaggle_worker.cli:console_main"

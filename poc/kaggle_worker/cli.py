@@ -169,6 +169,8 @@ def _parser() -> argparse.ArgumentParser:
                                 "then runs the real-repository tasks (R1-R4) instead of C1-C8")
     bench_run.add_argument("--no-harness", action="store_true",
                            help="code suite without fix rounds, self-review and repo context (baseline)")
+    bench_run.add_argument("--no-code-map", action="store_true",
+                           help="harness on, but without the graphify code map (to measure what it adds)")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
                                                           "unless --write)")
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
@@ -508,7 +510,9 @@ def _bench_command(args: argparse.Namespace) -> int:
     if "code" in suites:
         settings = sandbox_settings_from_config(config)
         if args.no_harness:
-            settings = dataclasses.replace(settings, fix_rounds=0, self_review=False)
+            settings = dataclasses.replace(settings, fix_rounds=0, self_review=False, code_map=False)
+        elif args.no_code_map:
+            settings = dataclasses.replace(settings, code_map=False)
 
         def run_code(task, model, out_dir):
             slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
@@ -539,9 +543,13 @@ def _bench_command(args: argparse.Namespace) -> int:
 
     log = lambda line: print(line, file=sys.stderr, flush=True)
     harness_settings = sandbox_settings_from_config(config)
+    map_on = harness_settings.code_map and not args.no_code_map
+    if map_on and sbx.codemap.graphify_cli() is None:
+        log("cảnh báo: không thấy lệnh graphify (pip install graphifyy) - chạy không có bản đồ code")
+        map_on = False
     harness = "tắt (không vòng sửa, không rà soát, không ngữ cảnh repo)" if args.no_harness else \
         (f"bật ({harness_settings.fix_rounds} vòng sửa, rà soát {'bật' if harness_settings.self_review else 'tắt'}, "
-         "có ngữ cảnh repo)")
+         f"có ngữ cảnh repo, bản đồ code graphify {'bật' if map_on else 'tắt'})")
     log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code"
         f" | harness {harness}")
     results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
