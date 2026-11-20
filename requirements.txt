@@ -1,2 +1,3 @@
 # Install the project and its pinned runtime dependencies from pyproject.toml.
--e .
+# The [codemap] extra brings graphify (local code map, no network or LLM).
+-e .[codemap]

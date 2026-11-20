@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass, field
+import errno
 import hashlib
 import json
 import os
@@ -907,18 +908,29 @@ def store_deps(cache_root: Path | None, key: str | None, deps: Path) -> bool:
         return False
     cache_root.mkdir(parents=True, exist_ok=True)
     staging = cache_root / f".{key}.{uuid.uuid4().hex[:8]}"
+    moved = True
     try:
-        os.rename(deps, staging)                  # same filesystem: instant; otherwise do not cache
-    except OSError:
-        return False
+        os.rename(deps, staging)                  # same filesystem: instant
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            return False
+        moved = False                             # another disk (bench runs under ~/, the cache in
+        try:                                      # the data volume): copy it over instead
+            shutil.copytree(deps, staging, symlinks=True)
+        except (OSError, shutil.Error):
+            shutil.rmtree(staging, ignore_errors=True)
+            return False
     (staging / ".kite-ready").write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
     try:
         os.rename(staging, target)
     except OSError:                               # someone stored the same key meanwhile
-        os.rename(staging, deps)
-        (deps / ".kite-ready").unlink(missing_ok=True)
+        if moved:
+            os.rename(staging, deps)
+            (deps / ".kite-ready").unlink(missing_ok=True)
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
         return False
-    link_deps(deps, target)
+    link_deps(deps, target)                       # (a copied original is removed here)
     prune_deps(cache_root)
     return True
 

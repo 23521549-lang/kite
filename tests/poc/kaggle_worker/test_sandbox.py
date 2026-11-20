@@ -447,6 +447,30 @@ def test_setup_is_installed_once_and_reused_read_only_by_later_tasks(tmp_path):
     assert not (tmp_path / "state" / "d3" / "deps").is_symlink()
 
 
+def test_deps_are_copied_into_a_cache_on_another_disk(tmp_path, monkeypatch):
+    import errno, os
+    deps = tmp_path / "task" / "deps"
+    (deps / "python").mkdir(parents=True)
+    (deps / "python" / "lib.py").write_text("installed\n")
+    real_rename = os.rename
+
+    def rename(src, dst):
+        if Path(src) == deps:                       # moving /deps out of the task dir crosses disks
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(sbx.os, "rename", rename)
+    assert sbx.store_deps(tmp_path / "cache", "k1", deps)
+    stored = tmp_path / "cache" / "k1"
+    assert (stored / "python" / "lib.py").read_text() == "installed\n" and (stored / ".kite-ready").is_file()
+    assert deps.is_symlink() and deps.resolve() == stored.resolve()
+    assert [p.name for p in (tmp_path / "cache").iterdir()] == ["k1"]          # no staging left behind
+    other = tmp_path / "task2" / "deps"
+    (other / "python").mkdir(parents=True)
+    assert not sbx.store_deps(tmp_path / "cache", "k1", other)                  # already stored
+    assert other.is_dir() and not other.is_symlink()
+
+
 def test_old_dependency_sets_are_pruned(tmp_path):
     import os
     for i in range(8):
