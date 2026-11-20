@@ -38,7 +38,8 @@ class FakeDocker:
 
     def __init__(self, *, test_returncode: int = 0, setup_returncode: int = 0,
                  agent_timeout: bool = False, test_returncodes: list[int] | None = None,
-                 review: str = "none", quick_returncodes: list[int] | None = None) -> None:
+                 review: str = "none", quick_returncodes: list[int] | None = None,
+                 check_returncodes: list[int] | None = None) -> None:
         self.calls: list[list[str]] = []
         self.test_returncode = test_returncode
         self.test_returncodes = list(test_returncodes or [])     # one per test run, then test_returncode
@@ -46,6 +47,7 @@ class FakeDocker:
         self.agent_timeout = agent_timeout
         self.review = review          # what the self-review pass does: none | improve | break
         self.quick_returncodes = list(quick_returncodes or [])
+        self.check_returncodes = list(check_returncodes or [])
 
     def kind(self, cmd: list[str]) -> str:
         return value_after(cmd, "--name").split("-")[1]          # kite-<kind>-<task>
@@ -82,6 +84,10 @@ class FakeDocker:
         if kind == "test":
             code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
             output = "2 passed\n" if code == 0 else "FAILED test_calc.py::test_empty - ZeroDivisionError\n1 failed\n"
+            return subprocess.CompletedProcess(cmd, code, output, "")
+        if kind == "check":
+            code = self.check_returncodes.pop(0) if self.check_returncodes else 0
+            output = "" if code == 0 else "calc.py:2:12: F821 Undefined name `total`\nFound 1 error.\n"
             return subprocess.CompletedProcess(cmd, code, output, "")
         raise AssertionError(f"unexpected docker call: {cmd}")
 
@@ -589,6 +595,132 @@ def test_streaming_runner_stops_a_looping_process_right_away(tmp_path):
     code, output = sbx._run_step(settings, sbx.default_runner, name="kite-agent-x", timeout=2,
                                  args=[sys.executable, str(script)], watch=sbx.StuckWatch())
     assert code == 124 and "step timed out" in output
+
+
+def checked_repo(tmp_path: Path, check: str = "ruff check --select F82 {py_files}") -> Path:
+    repo = make_repo(tmp_path)
+    (repo / ".kite.yml").write_text(f"test: python -m pytest -q\ncheck: {check}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "kite.yml")
+    return repo
+
+
+def test_check_command_comes_from_kite_yml_and_fills_in_the_changed_files(tmp_path):
+    repo = checked_repo(tmp_path)
+    assert sbx.repo_settings(SETTINGS, repo).check_command == "ruff check --select F82 {py_files}"
+    (repo / ".kite.yml").write_text("check: ruff check {tests}\n")
+    with pytest.raises(sbx.SandboxError, match="py_files"):
+        sbx.repo_settings(SETTINGS, repo)
+    files = ["calc.py", "docs/a b.md", "pkg/types.pyi"]
+    assert sbx.check_command("ruff check {py_files}", files) == "ruff check calc.py pkg/types.pyi"
+    assert sbx.check_command("prettier --check {files}", files) == "prettier --check calc.py 'docs/a b.md' pkg/types.pyi"
+    assert sbx.check_command("ruff check {py_files}", ["README.md"]) == ""          # nothing to check: skipped
+    assert sbx.check_command("mypy .", []) == "mypy ." and sbx.check_command("", files) == ""
+    assert "ruff check" in sbx.suggest_repo_config(["calc.py"], "[tool.ruff]\nline-length = 100\n")
+
+
+def test_changed_scratch_and_broken_files_are_found(tmp_path):
+    repo = make_repo(tmp_path)
+    base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (repo / "calc.py").write_text("def average(xs):\n    return sum(xs) / len(xs) if xs else 0\n")
+    (repo / "tools").mkdir()
+    (repo / "tools" / "report.py").write_text("def report(:\n    pass\n")
+    (repo / "reproduce_bug.py").write_text("print(1)\n")
+    (repo / "calc.py.orig").write_text("old\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_debug_mode.py").write_text("def test_x():\n    pass\n")
+    files = sbx.changed_files(repo, base)
+    assert set(files) == {"calc.py", "tools/report.py", "reproduce_bug.py", "calc.py.orig", "tests/test_debug_mode.py"}
+    assert sbx.scratch_files(repo, base) == ["calc.py.orig", "reproduce_bug.py"]     # a real test is not scratch
+    problems = sbx.syntax_errors(repo, files)
+    assert problems.startswith("tools/report.py:1: SyntaxError") and "calc.py:" not in problems
+    assert sbx.syntax_command(problems) == "python -m py_compile tools/report.py"
+
+
+def test_a_failing_check_goes_back_to_the_agent_like_a_failing_test(tmp_path):
+    repo = checked_repo(tmp_path)
+    fake = FakeDocker(check_returncodes=[1, 0])
+    logs: list[str] = []
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                       state_dir=tmp_path / "state", task_id="c1", runner=fake, log=logs.append)
+    assert [fake.kind(c) for c in fake.calls] == ["agent", "test", "check", "fix1", "test", "check", "review"]
+    assert run.verified and run.check_exit_code == 0 and run.check_runs == 2 and run.fix_rounds_used == 1
+    assert fake.call("check")[-1] == "ruff check --select F82 calc.py"            # only the changed file
+    assert value_after(fake.call("check"), "--network") == "none"
+    fix = fake.call("fix1")[-1]
+    assert "Test đã QUA, nhưng Kite chạy kiểm tra `ruff check --select F82 calc.py`" in fix
+    assert "F821 Undefined name `total`" in fix and "không thêm `# noqa`" in fix
+    assert "Kite còn kiểm tra bằng `ruff check --select F82 <file .py đã sửa>`" in fake.call("agent")[-1]
+    review = fake.call("review")[-1]
+    assert "và `ruff check --select F82 <file .py đã sửa>`" in review and "Danh sách rà soát:" in review
+    assert "Bảo mật: không ghi cứng mật khẩu" in review
+    assert any("test qua nhưng kiểm tra lỗi (exit 1)" in line for line in logs)
+    # Never fixed within the rounds: not verified, and no review on top of a failing check.
+    fake = FakeDocker(check_returncodes=[1, 1, 1])
+    (tmp_path / "b").mkdir()
+    run = sbx.run_task(SETTINGS, repo=checked_repo(tmp_path / "b"), goal="Sửa average", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="c2", runner=fake,
+                       log=lambda _m: None)
+    assert not run.verified and run.check_exit_code == 1 and run.fix_rounds_used == 2
+    assert "review" not in [fake.kind(c) for c in fake.calls]
+    assert "F821" in run.check_output_tail and run.to_dict()["verified"] is False
+
+
+def test_a_review_that_breaks_the_check_is_rolled_back(tmp_path):
+    fake = FakeDocker(review="improve", check_returncodes=[0, 1])
+    logs: list[str] = []
+    run = sbx.run_task(SETTINGS, repo=checked_repo(tmp_path), goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                       state_dir=tmp_path / "state", task_id="c4", runner=fake, log=logs.append)
+    assert [fake.kind(c) for c in fake.calls][-4:] == ["review", "quick", "test", "check"]   # it added a test
+    assert run.review == "reverted" and run.verified and run.check_exit_code == 0
+    assert "else 0.0" not in (tmp_path / "state" / "c4" / "result.patch").read_text()
+    assert any("kiểm tra 1): trả lại bản trước" in line for line in logs)
+
+
+def test_a_check_tool_that_is_not_installed_is_not_the_agents_job(tmp_path):
+    fake = FakeDocker(check_returncodes=[127])
+    logs: list[str] = []
+    run = sbx.run_task(SETTINGS, repo=checked_repo(tmp_path), goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                       state_dir=tmp_path / "state", task_id="c3", runner=fake, log=logs.append)
+    assert [fake.kind(c) for c in fake.calls] == ["agent", "test", "check"]
+    assert not run.verified and run.check_exit_code == 127 and run.fix_rounds_used == 0
+    assert any("setup đã cài công cụ đó chưa" in line for line in logs)
+
+
+def test_a_syntax_error_outside_the_tests_is_caught_without_a_check(tmp_path):
+    class Broken(FakeDocker):
+        def __call__(self, cmd, *, timeout=None):
+            result = super().__call__(cmd, timeout=timeout)
+            if cmd[:2] != ["docker", "kill"] and self.kind(list(cmd)) == "agent":
+                workspace = Path(value_after(list(cmd), "-v").rsplit(":/work", 1)[0])
+                (workspace / "cli.py").write_text("def main(:\n    pass\n")      # not imported by any test
+            return result
+
+    fake = Broken()
+    _, run = run_task(tmp_path, fake, "s1")
+    assert [fake.kind(c) for c in fake.calls][:3] == ["agent", "test", "fix1"]
+    assert "`python -m py_compile cli.py`" in fake.call("fix1")[-1] and "SyntaxError" in fake.call("fix1")[-1]
+    assert run.check_exit_code == 1 and not run.verified          # the fake fix rounds never repair cli.py
+    assert (tmp_path / "state" / "s1" / "test.log").read_text().count("===== syntax after") == 3
+
+
+def test_scratch_files_are_flagged_for_the_review_and_in_the_result(tmp_path):
+    class Messy(FakeDocker):
+        def __call__(self, cmd, *, timeout=None):
+            result = super().__call__(cmd, timeout=timeout)
+            if cmd[:2] != ["docker", "kill"] and self.kind(list(cmd)) == "agent":
+                workspace = Path(value_after(list(cmd), "-v").rsplit(":/work", 1)[0])
+                (workspace / "repro_average.py").write_text("print(1)\n")
+            return result
+
+    fake = Messy()
+    logs: list[str] = []
+    repo = make_repo(tmp_path)
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                       state_dir=tmp_path / "state", task_id="m1", runner=fake, log=logs.append)
+    assert run.verified and run.scratch_files == ["repro_average.py"]
+    assert "File mới trông như file thử: repro_average.py" in fake.call("review")[-1]
+    assert any("có file trông như file thử: repro_average.py" in line for line in logs)
 
 
 def test_changed_existing_tests_are_flagged_for_the_review(tmp_path):

@@ -111,6 +111,9 @@ class SandboxSettings:
     # the ones the code map ties to the changed code) before the full suite (see quick_test_command).
     quick_tests: bool = True
     quick_test_command: str = ""     # from .kite.yml `quick_test`, with {tests}; derived for plain pytest
+    # After the tests pass: the repository's own static check (lint, types), from .kite.yml `check`.
+    # {files} / {py_files} are filled with the changed files. Part of "verified", like the tests.
+    check_command: str = ""
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
     model_context: dict[str, int] = field(default_factory=dict)
 
@@ -146,13 +149,19 @@ class SandboxRun:
     full_test_runs: int = 0
     stuck_stops: int = 0          # agent steps Kite stopped because they repeated themselves
     tests_edited: list[str] = field(default_factory=list)   # existing test files the agent changed
+    check_command: str = ""
+    check_exit_code: int | None = None    # None: no check ran (none declared, nothing to check)
+    check_seconds: float = 0.0
+    check_runs: int = 0
+    check_output_tail: str = ""
+    scratch_files: list[str] = field(default_factory=list)  # new files that look like experiments
 
     @property
     def verified(self) -> bool:
         """Setup (if any) worked, the agent finished (or was stopped in a loop after its fix was in)
-        and changed something, and Kite's tests passed."""
+        and changed something, Kite's tests passed and so did the check (if any)."""
         return (self.setup_exit_code in (None, 0) and self.agent_status in ("ok", "stuck")
-                and self.test_exit_code == 0 and bool(self.changed_files))
+                and self.test_exit_code == 0 and self.check_exit_code in (None, 0) and bool(self.changed_files))
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -262,7 +271,8 @@ TASK_GUIDES = {
         "3. Sửa đúng phạm vi yêu cầu. Không sửa, xóa hay bỏ qua test để cho qua, trừ khi yêu cầu nói vậy.",
         "4. Chạy lệnh kiểm tra; nếu lỗi thì đọc lỗi, tìm nguyên nhân gốc, sửa và chạy lại cho tới khi qua. "
         "Thử một cách hai lần mà kết quả không đổi thì đổi hướng, đừng lặp lại y nguyên.",
-        "5. Kết thúc bằng tóm tắt ngắn: đã đổi gì, vì sao, kết quả kiểm tra.",
+        "5. Trước khi kết thúc: xóa file thử bạn tạo (reproduce_*.py, debug_*.py...) và print gỡ lỗi bạn thêm. "
+        "Rồi tóm tắt ngắn: đã đổi gì, vì sao, kết quả kiểm tra.",
     ],
     "analysis": [
         "1. Đọc code thật (chạy lệnh nếu cần) trước khi kết luận; không đoán nội dung file chưa đọc.",
@@ -288,6 +298,7 @@ TASK_GUIDES = {
 
 REPO_CONFIG = ".kite.yml"
 REPO_CONFIG_KEYS = {"setup": "setup_command", "test": "test_command", "quick_test": "quick_test_command",
+                    "check": "check_command",
                     "setup_timeout": "setup_timeout_seconds", "test_timeout": "test_timeout_seconds"}
 
 
@@ -301,9 +312,13 @@ def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings
         setup: pip install -r requirements.txt
         test: python -m pytest -q tests
         quick_test: python -m pytest -q {tests}   # optional: the same tests, only the given files
+        check: ruff check --select E9,F63,F7,F82 {py_files}   # optional: after the tests pass
         test_timeout: 900          # seconds, optional (60-3600)
         setup_timeout: 900
 
+    ``check`` (lint, type check) runs after the tests pass, without network; a failure goes back to the
+    agent like a failing test. ``{files}`` / ``{py_files}`` become the changed (Python) files; with
+    nothing to check there, the check is skipped. Its tool must be installed by ``setup``.
     The commands still run in the sandbox (setup with the operator's setup network, tests with none).
     A malformed file is an error, not a silent fallback: it would otherwise test the wrong thing.
     """
@@ -330,6 +345,8 @@ def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings
             raise SandboxError(f"{REPO_CONFIG}: {key} must be a shell command string ('' to skip)")
         elif key == "quick_test" and value and "{tests}" not in value:
             raise SandboxError(f"{REPO_CONFIG}: quick_test must contain {{tests}} (where Kite puts the test files)")
+        elif key == "check" and value and "{tests}" in value:
+            raise SandboxError(f"{REPO_CONFIG}: check takes {{files}} or {{py_files}}, not {{tests}}")
         changes[field_name] = value
     from dataclasses import replace
 
@@ -357,7 +374,8 @@ def suggest_repo_config(files: list[str], pyproject: str = "") -> str:
         if folder and folder not in folders:
             folders.append(folder)
     nested = [f for f in folders if "/" in f]
-    if not setup and not nested:
+    ruff = "ruff.toml" in files or ".ruff.toml" in files or "[tool.ruff" in pyproject
+    if not setup and not nested and not ruff:
         return ""
     lines = ["# Đề xuất của Kite: kiểm tra lại (nhất là biến môi trường test cần) rồi commit vào gốc repo"]
     if setup:
@@ -365,14 +383,29 @@ def suggest_repo_config(files: list[str], pyproject: str = "") -> str:
     if nested:
         lines += [f"test: PYTHONPATH=. python -m pytest -q {' '.join(sorted(folders)[:6])}",
                   "quick_test: PYTHONPATH=. python -m pytest -q {tests}"]
+    if ruff:
+        lines += ["# setup phải cài ruff (vd. thêm `ruff` vào lệnh pip ở trên)",
+                  "check: ruff check {py_files}"]
     return "\n".join(lines) + "\n"
 
 
+REVIEW_CHECKLIST = [
+    "- Phạm vi: chỉ đổi những gì yêu cầu cần; không đổi tên, định dạng lại hay \"dọn\" phần không liên quan.",
+    "- Giao diện: không đổi tên/tham số của hàm, class, route, trường dữ liệu mà chỗ khác đang dùng, "
+    "trừ khi yêu cầu bảo vậy.",
+    "- Lỗi: không nuốt lỗi (`except: pass`, bắt rồi bỏ qua); lỗi phải báo đúng kiểu/mã mà đặc tả nói.",
+    "- Bảo mật: không ghi cứng mật khẩu, token, khóa; không đưa dữ liệu từ ngoài vào lệnh shell, SQL, đường dẫn "
+    "file hay eval mà không kiểm tra; không tắt kiểm tra TLS hay xác thực.",
+    "- Sạch: không còn print/log gỡ lỗi, code chết, file thử (reproduce_*.py, debug_*.py, *.orig).",
+]
+
+
 def review_prompt(goal: str, test_command: str, impact: str = "", quick: str = "",
-                  edited: list[str] = ()) -> str:
-    """Prompt for the self-review pass, after Kite's tests already passed.
+                  edited: list[str] = (), check: str = "", scratch: list[str] = ()) -> str:
+    """Prompt for the self-review pass, after Kite's tests (and the check) already passed.
 
     ``impact`` (codemap.impact): the callers of what the agent changed, found by the code map.
+    ``check``: the repository's check command (template); ``scratch``: new files that look like experiments.
     """
     lines = [
         "Test của Kite đã QUA. Đây là vòng RÀ SOÁT lời giải trước khi bàn giao (không làm lại từ đầu).",
@@ -387,16 +420,20 @@ def review_prompt(goal: str, test_command: str, impact: str = "", quick: str = "
         "qua test không có nghĩa là đúng đặc tả.",
         "3. Tìm mọi chỗ khác trong repo dùng tới phần đã đổi (`grep -rn <tên> .`) và sửa cho nhất quán"
         + (" (bắt đầu từ danh sách bên dưới)." if impact else "."),
-        "4. Nếu thấy sai thì sửa code. Không sửa hay xóa file test có sẵn và conftest.py; được THÊM file test mới "
+        "4. Rà phần đã đổi theo danh sách dưới đây.",
+        "5. Nếu thấy sai thì sửa code. Không sửa hay xóa file test có sẵn và conftest.py; được THÊM file test mới "
         "cho các trường hợp biên vừa kiểm tra.",
-        f"5. Chạy lại `{test_command}` và đảm bảo vẫn qua.",
-        "6. Kết thúc bằng: các quy tắc đã kiểm tra, chỗ đã sửa thêm (hoặc \"không cần sửa\").",
+        f"6. Chạy lại `{test_command}`" + (f" và `{check_hint(check)}`" if check else "") + ", đảm bảo vẫn qua.",
+        "7. Kết thúc bằng: các quy tắc đã kiểm tra, chỗ đã sửa thêm (hoặc \"không cần sửa\").",
     ]
     if quick_hint(quick):
         lines.append(quick_hint(quick))
+    lines += ["", "Danh sách rà soát:", *REVIEW_CHECKLIST]
     if edited:
         lines += ["", "Bạn đã sửa hoặc xóa test có sẵn: " + ", ".join(edited) + ". Chỉ giữ nếu yêu cầu đổi đúng hành vi "
                   "mà test cũ kiểm tra; nếu chỉ để cho test qua thì trả file test về như cũ và sửa code."]
+    if scratch:
+        lines += ["", "File mới trông như file thử: " + ", ".join(scratch) + ". Xóa nếu nó không thuộc lời giải."]
     if impact:
         lines += ["", "Phần bạn đã đổi và những chỗ đang dùng nó (bản đồ code của Kite; có thể thiếu, vẫn grep thêm):",
                   impact]
@@ -482,6 +519,71 @@ def edited_tests(workspace: Path, base: str) -> list[str]:
     rows = _git(Path(workspace), "diff", "--name-status", base, check=False).splitlines()
     return sorted(row.split("\t")[-1] for row in rows
                   if row[:1] in ("M", "D", "R") and codemap.is_test_path(row.split("\t")[1]))
+
+
+SCRATCH_FILE = re.compile(
+    r"(^|/)((repro|reproduce|reproduction|debug|scratch|tmp|temp|playground)([_.-][^/]*)?\.(py|sh|js|ts|txt|json)"
+    r"|[^/]+\.(orig|rej|bak|log))$", re.I)
+CHECK_UNAVAILABLE = (126, 127)     # the check's tool is not installed or not runnable: setup's job, not the agent's
+
+
+def changed_files(workspace: Path, base: str) -> list[str]:
+    """Files added or modified since ``base`` that exist now (new, untracked files included)."""
+    workspace = Path(workspace)
+    tracked = _git(workspace, "diff", "--name-only", "--diff-filter=AMR", base, check=False).splitlines()
+    new = _git(workspace, "ls-files", "--others", "--exclude-standard", check=False).splitlines()
+    return [path for path in dict.fromkeys(tracked + new)
+            if path and "__pycache__/" not in path and (workspace / path).is_file()]
+
+
+def scratch_files(workspace: Path, base: str) -> list[str]:
+    """New files that look like the agent's own experiments (reproduce_x.py, debug.log, a.py.orig)."""
+    workspace = Path(workspace)
+    added = _git(workspace, "diff", "--name-only", "--diff-filter=A", base, check=False).splitlines()
+    added += _git(workspace, "ls-files", "--others", "--exclude-standard", check=False).splitlines()
+    return sorted(path for path in set(added)
+                  if path and SCRATCH_FILE.search(path) and not codemap.is_test_path(path)
+                  and (workspace / path).is_file())
+
+
+def syntax_errors(workspace: Path, files: list[str], limit: int = 5) -> str:
+    """Changed Python files that do not even parse. Kite checks this itself: compile only, nothing runs."""
+    problems = []
+    for path in files:
+        if not path.endswith(".py"):
+            continue
+        try:
+            compile((Path(workspace) / path).read_bytes(), path, "exec", dont_inherit=True)
+        except SyntaxError as exc:
+            problems.append(f"{path}:{exc.lineno}: SyntaxError: {exc.msg}")
+        except (OSError, ValueError):
+            continue
+        if len(problems) >= limit:
+            break
+    return "\n".join(problems)
+
+
+def syntax_command(problems: str) -> str:
+    """The command that shows the same syntax errors (what the agent can run to check its fix)."""
+    files = dict.fromkeys(line.split(":", 1)[0] for line in problems.splitlines() if line)
+    return "python -m py_compile " + " ".join(shlex.quote(path) for path in files)
+
+
+def check_command(template: str, files: list[str]) -> str:
+    """The repository's check with {files} / {py_files} filled in; "" when it needs files and has none."""
+    if not template:
+        return ""
+    python = [path for path in files if path.endswith((".py", ".pyi"))]
+    for slot, chosen in (("{files}", files), ("{py_files}", python)):
+        if slot in template:
+            if not chosen:
+                return ""
+            template = template.replace(slot, " ".join(shlex.quote(path) for path in chosen))
+    return template
+
+
+def check_hint(template: str) -> str:
+    return template.replace("{files}", "<file đã sửa>").replace("{py_files}", "<file .py đã sửa>")
 
 
 def _is_noise(path: str) -> bool:
@@ -755,7 +857,7 @@ def quick_hint(template: str) -> str:
 
 
 def agent_prompt(goal: str, test_command: str, *, task_type: str = "coding", context: str = "",
-                 quick: str = "") -> str:
+                 quick: str = "", check: str = "") -> str:
     lines = [goal.strip(), "", "Cách làm:", *TASK_GUIDES.get(task_type, TASK_GUIDES["coding"]), "",
              "Làm việc trong thư mục hiện tại (/work). Môi trường không có Internet: "
              "không cài gói, không tải gì về; thư viện cần thiết đã được cài sẵn."]
@@ -763,6 +865,8 @@ def agent_prompt(goal: str, test_command: str, *, task_type: str = "coding", con
         lines.append(f"Kiểm tra lại bằng lệnh: {test_command}")
         if quick_hint(quick):
             lines.append(quick_hint(quick))
+        if check:
+            lines.append(f"Sau khi test qua, Kite còn kiểm tra bằng `{check_hint(check)}`; chạy lệnh này trước khi kết thúc.")
     lines.append("Không commit, không push: Kite sẽ tự lấy thay đổi để người dùng duyệt.")
     if context:
         lines += ["", "Ngữ cảnh repo (Kite chuẩn bị sẵn; vẫn đọc lại file trước khi sửa):", context]
@@ -788,11 +892,26 @@ def failure_digest(output: str, limit: int = FIX_OUTPUT_CHARS) -> str:
 
 
 def fix_prompt(goal: str, test_command: str, test_output: str, attempt: int, rounds: int,
-               targets: str = "", quick: str = "", stuck: str = "") -> str:
+               targets: str = "", quick: str = "", stuck: str = "", check: str = "") -> str:
     """The next round after Kite's own test run failed: same goal, plus the real failing output.
 
     ``targets`` (codemap.failing_targets): what each failing test calls, from the code map.
+    ``check``: the tests passed but this check failed; ``test_output`` is then the check's output.
     """
+    if check:
+        lines = [
+            goal.strip(), "",
+            f"Test đã QUA, nhưng Kite chạy kiểm tra `{check}` (không mạng) và có lỗi "
+            f"(vòng sửa {attempt}/{rounds}). Output:",
+            "```", clean_output(test_output)[-FIX_OUTPUT_CHARS:].strip(), "```",
+            "Các thay đổi lần trước vẫn còn trong /work. Sửa đúng các lỗi được báo trong code; không tắt quy tắc, "
+            "không thêm `# noqa` hay `type: ignore` để lách. Rồi chạy lại lệnh kiểm tra đó và "
+            f"`{test_command}` cho tới khi cả hai qua.",
+            "Môi trường không có Internet. Không commit, không push.",
+        ]
+        if stuck:
+            lines[1:1] = [f"Lần trước Kite đã dừng bạn vì {stuck}. Đổi hướng.", ""]
+        return "\n".join(lines)
     lines = [
         goal.strip(), "",
         f"Kite đã tự chạy `{test_command}` (không mạng) sau lần làm trước và test THẤT BẠI "
@@ -1091,8 +1210,10 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                            encoding="utf-8")
     graph = code_graph(settings, workspace, root / "graph", lambda m: log(f"[{task_id}] {m}")) if with_context else None
     template = quick_template(settings, run.test_command)
+    run.check_command = settings.check_command if run.test_command else ""
     prompt = agent_prompt(goal, run.test_command, task_type=task_type,
-                          context=repo_context(workspace, goal, graph=graph) if with_context else "", quick=template)
+                          context=repo_context(workspace, goal, graph=graph) if with_context else "", quick=template,
+                          check=run.check_command)
     agent_log, test_log = [], []
     attempt, test_output = 0, ""
 
@@ -1123,6 +1244,28 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.test_seconds = round(run.test_seconds + time.monotonic() - started, 1)
         test_log.append(f"===== after {after} exit={code} =====\n{output}")
         return code, output, run.test_command
+
+    def run_check(after: str) -> tuple[int | None, str, str]:
+        """After the tests pass: Python syntax of the changed files (Kite itself), then the repo's check."""
+        files = changed_files(workspace, run.patch_base)
+        problems = syntax_errors(workspace, files)
+        if problems:
+            test_log.append(f"===== syntax after {after} =====\n{problems}")
+            return 1, problems, syntax_command(problems)
+        command = check_command(run.check_command, files)
+        if not command:
+            return None, "", ""
+        log(f"[{task_id}] Kite kiểm tra (không mạng): {command}")
+        name = container_name("check", task_id)
+        started = time.monotonic()
+        code, output = _run_step(
+            settings, runner, name=name, timeout=settings.test_timeout_seconds,
+            args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
+            + ["sh", "-c", command])
+        run.check_runs += 1
+        run.check_seconds = round(run.check_seconds + time.monotonic() - started, 1)
+        test_log.append(f"===== check after {after} exit={code} =====\n{output}")
+        return code, output, command
     while True:
         kind = "agent" if attempt == 0 else f"fix{attempt}"
         log(f"[{task_id}] {'agent' if attempt == 0 else f'vòng sửa {attempt}/{settings.fix_rounds}:'} {model} "
@@ -1146,16 +1289,35 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             break
         run.test_exit_code, test_output, ran = run_tests(kind, test_output)
         run.test_output_tail = _tail(test_output)
-        if run.test_exit_code == 0 or run.agent_status not in ("ok", "stuck") or attempt >= settings.fix_rounds:
+        failed_check, check_output = "", ""
+        run.check_exit_code, run.check_output_tail = None, ""      # the check only counts on passing tests
+        if run.test_exit_code == 0:
+            run.check_exit_code, check_output, checked = run_check(kind)
+            run.check_output_tail = _tail(check_output)
+            if run.check_exit_code in CHECK_UNAVAILABLE:
+                log(f"[{task_id}] lệnh check không chạy được (exit {run.check_exit_code}): setup đã cài công cụ "
+                    "đó chưa? Không đưa lỗi này cho agent")
+                break
+            if run.check_exit_code not in (None, 0):
+                failed_check = checked
+                log(f"[{task_id}] test qua nhưng kiểm tra lỗi (exit {run.check_exit_code}): {checked}")
+        if ((run.test_exit_code == 0 and not failed_check) or run.agent_status not in ("ok", "stuck")
+                or attempt >= settings.fix_rounds):
             break
         attempt += 1
         run.fix_rounds_used = attempt
-        prompt = fix_prompt(goal, ran, test_output, attempt, settings.fix_rounds,
-                            codemap.failing_targets(graph, test_output) if graph is not None else "", quick=template,
-                            stuck=watch.reason)
+        if failed_check:
+            prompt = fix_prompt(goal, run.test_command, check_output, attempt, settings.fix_rounds, quick=template,
+                                stuck=watch.reason, check=failed_check)
+        else:
+            prompt = fix_prompt(goal, ran, test_output, attempt, settings.fix_rounds,
+                                codemap.failing_targets(graph, test_output) if graph is not None else "",
+                                quick=template, stuck=watch.reason)
 
-    # 4. Self-review: tests pass, but passing tests is not the spec. Keep it only if tests still pass.
-    if wants_review(settings, task_type, run.test_command, run.agent_status, run.test_exit_code):
+    # 4. Self-review: tests pass, but passing tests is not the spec. Keep it only if tests (and the
+    #    check) still pass.
+    if (wants_review(settings, task_type, run.test_command, run.agent_status, run.test_exit_code)
+            and run.check_exit_code in (None, 0)):
         before = snapshot_tree(workspace)
         log(f"[{task_id}] vòng rà soát: {model} kiểm tra lại lời giải theo yêu cầu và docstring...")
         name = container_name("review", task_id)
@@ -1167,19 +1329,23 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             + ["opencode", "run", "-m", f"kite/{model}",
                review_prompt(goal, run.test_command,
                              codemap.impact(graph, workspace, run.patch_base) if graph is not None else "",
-                             quick=template, edited=edited_tests(workspace, run.patch_base))])
+                             quick=template, edited=edited_tests(workspace, run.patch_base),
+                             check=run.check_command, scratch=scratch_files(workspace, run.patch_base))])
         run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
         agent_log.append(f"===== review exit={review_code} =====\n{output}")
         if snapshot_tree(workspace) == before:
             run.review = "unchanged"
         else:
             code, test_output, _ = run_tests("review")
-            if review_code == 0 and code == 0:
+            check_code, check_output, _ = run_check("review") if code == 0 else (None, "", "")
+            if review_code == 0 and code == 0 and check_code in (None, 0):
                 run.review, run.agent_output_tail, run.test_output_tail = "kept", _tail(output), _tail(test_output)
+                run.check_exit_code, run.check_output_tail = check_code, _tail(check_output)
             else:
                 restore_tree(workspace, before)
                 run.review = "reverted"
-                log(f"[{task_id}] rà soát làm hỏng (agent exit {review_code}, test exit {code}): trả lại bản trước")
+                log(f"[{task_id}] rà soát làm hỏng (agent exit {review_code}, test exit {code}, kiểm tra "
+                    f"{check_code}): trả lại bản trước")
     (root / "agent.log").write_text("\n".join(agent_log), encoding="utf-8")
     if test_log:
         (root / "test.log").write_text("\n".join(test_log), encoding="utf-8")
@@ -1188,6 +1354,9 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     run.tests_edited = edited_tests(workspace, run.patch_base)
     if run.tests_edited:
         log(f"[{task_id}] lưu ý: agent đã sửa test có sẵn: {', '.join(run.tests_edited)}")
+    run.scratch_files = scratch_files(workspace, run.patch_base)
+    if run.scratch_files:
+        log(f"[{task_id}] lưu ý: có file trông như file thử: {', '.join(run.scratch_files)}")
     run.changed_files = collect_patch(workspace, run.patch_base, patch_path)
     run.patch_path = str(patch_path)
     return _write_result(root, run)

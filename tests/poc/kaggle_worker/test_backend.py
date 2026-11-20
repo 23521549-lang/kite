@@ -40,8 +40,10 @@ def make_repo(tmp_path: Path) -> tuple[Path, str]:
 
 class FakeDocker:
     def __init__(self, *, test_returncode: int = 0, setup_returncode: int = 0,
-                 test_returncodes: list[int] | None = None, review: str = "none") -> None:
+                 test_returncodes: list[int] | None = None, review: str = "none",
+                 check_returncodes: list[int] | None = None) -> None:
         self.calls: list[list[str]] = []
+        self.check_returncodes = list(check_returncodes or [])
         self.review = review
         self.test_returncode = test_returncode
         self.test_returncodes = list(test_returncodes or [])
@@ -69,6 +71,9 @@ class FakeDocker:
         if kind == "test":
             code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
             return CP(cmd, code, "2 passed\n" if code == 0 else "E   AssertionError: average\n1 failed\n", "")
+        if kind == "check":
+            code = self.check_returncodes.pop(0) if self.check_returncodes else 0
+            return CP(cmd, code, "" if code == 0 else "calc.py:2:12: F821 Undefined name `total`\n", "")
         raise AssertionError(f"unexpected docker call: {cmd}")
 
     def kinds(self) -> list[str]:
@@ -462,3 +467,55 @@ def test_backend_stops_a_looping_agent_and_says_so(tmp_path):
     assert record["stuck_stops"] == 1 and record["verified"] and record["tests_edited"] == []
     trace = read_jsonl(backend.task_dir("task-loop") / "trace.jsonl")
     assert any(e.get("stuck") for e in trace if e["event"] == "step")
+
+
+def test_backend_runs_the_repository_check_after_the_tests_and_reports_it(tmp_path):
+    from poc.kaggle_worker.journal import read_jsonl
+
+    repo, _ = make_repo(tmp_path)
+    (repo / ".kite.yml").write_text("test: python -m pytest -q\ncheck: ruff check {py_files}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "kite config")
+    head = git(repo, "rev-parse", "HEAD")
+    store = make_store(tmp_path)
+    fake = FakeDocker(check_returncodes=[1, 0], review="improve")
+    backend = make_backend(tmp_path, store, fake)
+    task = make_task(store, repo, head, "task-check")
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        return await backend.run_opencode(task, route, work, "", "s", "k4", lambda beat: None)
+
+    result = asyncio.run(scenario())
+    assert fake.kinds() == ["setup", "agent", "test", "check", "fix1", "test", "check", "review", "test", "check"]
+    fix = fake.agent_calls()[1][-1]
+    assert "Test đã QUA, nhưng Kite chạy kiểm tra `ruff check calc.py`" in fix and "F821" in fix
+    assert "Kite check `ruff check calc.py` (no network): PASSED." in result.summary
+    (record,) = read_jsonl(backend.state_dir / "journal" / "tasks.jsonl")
+    assert record["check_exit"] == 0 and record["verified"] and record["review"] == "kept"
+    saved = json.loads((backend.task_dir("task-check") / "result.json").read_text())
+    assert saved["check_command"] == "ruff check calc.py" and saved["scratch_files"] == []
+    trace = read_jsonl(backend.task_dir("task-check") / "trace.jsonl")
+    assert any(e["event"] == "repo_config" and e["check"] == "ruff check {py_files}" for e in trace)
+
+
+def test_backend_never_verifies_a_task_whose_check_keeps_failing(tmp_path):
+    repo, _ = make_repo(tmp_path)
+    (repo / ".kite.yml").write_text("test: python -m pytest -q\ncheck: ruff check {py_files}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "kite config")
+    store = make_store(tmp_path)
+    fake = FakeDocker(check_returncodes=[1, 1, 1])
+    backend = make_backend(tmp_path, store, fake)
+    task = make_task(store, repo, git(repo, "rev-parse", "HEAD"), "task-check-bad")
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        return await backend.run_opencode(task, route, work, "", "s", "k4", lambda beat: None)
+
+    result = asyncio.run(scenario())
+    assert "review" not in fake.kinds() and "FAILED (exit 1)" in result.summary and "F821" in result.summary
+    saved = json.loads((backend.task_dir("task-check-bad") / "result.json").read_text())
+    assert saved["verified"] is False and saved["check_exit_code"] == 1 and saved["fix_rounds_used"] == 2

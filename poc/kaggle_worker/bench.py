@@ -878,9 +878,10 @@ class RepoTask:
 
 
 AIOPS_KITE_YML = """# How Kite installs and tests this repository (added by the Kite bench).
-setup: pip install -q -r services/backend/requirements.txt
+setup: pip install -q -r services/backend/requirements.txt ruff==0.16.9
 test: PYTHONPATH=. AWS_DEFAULT_REGION=us-east-1 python -m pytest -q -p no:cacheprovider -W ignore -k "not test_an_unknown_name_is_refused" services/backend/tests services/agent/tests
 quick_test: PYTHONPATH=. AWS_DEFAULT_REGION=us-east-1 python -m pytest -q -p no:cacheprovider -W ignore -k "not test_an_unknown_name_is_refused" {tests}
+check: ruff check --quiet --no-cache --select E9,F63,F7,F82 {py_files}
 setup_timeout: 1200
 test_timeout: 1200
 """
@@ -889,6 +890,7 @@ test_timeout: 1200
 # the fix (checked), on bases where the full suite (1100+ tests, offline, moto) is green. One test is
 # deselected: on the R1 and R3 bases test_an_unknown_name_is_refused reaches real DynamoDB (the very
 # usage write R1 removes), so it fails with no network and would send the agent after the wrong thing.
+# The check (syntax errors, undefined names: E9,F63,F7,F82) is clean on all four bases.
 REPO_TASKS = [
     RepoTask("R1-usage-404", "5138707fb810c8297f260e20c8e240dc04a6f01a",
              "de4214bae25879defacefac673c26844ccea78c4", ("services/backend/tests/test_usage_measured.py",),
@@ -1002,7 +1004,9 @@ def score_code(task, run: dict) -> dict:
             "setup_cached": run.get("setup_cached"), "test_seconds": run.get("test_seconds"),
             "full_test_runs": run.get("full_test_runs"), "quick_test_seconds": run.get("quick_test_seconds"),
             "quick_test_runs": run.get("quick_test_runs"), "stuck_stops": run.get("stuck_stops"),
-            "tests_edited": run.get("tests_edited")}
+            "tests_edited": run.get("tests_edited"), "check_exit_code": run.get("check_exit_code"),
+            "check_runs": run.get("check_runs"), "check_seconds": run.get("check_seconds"),
+            "scratch_files": run.get("scratch_files")}
 
 
 # --------------------------------------------------------------------------------------- driver
@@ -1038,7 +1042,8 @@ def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, sy
                 log(f"[{model}] {task.id} {'OK' if outcome['passed'] else 'SAI'} {outcome.get('agent_seconds')}s"
                     f" | vòng sửa {outcome.get('fix_rounds_used', 0)} | rà soát {outcome.get('review')}"
                     f" | test ẩn {outcome.get('hidden_passed')} | tổng {outcome.get('wall_seconds')}s"
-                    f" | dừng vì lặp {outcome.get('stuck_stops') or 0}")
+                    f" | dừng vì lặp {outcome.get('stuck_stops') or 0} | kiểm tra {outcome.get('check_exit_code')}"
+                    f" | file thử {outcome.get('scratch_files') or '-'}")
         (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     results["finished"] = time.strftime("%Y-%m-%d %H:%M")
     (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1103,14 +1108,17 @@ def render_report(results: dict) -> str:
     if timed:
         lines += ["", "## Thời gian từng task code (giây)", "",
                   "| Model | Task | Đạt | Tổng | Cài thư viện | Agent | Test đầy đủ (lần) | Test nhanh (lần) "
-                  "| Vòng sửa | Rà soát | Dừng vì lặp |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+                  "| Kiểm tra (lần) | Vòng sửa | Rà soát | Dừng vì lặp | File thử |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for model, item in timed:
             setup = "dùng lại" if item.get("setup_cached") else item.get("setup_seconds")
+            check = {None: "-", 0: "✓"}.get(item.get("check_exit_code"), f"✗ {item.get('check_exit_code')}")
             lines.append(f"| `{model}` | {item['id']} | {'✓' if item['passed'] else '✗'} | {item['wall_seconds']} "
                          f"| {setup} | {item.get('agent_seconds')} | {item.get('test_seconds')} "
                          f"({item.get('full_test_runs')}) | {item.get('quick_test_seconds')} "
-                         f"({item.get('quick_test_runs')}) | {item.get('fix_rounds_used', 0)} | {item.get('review')} "
-                         f"| {item.get('stuck_stops') or 0} |")
+                         f"({item.get('quick_test_runs')}) | {check} ({item.get('check_runs') or 0}) "
+                         f"| {item.get('fix_rounds_used', 0)} | {item.get('review')} "
+                         f"| {item.get('stuck_stops') or 0} | {', '.join(item.get('scratch_files') or []) or '-'} |")
     lines += ["", "## Kịch bản sai", ""]
     for model, entry in results["models"].items():
         for item in entry.get("lead") or []:
@@ -1122,6 +1130,7 @@ def render_report(results: dict) -> str:
             if not item["passed"]:
                 lines.append(f"- `{model}` {item['id']}: {item.get('error') or item.get('agent_status')}, "
                              f"test exit {item.get('test_exit_code')}, test ẩn {item.get('hidden_passed')}, "
+                             f"kiểm tra {item.get('check_exit_code')}, "
                              f"vòng sửa {item.get('fix_rounds_used', 0)}, rà soát {item.get('review')}, "
                              f"sửa test: {item.get('touched_tests')}")
     lines += ["", "## Cách chấm", "",
@@ -1132,7 +1141,8 @@ def render_report(results: dict) -> str:
               "- **Code**: agent chạy trong sandbox thật trên repo mẫu có test đang fail; đạt khi Kite tự chạy test "
               "(không mạng) qua, agent không sửa file test, và (C5–C8) bộ test ẩn agent không thấy cũng qua. "
               "C1–C4 dễ; C5 lần lỗi qua 3 file, C6 nhiều trường hợp biên, C7 refactor phải sửa mọi chỗ gọi, "
-              "C8 test hiện có quá sơ sài.",
+              "C8 test hiện có quá sơ sài. R1–R4: repo thật (aiops-traffic-shaper), test ẩn lấy từ commit sửa thật; "
+              "`.kite.yml` của bench có thêm `check:` (ruff: lỗi cú pháp, tên chưa định nghĩa), cũng phải qua.",
               "- **Tốc độ**: `timings` của llama.cpp ở lần gọi thứ hai; thời gian đổi model = lần một trừ lần hai."]
     return "\n".join(lines) + "\n"
 

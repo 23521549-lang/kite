@@ -172,7 +172,8 @@ class SandboxActivityBackend:
         except sbx.SandboxError as exc:
             raise ApplicationError(str(exc), non_retryable=True) from exc
         if settings is not self.settings:
-            self._trace(task.task_id, "repo_config", setup=settings.setup_command, test=settings.test_command)
+            self._trace(task.task_id, "repo_config", setup=settings.setup_command, test=settings.test_command,
+                        check=settings.check_command or None)
         cache_root = self.state_dir / "deps-cache" if settings.deps_cache else None
         key = sbx.deps_key(settings, work, settings.setup_command) if cache_root is not None else None
         cached = sbx.cached_deps(cache_root, key)
@@ -251,10 +252,12 @@ class SandboxActivityBackend:
                          graph: sbx.codemap.CodeGraph | None = None) -> CodingRunResult:
         settings = sbx.repo_settings(self.settings, work)   # the repo's .kite.yml (already validated in setup)
         template = sbx.quick_template(settings)
-        prompt = sbx.agent_prompt(goal, settings.test_command, task_type=task.task_type, context=context,
-                                  quick=template)
         test_command = settings.test_command
+        check_template = settings.check_command if test_command else ""
+        prompt = sbx.agent_prompt(goal, settings.test_command, task_type=task.task_type, context=context,
+                                  quick=template, check=check_template)
         attempt, seconds, test_code, test_output = 0, 0.0, None, ""
+        check_code, check_output, check_ran = None, "", ""
 
         async def run_tests(after: str, last_output: str = "") -> tuple[int, str, str]:
             """The related tests first (seconds), the full suite only if they pass."""
@@ -276,6 +279,25 @@ class SandboxActivityBackend:
             with (root / "test.log").open("a", encoding="utf-8") as stream:
                 stream.write(f"\n===== after {after} exit={code} =====\n{output}")
             return code, output, test_command
+
+        async def run_check(after: str) -> tuple[int | None, str, str]:
+            """After the tests pass: Python syntax of the changed files, then the repo's own check."""
+            files = await asyncio.to_thread(sbx.changed_files, work, patch_base)
+            problems = await asyncio.to_thread(sbx.syntax_errors, work, files)
+            if problems:
+                with (root / "test.log").open("a", encoding="utf-8") as stream:
+                    stream.write(f"\n===== syntax after {after} =====\n{problems}")
+                return 1, problems, sbx.syntax_command(problems)
+            command = sbx.check_command(check_template, files)
+            if not command:
+                return None, "", ""
+            name = sbx.container_name("check", slug)
+            code, output, _ = await self._run_container(
+                name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
+                + ["sh", "-c", command], settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
+            with (root / "test.log").open("a", encoding="utf-8") as stream:
+                stream.write(f"\n===== check after {after} exit={code} =====\n{output}")
+            return code, output, command
         stuck_stops = 0
         while True:
             kind = "agent" if attempt == 0 else f"fix{attempt}"
@@ -297,15 +319,28 @@ class SandboxActivityBackend:
             if not test_command:
                 break
             test_code, test_output, ran = await run_tests(kind, test_output)
-            if test_code == 0 or status not in ("ok", "stuck") or attempt >= self.settings.fix_rounds:
+            failed_check = ""
+            check_code, check_output, check_ran = None, "", ""      # the check only counts on passing tests
+            if test_code == 0:
+                check_code, check_output, check_ran = await run_check(kind)
+                if check_code in sbx.CHECK_UNAVAILABLE:
+                    break                           # the tool is missing: setup's job, not the agent's
+                if check_code not in (None, 0):
+                    failed_check = check_ran
+            if ((test_code == 0 and not failed_check) or status not in ("ok", "stuck")
+                    or attempt >= self.settings.fix_rounds):
                 break
             attempt += 1
-            prompt = sbx.fix_prompt(goal, ran, test_output, attempt, self.settings.fix_rounds,
-                                    sbx.codemap.failing_targets(graph, test_output) if graph is not None else "",
-                                    quick=template, stuck=watch.reason)
+            if failed_check:
+                prompt = sbx.fix_prompt(goal, test_command, check_output, attempt, self.settings.fix_rounds,
+                                        quick=template, stuck=watch.reason, check=failed_check)
+            else:
+                prompt = sbx.fix_prompt(goal, ran, test_output, attempt, self.settings.fix_rounds,
+                                        sbx.codemap.failing_targets(graph, test_output) if graph is not None else "",
+                                        quick=template, stuck=watch.reason)
 
         review = "skipped"
-        if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code):
+        if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code) and check_code in (None, 0):
             before = await asyncio.to_thread(sbx.snapshot_tree, work)
             name = sbx.container_name("review", slug)
             review_code, review_output, step_seconds = await self._run_container(
@@ -314,7 +349,8 @@ class SandboxActivityBackend:
                 + ["opencode", "run", "-m", f"kite/{route.model_id}",
                    sbx.review_prompt(goal, test_command, await asyncio.to_thread(
                        sbx.codemap.impact, graph, work, patch_base) if graph is not None else "", quick=template,
-                       edited=await asyncio.to_thread(sbx.edited_tests, work, patch_base))],
+                       edited=await asyncio.to_thread(sbx.edited_tests, work, patch_base), check=check_template,
+                       scratch=await asyncio.to_thread(sbx.scratch_files, work, patch_base))],
                 self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id, sbx.StuckWatch())
             seconds = round(seconds + step_seconds, 1)
             with (root / "agent.log").open("a", encoding="utf-8") as stream:
@@ -325,15 +361,20 @@ class SandboxActivityBackend:
                 review = "unchanged"
             else:
                 code_after, test_after, _ = await run_tests("review")
-                if review_code == 0 and code_after == 0:
+                check_after, check_after_output, check_after_ran = (
+                    await run_check("review") if code_after == 0 else (None, "", ""))
+                if review_code == 0 and code_after == 0 and check_after in (None, 0):
                     review, output, test_output = "kept", review_output, test_after
+                    check_code, check_output, check_ran = check_after, check_after_output, check_after_ran
                 else:
                     await asyncio.to_thread(sbx.restore_tree, work, before)
                     review = "reverted"
 
         patch_path = root / "result.patch"
         tests_edited = await asyncio.to_thread(sbx.edited_tests, work, patch_base)
+        scratch = await asyncio.to_thread(sbx.scratch_files, work, patch_base)
         changed = await asyncio.to_thread(sbx.collect_patch, work, patch_base, patch_path)
+        verified = status in ("ok", "stuck") and test_code == 0 and check_code in (None, 0) and bool(changed)
         patch = patch_path.read_text(encoding="utf-8")
 
         lines = [f"Agent {route.model_id} on {route.worker_id}: {status} (exit {code}, {seconds}s"
@@ -345,12 +386,24 @@ class SandboxActivityBackend:
         if tests_edited:
             lines.append(f"NOTE: existing tests were changed: {', '.join(tests_edited)} - check that this was "
                          "intended and not just to make tests pass.")
+        if scratch:
+            lines.append(f"NOTE: new files that look like experiments: {', '.join(scratch)} - drop them if they "
+                         "are not part of the change.")
         if test_code is None:
             lines.append("Kite test run: skipped (no sandbox.test_command).")
         else:
             verdict = "PASSED" if test_code == 0 else f"FAILED (exit {test_code})"
             lines.append(f"Kite test run `{settings.test_command}` (no network): {verdict}.")
             lines.append(sbx._tail(test_output, 1500).strip())
+        if check_code is not None:
+            if check_code in sbx.CHECK_UNAVAILABLE:
+                lines.append(f"Kite check `{check_ran}` could not run (exit {check_code}): does `setup` in .kite.yml "
+                             "install its tool?")
+            else:
+                lines.append(f"Kite check `{check_ran}` (no network): "
+                             f"{'PASSED' if check_code == 0 else f'FAILED (exit {check_code})'}.")
+            if check_code != 0:
+                lines.append(sbx._tail(check_output, 1000).strip())
         # Analysis / review / docs answers live in the agent's output: keep much more of it.
         lines += ["Agent output (tail):", sbx._tail(output, 1500 if task.task_type == "coding" else 6000).strip()]
         summary = "\n".join(line for line in lines if line)
@@ -359,7 +412,8 @@ class SandboxActivityBackend:
             "agent_status": status, "agent_exit_code": code, "agent_seconds": seconds,
             "changed_files": changed, "test_exit_code": test_code, "fix_rounds_used": attempt,
             "review": review, "stuck_stops": stuck_stops, "tests_edited": tests_edited,
-            "verified": status in ("ok", "stuck") and test_code == 0 and bool(changed),
+            "check_command": check_ran, "check_exit_code": check_code, "scratch_files": scratch,
+            "verified": verified,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
         removed = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
@@ -368,8 +422,8 @@ class SandboxActivityBackend:
                "instruction": short(instruction, 500), "status": "finished", "agent_status": status,
                "agent_exit": code, "seconds": seconds, "fix_rounds": attempt, "review": review,
                "test_command": test_command, "test_exit": test_code, "stuck_stops": stuck_stops,
-               "tests_edited": tests_edited,
-               "verified": status in ("ok", "stuck") and test_code == 0 and bool(changed),
+               "tests_edited": tests_edited, "check_exit": check_code, "scratch_files": scratch,
+               "verified": verified,
                "changed_files": changed, "lines_added": added, "lines_removed": removed,
                "context_chars": len(context)}
         self._trace(task.task_id, "run_end", **{k: v for k, v in run.items() if k not in ("task_id", "goal")})
