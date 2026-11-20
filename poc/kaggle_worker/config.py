@@ -105,6 +105,7 @@ class SandboxConfig:
     deps_cache: bool = True
     quick_tests: bool = True
     fast_path: bool = True
+    fast_review: bool = True
 
 
 @dataclass(frozen=True)
@@ -373,7 +374,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
     unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
                          "agent_timeout_seconds", "test_timeout_seconds", "test_command",
                          "setup_command", "setup_network", "setup_timeout_seconds", "docker_command",
-                         "fix_rounds", "self_review", "code_map", "deps_cache", "quick_tests", "fast_path"}
+                         "fix_rounds", "self_review", "code_map", "deps_cache", "quick_tests", "fast_path", "fast_review"}
     if unknown:
         raise ConfigError("sandbox has unsupported fields")
     image = sb.get("image", "kite-sandbox:latest")
@@ -420,6 +421,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
         deps_cache=_flag(sb.get("deps_cache", True), "sandbox.deps_cache"),
         quick_tests=_flag(sb.get("quick_tests", True), "sandbox.quick_tests"),
         fast_path=_flag(sb.get("fast_path", True), "sandbox.fast_path"),
+        fast_review=_flag(sb.get("fast_review", True), "sandbox.fast_review"),
     )
 
 
@@ -488,7 +490,8 @@ def sandbox_settings_from_config(config: KiteConfig):
         test_command=sb.test_command, setup_command=sb.setup_command,
         setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
         docker_command=sb.docker_command, fix_rounds=sb.fix_rounds, self_review=sb.self_review,
-        code_map=sb.code_map, deps_cache=sb.deps_cache, quick_tests=sb.quick_tests, fast_path=sb.fast_path, model_context=model_contexts(config, gateway_models(config)),
+        code_map=sb.code_map, deps_cache=sb.deps_cache, quick_tests=sb.quick_tests, fast_path=sb.fast_path, fast_review=sb.fast_review,
+        model_context=model_contexts(config, gateway_models(config)),
     )
 
 

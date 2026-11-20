@@ -71,6 +71,10 @@ class FakeDocker:
         if kind == "test":
             code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
             return CP(cmd, code, "2 passed\n" if code == 0 else "E   AssertionError: average\n1 failed\n", "")
+        if kind == "quick":
+            return CP(cmd, 0, "1 passed\n", "")
+        if kind == "repro":
+            return CP(cmd, 1, "FAILED test_kite_repro.py::test_empty_list_gives_zero\n", "")
         if kind == "check":
             code = self.check_returncodes.pop(0) if self.check_returncodes else 0
             return CP(cmd, code, "" if code == 0 else "calc.py:2:12: F821 Undefined name `total`\n", "")
@@ -523,32 +527,35 @@ def test_backend_never_verifies_a_task_whose_check_keeps_failing(tmp_path):
 
 def test_backend_fast_path_solves_with_one_call_or_hands_over_to_the_agent(tmp_path, monkeypatch):
     from poc.kaggle_worker.journal import read_jsonl
-    from test_sandbox import FIX
+    from test_sandbox import FIX, REPRO
 
     asked = []
 
     def asker(settings, model, *, tag, pin=None, timeout=900):
         def ask(prompt):
             asked.append((model, tag, pin, prompt))
-            return FIX
+            return "ỔN" if "RÀ SOÁT cuối" in prompt else REPRO if "TRƯỚC khi sửa" in prompt else FIX
         return ask
 
     monkeypatch.setattr(sbx, "gateway_asker", asker)
     (tmp_path / "ok").mkdir()
     fake = FakeDocker()
     backend, result = run_backend_task(tmp_path / "ok", fake, "task-fast")
-    assert fake.kinds() == ["setup", "test", "review"]                  # one model call, then tests and review
-    assert "if xs else 0" in result.patch and "Kite fast path: the whole fix came from one model call" in result.summary
-    assert asked[0][1:3] == ("task-fast", "kaggle-han") and "calc.py" in asked[0][3]
+    assert fake.kinds() == ["setup", "repro", "quick", "test"]      # test first, one call to fix, one to review
+    assert "if xs else 0" in result.patch and "Kite fast path: the fix came from one model call" in result.summary
+    assert "failed before the fix and passes now" in result.summary and "test_empty_list_gives_zero" in result.patch
+    assert asked[0][1:3] == ("task-fast", "kaggle-han") and "calc.py" in asked[1][3]
     (record,) = read_jsonl(backend.state_dir / "journal" / "tasks.jsonl")
     assert record["fast_path"] == "passed" and record["verified"] and record["agent_status"] == "ok"
+    assert record["review_mode"] == "one_call" and record["review"] == "unchanged" and len(asked) == 3
+    assert record["repro"] == "reproduced"
     trace = read_jsonl(backend.task_dir("task-fast") / "trace.jsonl")
     assert any(e["event"] == "fast_path" and e["outcome"] == "passed" for e in trace)
 
     (tmp_path / "bad").mkdir()
     fake = FakeDocker(test_returncodes=[1, 0])
     backend, result = run_backend_task(tmp_path / "bad", fake, "task-fast-bad")
-    assert fake.kinds()[:4] == ["setup", "test", "agent", "test"]
+    assert fake.kinds()[:5] == ["setup", "repro", "quick", "test", "agent"]
     assert "Kite đã thử một bản sửa nhanh" in fake.agent_calls()[0][-1]
     assert "Kite fast path: tried (tests_failed" in result.summary
     saved = json.loads((backend.task_dir("task-fast-bad") / "result.json").read_text())

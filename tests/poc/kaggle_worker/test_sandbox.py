@@ -39,7 +39,8 @@ class FakeDocker:
     def __init__(self, *, test_returncode: int = 0, setup_returncode: int = 0,
                  agent_timeout: bool = False, test_returncodes: list[int] | None = None,
                  review: str = "none", quick_returncodes: list[int] | None = None,
-                 check_returncodes: list[int] | None = None) -> None:
+                 check_returncodes: list[int] | None = None, repro_returncodes: list[int] | None = None,
+                 quick_fail: str = "FAILED test_calc.py::test_empty - ZeroDivisionError\n1 failed\n") -> None:
         self.calls: list[list[str]] = []
         self.test_returncode = test_returncode
         self.test_returncodes = list(test_returncodes or [])     # one per test run, then test_returncode
@@ -48,6 +49,8 @@ class FakeDocker:
         self.review = review          # what the self-review pass does: none | improve | break
         self.quick_returncodes = list(quick_returncodes or [])
         self.check_returncodes = list(check_returncodes or [])
+        self.repro_returncodes = list(repro_returncodes or [])
+        self.quick_fail = quick_fail
 
     def kind(self, cmd: list[str]) -> str:
         return value_after(cmd, "--name").split("-")[1]          # kite-<kind>-<task>
@@ -79,7 +82,11 @@ class FakeDocker:
             return subprocess.CompletedProcess(cmd, 0, "Đã rà soát\n", "")
         if kind == "quick":
             code = self.quick_returncodes.pop(0) if self.quick_returncodes else 0
-            output = "1 passed\n" if code == 0 else "FAILED test_calc.py::test_empty - ZeroDivisionError\n1 failed\n"
+            output = "1 passed\n" if code == 0 else self.quick_fail
+            return subprocess.CompletedProcess(cmd, code, output, "")
+        if kind == "repro":                     # the fast path's reproduction test, on the code before the fix
+            code = self.repro_returncodes.pop(0) if self.repro_returncodes else 1
+            output = "1 passed\n" if code == 0 else "FAILED test_kite_repro.py::test_empty_list - ZeroDivisionError\n"
             return subprocess.CompletedProcess(cmd, code, output, "")
         if kind == "test":
             code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
@@ -773,20 +780,129 @@ def test_fast_context_shows_the_named_code_verbatim(tmp_path):
     assert sbx.fast_context(repo, "Làm cho nó tốt hơn", None) == ""         # nothing located: agent explores
 
 
+REPRO = """test_kite_repro.py
+<<<<<<< SEARCH
+=======
+from calc import average
+
+
+def test_empty_list_gives_zero():
+    assert average([]) == 0
+>>>>>>> REPLACE
+"""
+
+
+def answers(*texts):
+    """An asker that gives these answers in turn (and records the prompts)."""
+    queue, prompts = list(texts), []
+
+    def ask(prompt):
+        prompts.append(prompt)
+        return queue.pop(0)
+    ask.prompts = prompts
+    return ask
+
+
 def test_the_fast_path_fixes_a_task_with_one_model_call_and_skips_the_agent(tmp_path):
     fake = FakeDocker()
-    prompts: list[str] = []
+    logs: list[str] = []
+    repo = make_repo(tmp_path)
+    ask = answers(REPRO, FIX, "ỔN")
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="f1", runner=fake,
+                       log=logs.append, asker=ask)
+    prompts = ask.prompts
+    # The reproduction test fails on the old code, then the fix passes it and the whole suite:
+    # no agent session, no review session.
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test"]
+    assert fake.call("repro")[-1] == "python -m pytest -q test_kite_repro.py"
+    assert fake.call("quick")[-1] == "python -m pytest -q test_kite_repro.py"
+    assert run.verified and run.fast_path == "passed" and run.repro == "reproduced" and run.agent_status == "ok"
+    assert (run.review, run.review_mode) == ("unchanged", "one_call") and len(prompts) == 3
+    assert "TRƯỚC khi sửa" in prompts[0] and "test_kite_repro.py" in prompts[0]
+    assert "test_empty_list_gives_zero" not in prompts[1]                 # the fix never sees the test
+    assert "RÀ SOÁT cuối" in prompts[2] and "+    return sum(xs) / len(xs) if xs else 0" in prompts[2]
+    patch = (tmp_path / "state" / "f1" / "result.patch").read_text()
+    assert "test_empty_list_gives_zero" in patch                          # the test ships with the fix
+    assert run.changed_files == ["calc.py", "test_kite_repro.py"] and "if xs else 0" in patch
+    assert "<<<<<<< SEARCH" in prompts[1] and "return sum(xs) / len(xs) - 1" in prompts[1]
+    assert any("đường nhanh: passed" in line and "bỏ qua agent" in line for line in logs)
+    agent_log = (tmp_path / "state" / "f1" / "agent.log").read_text()
+    assert "===== fast repro reproduced =====" in agent_log and "===== fast passed =====" in agent_log
+
+
+def test_the_one_call_review_can_correct_a_fast_fix_but_never_break_it(tmp_path):
+    better = ("calc.py\n<<<<<<< SEARCH\n    return sum(xs) / len(xs) if xs else 0\n=======\n"
+              "    return sum(xs) / len(xs) if xs else 0.0\n>>>>>>> REPLACE\n")
+    fake = FakeDocker()
+    _, run = run_task(tmp_path, fake, "r1", asker=answers(REPRO, FIX, better))
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "quick", "test"]
+    assert run.review == "kept" and run.verified
+    assert "else 0.0" in (tmp_path / "state" / "r1" / "result.patch").read_text()
+    # The correction breaks the tests: the fast fix as it was is kept.
+    (tmp_path / "b").mkdir()
+    fake = FakeDocker(test_returncodes=[0, 1])
+    _, run = run_task(tmp_path / "b", fake, "r2", asker=answers(REPRO, FIX, better))
+    assert run.review == "reverted" and run.verified and "else 0.0" not in (tmp_path / "b" / "state" / "r2" / "result.patch").read_text()
+    # The review cannot be applied or asked: nothing changes, the fast fix stands.
+    (tmp_path / "c").mkdir()
+    fake = FakeDocker()
+    _, run = run_task(tmp_path / "c", fake, "r3",
+                      asker=answers(REPRO, FIX, "calc.py\n<<<<<<< SEARCH\nnope\n=======\nx\n>>>>>>> REPLACE"))
+    assert run.review == "unchanged" and run.verified and [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test"]
+    from dataclasses import replace
+    (tmp_path / "d").mkdir()
+    fake = FakeDocker()
+    repo = make_repo(tmp_path / "d")
+    run = sbx.run_task(replace(SETTINGS, fast_review=False), repo=repo, goal="Sửa average", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "d" / "state", task_id="r4", runner=fake,
+                       log=lambda _m: None, asker=answers(REPRO, FIX))
+    assert run.review_mode == "agent" and [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "review"]
+
+
+def test_without_a_reproduction_the_fast_fix_gets_the_agent_review(tmp_path):
+    # The test passes on the old code too: it proves nothing, so a reading-only review is not enough.
+    fake = FakeDocker(repro_returncodes=[0])
+    _, run = run_task(tmp_path, fake, "p1", asker=answers(REPRO, FIX))
+    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "not_reproduced", "agent") and run.verified
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "review"]
+    # No test written at all (the model answered something else): the same.
+    (tmp_path / "b").mkdir()
+    fake = FakeDocker()
+    _, run = run_task(tmp_path / "b", fake, "p2", asker=answers("Không viết được.", FIX))
+    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "none", "agent")
+    assert [fake.kind(c) for c in fake.calls] == ["test", "review"]
+
+
+def test_a_fix_that_disagrees_with_the_reproduction_test_goes_to_the_agent(tmp_path):
+    fake = FakeDocker(quick_returncodes=[1, 0],
+                      quick_fail="FAILED test_kite_repro.py::test_empty_list_gives_zero - assert 1 == 0\n1 failed\n")
     logs: list[str] = []
     repo = make_repo(tmp_path)
     run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
-                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="f1", runner=fake,
-                       log=logs.append, asker=lambda prompt: prompts.append(prompt) or FIX)
-    assert [fake.kind(c) for c in fake.calls] == ["test", "review"]            # no agent session at all
-    assert run.verified and run.fast_path == "passed" and run.agent_status == "ok" and run.fast_seconds >= 0
-    assert run.changed_files == ["calc.py"] and "if xs else 0" in (tmp_path / "state" / "f1" / "result.patch").read_text()
-    assert "<<<<<<< SEARCH" in prompts[0] and "return sum(xs) / len(xs) - 1" in prompts[0]
-    assert any("đường nhanh: passed" in line and "bỏ qua agent" in line for line in logs)
-    assert "===== fast applied =====" in (tmp_path / "state" / "f1" / "agent.log").read_text()
+                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="d1", runner=fake,
+                       log=logs.append, asker=answers(REPRO, FIX))
+    assert run.fast_path == "repro_failed" and run.repro == "reproduced" and run.verified
+    assert [fake.kind(c) for c in fake.calls][:4] == ["repro", "quick", "agent", "test"]
+    agent = fake.call("agent")[-1]
+    assert "test tái hiện lỗi trên bản sửa" in agent and "test_empty_list_gives_zero" in agent
+    assert "yêu cầu gốc mới là chuẩn" in agent and "if xs else 0" in agent          # both the test and the fix
+    work = tmp_path / "state" / "d1" / "work"
+    assert not (work / "test_kite_repro.py").exists() or "test_kite_repro.py" in run.changed_files
+    assert any("đường nhanh: repro_failed, test tái hiện: reproduced" in line for line in logs)
+
+
+def test_the_reproduction_test_goes_next_to_the_tests_of_the_named_code(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "svc" / "tests").mkdir(parents=True)
+    (repo / "svc" / "app.py").write_text("def handler():\n    return 1\n")
+    (repo / "svc" / "tests" / "test_app.py").write_text("def test_x():\n    pass\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "svc")
+    assert sbx.repro_path(repo, "Sửa handler trong svc/app.py", None) == "svc/tests/test_kite_repro.py"
+    (repo / "svc" / "tests" / "test_kite_repro.py").write_text("")
+    assert sbx.repro_path(repo, "Sửa handler trong svc/app.py", None) == "svc/tests/test_kite_repro_2.py"
+    assert sbx.repro_path(repo, "Sửa average", None) == "test_kite_repro.py"
 
 
 def test_a_fast_fix_that_fails_the_tests_is_dropped_and_the_agent_is_told(tmp_path):

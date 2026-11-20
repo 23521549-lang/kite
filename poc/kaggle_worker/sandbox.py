@@ -119,6 +119,9 @@ class SandboxSettings:
     # the code Kite located itself (Agentless-style). Kept only if Kite's tests and check pass; else
     # the clone is put back and the agent runs as usual (see try_fast_path).
     fast_path: bool = True
+    # After a fast fix passed: review it with one model call too (approve, or SEARCH/REPLACE corrections
+    # kept only if the tests and check still pass) instead of a whole agent session.
+    fast_review: bool = True
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
     model_context: dict[str, int] = field(default_factory=dict)
 
@@ -163,6 +166,8 @@ class SandboxRun:
     # off | skipped | passed | declined | not_applied | tests_failed | check_failed | error
     fast_path: str = "off"
     fast_seconds: float = 0.0
+    review_mode: str = ""         # agent | one_call
+    repro: str = "off"            # the fast path's reproduction test: off | none | not_reproduced | reproduced
 
     @property
     def verified(self) -> bool:
@@ -676,9 +681,9 @@ class FastAttempt:
 
 
 def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: Callable[[str], str],
-                 test_command: str, check: str = "") -> FastAttempt:
+                 test_command: str, check: str = "", context: str | None = None) -> FastAttempt:
     """Locate the code, ask once, apply the edit blocks (all or nothing). Tests are the caller's."""
-    context = fast_context(workspace, goal, graph)
+    context = fast_context(workspace, goal, graph) if context is None else context
     if not context:
         return FastAttempt("skipped", reason="không xác định được phần code liên quan")
     try:
@@ -705,7 +710,296 @@ def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, as
 
 
 FAST_REASONS = {"tests_failed": "test của Kite lỗi", "check_failed": "bước kiểm tra lỗi",
-                "not_applied": "không áp được vào code"}
+                "not_applied": "không áp được vào code", "repro_failed": "test tái hiện lỗi trên bản sửa"}
+REPRO_FILE = "test_kite_repro.py"
+
+
+def repro_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None = None) -> str:
+    """Where the reproduction test goes: next to the tests of the code the goal names (so its
+    conftest fixtures apply), else the nearest tests/ folder above the named files, else tests/."""
+    workspace = Path(workspace)
+    files = [f for f in _git(workspace, "ls-files", check=False).splitlines() if f]
+    mentioned = [f for f in files if f in goal or re.search(
+        rf"(?<![\w./-]){re.escape(Path(f).name)}(?![\w-])", goal)]
+    folders = [str(Path(f).parent) for f in mentioned if codemap.is_test_path(f)]
+    if graph is not None:
+        _, symbols = codemap.goal_map(graph, goal, mentioned, max_chars=CODE_MAP_CHARS, workspace=workspace)
+        folders += [str(Path(path).parent) for symbol in symbols[:6] for _, _, path, _ in graph.users(symbol)
+                    if codemap.is_test_path(path) and path.endswith(".py")]
+    for source in mentioned:
+        here = Path(source).parent
+        while True:
+            for name in ("tests", "test"):
+                if (workspace / here / name).is_dir():
+                    folders.append(str(here / name))
+            if here == here.parent:
+                break
+            here = here.parent
+    folders += ["tests"] if (workspace / "tests").is_dir() else []
+    folder = next((f for f in folders if f not in ("", ".")), "")
+    name = REPRO_FILE
+    for number in range(2, 20):
+        if not (workspace / folder / name).exists():
+            break
+        name = f"test_kite_repro_{number}.py"
+    return (Path(folder) / name).as_posix() if folder else name
+
+
+def test_examples(workspace: Path, path: str, goal: str, max_chars: int = 4000) -> str:
+    """The conftest.py that applies to ``path`` and one nearby test file: how this repository's tests
+    build their data and fixtures (a reproduction test written without them rarely even runs)."""
+    workspace, folder = Path(workspace), Path(path).parent
+    sections = []
+    here = folder
+    while True:
+        conftest = workspace / here / "conftest.py"
+        if conftest.is_file():
+            text = conftest.read_text(encoding="utf-8", errors="replace")
+            sections.append(f"### {(here / 'conftest.py').as_posix()} (fixture có sẵn)\n`````\n{text[:max_chars]}\n`````")
+            break
+        if here == here.parent:
+            break
+        here = here.parent
+    words = {w.lower() for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", goal)}
+    candidates = sorted((f for f in (workspace / folder).glob("test_*.py") if not f.name.startswith("test_kite_repro")),
+                        key=lambda f: (-sum(w in f.stem.lower() for w in words), f.stat().st_size))
+    if candidates:
+        text = candidates[0].read_text(encoding="utf-8", errors="replace")
+        sections.append(f"### {candidates[0].relative_to(workspace).as_posix()} (test mẫu cùng thư mục)\n`````\n"
+                        f"{text[:max_chars]}\n`````")
+    return "\n\n".join(sections)
+
+
+def repro_prompt(goal: str, context: str, path: str, command: str) -> str:
+    return "\n".join([
+        goal.strip(), "",
+        "Bước 1 của Kite: TRƯỚC khi sửa, viết test kiểm tra đúng hành vi mà yêu cầu trên đòi hỏi.",
+        "- Test phải THẤT BẠI với code hiện tại (bên dưới) và QUA khi code đã được sửa đúng yêu cầu.",
+        "- Bao các quy tắc và trường hợp biên yêu cầu nêu; mỗi test kiểm một ý, tên test nói rõ ý đó.",
+        "- Dựng dữ liệu và fixture giống file test liên quan bên dưới; không dùng mạng.",
+        "- Không sửa code, không sửa test có sẵn.",
+        "Trả lời bằng đúng một khối tạo file mới, theo mẫu:", "",
+        path, "<<<<<<< SEARCH", "=======", "<toàn bộ nội dung file test>", ">>>>>>> REPLACE", "",
+        f"Kite sẽ chạy: `{command}`", "",
+        "Code liên quan:", context,
+    ])
+
+
+@dataclass
+class FastResult:
+    status: str                 # off | skipped | declined | not_applied | error | tests_failed | check_failed
+    #                             | repro_failed | passed
+    repro: str = "off"          # off | none | not_reproduced | reproduced
+    reason: str = ""
+    answer: str = ""
+    repro_answer: str = ""
+    note: str = ""              # for the agent's prompt when the fast path did not hold
+    test_output: str = ""
+    check_code: int | None = None
+    check_output: str = ""
+    failing_output: str = ""    # for the agent's quick test selection
+    files: list[str] = field(default_factory=list)
+    context_chars: int = 0
+    log: list[str] = field(default_factory=list)
+
+
+def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: Callable[[str], str], *,
+              test_command: str, check: str, template: str,
+              run_tests: Callable[[str], tuple[int, str, str]],
+              run_check: Callable[[str], tuple[int | None, str, str]],
+              run_one: Callable[[str, str], tuple[int, str]]) -> FastResult:
+    """Agentless-style fix with evidence (Xia et al. 2024, github.com/OpenAutoCoder/Agentless).
+
+    1. reproduction test written from the goal alone, run on the current code: it must fail;
+    2. the fix, asked separately (it never sees that test), applied all-or-nothing;
+    3. validation: the reproduction test now passes, and so do the repository's tests and check.
+    The fix and the test come from the goal independently, so their agreement is evidence that a
+    reading-only review can trust; without a reproduction ("not_reproduced"/"none") the caller
+    reviews with the agent instead. Anything failing puts the clone back for the agent.
+    """
+    workspace = Path(workspace)
+    context = fast_context(workspace, goal, graph)
+    if not context:
+        return FastResult("skipped", reason="không xác định được phần code liên quan")
+    result = FastResult("error", context_chars=len(context))
+    repro_text, repro_file, repro_output = "", "", ""
+    if template:
+        repro_file = repro_path(workspace, goal, graph)
+        command = quick_test_command(template, [repro_file])
+        try:
+            examples = test_examples(workspace, repro_file, goal)
+            reply = result.repro_answer = ask(repro_prompt(goal, context + ("\n\n" + examples if examples else ""),
+                                                           repro_file, command))
+            blocks = [b for b in editblocks.parse(reply) if not b.search.strip() and codemap.is_test_path(b.path)]
+        except Exception as exc:                       # no test is no evidence, not a failure
+            blocks, result.log = [], [f"không viết được test tái hiện: {str(exc)[:200]}"]
+        if blocks and not (workspace / blocks[0].path).exists():
+            repro_file = blocks[0].path
+            try:
+                editblocks.apply(workspace, blocks[:1])
+            except editblocks.EditError:
+                blocks = []
+        if blocks and (workspace / repro_file).is_file():
+            repro_text = (workspace / repro_file).read_text(encoding="utf-8")
+            code, repro_output = run_one("repro", quick_test_command(template, [repro_file]))
+            result.repro = "not_reproduced" if code == 0 else "none" if code == 5 else "reproduced"
+            (workspace / repro_file).unlink()
+        else:
+            result.repro = "none"
+    fast = fast_attempt(workspace, goal, graph, ask, test_command, check, context=context)
+    result.answer, result.files, result.reason = fast.answer, fast.files, fast.reason
+    repro_note = ("\nTest tái hiện Kite đã viết từ yêu cầu (có thể sai; yêu cầu gốc mới là chuẩn), "
+                  f"`{repro_file}`:\n```python\n{repro_text.strip()[:3000]}\n```\n"
+                  f"Kết quả trên code ban đầu:\n```\n{failure_digest(repro_output, 1500).strip()}\n```"
+                  if result.repro == "reproduced" else "")
+    if fast.status != "applied":
+        result.status = fast.status
+        if fast.status == "not_applied":
+            result.note = fast_note(f"{FAST_REASONS['not_applied']} ({fast.reason})", "", "") + repro_note
+        elif repro_note:
+            result.note = "\n" + repro_note
+        return result
+    if result.repro in ("reproduced", "not_reproduced"):
+        target = workspace / repro_file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(repro_text, encoding="utf-8")
+    code, output, _ = run_tests("fast")
+    check_code, check_output, _ = run_check("fast") if code == 0 else (None, "", "")
+    if code == 0 and check_code in (None, 0):
+        result.status, result.test_output = "passed", output
+        result.check_code, result.check_output = check_code, check_output
+        return result
+    restore_tree(workspace, fast.before)              # also drops the reproduction test
+    if code != 0:
+        result.status = "repro_failed" if repro_file and repro_file in output and result.repro != "off" \
+            else "tests_failed"
+        result.failing_output = output
+    else:
+        result.status = "check_failed"
+    result.note = fast_note(FAST_REASONS[result.status], fast.diff, output if code != 0 else check_output) + repro_note
+    return result
+
+
+def fast_review(workspace: Path, goal: str, base: str, graph: codemap.CodeGraph | None,
+                ask: Callable[[str], str], test_command: str, check: str = "") -> tuple[int, str]:
+    """One-call review of the change since ``base``: (0, answer) when it approved or its corrections
+    were applied (the caller re-runs the tests); (1, reason) when it could not be asked or applied."""
+    diff, context = review_context(workspace, base, graph)
+    try:
+        answer = ask(fast_review_prompt(goal, diff, context, test_command, check))
+    except Exception as exc:
+        return 1, f"không hỏi được model: {str(exc)[:200]}"
+    try:
+        blocks = editblocks.parse(answer)
+    except editblocks.EditError as exc:
+        return 1, f"câu trả lời rà soát hỏng: {exc}\n{answer}"
+    if not blocks:
+        return 0, answer
+    try:
+        files = editblocks.apply(workspace, blocks)
+    except editblocks.EditError as exc:
+        return 1, f"không áp được khối sửa của rà soát: {exc}\n{answer}"
+    edited = [f for f in files if codemap.is_test_path(f) and subprocess.run(
+        ["git", "-C", str(workspace), "cat-file", "-e", f"{base}:{f}"], capture_output=True).returncode == 0]
+    if edited:
+        return 1, f"rà soát sửa test có sẵn ({', '.join(edited)}): bỏ\n{answer}"
+    return 0, answer
+
+
+FAST_APPROVE = "ỔN"
+
+
+def _new_lines(workspace: Path, base: str) -> dict[str, list[int]]:
+    """New-side line numbers each file changed at since ``base`` (new files included: stage first)."""
+    out = _git(Path(workspace), "diff", "--cached", "-U0", "--no-color", base, check=False)
+    changed: dict[str, list[int]] = {}
+    path = None
+    for line in out.splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else None
+        elif path and line.startswith("@@"):
+            match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            if match:
+                start, count = int(match.group(1)), int(match.group(2) if match.group(2) is not None else 1)
+                changed.setdefault(path, []).extend(range(start, start + max(count, 1)))
+    return changed
+
+
+def review_context(workspace: Path, base: str, graph: codemap.CodeGraph | None = None,
+                   max_chars: int = FAST_CONTEXT_CHARS) -> tuple[str, str]:
+    """(diff, current code) for a one-call review: the changed files as they are now (whole when
+    small, else the definitions around the changed lines) and the callers of the changed code."""
+    workspace = Path(workspace)
+    _git(workspace, "add", "-A")
+    diff = _git(workspace, "diff", "--cached", "--no-color", base, check=False)
+    sections, budget = [], max_chars
+
+    def add(title: str, text: str) -> None:
+        nonlocal budget
+        if len(text) + 200 <= budget:
+            sections.append(f"### {title}\n`````\n{text.rstrip()}\n`````")
+            budget -= len(text) + 200
+
+    spans: list[tuple[str, int, int]] = []
+
+    def covered(path: str, line: int) -> bool:
+        return any(p == path and first <= line <= last for p, first, last in spans)
+
+    changed = _new_lines(workspace, base)
+    for path, lines in changed.items():
+        try:
+            content = (workspace / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if len(content) <= FAST_FILE_CHARS:
+            add(f"{path} (toàn bộ file hiện tại)", content)
+            continue
+        rows = content.split("\n")
+        for line in lines:
+            if not covered(path, line):
+                first, block = _span(rows, line)
+                spans.append((path, first, first + len(block) - 1))
+                add(f"{path}, dòng {first}-{first + len(block) - 1} (hiện tại)", "\n".join(block))
+    if graph is not None:
+        callers = 0
+        for path, lines in codemap.changed_lines(workspace, base).items():
+            for symbol in dict.fromkeys(graph.at(path, line) for line in lines):
+                if symbol is None or symbol.kind == "module":
+                    continue
+                for _, user, user_path, _line in graph.users(symbol):
+                    if (user is None or user.kind == "module" or codemap.is_test_path(user_path)
+                            or user_path in changed or callers >= 4 or covered(user_path, user.line)):
+                        continue
+                    try:
+                        rows = (workspace / user_path).read_text(encoding="utf-8").split("\n")
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                    first, block = _span(rows, user.line)
+                    spans.append((user_path, first, first + len(block) - 1))
+                    add(f"{user_path}, dòng {first}-{first + len(block) - 1} (chỗ gọi {graph.qualified(symbol)})",
+                        "\n".join(block))
+                    callers += 1
+    return diff, "\n\n".join(sections)
+
+
+def fast_review_prompt(goal: str, diff: str, context: str, test_command: str, check: str = "") -> str:
+    checks = f"`{test_command}`" + (f" và `{check_hint(check)}`" if check else "")
+    return "\n".join([
+        goal.strip(), "",
+        f"Kite đã sửa code cho yêu cầu trên và {checks} đã QUA. Đây là bước RÀ SOÁT cuối, trả lời một lần.",
+        "Thay đổi so với ban đầu:", "```diff", diff.strip()[:8000], "```", "",
+        "Rà soát:",
+        "- Đủ mọi quy tắc và ví dụ trong yêu cầu và docstring, kể cả trường hợp biên (rỗng, None, 0, thiếu trường, "
+        "ranh giới, lỗi phải báo).",
+        "- Mọi chỗ gọi tới phần đã đổi vẫn đúng (code bên dưới).",
+        *REVIEW_CHECKLIST, "",
+        f"Nếu bản sửa đã đúng và đủ: chỉ trả lời một dòng: {FAST_APPROVE}",
+        "Nếu còn sai hoặc thiếu: đưa các khối sửa trên code HIỆN TẠI bên dưới, đúng mẫu",
+        "đường/dẫn/file.py", "<<<<<<< SEARCH", "các dòng chép nguyên văn từ code hiện tại", "=======",
+        "các dòng mới", ">>>>>>> REPLACE",
+        "Không sửa hay xóa test có sẵn. Kite sẽ chạy lại test; khối sửa làm hỏng test sẽ bị bỏ.", "",
+        "Code hiện tại:", context,
+    ])
 
 
 def fast_note(reason: str, diff: str, output: str) -> str:
@@ -1534,35 +1828,43 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.check_seconds = round(run.check_seconds + time.monotonic() - started, 1)
         test_log.append(f"===== check after {after} exit={code} =====\n{output}")
         return code, output, command
-    # 2a. Fast path (Agentless-style): one model call for the whole fix on code Kite located itself.
-    #     Kept only if Kite's tests and check pass; otherwise the clone goes back and the agent runs.
+    # 2a. Fast path (Agentless-style): a reproduction test and a one-call fix on code Kite located
+    #     itself, checked against each other and the repository's tests (see fast_path). Kept only if
+    #     everything passes; otherwise the clone goes back and the agent runs, told what was tried.
+    ask = None
+
+    def run_one(kind: str, command: str) -> tuple[int, str]:
+        name = container_name(kind, task_id)
+        code, output = _run_step(
+            settings, runner, name=name, timeout=settings.test_timeout_seconds,
+            args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
+            + ["sh", "-c", command])
+        test_log.append(f"===== {kind} exit={code} =====\n{output}")
+        return code, output
+
     if settings.fast_path and with_context and task_type == "coding" and run.test_command:
         ask = asker if asker is not None else gateway_asker(settings, model, tag=task_id, pin=worker_pin)
         if ask is not None:
             started = time.monotonic()
-            log(f"[{task_id}] đường nhanh: hỏi {model} một lần để có cả bản sửa (SEARCH/REPLACE)...")
-            fast = fast_attempt(workspace, goal, graph, ask, run.test_command, run.check_command)
+            log(f"[{task_id}] đường nhanh: viết test tái hiện, rồi hỏi {model} một lần để có cả bản sửa...")
+            fast = fast_path(workspace, goal, graph, ask, test_command=run.test_command, check=run.check_command,
+                             template=template, run_tests=run_tests, run_check=run_check, run_one=run_one)
+            agent_log.append(f"===== fast repro {fast.repro} =====\n{fast.repro_answer}")
             agent_log.append(f"===== fast {fast.status} =====\n{fast.answer}")
-            run.fast_path = fast.status
-            if fast.status == "applied":
-                code, output, _ = run_tests("fast")
-                check_code, check_output, _ = run_check("fast") if code == 0 else (None, "", "")
-                if code == 0 and check_code in (None, 0):
-                    run.fast_path = "passed"
-                    run.agent_status, run.agent_exit_code, run.agent_output_tail = "ok", 0, _tail(fast.answer)
-                    run.test_exit_code, run.test_output_tail = 0, _tail(output)
-                    run.check_exit_code, run.check_output_tail = check_code, _tail(check_output)
-                else:
-                    run.fast_path = "tests_failed" if code != 0 else "check_failed"
-                    restore_tree(workspace, fast.before)
-                    prompt += fast_note(FAST_REASONS[run.fast_path], fast.diff, output if code != 0 else check_output)
-                    test_output = output if code != 0 else ""
-            elif fast.status == "not_applied":
-                prompt += fast_note(f"{FAST_REASONS['not_applied']} ({fast.reason})", "", "")
+            run.fast_path, run.repro = fast.status, fast.repro
+            if fast.status == "passed":
+                run.agent_status, run.agent_exit_code, run.agent_output_tail = "ok", 0, _tail(fast.answer)
+                run.test_exit_code, run.test_output_tail = 0, _tail(fast.test_output)
+                run.check_exit_code, run.check_output_tail = fast.check_code, _tail(fast.check_output)
+            else:
+                prompt += fast.note
+                test_output = fast.failing_output
             run.fast_seconds = round(time.monotonic() - started, 1)
-            log(f"[{task_id}] đường nhanh: {run.fast_path}{f' ({fast.reason})' if fast.reason else ''} sau "
-                f"{run.fast_seconds}s" + ("; bỏ qua agent, sang rà soát" if run.fast_path == "passed"
-                                          else "; chuyển sang agent"))
+            for line in fast.log:
+                log(f"[{task_id}] {line}")
+            log(f"[{task_id}] đường nhanh: {run.fast_path}, test tái hiện: {run.repro}"
+                f"{f' ({fast.reason})' if fast.reason else ''} sau {run.fast_seconds}s"
+                + ("; bỏ qua agent, sang rà soát" if run.fast_path == "passed" else "; chuyển sang agent"))
 
     while run.fast_path != "passed":
         kind = "agent" if attempt == 0 else f"fix{attempt}"
@@ -1617,20 +1919,31 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     if (wants_review(settings, task_type, run.test_command, run.agent_status, run.test_exit_code)
             and run.check_exit_code in (None, 0)):
         before = snapshot_tree(workspace)
-        log(f"[{task_id}] vòng rà soát: {model} kiểm tra lại lời giải theo yêu cầu và docstring...")
-        name = container_name("review", task_id)
         started = time.monotonic()
-        review_code, output = _run_step(
-            settings, runner, name=name, timeout=settings.agent_timeout_seconds, watch=StuckWatch(),
-            args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
-                                 config_file=config_file, deps=deps)
-            + ["opencode", "run", "-m", f"kite/{model}",
-               review_prompt(goal, run.test_command,
-                             codemap.impact(graph, workspace, run.patch_base) if graph is not None else "",
-                             quick=template, edited=edited_tests(workspace, run.patch_base),
-                             check=run.check_command, scratch=scratch_files(workspace, run.patch_base))])
+        if run.fast_path == "passed" and run.repro == "reproduced" and settings.fast_review and ask is not None:
+            # A one-call fix gets a one-call review: approve, or corrections kept only if tests still pass.
+            run.review_mode = "one_call"
+            log(f"[{task_id}] vòng rà soát (một lần gọi): {model} đọc lại bản sửa theo yêu cầu và chỗ gọi...")
+            review_code, output = fast_review(workspace, goal, run.patch_base, graph, ask, run.test_command,
+                                              run.check_command)
+            if review_code != 0:
+                log(f"[{task_id}] rà soát một lần gọi: {output.splitlines()[0] if output else 'lỗi'}")
+                restore_tree(workspace, before)
+        else:
+            run.review_mode = "agent"
+            log(f"[{task_id}] vòng rà soát: {model} kiểm tra lại lời giải theo yêu cầu và docstring...")
+            name = container_name("review", task_id)
+            review_code, output = _run_step(
+                settings, runner, name=name, timeout=settings.agent_timeout_seconds, watch=StuckWatch(),
+                args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
+                                     config_file=config_file, deps=deps)
+                + ["opencode", "run", "-m", f"kite/{model}",
+                   review_prompt(goal, run.test_command,
+                                 codemap.impact(graph, workspace, run.patch_base) if graph is not None else "",
+                                 quick=template, edited=edited_tests(workspace, run.patch_base),
+                                 check=run.check_command, scratch=scratch_files(workspace, run.patch_base))])
         run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
-        agent_log.append(f"===== review exit={review_code} =====\n{output}")
+        agent_log.append(f"===== review ({run.review_mode}) exit={review_code} =====\n{output}")
         if snapshot_tree(workspace) == before:
             run.review = "unchanged"
         else:

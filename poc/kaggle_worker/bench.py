@@ -1007,7 +1007,8 @@ def score_code(task, run: dict) -> dict:
             "tests_edited": run.get("tests_edited"), "check_exit_code": run.get("check_exit_code"),
             "check_runs": run.get("check_runs"), "check_seconds": run.get("check_seconds"),
             "scratch_files": run.get("scratch_files"), "fast_path": run.get("fast_path"),
-            "fast_seconds": run.get("fast_seconds")}
+            "fast_seconds": run.get("fast_seconds"), "review_mode": run.get("review_mode"),
+            "repro": run.get("repro")}
 
 
 # --------------------------------------------------------------------------------------- driver
@@ -1045,7 +1046,8 @@ def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, sy
                     f" | test ẩn {outcome.get('hidden_passed')} | tổng {outcome.get('wall_seconds')}s"
                     f" | dừng vì lặp {outcome.get('stuck_stops') or 0} | kiểm tra {outcome.get('check_exit_code')}"
                     f" | file thử {outcome.get('scratch_files') or '-'}"
-                    f" | đường nhanh {outcome.get('fast_path')} {outcome.get('fast_seconds') or 0}s")
+                    f" | đường nhanh {outcome.get('fast_path')} {outcome.get('fast_seconds') or 0}s"
+                    f" (test tái hiện {outcome.get('repro')})")
         (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     results["finished"] = time.strftime("%Y-%m-%d %H:%M")
     (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1116,12 +1118,16 @@ def render_report(results: dict) -> str:
             setup = "dùng lại" if item.get("setup_cached") else item.get("setup_seconds")
             check = {None: "-", 0: "✓"}.get(item.get("check_exit_code"), f"✗ {item.get('check_exit_code')}")
             fast = item.get("fast_path") or "off"
-            fast = "-" if fast in ("off", "skipped") else f"{fast} ({item.get('fast_seconds')})"
+            repro = {"reproduced": "tái hiện ✓", "not_reproduced": "không tái hiện", "none": "không có test"}.get(
+                item.get("repro") or "", "")
+            fast = "-" if fast in ("off", "skipped") else \
+                f"{fast} ({item.get('fast_seconds')}{', ' + repro if repro else ''})"
             lines.append(f"| `{model}` | {item['id']} | {'✓' if item['passed'] else '✗'} | {item['wall_seconds']} "
                          f"| {setup} | {fast} | {item.get('agent_seconds')} | {item.get('test_seconds')} "
                          f"({item.get('full_test_runs')}) | {item.get('quick_test_seconds')} "
                          f"({item.get('quick_test_runs')}) | {check} ({item.get('check_runs') or 0}) "
-                         f"| {item.get('fix_rounds_used', 0)} | {item.get('review')} "
+                         f"| {item.get('fix_rounds_used', 0)} | {item.get('review')}"
+                         f"{' (1 lần gọi)' if item.get('review_mode') == 'one_call' else ''} "
                          f"| {item.get('stuck_stops') or 0} | {', '.join(item.get('scratch_files') or []) or '-'} |")
     lines += ["", "## Kịch bản sai", ""]
     for model, entry in results["models"].items():

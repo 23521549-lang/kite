@@ -300,14 +300,33 @@ class SandboxActivityBackend:
             return code, output, command
         stuck_stops = 0
         status, code, output = "not_started", None, ""
-        fast_status, fast_seconds = "off", 0.0
+        fast_status, fast_seconds, ask, repro = "off", 0.0, None, "off"
         if self.settings.fast_path and task.task_type == "coding" and test_command:
             ask = sbx.gateway_asker(self.settings, route.model_id, tag=clean_tag(task.task_id) or slug,
                                     pin=route.worker_id)
             if ask is not None:
                 started = time.monotonic()
+                loop = asyncio.get_running_loop()
+
+                # sbx.fast_path runs in a thread; its test runs are this loop's containers.
+                def in_loop(coroutine):
+                    return asyncio.run_coroutine_threadsafe(coroutine, loop).result()
+
+                async def one(kind: str, command: str) -> tuple[int, str]:
+                    name = sbx.container_name(kind, slug)
+                    code_, output_, _ = await self._run_container(
+                        name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none",
+                                                  deps=deps) + ["sh", "-c", command],
+                        settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
+                    with (root / "test.log").open("a", encoding="utf-8") as stream:
+                        stream.write(f"\n===== {kind} exit={code_} =====\n{output_}")
+                    return code_, output_
+
                 step = asyncio.create_task(asyncio.to_thread(
-                    sbx.fast_attempt, work, goal, graph, ask, test_command, check_template))
+                    sbx.fast_path, work, goal, graph, ask, test_command=test_command, check=check_template,
+                    template=template, run_tests=lambda after: in_loop(run_tests(after)),
+                    run_check=lambda after: in_loop(run_check(after)),
+                    run_one=lambda kind, command: in_loop(one(kind, command))))
                 while True:
                     done, _ = await asyncio.wait({step}, timeout=self.heartbeat_seconds)
                     if done:
@@ -315,28 +334,22 @@ class SandboxActivityBackend:
                     heartbeat({"task_id": task.task_id, "state": "FAST_PATH",
                                "seconds": round(time.monotonic() - started)})
                 fast = step.result()
-                fast_status = fast.status
+                fast_status, repro = fast.status, fast.repro
                 with (root / "agent.log").open("a", encoding="utf-8") as stream:
+                    stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} fast repro {fast.repro} "
+                                 f"model={route.model_id} =====\n{fast.repro_answer}")
                     stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} fast {fast.status} "
                                  f"model={route.model_id} =====\n{fast.answer}")
-                if fast.status == "applied":
-                    fast_code, fast_output, _ = await run_tests("fast")
-                    fast_check = await run_check("fast") if fast_code == 0 else (None, "", "")
-                    if fast_code == 0 and fast_check[0] in (None, 0):
-                        fast_status = "passed"
-                        status, code, output = "ok", 0, fast.answer
-                        test_code, test_output = 0, fast_output
-                        check_code, check_output, check_ran = fast_check
-                    else:
-                        fast_status = "tests_failed" if fast_code != 0 else "check_failed"
-                        await asyncio.to_thread(sbx.restore_tree, work, fast.before)
-                        prompt += sbx.fast_note(sbx.FAST_REASONS[fast_status], fast.diff,
-                                                fast_output if fast_code != 0 else fast_check[1])
-                        test_output = fast_output if fast_code != 0 else ""
-                elif fast.status == "not_applied":
-                    prompt += sbx.fast_note(f"{sbx.FAST_REASONS['not_applied']} ({fast.reason})", "", "")
+                if fast.status == "passed":
+                    status, code, output = "ok", 0, fast.answer
+                    test_code, test_output = 0, fast.test_output
+                    check_code, check_output = fast.check_code, fast.check_output
+                    check_ran = check_template if fast.check_code is not None else ""
+                else:
+                    prompt += fast.note
+                    test_output = fast.failing_output
                 fast_seconds = round(time.monotonic() - started, 1)
-                self._trace(task.task_id, "fast_path", outcome=fast_status, seconds=fast_seconds,
+                self._trace(task.task_id, "fast_path", outcome=fast_status, repro=repro, seconds=fast_seconds,
                             reason=fast.reason or None, files=fast.files or None, context_chars=fast.context_chars)
         while fast_status != "passed":
             kind = "agent" if attempt == 0 else f"fix{attempt}"
@@ -378,23 +391,41 @@ class SandboxActivityBackend:
                                         sbx.codemap.failing_targets(graph, test_output) if graph is not None else "",
                                         quick=template, stuck=watch.reason)
 
-        review = "skipped"
+        review, review_mode = "skipped", ""
         if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code) and check_code in (None, 0):
             before = await asyncio.to_thread(sbx.snapshot_tree, work)
+            if fast_status == "passed" and repro == "reproduced" and self.settings.fast_review and ask is not None:
+                review_mode = "one_call"
+                started = time.monotonic()
+                step = asyncio.create_task(asyncio.to_thread(
+                    sbx.fast_review, work, goal, patch_base, graph, ask, test_command, check_template))
+                while True:
+                    done, _ = await asyncio.wait({step}, timeout=self.heartbeat_seconds)
+                    if done:
+                        break
+                    heartbeat({"task_id": task.task_id, "state": "REVIEWING",
+                               "seconds": round(time.monotonic() - started)})
+                review_code, review_output = step.result()
+                step_seconds = round(time.monotonic() - started, 1)
+                if review_code != 0:
+                    await asyncio.to_thread(sbx.restore_tree, work, before)
+            else:
+                review_mode = "agent"
             name = sbx.container_name("review", slug)
-            review_code, review_output, step_seconds = await self._run_container(
-                name, sbx.docker_run_args(self.settings, name=name, workspace=work, network=self.settings.network,
-                                          config_file=config_file, deps=deps)
-                + ["opencode", "run", "-m", f"kite/{route.model_id}",
-                   sbx.review_prompt(goal, test_command, await asyncio.to_thread(
-                       sbx.codemap.impact, graph, work, patch_base) if graph is not None else "", quick=template,
-                       edited=await asyncio.to_thread(sbx.edited_tests, work, patch_base), check=check_template,
-                       scratch=await asyncio.to_thread(sbx.scratch_files, work, patch_base))],
-                self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id, sbx.StuckWatch())
+            if review_mode == "agent":
+                review_code, review_output, step_seconds = await self._run_container(
+                    name, sbx.docker_run_args(self.settings, name=name, workspace=work, network=self.settings.network,
+                                              config_file=config_file, deps=deps)
+                    + ["opencode", "run", "-m", f"kite/{route.model_id}",
+                       sbx.review_prompt(goal, test_command, await asyncio.to_thread(
+                           sbx.codemap.impact, graph, work, patch_base) if graph is not None else "", quick=template,
+                           edited=await asyncio.to_thread(sbx.edited_tests, work, patch_base), check=check_template,
+                           scratch=await asyncio.to_thread(sbx.scratch_files, work, patch_base))],
+                    self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id, sbx.StuckWatch())
             seconds = round(seconds + step_seconds, 1)
             with (root / "agent.log").open("a", encoding="utf-8") as stream:
-                stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} review model={route.model_id} "
-                             f"exit={review_code} =====\n")
+                stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} review ({review_mode}) "
+                             f"model={route.model_id} exit={review_code} =====\n")
                 stream.write(review_output)
             if await asyncio.to_thread(sbx.snapshot_tree, work) == before:
                 review = "unchanged"
@@ -421,8 +452,12 @@ class SandboxActivityBackend:
                  f"{REVIEW_NOTES.get(review, '')}).",
                  f"Files changed: {', '.join(changed) if changed else 'none'}."]
         if fast_status == "passed":
-            lines.insert(0, f"Kite fast path: the whole fix came from one model call ({fast_seconds}s) and passed "
-                            "Kite's tests; no agent session was needed.")
+            evidence = {"reproduced": "a reproduction test written from the goal failed before the fix and passes "
+                                      "now (it is part of the patch)",
+                        "not_reproduced": "its reproduction test also passed before the fix, so the agent reviewed it",
+                        }.get(repro, "no reproduction test, so the agent reviewed it")
+            lines.insert(0, f"Kite fast path: the fix came from one model call ({fast_seconds}s in all) and passed "
+                            f"Kite's tests; {evidence}; no agent session was needed to write it.")
         elif fast_status not in ("off", "skipped"):
             lines.insert(0, f"Kite fast path: tried ({fast_status}, {fast_seconds}s), then the agent took over.")
         if stuck_stops:
@@ -457,7 +492,7 @@ class SandboxActivityBackend:
             "changed_files": changed, "test_exit_code": test_code, "fix_rounds_used": attempt,
             "review": review, "stuck_stops": stuck_stops, "tests_edited": tests_edited,
             "check_command": check_ran, "check_exit_code": check_code, "scratch_files": scratch,
-            "fast_path": fast_status, "fast_seconds": fast_seconds,
+            "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode, "repro": repro,
             "verified": verified,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
@@ -468,8 +503,8 @@ class SandboxActivityBackend:
                "agent_exit": code, "seconds": seconds, "fix_rounds": attempt, "review": review,
                "test_command": test_command, "test_exit": test_code, "stuck_stops": stuck_stops,
                "tests_edited": tests_edited, "check_exit": check_code, "scratch_files": scratch,
-               "fast_path": fast_status, "fast_seconds": fast_seconds,
-               "verified": verified,
+               "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode,
+               "repro": repro, "verified": verified,
                "changed_files": changed, "lines_added": added, "lines_removed": removed,
                "context_chars": len(context)}
         self._trace(task.task_id, "run_end", **{k: v for k, v in run.items() if k not in ("task_id", "goal")})
