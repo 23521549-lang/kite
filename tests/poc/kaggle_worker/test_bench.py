@@ -203,7 +203,7 @@ def test_real_tool_schemas_for_the_lead_agent(tmp_path):
 
     tools = bench.lead_tools(asyncio.run(build_server(make_ops(tmp_path, FakeClient())).list_tools()))
     names = {t["function"]["name"] for t in tools}
-    assert "kite_apply_result" in names and "bash" in names and len(names) == 14
+    assert "kite_apply_result" in names and "kite_note_task" in names and "bash" in names and len(names) == 15
 
 
 def lead_item(passed, score, seconds, calls):

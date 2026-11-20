@@ -171,6 +171,9 @@ def _parser() -> argparse.ArgumentParser:
                            help="code suite without fix rounds, self-review and repo context (baseline)")
     bench_run.add_argument("--no-code-map", action="store_true",
                            help="harness on, but without the graphify code map (to measure what it adds)")
+    bench_run.add_argument("--worker", default="",
+                           help="send every request to this worker (e.g. kaggle-han): comparable timings, and "
+                                "the other worker stays free for real tasks")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
                                                           "unless --write)")
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
@@ -502,7 +505,7 @@ def _bench_command(args: argparse.Namespace) -> int:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = (args.out or args.config.parent / "bench" / stamp).expanduser().resolve()
     post = bench.gateway_post(f"http://{config.gateway.host}:{config.gateway.port}/v1/chat/completions",
-                              timeout=config.gateway.job_timeout_seconds + 60)
+                              timeout=config.gateway.job_timeout_seconds + 60, worker=args.worker or None)
     ops = KiteOps(config, db_path=_db_path(args), state_dir=args.config.parent, allowed_roots=[Path.home()])
     tools = bench.lead_tools(asyncio.run(build_server(ops).list_tools()))
     system = chat_files(config, lead_model=models[0], kite_command=["kite"], allowed_roots=[Path.home()])["AGENTS.md"]
@@ -510,7 +513,8 @@ def _bench_command(args: argparse.Namespace) -> int:
     if "code" in suites:
         settings = sandbox_settings_from_config(config)
         if args.no_harness:
-            settings = dataclasses.replace(settings, fix_rounds=0, self_review=False, code_map=False)
+            settings = dataclasses.replace(settings, fix_rounds=0, self_review=False, code_map=False,
+                                           quick_tests=False)
         elif args.no_code_map:
             settings = dataclasses.replace(settings, code_map=False)
 
@@ -521,10 +525,13 @@ def _bench_command(args: argparse.Namespace) -> int:
             else:
                 repo = bench.make_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
             task_id = f"bench-{slug}-{task.id.lower()}-{stamp[-6:]}"
+            started = time.monotonic()
             run = sbx.run_task(settings, repo=repo, goal=task.goal, model=model, models=served,
                                state_dir=out_dir / "runs", task_id=task_id, with_context=not args.no_harness,
-                               log=lambda line: print(line, file=sys.stderr))
+                               log=lambda line: print(line, file=sys.stderr), worker_pin=args.worker or None,
+                               deps_cache=args.config.parent / "deps-cache" if settings.deps_cache else None)
             result = run.to_dict()
+            result["wall_seconds"] = round(time.monotonic() - started, 1)
             files = bench.hidden_files(task, source) if run.agent_status == "ok" else {}
             if files:
                 # Hidden tests: written only now, run like Kite's own tests (no network, same deps).

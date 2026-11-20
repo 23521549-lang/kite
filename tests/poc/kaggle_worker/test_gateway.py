@@ -345,3 +345,33 @@ def test_chat_requests_go_before_queued_task_requests():
         assert (await gateway.next_job("w1", 0)).job_id == chat_job.job_id
         assert task_job.job_id in gateway._queue                  # the task's request waits its turn
     asyncio.run(scenario())
+
+
+def test_a_conversation_waits_briefly_for_the_worker_that_has_it_cached():
+    now = [1000.0]
+
+    async def scenario():
+        gateway = make_gateway(clock=lambda: now[0], affinity_seconds=20)
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+        await gateway.heartbeat("w2", {"ready": True, "loaded_model": "qwen3.6"})
+        body = {"model": "qwen3.6", "messages": []}
+        first = await gateway.submit(body, tag="chat")
+        assert (await gateway.next_job("w1", 0)).job_id == first.job_id
+        gateway.complete("w1", first.job_id, {"status": "ok", "response": COMPLETION})
+        second = await gateway.submit(body, tag="chat")
+        assert await gateway.next_job("w2", 0) is None            # w1 has this conversation cached
+        assert (await gateway.next_job("w1", 0)).job_id == second.job_id
+        third = await gateway.submit(body, tag="chat")              # w1 is busy with the second one...
+        assert await gateway.next_job("w2", 0) is None
+        now[0] += 21                                                # ...for too long: w2 takes it
+        assert (await gateway.next_job("w2", 0)).job_id == third.job_id
+        assert gateway.affinity["chat"] == "w2"
+        gateway.complete("w1", second.job_id, {"status": "ok", "response": COMPLETION})
+        gateway.complete("w2", third.job_id, {"status": "ok", "response": COMPLETION})
+        untagged = await gateway.submit(body)                       # no tag: whoever asks first
+        assert (await gateway.next_job("w2", 0)).job_id == untagged.job_id
+        await gateway.heartbeat("w2", {"ready": True, "loaded_model": "devstral"})
+        gateway.complete("w2", untagged.job_id, {"status": "ok", "response": COMPLETION})
+        fourth = await gateway.submit(body, tag="chat")             # w2 switched models: its cache is gone
+        assert (await gateway.next_job("w1", 0)).job_id == fourth.job_id
+    asyncio.run(scenario())

@@ -342,7 +342,7 @@ def test_mcp_server_exposes_every_tool(tmp_path):
     names = {tool.name for tool in asyncio.run(server.list_tools())}
     assert names == {"start_task", "task_status", "task_result", "apply_result", "commit_result", "repo_status",
                      "run_command", "send_instruction", "pause_task",
-                     "resume_task", "cancel_task", "list_tasks", "worker_status"}
+                     "resume_task", "cancel_task", "list_tasks", "worker_status", "note_task"}
 
 
 def fake_process(proc: Path, pid: int, argv: list[str], namespace: str = "pid:[1]") -> None:
@@ -453,3 +453,50 @@ def test_persisted_always_allow_shell_approvals_are_found_and_cleared(tmp_path):
     assert left == [("psv_2",)]                                   # only shell approvals are removed
     assert sqlite3.connect(result["backup"]).execute("select count(*) from permission").fetchone() == (2,)
     assert clear_shell_approvals(path) == {"cleared": 0}
+
+
+def test_note_task_records_the_users_verdict_in_the_journal(tmp_path):
+    from poc.kaggle_worker.journal import read_jsonl
+
+    ops = make_ops(tmp_path, FakeClient())
+    saved = asyncio.run(ops.note_task("chat-20261120-aaaa", "BAD", "sửa luôn cả file test"))
+    assert saved["saved"] and saved["verdict"] == "bad"
+    (note,) = read_jsonl(tmp_path / "state" / "journal" / "notes.jsonl")
+    assert (note["task_id"], note["verdict"], note["text"], note["source"]) == (
+        "chat-20261120-aaaa", "bad", "sửa luôn cả file test", "chat")
+    for bad in (("chat-1", "meh"), ("", "good")):
+        with pytest.raises(KiteToolError):
+            asyncio.run(ops.note_task(*bad))
+    from poc.kaggle_worker.mcp_server import LEAD_INSTRUCTIONS as agents
+    assert "`note_task`" in agents and "kite_yml_suggestion" in agents and "kite_note_task" in agents
+
+
+def test_a_repo_without_kite_yml_gets_a_proposal_and_never_a_file(tmp_path):
+    from poc.kaggle_worker.sandbox import suggest_repo_config
+
+    repo, _ = make_repo(tmp_path)
+    run = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e.com", *a],
+                                    check=True, capture_output=True)
+    (repo / "svc" / "api" / "tests").mkdir(parents=True)
+    (repo / "svc" / "api" / "requirements.txt").write_text("fastapi\n")
+    (repo / "svc" / "api" / "tests" / "test_api.py").write_text("def test_ok():\n    pass\n")
+    run("add", "-A")
+    run("commit", "-qm", "service")
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    started = asyncio.run(ops.start_task(str(repo), "Thêm endpoint /health"))
+    proposal = started["kite_yml_suggestion"]
+    assert "setup: pip install -q -r svc/api/requirements.txt" in proposal
+    assert "test: PYTHONPATH=. python -m pytest -q svc/api/tests" in proposal and "{tests}" in proposal
+    assert not (repo / ".kite.yml").exists()                                    # only a proposal
+    status = asyncio.run(ops.repo_status(str(repo)))
+    assert status["kite_yml"] == {"present": False, "suggestion": proposal}
+    (repo / ".kite.yml").write_text("test: python -m pytest -q svc\n")
+    run("add", "-A")
+    run("commit", "-qm", "kite")
+    assert asyncio.run(ops.repo_status(str(repo)))["kite_yml"]["present"] is True
+    assert "kite_yml_suggestion" not in asyncio.run(ops.start_task(str(repo), "x y"))
+    # Nothing to install and tests at the root: Kite's defaults fit, no proposal.
+    assert suggest_repo_config(["calc.py", "tests/test_calc.py"]) == ""
+    assert "pip install -q -e '.[test]'" in suggest_repo_config(
+        ["pyproject.toml", "pkg/core.py", "tests/test_core.py"], "[project.optional-dependencies]\ntest = [\"pytest\"]\n")

@@ -97,6 +97,7 @@ class ModelGateway:
         clock: Callable[[], float] = time.time,
         on_worker_status: StatusHook | None = None,
         journal: Callable[[dict], None] | None = None,
+        affinity_seconds: float = 20.0,
     ) -> None:
         if not workers:
             raise ValueError("at least one worker must be configured")
@@ -118,6 +119,11 @@ class ModelGateway:
         self.clock = clock
         self.on_worker_status = on_worker_status
         self.journal = journal            # receives one record per finished request (no prompt content)
+        # Soft affinity: the next request of a conversation (same X-Kite-Task tag) waits up to this
+        # long for the worker that served the previous one, whose KV cache already holds the long
+        # shared prefix (system prompt, tools, history). Another worker would re-read all of it.
+        self.affinity_seconds = affinity_seconds
+        self.affinity: dict[str, str] = {}
         self.jobs: dict[str, Job] = {}
         self._queue: list[str] = []
         self._changed = asyncio.Event()
@@ -225,10 +231,16 @@ class ModelGateway:
         now = self.clock()
 
         def allowed(job: Job) -> bool:
-            if job.pinned is None or job.pinned == worker.worker_id:
-                return True
-            holder = self.workers.get(job.pinned)
-            return holder is None or holder.draining or not self._alive(holder, now)
+            if job.pinned is not None and job.pinned != worker.worker_id:
+                holder = self.workers.get(job.pinned)
+                return holder is None or holder.draining or not self._alive(holder, now)
+            owner = self.affinity.get(job.tag) if job.pinned is None and job.tag else None
+            if owner and owner != worker.worker_id and now - job.created_at < self.affinity_seconds:
+                holder = self.workers.get(owner)
+                if (holder is not None and not holder.draining and self._alive(holder, now)
+                        and holder.loaded_model == job.model):
+                    return False        # leave it a moment for the worker that has this conversation cached
+            return True
 
         candidates = [self.jobs[j] for j in self._queue
                       if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j])]
@@ -265,6 +277,11 @@ class ModelGateway:
                     self._queue.remove(job.job_id)
                     job.worker_id = worker_id
                     job.assigned_at = self.clock()
+                    if job.tag:
+                        self.affinity.pop(job.tag, None)          # re-insert: newest last, oldest dropped
+                        self.affinity[job.tag] = worker_id
+                        while len(self.affinity) > 1000:
+                            self.affinity.pop(next(iter(self.affinity)))
                     job.attempts += 1
                     worker.current_job = job.job_id
                     return job

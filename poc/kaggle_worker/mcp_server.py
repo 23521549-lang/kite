@@ -235,8 +235,33 @@ class KiteOps:
                 id=task_id, task_queue=self.config.temporal_task_queue)
         except Exception as exc:
             raise KiteToolError(f"không khởi động được workflow: {exc}") from exc
-        return {"task_id": task_id, "repo": str(path), "commit": head, "task_type": task_type,
-                "model": model or "Kite tự chọn", "status": "started"}
+        result = {"task_id": task_id, "repo": str(path), "commit": head, "task_type": task_type,
+                  "model": model or "Kite tự chọn", "status": "started"}
+        suggestion = self._kite_yml(path).get("suggestion")
+        if suggestion:
+            result["kite_yml_suggestion"] = suggestion
+        return result
+
+    def _kite_yml(self, path: Path) -> dict:
+        """The repository's committed .kite.yml, or a proposal when its defaults would not fit."""
+        from . import sandbox as sbx
+
+        files = self._git(path, "ls-files").stdout.splitlines()
+        if ".kite.yml" in files:
+            return {"present": True, "content": self._git(path, "show", "HEAD:.kite.yml").stdout[:1500]}
+        pyproject = self._git(path, "show", "HEAD:pyproject.toml").stdout if "pyproject.toml" in files else ""
+        return {"present": False, "suggestion": sbx.suggest_repo_config(files, pyproject)}
+
+    async def note_task(self, task_id: str, verdict: str, reason: str = "") -> dict:
+        """The user's verdict on a task's result, kept in journal/notes.jsonl to improve Kite."""
+        verdict = verdict.strip().lower()
+        if verdict not in ("good", "bad"):
+            raise KiteToolError("verdict phải là 'good' (dùng được) hoặc 'bad' (sai, không dùng được)")
+        if not task_id.strip() or len(task_id) > 200:
+            raise KiteToolError("task_id không hợp lệ")
+        record = {"task_id": task_id.strip(), "verdict": verdict, "text": reason.strip()[:2000], "source": "chat"}
+        self.journal.write("notes", record)
+        return {"saved": True, **record}
 
     async def task_status(self, task_id: str) -> dict:
         from .temporal_workflow import CodingTaskWorkflow
@@ -327,7 +352,8 @@ class KiteOps:
         git = lambda *args: self._git(path, *args).stdout.strip()
         return {"repo": str(path), "branch": git("rev-parse", "--abbrev-ref", "HEAD"), "head": head,
                 "changes": git("status", "--short")[:4000] or "(không có thay đổi)",
-                "diff_stat": git("diff", "--stat")[:4000], "recent_commits": git("log", "-8", "--oneline")}
+                "diff_stat": git("diff", "--stat")[:4000], "recent_commits": git("log", "-8", "--oneline"),
+                "kite_yml": self._kite_yml(path)}
 
     async def run_command(self, repo: str, command: str, timeout_seconds: int = 120) -> dict:
         """Run a shell command in a throw-away offline container on a copy of the repository."""
@@ -485,6 +511,12 @@ def build_server(ops: KiteOps):
     async def worker_status() -> dict:
         return await ops.logged("worker_status", ops.worker_status)
 
+    @server.tool(description="Ghi nhận xét của người dùng về KẾT QUẢ một task vào nhật ký của Kite (để cải tiến): "
+                             "verdict = 'good' (dùng được) hoặc 'bad' (sai, không dùng được, phải sửa lại); "
+                             "reason = lời người dùng. Gọi khi người dùng khen/chê kết quả một task.")
+    async def note_task(task_id: str, verdict: str, reason: str = "") -> dict:
+        return await ops.logged("note_task", ops.note_task, task_id, verdict, reason)
+
     return server
 
 
@@ -494,7 +526,7 @@ Bạn là agent trưởng của Kite. Luôn trả lời người dùng bằng **
 
 ## Việc của bạn
 
-Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_start_task`, `kite_task_status`, `kite_task_result`, `kite_apply_result`, `kite_commit_result`, `kite_repo_status`, `kite_run_command`, `kite_send_instruction`, `kite_pause_task`, `kite_resume_task`, `kite_cancel_task`, `kite_list_tasks`, `kite_worker_status`. Nếu gọi tool bị báo lỗi, đọc kỹ lỗi và báo đúng lỗi cho người dùng; không đoán, không làm đường vòng.
+Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_start_task`, `kite_task_status`, `kite_task_result`, `kite_apply_result`, `kite_commit_result`, `kite_repo_status`, `kite_run_command`, `kite_send_instruction`, `kite_pause_task`, `kite_resume_task`, `kite_cancel_task`, `kite_list_tasks`, `kite_worker_status`, `kite_note_task`. Nếu gọi tool bị báo lỗi, đọc kỹ lỗi và báo đúng lỗi cho người dùng; không đoán, không làm đường vòng.
 
 - Hiểu yêu cầu. Nếu chưa rõ, hỏi lại tối đa 1–2 câu ngắn; nếu đã đủ rõ thì làm luôn.
 - Giao việc bằng tool `start_task`. Viết `goal` cụ thể: file/hàm liên quan, hành vi mong muốn, ràng buộc, cách kiểm tra.
@@ -506,6 +538,8 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 - Khi task xong, gọi `task_result` và tóm tắt ngắn: đã đổi file nào, đổi gì, test do Kite tự chạy **PASSED** hay **FAILED**, rồi hỏi người dùng có muốn áp patch không.
 - Việc nhỏ cần xem hoặc chạy thử (đọc file, tìm code, chạy test, xem `git log`): dùng `run_command` trên repo, vài giây là có kết quả, không cần GPU. Xem nhanh trạng thái repo: `repo_status`.
 - Muốn sửa thêm trên task CHƯA xong: `send_instruction`. Task đã xong: tạo task mới.
+- Người dùng nhận xét kết quả một task (đúng, sai, dùng được, phải sửa lại…): gọi `note_task` với `verdict` `good` hoặc `bad`, `reason` là lời người dùng, rồi xác nhận ngắn là đã ghi. Không hỏi lại.
+- Kết quả `start_task` có `kite_yml_suggestion` nghĩa là repo chưa có `.kite.yml` nên Kite có thể cài thư viện hoặc chạy test chưa đúng. Báo `task_id` như thường, rồi đưa khối YAML đề xuất và nói người dùng kiểm tra rồi tự commit file `.kite.yml` vào gốc repo. Bạn không tự tạo file đó.
 - Hỏi về GPU/worker: `worker_status`. Nếu không có worker nào `alive`, nhắc người dùng bật notebook Kaggle (mục Worker mode); task vẫn được giữ và sẽ chạy khi worker kết nối.
 
 ## Quy tắc an toàn

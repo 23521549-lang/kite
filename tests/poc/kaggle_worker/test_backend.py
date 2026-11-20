@@ -409,3 +409,56 @@ def test_backend_builds_the_code_map_and_uses_it_in_the_prompts(tmp_path, monkey
     assert built and built[0].name == "work" and "else 0.0" in result.patch
     trace = read_jsonl(backend.task_dir("task-map") / "trace.jsonl")
     assert next(e for e in trace if e["event"] == "run_start")["code_map"] == 8
+
+
+def test_backend_reuses_installed_dependencies_for_the_next_task(tmp_path):
+    from poc.kaggle_worker.journal import read_jsonl
+
+    class DepsOnly(FakeDocker):
+        def __call__(self, cmd, *, timeout=None):
+            if cmd[1] == "run" and cmd[cmd.index("--name") + 1].split("-")[1] == "setup":
+                self.calls.append(list(cmd))
+                deps = Path(next(v for v in cmd if v.endswith(":/deps")).rsplit(":/deps", 1)[0])
+                (deps / "python").mkdir(parents=True, exist_ok=True)
+                return CP(cmd, 0, "installed\n", "")
+            return super().__call__(cmd, timeout=timeout)
+
+    repo, head = make_repo(tmp_path)
+    store = make_store(tmp_path)
+    first, second = DepsOnly(), DepsOnly()
+
+    tasks = {i: make_task(store, repo, head, f"task-deps-{i}") for i in (1, 2)}
+
+    def prepare(fake, i):
+        backend = make_backend(tmp_path, store, fake)
+        return backend, asyncio.run(backend.prepare_workspace(tasks[i], "k1"))
+
+    backend, _ = prepare(first, 1)
+    assert "setup" in first.kinds()
+    assert (backend.task_dir("task-deps-1") / "deps").is_symlink()
+    backend, work = prepare(second, 2)
+    assert "setup" not in second.kinds()                                  # same requirements: reused
+    trace = read_jsonl(backend.task_dir("task-deps-2") / "trace.jsonl")
+    assert any(e["event"] == "deps_cached" for e in trace)
+    assert prepare(DepsOnly(), 2)[1] == work                              # a retry keeps the prepared clone
+
+
+def test_backend_stops_a_looping_agent_and_says_so(tmp_path):
+    from poc.kaggle_worker.journal import read_jsonl
+    from test_sandbox import LOOP
+
+    class Looping(FakeDocker):
+        def __call__(self, cmd, *, timeout=None):
+            result = super().__call__(cmd, timeout=timeout)
+            if cmd[1] == "run" and cmd[cmd.index("--name") + 1].split("-")[1] == "agent":
+                return CP(cmd, 0, LOOP, "")
+            return result
+
+    fake = Looping(test_returncodes=[1, 0])
+    backend, result = run_backend_task(tmp_path, fake, "task-loop")
+    assert "Kite stopped the agent 1 time(s)" in result.summary
+    assert "Lần trước Kite đã dừng bạn vì lặp lại" in fake.agent_calls()[1][-1]        # the fix round
+    (record,) = read_jsonl(backend.state_dir / "journal" / "tasks.jsonl")
+    assert record["stuck_stops"] == 1 and record["verified"] and record["tests_edited"] == []
+    trace = read_jsonl(backend.task_dir("task-loop") / "trace.jsonl")
+    assert any(e.get("stuck") for e in trace if e["event"] == "step")

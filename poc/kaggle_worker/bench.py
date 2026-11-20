@@ -34,9 +34,12 @@ TASK = "chat-20261118-011626-bfdb"
 
 
 # --------------------------------------------------------------------------------------- gateway
-def gateway_post(url: str, *, timeout: float = 2400) -> Post:
+def gateway_post(url: str, *, timeout: float = 2400, worker: str | None = None) -> Post:
+    """POST to the gateway; ``worker`` pins every request to one worker (X-Kite-Worker)."""
+    headers = {"Content-Type": "application/json", **({"X-Kite-Worker": worker} if worker else {})}
+
     def post(body: dict) -> dict:
-        request = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
+        request = urllib.request.Request(url, json.dumps(body).encode(), headers)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read())
@@ -100,6 +103,7 @@ FAKE_RESULTS: dict[str, Any] = {
     "worker_status": {"workers": [{"worker_id": "kaggle-han", "alive": True, "loaded_model": "qwen3.6",
                                    "busy": False}], "queued_jobs": 0, "running_jobs": 0},
     "list_tasks": [{"task_id": TASK, "state": "COMPLETED", "task_type": "coding", "goal": "Thêm hàm median"}],
+    "note_task": {"saved": True},
     "repo_status": {"repo": SANDBOX_REPO, "branch": "master", "changes": "(không có thay đổi)",
                     "recent_commits": "434f3a0 Add median\n1538c3f fix average"},
     "run_command": {"exit_code": 0, "seconds": 0.8, "output": "......\n6 passed in 0.02s"},
@@ -179,6 +183,8 @@ SCENARIOS: list[Scenario] = [
       must_not=[r"(?i)(mình|tôi|em) sẽ (tự động |chủ động )?(báo|thông báo|cập nhật|nhắn)[^.\n]{0,30}"
                 r"(ngay khi|khi (task|nó|có|xong)|lúc (task|nó) xong)"],
       forbid={"start_task", "apply_result", "commit_result"}, optional=True),
+    S("L24", "ghi nhận xét", f"task {TASK} làm sai rồi, nó sửa luôn cả file test, mình phải tự sửa lại", {"note_task"},
+      {"task_id": TASK, "verdict": "^bad$"}, forbid={"apply_result", "commit_result"}),
 ]
 
 
@@ -874,6 +880,7 @@ class RepoTask:
 AIOPS_KITE_YML = """# How Kite installs and tests this repository (added by the Kite bench).
 setup: pip install -q -r services/backend/requirements.txt
 test: PYTHONPATH=. AWS_DEFAULT_REGION=us-east-1 python -m pytest -q -p no:cacheprovider -W ignore -k "not test_an_unknown_name_is_refused" services/backend/tests services/agent/tests
+quick_test: PYTHONPATH=. AWS_DEFAULT_REGION=us-east-1 python -m pytest -q -p no:cacheprovider -W ignore -k "not test_an_unknown_name_is_refused" {tests}
 setup_timeout: 1200
 test_timeout: 1200
 """
@@ -989,7 +996,13 @@ def score_code(task, run: dict) -> dict:
             "agent_status": run.get("agent_status"), "agent_seconds": run.get("agent_seconds"),
             "test_exit_code": run.get("test_exit_code"), "changed_files": run.get("changed_files", []),
             "fix_rounds_used": run.get("fix_rounds_used", 0), "review": run.get("review"),
-            "task_id": run.get("task_id")}
+            "task_id": run.get("task_id"),
+            # Where the time went (wall = the whole Kite run, hidden tests excluded).
+            "wall_seconds": run.get("wall_seconds"), "setup_seconds": run.get("setup_seconds"),
+            "setup_cached": run.get("setup_cached"), "test_seconds": run.get("test_seconds"),
+            "full_test_runs": run.get("full_test_runs"), "quick_test_seconds": run.get("quick_test_seconds"),
+            "quick_test_runs": run.get("quick_test_runs"), "stuck_stops": run.get("stuck_stops"),
+            "tests_edited": run.get("tests_edited")}
 
 
 # --------------------------------------------------------------------------------------- driver
@@ -1024,12 +1037,21 @@ def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, sy
                 entry["code"].append(outcome)
                 log(f"[{model}] {task.id} {'OK' if outcome['passed'] else 'SAI'} {outcome.get('agent_seconds')}s"
                     f" | vòng sửa {outcome.get('fix_rounds_used', 0)} | rà soát {outcome.get('review')}"
-                    f" | test ẩn {outcome.get('hidden_passed')}")
+                    f" | test ẩn {outcome.get('hidden_passed')} | tổng {outcome.get('wall_seconds')}s"
+                    f" | dừng vì lặp {outcome.get('stuck_stops') or 0}")
         (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     results["finished"] = time.strftime("%Y-%m-%d %H:%M")
     (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     (out / "README.md").write_text(render_report(results), encoding="utf-8")
     return results
+
+
+def _median(values: list[float]) -> float | None:
+    values = sorted(values)
+    if not values:
+        return None
+    middle = len(values) // 2
+    return round(values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2, 1)
 
 
 def summarize(entry: dict) -> dict:
@@ -1047,6 +1069,7 @@ def summarize(entry: dict) -> dict:
         "code_fix_rounds": sum(item.get("fix_rounds_used") or 0 for item in code),
         "code_hidden_failed": sum(item.get("hidden_passed") is False for item in code),
         "code_seconds": round(sum(item.get("agent_seconds") or 0 for item in code) / len(code), 1) if code else None,
+        "code_wall_median": _median([item["wall_seconds"] for item in code if item.get("wall_seconds")]),
         "gen_tps": (speed.get("second") or {}).get("gen_tps"), "prompt_tps": (speed.get("second") or {}).get("prompt_tps"),
         "swap_seconds": speed.get("swap_seconds"),
     }
@@ -1058,15 +1081,15 @@ def render_report(results: dict) -> str:
              "Dữ liệu đầy đủ (mọi lần gọi tool, câu trả lời) ở `results.json`.",
              *([f"Harness code: {results['harness']}."] if results.get("harness") else []), "",
              "| Model | Agent trưởng (kịch bản đạt) | Điểm TB | Gọi shell | s/kịch bản | Code (task đạt) | Vòng sửa "
-             "| Trượt test ẩn | s/task code | Sinh tok/s | Đọc prompt tok/s | Đổi model (s) |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| Trượt test ẩn | s agent/task | s tổng/task (trung vị) | Sinh tok/s | Đọc prompt tok/s | Đổi model (s) |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     categories: set[str] = set()
     for model, entry in results["models"].items():
         s = summarize(entry)
         categories |= set(s["categories"])
         lines.append(f"| `{model}` | {s['lead_passed']}/{s['lead_total']} | {s['lead_score']} | {s['shell_used']} "
                      f"| {s['lead_seconds']} | {s['code_passed']}/{s['code_total']} | {s['code_fix_rounds']} "
-                     f"| {s['code_hidden_failed']} | {s['code_seconds']} "
+                     f"| {s['code_hidden_failed']} | {s['code_seconds']} | {s['code_wall_median']} "
                      f"| {s['gen_tps']} | {s['prompt_tps']} | {s['swap_seconds']} |")
     if categories:
         cats = sorted(categories)
@@ -1075,6 +1098,19 @@ def render_report(results: dict) -> str:
         for model, entry in results["models"].items():
             s = summarize(entry)
             lines.append(f"| `{model}` | " + " | ".join(str(s["categories"].get(c, "")) for c in cats) + " |")
+    timed = [(model, item) for model, entry in results["models"].items() for item in entry.get("code") or []
+             if item.get("wall_seconds")]
+    if timed:
+        lines += ["", "## Thời gian từng task code (giây)", "",
+                  "| Model | Task | Đạt | Tổng | Cài thư viện | Agent | Test đầy đủ (lần) | Test nhanh (lần) "
+                  "| Vòng sửa | Rà soát | Dừng vì lặp |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for model, item in timed:
+            setup = "dùng lại" if item.get("setup_cached") else item.get("setup_seconds")
+            lines.append(f"| `{model}` | {item['id']} | {'✓' if item['passed'] else '✗'} | {item['wall_seconds']} "
+                         f"| {setup} | {item.get('agent_seconds')} | {item.get('test_seconds')} "
+                         f"({item.get('full_test_runs')}) | {item.get('quick_test_seconds')} "
+                         f"({item.get('quick_test_runs')}) | {item.get('fix_rounds_used', 0)} | {item.get('review')} "
+                         f"| {item.get('stuck_stops') or 0} |")
     lines += ["", "## Kịch bản sai", ""]
     for model, entry in results["models"].items():
         for item in entry.get("lead") or []:
@@ -1089,7 +1125,7 @@ def render_report(results: dict) -> str:
                              f"vòng sửa {item.get('fix_rounds_used', 0)}, rà soát {item.get('review')}, "
                              f"sửa test: {item.get('touched_tests')}")
     lines += ["", "## Cách chấm", "",
-              "- **Agent trưởng**: gửi `AGENTS.md` thật và schema thật của 13 tool MCP (tên `kite_*` như OpenCode), "
+              "- **Agent trưởng**: gửi `AGENTS.md` thật và schema thật của 14 tool MCP (tên `kite_*` như OpenCode), "
               "thêm tool `bash` luôn bị từ chối. Kết quả tool là kịch bản cố định, nên đo được tính đúng/sai: tool "
               "đầu tiên, tham số, không gọi shell, không gọi tool bị cấm, câu trả lời không khẳng định điều kết quả "
               "tool không nói, trả lời tiếng Việt.",

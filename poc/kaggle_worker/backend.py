@@ -90,12 +90,13 @@ class SandboxActivityBackend:
 
     async def _run_container(self, name: str, args: list[str], timeout: int,
                              heartbeat: Callable[[dict], None] | None = None,
-                             state: str = "RUNNING", task_id: str = "") -> tuple[int, str, float]:
+                             state: str = "RUNNING", task_id: str = "",
+                             watch: sbx.StuckWatch | None = None) -> tuple[int, str, float]:
         """Run one sandbox container, heartbeating Temporal while it works; kill it if cancelled."""
         await asyncio.to_thread(self._docker, "rm", "-f", name)     # leftover from a crashed attempt
         started = time.monotonic()
         step = asyncio.create_task(asyncio.to_thread(
-            sbx._run_step, self.settings, self.runner, name=name, args=args, timeout=timeout))
+            sbx._run_step, self.settings, self.runner, name=name, args=args, timeout=timeout, watch=watch))
         try:
             while True:
                 done, _ = await asyncio.wait({step}, timeout=self.heartbeat_seconds)
@@ -111,7 +112,8 @@ class SandboxActivityBackend:
         seconds = round(time.monotonic() - started, 1)
         if task_id:
             self._trace(task_id, "step", step=name.split("-")[1], state=state, seconds=seconds, exit=code,
-                        output_chars=len(output), tail=output[-400:] if code != 0 else None)
+                        output_chars=len(output), tail=output[-400:] if code != 0 else None,
+                        stuck=watch.reason if watch is not None and watch.reason else None)
         return code, output, seconds
 
     def _worker_result(self, task: CodingTaskInput, route: RouteLease, result: CodingRunResult) -> WorkerResult:
@@ -152,6 +154,8 @@ class SandboxActivityBackend:
             if base and base != task.repo_head:
                 raise ApplicationError(f"{work} was prepared for commit {base}, not {task.repo_head}",
                                        non_retryable=True)
+        if deps.is_symlink():                      # a link into the shared deps cache: drop the link only
+            deps.unlink()
         for leftover in (work, deps):              # an earlier attempt stopped half-way: start over
             if leftover.exists():
                 shutil.rmtree(leftover)
@@ -169,7 +173,14 @@ class SandboxActivityBackend:
             raise ApplicationError(str(exc), non_retryable=True) from exc
         if settings is not self.settings:
             self._trace(task.task_id, "repo_config", setup=settings.setup_command, test=settings.test_command)
-        if settings.setup_command:
+        cache_root = self.state_dir / "deps-cache" if settings.deps_cache else None
+        key = sbx.deps_key(settings, work, settings.setup_command) if cache_root is not None else None
+        cached = sbx.cached_deps(cache_root, key)
+        if cached is not None:
+            sbx.link_deps(deps, cached)
+            self._trace(task.task_id, "deps_cached", key=key)
+        elif settings.setup_command:
+            before = sbx.workspace_state(work)
             name = sbx.container_name("setup", task_slug(task.task_id))
             code, output, seconds = await self._run_container(
                 name, sbx.docker_run_args(self.settings, name=name, workspace=work,
@@ -180,6 +191,8 @@ class SandboxActivityBackend:
             if code != 0:
                 raise ApplicationError(f"setup command failed (exit {code}) after {seconds}s; "
                                        f"see {root / 'setup.log'}", non_retryable=True)
+            if sbx.workspace_state(work) == before and await asyncio.to_thread(sbx.store_deps, cache_root, key, deps):
+                self._trace(task.task_id, "deps_stored", key=key)
         patch_base = sbx.commit_setup_changes(work)
         sbx._git(work, "update-ref", "refs/kite/patch-base", patch_base)
         return str(work)
@@ -237,38 +250,59 @@ class SandboxActivityBackend:
                          context: str, session_id: str, heartbeat: Callable[[dict], None],
                          graph: sbx.codemap.CodeGraph | None = None) -> CodingRunResult:
         settings = sbx.repo_settings(self.settings, work)   # the repo's .kite.yml (already validated in setup)
-        prompt = sbx.agent_prompt(goal, settings.test_command, task_type=task.task_type, context=context)
+        template = sbx.quick_template(settings)
+        prompt = sbx.agent_prompt(goal, settings.test_command, task_type=task.task_type, context=context,
+                                  quick=template)
         test_command = settings.test_command
         attempt, seconds, test_code, test_output = 0, 0.0, None, ""
+
+        async def run_tests(after: str, last_output: str = "") -> tuple[int, str, str]:
+            """The related tests first (seconds), the full suite only if they pass."""
+            tests = await asyncio.to_thread(sbx.select_tests, work, patch_base, graph, last_output)
+            quick = sbx.quick_test_command(template, tests)
+            if quick:
+                name = sbx.container_name("quick", slug)
+                code, output, _ = await self._run_container(
+                    name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
+                    + ["sh", "-c", quick], settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
+                with (root / "test.log").open("a", encoding="utf-8") as stream:
+                    stream.write(f"\n===== quick after {after} exit={code} =====\n{output}")
+                if code == 1:
+                    return code, output, quick
+            name = sbx.container_name("test", slug)
+            code, output, _ = await self._run_container(
+                name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
+                + ["sh", "-c", test_command], settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
+            with (root / "test.log").open("a", encoding="utf-8") as stream:
+                stream.write(f"\n===== after {after} exit={code} =====\n{output}")
+            return code, output, test_command
+        stuck_stops = 0
         while True:
             kind = "agent" if attempt == 0 else f"fix{attempt}"
             name = sbx.container_name(kind, slug)
+            watch = sbx.StuckWatch()
             code, output, step_seconds = await self._run_container(
                 name, sbx.docker_run_args(self.settings, name=name, workspace=work, network=self.settings.network,
                                           config_file=config_file, deps=deps)
                 + ["opencode", "run", "-m", f"kite/{route.model_id}", prompt],
                 self.settings.agent_timeout_seconds, heartbeat, "AGENT_RUNNING" if attempt == 0 else "FIXING",
-                task.task_id)
+                task.task_id, watch)
             seconds = round(seconds + step_seconds, 1)
             with (root / "agent.log").open("a", encoding="utf-8") as stream:
                 stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {kind} model={route.model_id} "
                              f"exit={code} =====\n")
                 stream.write(output)
-            status = {0: "ok", 124: "timeout"}.get(code, "failed")
+            status = sbx.AGENT_STATUS.get(code, "failed")
+            stuck_stops += status == "stuck"
             if not test_command:
                 break
-            name = sbx.container_name("test", slug)
-            test_code, test_output, _ = await self._run_container(
-                name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
-                + ["sh", "-c", test_command],
-                settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
-            with (root / "test.log").open("a", encoding="utf-8") as stream:
-                stream.write(f"\n===== after {kind} exit={test_code} =====\n{test_output}")
-            if test_code == 0 or status != "ok" or attempt >= self.settings.fix_rounds:
+            test_code, test_output, ran = await run_tests(kind, test_output)
+            if test_code == 0 or status not in ("ok", "stuck") or attempt >= self.settings.fix_rounds:
                 break
             attempt += 1
-            prompt = sbx.fix_prompt(goal, test_command, test_output, attempt, self.settings.fix_rounds,
-                                    sbx.codemap.failing_targets(graph, test_output) if graph is not None else "")
+            prompt = sbx.fix_prompt(goal, ran, test_output, attempt, self.settings.fix_rounds,
+                                    sbx.codemap.failing_targets(graph, test_output) if graph is not None else "",
+                                    quick=template, stuck=watch.reason)
 
         review = "skipped"
         if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code):
@@ -279,8 +313,9 @@ class SandboxActivityBackend:
                                           config_file=config_file, deps=deps)
                 + ["opencode", "run", "-m", f"kite/{route.model_id}",
                    sbx.review_prompt(goal, test_command, await asyncio.to_thread(
-                       sbx.codemap.impact, graph, work, patch_base) if graph is not None else "")],
-                self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id)
+                       sbx.codemap.impact, graph, work, patch_base) if graph is not None else "", quick=template,
+                       edited=await asyncio.to_thread(sbx.edited_tests, work, patch_base))],
+                self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id, sbx.StuckWatch())
             seconds = round(seconds + step_seconds, 1)
             with (root / "agent.log").open("a", encoding="utf-8") as stream:
                 stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} review model={route.model_id} "
@@ -289,13 +324,7 @@ class SandboxActivityBackend:
             if await asyncio.to_thread(sbx.snapshot_tree, work) == before:
                 review = "unchanged"
             else:
-                name = sbx.container_name("test", slug)
-                code_after, test_after, _ = await self._run_container(
-                    name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
-                    + ["sh", "-c", test_command],
-                    settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
-                with (root / "test.log").open("a", encoding="utf-8") as stream:
-                    stream.write(f"\n===== after review exit={code_after} =====\n{test_after}")
+                code_after, test_after, _ = await run_tests("review")
                 if review_code == 0 and code_after == 0:
                     review, output, test_output = "kept", review_output, test_after
                 else:
@@ -303,6 +332,7 @@ class SandboxActivityBackend:
                     review = "reverted"
 
         patch_path = root / "result.patch"
+        tests_edited = await asyncio.to_thread(sbx.edited_tests, work, patch_base)
         changed = await asyncio.to_thread(sbx.collect_patch, work, patch_base, patch_path)
         patch = patch_path.read_text(encoding="utf-8")
 
@@ -310,6 +340,11 @@ class SandboxActivityBackend:
                  f"{f', {attempt} vòng sửa sau test lỗi' if attempt else ''}"
                  f"{REVIEW_NOTES.get(review, '')}).",
                  f"Files changed: {', '.join(changed) if changed else 'none'}."]
+        if stuck_stops:
+            lines.append(f"Kite stopped the agent {stuck_stops} time(s) for repeating the same steps.")
+        if tests_edited:
+            lines.append(f"NOTE: existing tests were changed: {', '.join(tests_edited)} - check that this was "
+                         "intended and not just to make tests pass.")
         if test_code is None:
             lines.append("Kite test run: skipped (no sandbox.test_command).")
         else:
@@ -323,8 +358,8 @@ class SandboxActivityBackend:
             "task_id": task.task_id, "model": route.model_id, "worker": route.worker_id,
             "agent_status": status, "agent_exit_code": code, "agent_seconds": seconds,
             "changed_files": changed, "test_exit_code": test_code, "fix_rounds_used": attempt,
-            "review": review,
-            "verified": status == "ok" and test_code == 0 and bool(changed),
+            "review": review, "stuck_stops": stuck_stops, "tests_edited": tests_edited,
+            "verified": status in ("ok", "stuck") and test_code == 0 and bool(changed),
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
         removed = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
@@ -332,8 +367,9 @@ class SandboxActivityBackend:
                "model": route.model_id, "worker": route.worker_id, "goal": short(task.goal, 500),
                "instruction": short(instruction, 500), "status": "finished", "agent_status": status,
                "agent_exit": code, "seconds": seconds, "fix_rounds": attempt, "review": review,
-               "test_command": test_command, "test_exit": test_code,
-               "verified": status == "ok" and test_code == 0 and bool(changed),
+               "test_command": test_command, "test_exit": test_code, "stuck_stops": stuck_stops,
+               "tests_edited": tests_edited,
+               "verified": status in ("ok", "stuck") and test_code == 0 and bool(changed),
                "changed_files": changed, "lines_added": added, "lines_removed": removed,
                "context_chars": len(context)}
         self._trace(task.task_id, "run_end", **{k: v for k, v in run.items() if k not in ("task_id", "goal")})

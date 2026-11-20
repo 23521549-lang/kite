@@ -17,12 +17,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
+import threading
 import tempfile
 import time
 import urllib.request
@@ -100,6 +103,13 @@ class SandboxSettings:
     # Build a graphify code map of the task's clone (if graphify is installed) and use it in the
     # first prompt, the fix rounds and the self-review (see codemap.py).
     code_map: bool = True
+    # Reuse what the setup step installed into /deps for later tasks of the same repository and
+    # dependency files (a shared, read-only cache; see deps_key / store_deps).
+    deps_cache: bool = True
+    # Between agent rounds, run only the tests that matter (failing ones, the ones the agent wrote,
+    # the ones the code map ties to the changed code) before the full suite (see quick_test_command).
+    quick_tests: bool = True
+    quick_test_command: str = ""     # from .kite.yml `quick_test`, with {tests}; derived for plain pytest
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
     model_context: dict[str, int] = field(default_factory=dict)
 
@@ -129,11 +139,18 @@ class SandboxRun:
     test_output_tail: str = ""
     fix_rounds_used: int = 0
     review: str = "skipped"       # skipped | unchanged | kept | reverted
+    setup_cached: bool = False    # setup skipped: the dependencies were reused from the cache
+    quick_test_runs: int = 0
+    quick_test_seconds: float = 0.0
+    full_test_runs: int = 0
+    stuck_stops: int = 0          # agent steps Kite stopped because they repeated themselves
+    tests_edited: list[str] = field(default_factory=list)   # existing test files the agent changed
 
     @property
     def verified(self) -> bool:
-        """Setup (if any) worked, the agent finished and changed something, Kite's tests passed."""
-        return (self.setup_exit_code in (None, 0) and self.agent_status == "ok"
+        """Setup (if any) worked, the agent finished (or was stopped in a loop after its fix was in)
+        and changed something, and Kite's tests passed."""
+        return (self.setup_exit_code in (None, 0) and self.agent_status in ("ok", "stuck")
                 and self.test_exit_code == 0 and bool(self.changed_files))
 
     def to_dict(self) -> dict:
@@ -184,7 +201,8 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
         "-v", f"{Path(workspace).resolve()}:/work", "-w", "/work",
     ]
     if deps is not None:
-        args += ["-v", f"{Path(deps).resolve()}:/deps"]
+        # A link into the shared dependency cache is mounted read-only: no task may change it.
+        args += ["-v", f"{Path(deps).resolve()}:/deps" + (":ro" if Path(deps).is_symlink() else "")]
         for key, value in DEPS_ENV:
             args += ["-e", f"{key}={value}"]
     for key, value in extra_env:
@@ -241,7 +259,8 @@ TASK_GUIDES = {
         "1. Đọc các file liên quan và test hiện có trước khi sửa.",
         "2. Lập kế hoạch ngắn: cần đổi file nào, vì sao.",
         "3. Sửa đúng phạm vi yêu cầu. Không sửa, xóa hay bỏ qua test để cho qua, trừ khi yêu cầu nói vậy.",
-        "4. Chạy lệnh kiểm tra; nếu lỗi thì đọc lỗi, tìm nguyên nhân gốc, sửa và chạy lại cho tới khi qua.",
+        "4. Chạy lệnh kiểm tra; nếu lỗi thì đọc lỗi, tìm nguyên nhân gốc, sửa và chạy lại cho tới khi qua. "
+        "Thử một cách hai lần mà kết quả không đổi thì đổi hướng, đừng lặp lại y nguyên.",
         "5. Kết thúc bằng tóm tắt ngắn: đã đổi gì, vì sao, kết quả kiểm tra.",
     ],
     "analysis": [
@@ -267,7 +286,7 @@ TASK_GUIDES = {
 
 
 REPO_CONFIG = ".kite.yml"
-REPO_CONFIG_KEYS = {"setup": "setup_command", "test": "test_command",
+REPO_CONFIG_KEYS = {"setup": "setup_command", "test": "test_command", "quick_test": "quick_test_command",
                     "setup_timeout": "setup_timeout_seconds", "test_timeout": "test_timeout_seconds"}
 
 
@@ -280,6 +299,7 @@ def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings
 
         setup: pip install -r requirements.txt
         test: python -m pytest -q tests
+        quick_test: python -m pytest -q {tests}   # optional: the same tests, only the given files
         test_timeout: 900          # seconds, optional (60-3600)
         setup_timeout: 900
 
@@ -307,13 +327,48 @@ def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings
                 raise SandboxError(f"{REPO_CONFIG}: {key} must be seconds between 60 and 3600")
         elif not isinstance(value, str):
             raise SandboxError(f"{REPO_CONFIG}: {key} must be a shell command string ('' to skip)")
+        elif key == "quick_test" and value and "{tests}" not in value:
+            raise SandboxError(f"{REPO_CONFIG}: quick_test must contain {{tests}} (where Kite puts the test files)")
         changes[field_name] = value
     from dataclasses import replace
 
     return replace(settings, **changes)
 
 
-def review_prompt(goal: str, test_command: str, impact: str = "") -> str:
+def suggest_repo_config(files: list[str], pyproject: str = "") -> str:
+    """A ``.kite.yml`` proposal from a repository's file list, or "" when Kite's defaults fit
+    (nothing to install, tests found by ``python -m pytest -q``). For the user to check and commit:
+    Kite never writes it into a repository itself."""
+    requirements = sorted((f for f in files if re.search(r"(^|/)requirements[^/]*\.txt$", f)),
+                          key=lambda f: (f.count("/"), f))[:4]
+    setup = ""
+    if requirements:
+        setup = "pip install -q " + " ".join(f"-r {f}" for f in requirements)
+    elif "pyproject.toml" in files or "setup.py" in files:
+        extra = re.search(r"^\s*(test|tests|dev)\s*=", pyproject, re.M)
+        setup = f"pip install -q -e '.[{extra.group(1)}]'" if extra else "pip install -q -e ."
+    tests = [f for f in files if f.endswith(".py") and codemap.is_test_path(f) and not f.endswith("conftest.py")]
+    folders = []
+    for path in tests:
+        parts = path.split("/")
+        cut = next((i for i, part in enumerate(parts[:-1]) if part in ("tests", "test")), len(parts) - 1)
+        folder = "/".join(parts[:cut + 1]) if cut < len(parts) - 1 else "/".join(parts[:-1])
+        if folder and folder not in folders:
+            folders.append(folder)
+    nested = [f for f in folders if "/" in f]
+    if not setup and not nested:
+        return ""
+    lines = ["# Đề xuất của Kite: kiểm tra lại (nhất là biến môi trường test cần) rồi commit vào gốc repo"]
+    if setup:
+        lines.append(f"setup: {setup}")
+    if nested:
+        lines += [f"test: PYTHONPATH=. python -m pytest -q {' '.join(sorted(folders)[:6])}",
+                  "quick_test: PYTHONPATH=. python -m pytest -q {tests}"]
+    return "\n".join(lines) + "\n"
+
+
+def review_prompt(goal: str, test_command: str, impact: str = "", quick: str = "",
+                  edited: list[str] = ()) -> str:
     """Prompt for the self-review pass, after Kite's tests already passed.
 
     ``impact`` (codemap.impact): the callers of what the agent changed, found by the code map.
@@ -336,6 +391,11 @@ def review_prompt(goal: str, test_command: str, impact: str = "") -> str:
         f"5. Chạy lại `{test_command}` và đảm bảo vẫn qua.",
         "6. Kết thúc bằng: các quy tắc đã kiểm tra, chỗ đã sửa thêm (hoặc \"không cần sửa\").",
     ]
+    if quick_hint(quick):
+        lines.append(quick_hint(quick))
+    if edited:
+        lines += ["", "Bạn đã sửa hoặc xóa test có sẵn: " + ", ".join(edited) + ". Chỉ giữ nếu yêu cầu đổi đúng hành vi "
+                  "mà test cũ kiểm tra; nếu chỉ để cho test qua thì trả file test về như cũ và sửa code."]
     if impact:
         lines += ["", "Phần bạn đã đổi và những chỗ đang dùng nó (bản đồ code của Kite; có thể thiếu, vẫn grep thêm):",
                   impact]
@@ -356,7 +416,71 @@ def restore_tree(workspace: Path, tree: str) -> None:
 
 def wants_review(settings: SandboxSettings, task_type: str, test_command: str, status: str, test_code) -> bool:
     return bool(settings.self_review and task_type == "coding" and test_command
-                and status == "ok" and test_code == 0)
+                and status in ("ok", "stuck") and test_code == 0)
+
+
+AGENT_STATUS = {0: "ok", 124: "timeout", 125: "stuck"}
+STUCK_REPEATS = 4            # the same steps this many times in a row, with the same results: stuck
+STUCK_CYCLE = 4              # longest repeating block of steps looked for
+
+
+class StuckWatch:
+    """Notices an agent going round in circles in ``opencode run`` output.
+
+    Each step starts with a ``> agent · model`` header; a step is its action and what came back.
+    When the last few steps are one block repeated ``STUCK_REPEATS`` times with identical text
+    (re-reading a file, rewriting a script, running it, getting the same answer), more of the
+    same will not help: v1 of the real-repo bench lost 50 minutes of a 60-minute step that way.
+    """
+
+    def __init__(self, repeats: int = STUCK_REPEATS, cycle: int = STUCK_CYCLE):
+        self.repeats, self.cycle = repeats, cycle
+        self.steps: list[str] = []
+        self.current: list[str] | None = None
+        self.reason = ""
+
+    @staticmethod
+    def _normal(line: str) -> str:
+        return re.sub(r"\d+(\.\d+)?\s*(ms|s)\b", "<t>", ANSI.sub("", line).rstrip())
+
+    def feed(self, line: str) -> str:
+        """One output line; returns the reason once the agent is stuck (and keeps returning it)."""
+        if self.reason:
+            return self.reason
+        line = self._normal(line)
+        if line.startswith("> "):
+            if self.current:
+                self.steps.append("\n".join(self.current).strip())
+                self.reason = self._check()
+            self.current = []
+        elif self.current is not None and line:
+            self.current.append(line)
+        return self.reason
+
+    def _check(self) -> str:
+        steps = self.steps
+        for size in range(1, self.cycle + 1):
+            span = size * self.repeats
+            if len(steps) < span:
+                break
+            block = steps[-size:]
+            if any(steps[-span + i] != block[i % size] for i in range(span)) or not any(block):
+                continue
+            actions = " → ".join(step.splitlines()[0][:80] for step in block if step)
+            return f"lặp lại {self.repeats} lần cùng {size} bước với cùng kết quả ({actions})"
+        return ""
+
+    def scan(self, text: str) -> str:
+        for line in clean_output(text).splitlines():
+            self.feed(line)
+        return self.feed("> end")
+
+
+def edited_tests(workspace: Path, base: str) -> list[str]:
+    """Test files that existed at ``base`` and the agent changed or deleted (adding tests is fine)."""
+    rows = _git(Path(workspace), "diff", "--name-status", base, check=False).splitlines()
+    return sorted(row.split("\t")[-1] for row in rows
+                  if row[:1] in ("M", "D", "R") and codemap.is_test_path(row.split("\t")[1]))
 
 
 def _is_noise(path: str) -> bool:
@@ -534,12 +658,110 @@ def code_graph(settings: SandboxSettings, workspace: Path, out_dir: Path,
     return graph
 
 
-def agent_prompt(goal: str, test_command: str, *, task_type: str = "coding", context: str = "") -> str:
+QUICK_TEST_MAX = 40                 # more related tests than this: the full suite is as good
+_PYTEST_VALUE_OPTIONS = {"-k", "-m", "-p", "-W", "-c", "-o", "-n", "--deselect", "--ignore", "--rootdir",
+                         "--maxfail", "--confcutdir", "--basetemp", "--import-mode", "--tb"}
+
+
+def quick_template(settings: SandboxSettings, test_command: str | None = None) -> str:
+    """The quick-test command with a ``{tests}`` slot, or "" if there is none.
+
+    From ``.kite.yml`` (``quick_test``), else derived from a plain pytest command that has only
+    options (``python -m pytest -q``): appending files to a command that already names folders
+    would still run everything, so such commands need an explicit ``quick_test``.
+    """
+    test_command = settings.test_command if test_command is None else test_command
+    if not settings.quick_tests or not test_command:
+        return ""
+    if settings.quick_test_command:
+        return settings.quick_test_command
+    try:
+        tokens = shlex.split(test_command)
+    except ValueError:
+        return ""
+    start = next((i for i, t in enumerate(tokens) if t == "pytest" or t.endswith("/pytest")), None)
+    if start is None:
+        return ""
+    takes_value = False
+    for token in tokens[start + 1:]:
+        if takes_value:
+            takes_value = False
+        elif token in _PYTEST_VALUE_OPTIONS:
+            takes_value = True
+        elif not token.startswith("-"):
+            return ""                         # a path, an expression or a shell operator
+    return f"{test_command} {{tests}}"
+
+
+def select_tests(workspace: Path, base: str, graph: codemap.CodeGraph | None = None, last_output: str = "",
+                 limit: int = QUICK_TEST_MAX) -> list[str]:
+    """Tests worth running before the full suite: the ones that just failed, the test files the
+    agent added or changed, and (with a code map) the tests that use the code it changed."""
+    workspace = Path(workspace)
+    failing, written, related = [], [], []
+    for node in re.findall(r"^(?:FAILED|ERROR) ([\w./-]+\.py(?:::\S+)?)", clean_output(last_output), re.M):
+        if (workspace / node.split("::", 1)[0]).is_file() and node not in failing:
+            failing.append(node)
+    changed = set(_git(workspace, "diff", "--name-only", base, check=False).splitlines())
+    changed |= set(_git(workspace, "ls-files", "--others", "--exclude-standard", check=False).splitlines())
+    for path in sorted(changed):
+        if path.endswith(".py") and codemap.is_test_path(path) and not path.endswith("conftest.py") \
+                and (workspace / path).is_file():
+            written.append(path)
+    if graph is not None:
+        changed_symbols = [symbol for path, lines in codemap.changed_lines(workspace, base).items()
+                           if not codemap.is_test_path(path)
+                           for symbol in dict.fromkeys(graph.at(path, line) for line in lines) if symbol is not None]
+        # Nearest first: tests that use the changed code, then tests of its callers, then (for a
+        # method) tests that use its class.
+        callers = [user for symbol in changed_symbols for _, user, path, _ in graph.users(symbol)
+                   if user is not None and not codemap.is_test_path(path)]
+        owners = [owner for symbol in changed_symbols if symbol.kind == "method"
+                  for owner in [graph.parent(symbol)] if owner is not None and owner.kind == "class"]
+        for symbol in changed_symbols + callers + owners:
+            for _, _, user_path, _ in graph.users(symbol):
+                if (codemap.is_test_path(user_path) and user_path.endswith(".py") and user_path not in related
+                        and (workspace / user_path).is_file()):
+                    related.append(user_path)
+        # Last: tests that import the changed module (an HTTP app is tested through its routes, which
+        # the graph cannot follow), but only when few do; many importers means "everything".
+        for path in dict.fromkeys(s.file for s in changed_symbols):
+            module = next((s for s in graph.by_file.get(path, []) if s.kind == "module"), None)
+            importers = {p for _, _, p, _ in graph.users(module)} if module is not None else set()
+            importers = sorted(p for p in importers if codemap.is_test_path(p) and p.endswith(".py")
+                               and (workspace / p).is_file())
+            if len(importers) <= 15:
+                related += [p for p in importers if p not in related]
+    picked = list(dict.fromkeys(failing + written))
+    if len(picked) > limit:
+        return []
+    for path in related:
+        if path not in picked and len(picked) < limit:
+            picked.append(path)
+    return picked
+
+
+def quick_test_command(template: str, tests: list[str]) -> str:
+    return template.replace("{tests}", " ".join(shlex.quote(t) for t in tests)) if template and tests else ""
+
+
+def quick_hint(template: str) -> str:
+    """The line telling the agent how to run only some tests while it works."""
+    if not template:
+        return ""
+    return ("Trong lúc sửa, chạy riêng các file test liên quan cho nhanh: `" + template.replace("{tests}", "<file test>")
+            + "`; chạy bộ đầy đủ một lần trước khi kết thúc (Kite cũng tự chạy lại).")
+
+
+def agent_prompt(goal: str, test_command: str, *, task_type: str = "coding", context: str = "",
+                 quick: str = "") -> str:
     lines = [goal.strip(), "", "Cách làm:", *TASK_GUIDES.get(task_type, TASK_GUIDES["coding"]), "",
              "Làm việc trong thư mục hiện tại (/work). Môi trường không có Internet: "
              "không cài gói, không tải gì về; thư viện cần thiết đã được cài sẵn."]
     if test_command:
         lines.append(f"Kiểm tra lại bằng lệnh: {test_command}")
+        if quick_hint(quick):
+            lines.append(quick_hint(quick))
     lines.append("Không commit, không push: Kite sẽ tự lấy thay đổi để người dùng duyệt.")
     if context:
         lines += ["", "Ngữ cảnh repo (Kite chuẩn bị sẵn; vẫn đọc lại file trước khi sửa):", context]
@@ -565,7 +787,7 @@ def failure_digest(output: str, limit: int = FIX_OUTPUT_CHARS) -> str:
 
 
 def fix_prompt(goal: str, test_command: str, test_output: str, attempt: int, rounds: int,
-               targets: str = "") -> str:
+               targets: str = "", quick: str = "", stuck: str = "") -> str:
     """The next round after Kite's own test run failed: same goal, plus the real failing output.
 
     ``targets`` (codemap.failing_targets): what each failing test calls, from the code map.
@@ -581,6 +803,11 @@ def fix_prompt(goal: str, test_command: str, test_output: str, attempt: int, rou
     ]
     if targets:
         lines[-2:-2] = ["Test thất bại gọi tới (bản đồ code của Kite, để biết nên đọc chỗ nào trước):", targets]
+    if quick_hint(quick):
+        lines.insert(-1, quick_hint(quick))
+    if stuck:
+        lines[1:1] = [f"Lần trước Kite đã dừng bạn vì {stuck}. Cách đó không dẫn tới đâu: đọc lại lỗi test bên "
+                      "dưới, xem lại giả định của mình và đổi hướng.", ""]
     return "\n".join(lines)
 
 
@@ -617,6 +844,98 @@ def prepare_clone(repo: Path, workspace: Path, *, head: str | None = None,
     return head
 
 
+DEPS_CACHE_KEEP = 6               # cached dependency sets kept (the most recently used)
+DEP_MANIFESTS = re.compile(
+    r"(^|/)(requirements[^/]*\.(txt|in)|constraints[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg|Pipfile(\.lock)?"
+    r"|poetry\.lock|uv\.lock|package(-lock)?\.json|yarn\.lock|pnpm-lock\.yaml|go\.(mod|sum)|Cargo\.(toml|lock)"
+    r"|Gemfile(\.lock)?|environment\.ya?ml)$")
+
+
+def deps_key(settings: SandboxSettings, workspace: Path, setup_command: str) -> str | None:
+    """Cache key of what the setup step installs: image, command, and the exact dependency files
+    (by Git blob, including any tracked file the command names). None when there is no setup."""
+    if not setup_command:
+        return None
+    named = {token for token in re.split(r"[\s=]+", setup_command) if token}
+    rows = [line for line in _git(Path(workspace), "ls-files", "-s", check=False).splitlines()
+            if "\t" in line and (DEP_MANIFESTS.search(line.split("\t", 1)[1]) or line.split("\t", 1)[1] in named)]
+    digest = hashlib.sha256(f"{settings.image}\0{setup_command}\0".encode())
+    for row in sorted(rows):
+        digest.update(row.encode() + b"\n")
+    return digest.hexdigest()[:24]
+
+
+def cached_deps(cache_root: Path | None, key: str | None) -> Path | None:
+    """The cached dependency set for ``key``, if a finished one exists (and mark it used)."""
+    if cache_root is None or key is None:
+        return None
+    path = Path(cache_root) / key
+    ready = path / ".kite-ready"
+    if not ready.is_file():
+        return None
+    os.utime(ready)
+    return path
+
+
+def link_deps(deps: Path, cached: Path) -> None:
+    """Make the task's /deps the cached set (a symlink; mounted read-only)."""
+    deps = Path(deps)
+    if deps.is_symlink():
+        deps.unlink()
+    elif deps.exists():
+        shutil.rmtree(deps)
+    deps.parent.mkdir(parents=True, exist_ok=True)
+    deps.symlink_to(Path(cached).resolve(), target_is_directory=True)
+
+
+def workspace_state(workspace: Path) -> str:
+    """Everything in the clone except Python bytecode, ignored files included (to see if setup wrote there)."""
+    lines = _git(Path(workspace), "status", "--porcelain", "--ignored", "--untracked-files=all", check=False)
+    return "\n".join(line for line in lines.splitlines()
+                     if "__pycache__/" not in line and not line.endswith((".pyc", ".pytest_cache/")))
+
+
+def store_deps(cache_root: Path | None, key: str | None, deps: Path) -> bool:
+    """After a successful setup that wrote only into /deps: move the task's /deps into the cache and
+    link it back. Two tasks racing for the same key: the first one stores it, the other keeps its own."""
+    deps = Path(deps)
+    if cache_root is None or key is None or deps.is_symlink() or not deps.is_dir():
+        return False
+    cache_root = Path(cache_root)
+    target = cache_root / key
+    if target.exists():
+        return False
+    cache_root.mkdir(parents=True, exist_ok=True)
+    staging = cache_root / f".{key}.{uuid.uuid4().hex[:8]}"
+    try:
+        os.rename(deps, staging)                  # same filesystem: instant; otherwise do not cache
+    except OSError:
+        return False
+    (staging / ".kite-ready").write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
+    try:
+        os.rename(staging, target)
+    except OSError:                               # someone stored the same key meanwhile
+        os.rename(staging, deps)
+        (deps / ".kite-ready").unlink(missing_ok=True)
+        return False
+    link_deps(deps, target)
+    prune_deps(cache_root)
+    return True
+
+
+def prune_deps(cache_root: Path, keep: int = DEPS_CACHE_KEEP, idle_seconds: float = 6 * 3600) -> None:
+    """Drop the least recently used sets beyond ``keep`` (only ones idle for a while)."""
+    sets = []
+    for path in Path(cache_root).iterdir():
+        ready = path / ".kite-ready"
+        if path.is_dir() and not path.name.startswith(".") and ready.is_file():
+            sets.append((ready.stat().st_mtime, path))
+    sets.sort(reverse=True)
+    for used, path in sets[keep:]:
+        if time.time() - used > idle_seconds:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def commit_setup_changes(workspace: Path) -> str:
     """Commit whatever the setup step created so the agent's patch excludes it; return HEAD."""
     if _git(workspace, "status", "--porcelain"):
@@ -639,14 +958,58 @@ def collect_patch(workspace: Path, base: str, patch_path: Path) -> list[str]:
 
 
 def _run_step(settings: SandboxSettings, runner: Runner, *, name: str, args: list[str],
-              timeout: int) -> tuple[int, str]:
-    """Run one container step; a timeout kills the container and returns exit code 124."""
+              timeout: int, watch: StuckWatch | None = None) -> tuple[int, str]:
+    """Run one container step; a timeout kills the container and returns exit code 124.
+
+    With ``watch`` (agent steps), output is read as it comes and a stuck agent is stopped at once
+    (exit code 125); a custom runner (tests) only gets its finished output checked.
+    """
+    if watch is not None and runner is default_runner:
+        return _run_watched(settings, name=name, args=args, timeout=timeout, watch=watch)
     try:
         result = runner(args, timeout=timeout)
-        return result.returncode, clean_output(result.stdout) + clean_output(result.stderr)
+        code, output = result.returncode, clean_output(result.stdout) + clean_output(result.stderr)
     except subprocess.TimeoutExpired as exc:
         runner([*settings.docker_command, "kill", name], timeout=30)
         return 124, clean_output(exc.stdout) + clean_output(exc.stderr) + "\n[kite] step timed out\n"
+    if watch is not None and watch.scan(output):
+        return 125, output + f"\n[kite] stopped: {watch.reason}\n"
+    return code, output
+
+
+def _run_watched(settings: SandboxSettings, *, name: str, args: list[str], timeout: int,
+                 watch: StuckWatch) -> tuple[int, str]:
+    proc = subprocess.Popen(list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace")
+    lines: list[str] = []
+    stopped = threading.Event()
+
+    def kill() -> None:
+        subprocess.run([*settings.docker_command, "kill", name], capture_output=True, timeout=30)
+
+    def read() -> None:
+        for line in proc.stdout:
+            lines.append(line)
+            if not stopped.is_set() and watch.feed(line):
+                stopped.set()
+                kill()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill()
+        proc.wait(timeout=60)
+    reader.join(timeout=30)
+    output = clean_output("".join(lines))
+    if stopped.is_set():
+        return 125, output + f"\n[kite] stopped: {watch.reason}\n"
+    if timed_out:
+        return 124, output + "\n[kite] step timed out\n"
+    return proc.returncode, output
 
 
 def _write_result(root: Path, run: SandboxRun) -> SandboxRun:
@@ -658,7 +1021,8 @@ def _write_result(root: Path, run: SandboxRun) -> SandboxRun:
 def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, models,
              state_dir: Path, task_id: str | None = None, small_model: str | None = None,
              test_command: str | None = None, setup_command: str | None = None, task_type: str = "coding",
-             with_context: bool = True, runner: Runner = default_runner, log: Callable[[str], None] = print) -> SandboxRun:
+             with_context: bool = True, runner: Runner = default_runner, log: Callable[[str], None] = print,
+             worker_pin: str | None = None, deps_cache: Path | None = None) -> SandboxRun:
     task_id = task_id or f"sbx-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     if not TASK_ID.fullmatch(task_id):
         raise SandboxError("task id must use lowercase letters, digits and dashes")
@@ -679,8 +1043,16 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         test_command=settings.test_command if test_command is None else test_command)
 
     # 1. Setup: the only step with network access, and it runs only the declared command.
-    if run.setup_command:
+    #    Already installed for these dependency files (deps cache): reuse, no setup at all.
+    key = deps_key(settings, workspace, run.setup_command) if settings.deps_cache else None
+    cached = cached_deps(deps_cache, key)
+    if cached is not None:
+        link_deps(deps, cached)
+        run.setup_exit_code, run.setup_cached = 0, True
+        log(f"[{task_id}] dùng lại thư viện đã cài ({cached.name}), bỏ qua bước cài")
+    elif run.setup_command:
         log(f"[{task_id}] cài thư viện (có mạng): {run.setup_command}")
+        before = workspace_state(workspace)
         name = container_name("setup", task_id)
         started = time.monotonic()
         run.setup_exit_code, output = _run_step(
@@ -695,51 +1067,80 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             run.agent_status = "skipped"
             log(f"[{task_id}] setup lỗi (exit {run.setup_exit_code}); không chạy agent. Xem setup.log")
             return _write_result(root, run)
+        if workspace_state(workspace) == before and store_deps(deps_cache, key, deps):
+            log(f"[{task_id}] đã lưu thư viện để task sau dùng lại ({key})")
         run.patch_base = commit_setup_changes(workspace)
 
     # 2. Agent (internal network, gateway only), then 3. Kite's own tests (no network at all).
     #    When the tests fail, the agent gets the failing output and tries again (settings.fix_rounds).
     config_file = root / "opencode.json"
     config_file.write_text(json.dumps(agent_config(settings, model=model, models=models, small_model=small_model,
-                                                   task_tag=task_id), indent=2), encoding="utf-8")
+                                                   task_tag=task_id, worker_pin=worker_pin), indent=2),
+                           encoding="utf-8")
     graph = code_graph(settings, workspace, root / "graph", lambda m: log(f"[{task_id}] {m}")) if with_context else None
+    template = quick_template(settings, run.test_command)
     prompt = agent_prompt(goal, run.test_command, task_type=task_type,
-                          context=repo_context(workspace, goal, graph=graph) if with_context else "")
+                          context=repo_context(workspace, goal, graph=graph) if with_context else "", quick=template)
     agent_log, test_log = [], []
-    attempt = 0
+    attempt, test_output = 0, ""
+
+    def run_tests(after: str, last_output: str = "") -> tuple[int, str, str]:
+        """Kite's test run: the related tests first (seconds), the full suite only if they pass."""
+        quick = quick_test_command(template, select_tests(workspace, run.patch_base, graph, last_output))
+        if quick:
+            log(f"[{task_id}] test nhanh (không mạng): {quick}")
+            name = container_name("quick", task_id)
+            started = time.monotonic()
+            code, output = _run_step(
+                settings, runner, name=name, timeout=settings.test_timeout_seconds,
+                args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
+                + ["sh", "-c", quick])
+            run.quick_test_runs += 1
+            run.quick_test_seconds = round(run.quick_test_seconds + time.monotonic() - started, 1)
+            test_log.append(f"===== quick after {after} exit={code} =====\n{output}")
+            if code == 1:                  # tests failed: no need to run everything to know that
+                return code, output, quick
+        log(f"[{task_id}] Kite tự chạy test (không mạng): {run.test_command}")
+        name = container_name("test", task_id)
+        started = time.monotonic()
+        code, output = _run_step(
+            settings, runner, name=name, timeout=settings.test_timeout_seconds,
+            args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
+            + ["sh", "-c", run.test_command])
+        run.full_test_runs += 1
+        run.test_seconds = round(run.test_seconds + time.monotonic() - started, 1)
+        test_log.append(f"===== after {after} exit={code} =====\n{output}")
+        return code, output, run.test_command
     while True:
         kind = "agent" if attempt == 0 else f"fix{attempt}"
         log(f"[{task_id}] {'agent' if attempt == 0 else f'vòng sửa {attempt}/{settings.fix_rounds}:'} {model} "
             f"đang làm trong sandbox (tối đa {settings.agent_timeout_seconds}s)...")
         name = container_name(kind, task_id)
         started = time.monotonic()
+        watch = StuckWatch()
         run.agent_exit_code, output = _run_step(
-            settings, runner, name=name, timeout=settings.agent_timeout_seconds,
+            settings, runner, name=name, timeout=settings.agent_timeout_seconds, watch=watch,
             args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
                                  config_file=config_file, deps=deps)
             + ["opencode", "run", "-m", f"kite/{model}", prompt])
-        run.agent_status = {0: "ok", 124: "timeout"}.get(run.agent_exit_code, "failed")
+        run.agent_status = AGENT_STATUS.get(run.agent_exit_code, "failed")
+        if run.agent_status == "stuck":
+            run.stuck_stops += 1
+            log(f"[{task_id}] Kite dừng agent: {watch.reason}")
         run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
         run.agent_output_tail = _tail(output)
         agent_log.append(f"===== {kind} exit={run.agent_exit_code} =====\n{output}")
         if not run.test_command:
             break
-        log(f"[{task_id}] Kite tự chạy test (không mạng): {run.test_command}")
-        name = container_name("test", task_id)
-        started = time.monotonic()
-        run.test_exit_code, test_output = _run_step(
-            settings, runner, name=name, timeout=settings.test_timeout_seconds,
-            args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
-            + ["sh", "-c", run.test_command])
-        run.test_seconds = round(run.test_seconds + time.monotonic() - started, 1)
+        run.test_exit_code, test_output, ran = run_tests(kind, test_output)
         run.test_output_tail = _tail(test_output)
-        test_log.append(f"===== after {kind} exit={run.test_exit_code} =====\n{test_output}")
-        if run.test_exit_code == 0 or run.agent_status != "ok" or attempt >= settings.fix_rounds:
+        if run.test_exit_code == 0 or run.agent_status not in ("ok", "stuck") or attempt >= settings.fix_rounds:
             break
         attempt += 1
         run.fix_rounds_used = attempt
-        prompt = fix_prompt(goal, run.test_command, test_output, attempt, settings.fix_rounds,
-                            codemap.failing_targets(graph, test_output) if graph is not None else "")
+        prompt = fix_prompt(goal, ran, test_output, attempt, settings.fix_rounds,
+                            codemap.failing_targets(graph, test_output) if graph is not None else "", quick=template,
+                            stuck=watch.reason)
 
     # 4. Self-review: tests pass, but passing tests is not the spec. Keep it only if tests still pass.
     if wants_review(settings, task_type, run.test_command, run.agent_status, run.test_exit_code):
@@ -748,25 +1149,19 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         name = container_name("review", task_id)
         started = time.monotonic()
         review_code, output = _run_step(
-            settings, runner, name=name, timeout=settings.agent_timeout_seconds,
+            settings, runner, name=name, timeout=settings.agent_timeout_seconds, watch=StuckWatch(),
             args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
                                  config_file=config_file, deps=deps)
             + ["opencode", "run", "-m", f"kite/{model}",
                review_prompt(goal, run.test_command,
-                             codemap.impact(graph, workspace, run.patch_base) if graph is not None else "")])
+                             codemap.impact(graph, workspace, run.patch_base) if graph is not None else "",
+                             quick=template, edited=edited_tests(workspace, run.patch_base))])
         run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
         agent_log.append(f"===== review exit={review_code} =====\n{output}")
         if snapshot_tree(workspace) == before:
             run.review = "unchanged"
         else:
-            name = container_name("test", task_id)
-            started = time.monotonic()
-            code, test_output = _run_step(
-                settings, runner, name=name, timeout=settings.test_timeout_seconds,
-                args=docker_run_args(settings, name=name, workspace=workspace, network="none", deps=deps)
-                + ["sh", "-c", run.test_command])
-            run.test_seconds = round(run.test_seconds + time.monotonic() - started, 1)
-            test_log.append(f"===== after review exit={code} =====\n{test_output}")
+            code, test_output, _ = run_tests("review")
             if review_code == 0 and code == 0:
                 run.review, run.agent_output_tail, run.test_output_tail = "kept", _tail(output), _tail(test_output)
             else:
@@ -778,6 +1173,9 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         (root / "test.log").write_text("\n".join(test_log), encoding="utf-8")
 
     patch_path = root / "result.patch"
+    run.tests_edited = edited_tests(workspace, run.patch_base)
+    if run.tests_edited:
+        log(f"[{task_id}] lưu ý: agent đã sửa test có sẵn: {', '.join(run.tests_edited)}")
     run.changed_files = collect_patch(workspace, run.patch_base, patch_path)
     run.patch_path = str(patch_path)
     return _write_result(root, run)
