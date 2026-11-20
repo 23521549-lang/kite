@@ -33,7 +33,7 @@ import urllib.request
 import uuid
 from typing import Callable
 
-from . import codemap
+from . import codemap, editblocks
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -83,6 +83,7 @@ class SandboxSettings:
     image: str = "kite-sandbox:latest"
     network: str = "kite-sandbox-net"
     gateway_url: str = "http://172.19.0.1:8787/v1"
+    host_gateway_url: str = ""       # the same gateway as Kite itself (on the host) reaches it; "" = gateway_url
     memory: str = "1g"
     cpus: float = 1.0
     pids_limit: int = 512
@@ -114,6 +115,10 @@ class SandboxSettings:
     # After the tests pass: the repository's own static check (lint, types), from .kite.yml `check`.
     # {files} / {py_files} are filled with the changed files. Part of "verified", like the tests.
     check_command: str = ""
+    # Coding tasks: before the agent, ask the model once for the whole fix as SEARCH/REPLACE blocks on
+    # the code Kite located itself (Agentless-style). Kept only if Kite's tests and check pass; else
+    # the clone is put back and the agent runs as usual (see try_fast_path).
+    fast_path: bool = True
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
     model_context: dict[str, int] = field(default_factory=dict)
 
@@ -155,6 +160,9 @@ class SandboxRun:
     check_runs: int = 0
     check_output_tail: str = ""
     scratch_files: list[str] = field(default_factory=list)  # new files that look like experiments
+    # off | skipped | passed | declined | not_applied | tests_failed | check_failed | error
+    fast_path: str = "off"
+    fast_seconds: float = 0.0
 
     @property
     def verified(self) -> bool:
@@ -450,6 +458,265 @@ def restore_tree(workspace: Path, tree: str) -> None:
     """Put the workspace back exactly as it was at ``snapshot_tree`` (drops files created since)."""
     _git(workspace, "read-tree", "-u", "--reset", tree)
     _git(workspace, "clean", "-fdq")
+
+
+FAST_CONTEXT_CHARS = 40000     # code shown to the fast path (about 11K tokens)
+FAST_FILE_CHARS = 16000        # a goal file this small is shown whole
+FAST_TEST_CHARS = 6000         # one related test file, for reference
+FAST_MAX_TOKENS = 8192         # thinking models spend part of it before the edit blocks
+FAST_DECLINE = "CẦN_AGENT"
+
+
+def _span(lines: list[str], line: int, max_lines: int = 400) -> tuple[int, list[str]]:
+    """The whole definition at 1-based ``line`` (decorators included, classes too), by indentation."""
+    i = max(0, min(line - 1, len(lines) - 1))
+    indent = len(lines[i]) - len(lines[i].lstrip())
+    start = i
+    while start > 0 and lines[start - 1].strip().startswith("@"):
+        start -= 1
+    end = i + 1
+    while end < len(lines) and end - start < max_lines:
+        text = lines[end]
+        if text.strip() and len(text) - len(text.lstrip()) <= indent and not text.lstrip().startswith((")", "]", "}")):
+            break
+        end += 1
+    while end > i + 1 and not lines[end - 1].strip():
+        end -= 1
+    return start + 1, lines[start:end]
+
+
+def fast_context(workspace: Path, goal: str, graph: codemap.CodeGraph | None = None,
+                 max_chars: int = FAST_CONTEXT_CHARS) -> str:
+    """The code a one-shot fix needs, verbatim (no line numbers: SEARCH blocks copy it).
+
+    In this order, within ``max_chars``: the files the goal names (whole when small), the
+    definitions it names, the base classes of those classes (the helpers a new method will use),
+    their callers (code map), one test file that uses them. Overlapping excerpts of a file are
+    merged. "" when nothing could be located: then the agent explores on its own.
+    """
+    workspace = Path(workspace)
+    files = [f for f in _git(workspace, "ls-files", check=False).splitlines() if f and not _is_noise(f)]
+    mentioned = [f for f in files if f in goal or re.search(
+        rf"(?<![\w./-]){re.escape(Path(f).name)}(?![\w-])", goal)]
+    names = codemap.goal_names(goal)
+    symbols: list = []
+    if graph is not None:
+        _, symbols = codemap.goal_map(graph, goal, mentioned, max_chars=CODE_MAP_CHARS, workspace=workspace)
+        symbols = [s for s in symbols if s.kind != "module"]
+        definitions = [(graph.qualified(s), s.file, s.line) for s in symbols]
+    else:
+        plain = [] if mentioned else [w for w in codemap.goal_words(goal) if w not in names]
+        definitions = _grep_definitions(workspace, names, plain)
+    cache: dict[str, list[str] | None] = {}
+
+    def read(path: str) -> list[str] | None:
+        if path not in cache:
+            try:
+                cache[path] = (workspace / path).read_text(encoding="utf-8").split("\n")
+            except (OSError, UnicodeDecodeError):
+                cache[path] = None
+        return cache[path]
+
+    whole = [f for f in mentioned if not codemap.is_test_path(f) and read(f) is not None
+             and len("\n".join(read(f))) <= FAST_FILE_CHARS]
+    spans: list[list] = []           # [path, first, last, labels]
+
+    def want(path: str, line: int, label: str, head_only: int = 0) -> None:
+        lines = read(path)
+        if lines is None or path in whole or codemap.is_test_path(path):
+            return
+        if head_only:
+            first, last = 1, min(len(lines), head_only)
+        else:
+            first, block = _span(lines, line)
+            last = first + len(block) - 1
+        for span in spans:
+            if span[0] == path and first <= span[2] + 1 and last >= span[1] - 1:
+                span[1], span[2] = min(span[1], first), max(span[2], last)
+                span[3].append(label)
+                return
+        spans.append([path, first, last, [label]])
+
+    for path in mentioned:
+        if path not in whole and not any(d[1] == path for d in definitions):
+            want(path, 1, f"file dài {len(read(path) or [])} dòng", head_only=150)
+    for name, path, line in definitions[:8]:
+        want(path, line, name)
+    bases: list[tuple[str, str, int]] = []
+    for name, path, line in definitions[:8]:
+        head = (read(path) or [""])[max(0, line - 1)] if read(path) else ""
+        match = re.match(r"\s*class\s+\w+\s*\(([^)]*)\)", head)
+        if match:
+            for base in re.findall(r"[A-Za-z_][\w.]*", match.group(1)):
+                base = base.rsplit(".", 1)[-1]
+                if base in ("object", "Exception", "BaseModel", "Enum", "ABC", "dict", "list"):
+                    continue
+                if graph is not None:
+                    bases += [(base, s.file, s.line) for s in graph.lookup(base) if s.kind == "class"][:1]
+                else:
+                    bases += _grep_definitions(workspace, [base])[:1]
+    for name, path, line in bases:
+        want(path, line, f"lớp cha {name}")
+    tests: list[str] = [f for f in mentioned if codemap.is_test_path(f)]
+    if graph is not None:
+        # What the named code itself uses (a schema it builds, a table it reads): a fix often has
+        # to change that too, and the agent would have gone to read it.
+        callees = 0
+        for symbol in symbols[:6]:
+            for relation, target, _path, _line in graph.out[symbol.id]:
+                callee = graph.symbols.get(target)
+                if (relation in codemap.CALL_RELATIONS and callee is not None and callee.kind != "module"
+                        and callees < 4 and not codemap.is_test_path(callee.file)):
+                    want(callee.file, callee.line, f"được {graph.qualified(symbol)} dùng")
+                    callees += 1
+        callers = 0
+        for symbol in symbols[:6]:
+            for _, user, path, _line in graph.users(symbol):
+                if codemap.is_test_path(path):
+                    if path.endswith(".py") and path not in tests:
+                        tests.append(path)
+                    continue
+                if user is not None and user.kind != "module" and callers < 4 and path not in whole:
+                    want(path, user.line, f"chỗ gọi {graph.qualified(symbol)}")
+                    callers += 1
+    if not whole and not spans:
+        return ""
+    merged: list[list] = []          # a later, wider excerpt (a whole class) can swallow earlier ones
+    for span in spans:
+        for kept in merged:
+            if kept[0] == span[0] and span[1] <= kept[2] + 1 and span[2] >= kept[1] - 1:
+                kept[1], kept[2] = min(kept[1], span[1]), max(kept[2], span[2])
+                kept[3] += span[3]
+                break
+        else:
+            merged.append(list(span))
+    for kept in merged:
+        for other in merged:
+            if other is not kept and other[0] == kept[0] and other[1] >= kept[1] and other[2] <= kept[2]:
+                kept[3] += other[3]
+                other[2] = -1
+    spans = [span for span in merged if span[2] >= 0]
+    sections: list[str] = []
+    budget = max_chars
+
+    def add(title: str, text: str) -> None:
+        nonlocal budget
+        if len(text) + 200 <= budget:
+            sections.append(f"### {title}\n`````\n{text.rstrip()}\n`````")
+            budget -= len(text) + 200
+
+    for path in whole:
+        add(f"{path} (toàn bộ file, {len(chr(10).join(read(path)).splitlines())} dòng)", "\n".join(read(path)))
+    for path, first, last, labels in spans:
+        add(f"{path}, dòng {first}-{last} ({', '.join(dict.fromkeys(labels))})", "\n".join(read(path)[first - 1:last]))
+    for path in tests[:1]:
+        content = "\n".join(read(path) or [])
+        if content:
+            cut = content[:FAST_TEST_CHARS]
+            add(f"{path} (test liên quan, chỉ để tham khảo{', đã cắt' if len(cut) < len(content) else ''})", cut)
+    return "\n\n".join(sections)
+
+
+def fast_prompt(goal: str, context: str, test_command: str, check: str = "") -> str:
+    checks = f"`{test_command}`" + (f" và `{check_hint(check)}`" if check else "")
+    return "\n".join([
+        goal.strip(), "",
+        "Kite đã tìm sẵn phần code liên quan (bên dưới, đúng nội dung hiện tại của file). Hãy đưa ra bản sửa "
+        "HOÀN CHỈNH bằng các khối SEARCH/REPLACE theo đúng mẫu sau, mỗi khối một chỗ sửa:",
+        "",
+        "đường/dẫn/tới/file.py",
+        "<<<<<<< SEARCH",
+        "các dòng chép NGUYÊN VĂN từ file hiện tại (cả thụt lề), vừa đủ để chỉ khớp một chỗ",
+        "=======",
+        "các dòng mới thay vào",
+        ">>>>>>> REPLACE",
+        "",
+        "Quy tắc:",
+        "- SEARCH chép đúng từng ký tự từ phần code bên dưới; giữ khối ngắn, chỉ quanh chỗ cần đổi.",
+        "- Tạo file mới: để SEARCH trống.",
+        "- Sửa đủ mọi chỗ yêu cầu cần (kể cả nơi gọi tới), không đổi thứ không liên quan.",
+        "- Không sửa hay xóa test có sẵn; được thêm file test mới.",
+        f"- Nếu phần code bên dưới chưa đủ để sửa chắc chắn đúng, chỉ trả lời một dòng: {FAST_DECLINE}: <lý do>.",
+        "- Chỉ cần các khối sửa, kèm tối đa hai câu tóm tắt.",
+        f"Kite sẽ tự áp các khối rồi chạy {checks} (không mạng).",
+        "",
+        "Code liên quan:",
+        context,
+    ])
+
+
+def gateway_asker(settings: SandboxSettings, model: str, *, tag: str, pin: str | None = None,
+                  timeout: int = 900) -> Callable[[str], str] | None:
+    """One chat request through Kite's gateway (the same queue and worker as the agent's requests)."""
+    url = (settings.host_gateway_url or settings.gateway_url).rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json", "X-Kite-Task": tag, **({"X-Kite-Worker": pin} if pin else {})}
+
+    def ask(prompt: str) -> str:
+        body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": FAST_MAX_TOKENS}
+        request = urllib.request.Request(url, json.dumps(body).encode(), headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read())
+        except Exception as exc:
+            raise SandboxError(f"gateway: {exc}") from exc
+        message = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+        return message.get("content") or ""
+    return ask
+
+
+@dataclass
+class FastAttempt:
+    status: str                 # skipped | declined | not_applied | applied | error
+    answer: str = ""
+    reason: str = ""
+    before: str = ""            # tree to go back to
+    diff: str = ""
+    files: list[str] = field(default_factory=list)
+    context_chars: int = 0
+
+
+def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: Callable[[str], str],
+                 test_command: str, check: str = "") -> FastAttempt:
+    """Locate the code, ask once, apply the edit blocks (all or nothing). Tests are the caller's."""
+    context = fast_context(workspace, goal, graph)
+    if not context:
+        return FastAttempt("skipped", reason="không xác định được phần code liên quan")
+    try:
+        answer = ask(fast_prompt(goal, context, test_command, check))
+    except Exception as exc:                    # gateway down, timeout: the agent still runs
+        return FastAttempt("error", reason=str(exc)[:300], context_chars=len(context))
+    visible = re.sub(r"<think>.*?</think>", "", answer, flags=re.S)
+    declined = re.search(rf"{FAST_DECLINE}\s*:?\s*(.*)", visible)
+    if declined and "<<<<<<<" not in visible:
+        return FastAttempt("declined", answer, declined.group(1).strip()[:300], context_chars=len(context))
+    before = snapshot_tree(workspace)
+    try:
+        files = editblocks.apply(workspace, editblocks.parse(answer))
+        existing_tests = [f for f in files if codemap.is_test_path(f) and subprocess.run(
+            ["git", "-C", str(workspace), "cat-file", "-e", f"{before}:{f}"], capture_output=True).returncode == 0]
+        if existing_tests:
+            raise editblocks.EditError(f"sửa test có sẵn ({', '.join(existing_tests)})")
+    except editblocks.EditError as exc:
+        restore_tree(workspace, before)
+        return FastAttempt("not_applied", answer, str(exc)[:300], before, context_chars=len(context))
+    _git(workspace, "add", "-A")
+    diff = _git(workspace, "diff", "--cached", before, check=False)
+    return FastAttempt("applied", answer, "", before, diff, files, len(context))
+
+
+FAST_REASONS = {"tests_failed": "test của Kite lỗi", "check_failed": "bước kiểm tra lỗi",
+                "not_applied": "không áp được vào code"}
+
+
+def fast_note(reason: str, diff: str, output: str) -> str:
+    """What the agent hears about a fast attempt that did not hold."""
+    lines = ["", f"Kite đã thử một bản sửa nhanh (một lần gọi model) nhưng {reason}. Bản đó đã được bỏ, /work đang "
+             "như ban đầu. Tham khảo để tránh lặp lại y nguyên:"]
+    if diff.strip():
+        lines += ["```diff", diff.strip()[:3000], "```"]
+    if output.strip():
+        lines += ["Kết quả kiểm tra của bản đó:", "```", failure_digest(output, 2000).strip(), "```"]
+    return "\n".join(lines)
 
 
 def wants_review(settings: SandboxSettings, task_type: str, test_command: str, status: str, test_code) -> bool:
@@ -1153,7 +1420,8 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
              state_dir: Path, task_id: str | None = None, small_model: str | None = None,
              test_command: str | None = None, setup_command: str | None = None, task_type: str = "coding",
              with_context: bool = True, runner: Runner = default_runner, log: Callable[[str], None] = print,
-             worker_pin: str | None = None, deps_cache: Path | None = None) -> SandboxRun:
+             worker_pin: str | None = None, deps_cache: Path | None = None,
+             asker: Callable[[str], str] | None = None) -> SandboxRun:
     task_id = task_id or f"sbx-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     if not TASK_ID.fullmatch(task_id):
         raise SandboxError("task id must use lowercase letters, digits and dashes")
@@ -1266,7 +1534,37 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.check_seconds = round(run.check_seconds + time.monotonic() - started, 1)
         test_log.append(f"===== check after {after} exit={code} =====\n{output}")
         return code, output, command
-    while True:
+    # 2a. Fast path (Agentless-style): one model call for the whole fix on code Kite located itself.
+    #     Kept only if Kite's tests and check pass; otherwise the clone goes back and the agent runs.
+    if settings.fast_path and with_context and task_type == "coding" and run.test_command:
+        ask = asker if asker is not None else gateway_asker(settings, model, tag=task_id, pin=worker_pin)
+        if ask is not None:
+            started = time.monotonic()
+            log(f"[{task_id}] đường nhanh: hỏi {model} một lần để có cả bản sửa (SEARCH/REPLACE)...")
+            fast = fast_attempt(workspace, goal, graph, ask, run.test_command, run.check_command)
+            agent_log.append(f"===== fast {fast.status} =====\n{fast.answer}")
+            run.fast_path = fast.status
+            if fast.status == "applied":
+                code, output, _ = run_tests("fast")
+                check_code, check_output, _ = run_check("fast") if code == 0 else (None, "", "")
+                if code == 0 and check_code in (None, 0):
+                    run.fast_path = "passed"
+                    run.agent_status, run.agent_exit_code, run.agent_output_tail = "ok", 0, _tail(fast.answer)
+                    run.test_exit_code, run.test_output_tail = 0, _tail(output)
+                    run.check_exit_code, run.check_output_tail = check_code, _tail(check_output)
+                else:
+                    run.fast_path = "tests_failed" if code != 0 else "check_failed"
+                    restore_tree(workspace, fast.before)
+                    prompt += fast_note(FAST_REASONS[run.fast_path], fast.diff, output if code != 0 else check_output)
+                    test_output = output if code != 0 else ""
+            elif fast.status == "not_applied":
+                prompt += fast_note(f"{FAST_REASONS['not_applied']} ({fast.reason})", "", "")
+            run.fast_seconds = round(time.monotonic() - started, 1)
+            log(f"[{task_id}] đường nhanh: {run.fast_path}{f' ({fast.reason})' if fast.reason else ''} sau "
+                f"{run.fast_seconds}s" + ("; bỏ qua agent, sang rà soát" if run.fast_path == "passed"
+                                          else "; chuyển sang agent"))
+
+    while run.fast_path != "passed":
         kind = "agent" if attempt == 0 else f"fix{attempt}"
         log(f"[{task_id}] {'agent' if attempt == 0 else f'vòng sửa {attempt}/{settings.fix_rounds}:'} {model} "
             f"đang làm trong sandbox (tối đa {settings.agent_timeout_seconds}s)...")

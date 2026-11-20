@@ -136,6 +136,13 @@ def request_record(*, job_id: str, tag: str | None, requested: str, model: str, 
             "gen_tps": round(timings["predicted_per_second"], 1) if timings.get("predicted_per_second") else None,
             "finish_reason": (choices[0] or {}).get("finish_reason"),
             "tool_calls": [c.get("function", {}).get("name") for c in message.get("tool_calls") or []],
+            # Where the generated tokens went (sizes only, never the text), and how much speculative
+            # decoding drafted and the model accepted.
+            "reasoning_chars": len(message.get("reasoning_content") or ""),
+            "content_chars": len(message.get("content") or ""),
+            "tool_args_chars": sum(len(str((c.get("function") or {}).get("arguments") or ""))
+                                   for c in message.get("tool_calls") or []),
+            "draft_n": timings.get("draft_n"), "draft_accepted": timings.get("draft_n_accepted"),
         })
     return record
 

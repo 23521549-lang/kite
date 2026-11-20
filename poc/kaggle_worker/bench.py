@@ -1006,7 +1006,8 @@ def score_code(task, run: dict) -> dict:
             "quick_test_runs": run.get("quick_test_runs"), "stuck_stops": run.get("stuck_stops"),
             "tests_edited": run.get("tests_edited"), "check_exit_code": run.get("check_exit_code"),
             "check_runs": run.get("check_runs"), "check_seconds": run.get("check_seconds"),
-            "scratch_files": run.get("scratch_files")}
+            "scratch_files": run.get("scratch_files"), "fast_path": run.get("fast_path"),
+            "fast_seconds": run.get("fast_seconds")}
 
 
 # --------------------------------------------------------------------------------------- driver
@@ -1043,7 +1044,8 @@ def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, sy
                     f" | vòng sửa {outcome.get('fix_rounds_used', 0)} | rà soát {outcome.get('review')}"
                     f" | test ẩn {outcome.get('hidden_passed')} | tổng {outcome.get('wall_seconds')}s"
                     f" | dừng vì lặp {outcome.get('stuck_stops') or 0} | kiểm tra {outcome.get('check_exit_code')}"
-                    f" | file thử {outcome.get('scratch_files') or '-'}")
+                    f" | file thử {outcome.get('scratch_files') or '-'}"
+                    f" | đường nhanh {outcome.get('fast_path')} {outcome.get('fast_seconds') or 0}s")
         (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     results["finished"] = time.strftime("%Y-%m-%d %H:%M")
     (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1107,14 +1109,16 @@ def render_report(results: dict) -> str:
              if item.get("wall_seconds")]
     if timed:
         lines += ["", "## Thời gian từng task code (giây)", "",
-                  "| Model | Task | Đạt | Tổng | Cài thư viện | Agent | Test đầy đủ (lần) | Test nhanh (lần) "
+                  "| Model | Task | Đạt | Tổng | Cài thư viện | Đường nhanh | Agent | Test đầy đủ (lần) | Test nhanh (lần) "
                   "| Kiểm tra (lần) | Vòng sửa | Rà soát | Dừng vì lặp | File thử |",
-                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for model, item in timed:
             setup = "dùng lại" if item.get("setup_cached") else item.get("setup_seconds")
             check = {None: "-", 0: "✓"}.get(item.get("check_exit_code"), f"✗ {item.get('check_exit_code')}")
+            fast = item.get("fast_path") or "off"
+            fast = "-" if fast in ("off", "skipped") else f"{fast} ({item.get('fast_seconds')})"
             lines.append(f"| `{model}` | {item['id']} | {'✓' if item['passed'] else '✗'} | {item['wall_seconds']} "
-                         f"| {setup} | {item.get('agent_seconds')} | {item.get('test_seconds')} "
+                         f"| {setup} | {fast} | {item.get('agent_seconds')} | {item.get('test_seconds')} "
                          f"({item.get('full_test_runs')}) | {item.get('quick_test_seconds')} "
                          f"({item.get('quick_test_runs')}) | {check} ({item.get('check_runs') or 0}) "
                          f"| {item.get('fix_rounds_used', 0)} | {item.get('review')} "
@@ -1130,7 +1134,7 @@ def render_report(results: dict) -> str:
             if not item["passed"]:
                 lines.append(f"- `{model}` {item['id']}: {item.get('error') or item.get('agent_status')}, "
                              f"test exit {item.get('test_exit_code')}, test ẩn {item.get('hidden_passed')}, "
-                             f"kiểm tra {item.get('check_exit_code')}, "
+                             f"kiểm tra {item.get('check_exit_code')}, đường nhanh {item.get('fast_path')}, "
                              f"vòng sửa {item.get('fix_rounds_used', 0)}, rà soát {item.get('review')}, "
                              f"sửa test: {item.get('touched_tests')}")
     lines += ["", "## Cách chấm", "",

@@ -261,7 +261,8 @@ def test_every_finished_request_is_journaled_with_its_task_tag_but_no_content():
                 json={"model": "qwen3.6-fast", "messages": [{"role": "user", "content": "bí mật"}], "max_tokens": 64}))
             job = await (await client.get("/worker/jobs?wait=5", headers=headers)).json()
             answer = {**TOOL_COMPLETION, "usage": {"prompt_tokens": 900, "completion_tokens": 40},
-                      "timings": {"prompt_per_second": 1200.0, "predicted_per_second": 48.5, "cache_n": 512}}
+                      "timings": {"prompt_per_second": 1200.0, "predicted_per_second": 48.5, "cache_n": 512,
+                                  "draft_n": 64, "draft_n_accepted": 51}}
             await client.post(f"/worker/jobs/{job['job_id']}/result", json={"status": "ok", "response": answer},
                               headers=headers)
             await chat
@@ -277,6 +278,8 @@ def test_every_finished_request_is_journaled_with_its_task_tag_but_no_content():
     assert (ok["worker"], ok["outcome"], ok["prompt_tokens"], ok["completion_tokens"]) == ("w1", "ok", 900, 40)
     assert (ok["prompt_tps"], ok["gen_tps"], ok["cached_tokens"]) == (1200.0, 48.5, 512)
     assert ok["tool_calls"] == ["read"] and ok["max_tokens"] == 64 and ok["queue_s"] >= 0
+    assert (ok["draft_n"], ok["draft_accepted"], ok["reasoning_chars"]) == (64, 51, 0)
+    assert ok["tool_args_chars"] > 0 and isinstance(ok["content_chars"], int)
     assert "bí mật" not in json.dumps(ok, ensure_ascii=False)           # prompts are never stored
     assert failed["tag"] is None and failed["outcome"] == "error" and "OOM" in failed["error"]
 

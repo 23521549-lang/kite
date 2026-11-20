@@ -171,6 +171,8 @@ def _parser() -> argparse.ArgumentParser:
                            help="code suite without fix rounds, self-review and repo context (baseline)")
     bench_run.add_argument("--no-code-map", action="store_true",
                            help="harness on, but without the graphify code map (to measure what it adds)")
+    bench_run.add_argument("--no-fast-path", action="store_true",
+                           help="harness on, but without the one-call fast path (to measure what it adds)")
     bench_run.add_argument("--worker", default="",
                            help="send every request to this worker (e.g. kaggle-han): comparable timings, and "
                                 "the other worker stays free for real tasks")
@@ -514,9 +516,12 @@ def _bench_command(args: argparse.Namespace) -> int:
         settings = sandbox_settings_from_config(config)
         if args.no_harness:
             settings = dataclasses.replace(settings, fix_rounds=0, self_review=False, code_map=False,
-                                           quick_tests=False)
-        elif args.no_code_map:
-            settings = dataclasses.replace(settings, code_map=False)
+                                           quick_tests=False, fast_path=False)
+        else:
+            if args.no_code_map:
+                settings = dataclasses.replace(settings, code_map=False)
+            if args.no_fast_path:
+                settings = dataclasses.replace(settings, fast_path=False)
 
         def run_code(task, model, out_dir):
             slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
@@ -556,7 +561,8 @@ def _bench_command(args: argparse.Namespace) -> int:
         map_on = False
     harness = "tắt (không vòng sửa, không rà soát, không ngữ cảnh repo)" if args.no_harness else \
         (f"bật ({harness_settings.fix_rounds} vòng sửa, rà soát {'bật' if harness_settings.self_review else 'tắt'}, "
-         f"có ngữ cảnh repo, bản đồ code graphify {'bật' if map_on else 'tắt'})")
+         f"có ngữ cảnh repo, bản đồ code graphify {'bật' if map_on else 'tắt'}, đường nhanh "
+         f"{'bật' if harness_settings.fast_path and not args.no_fast_path else 'tắt'})")
     log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code"
         f" | harness {harness}")
     results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,

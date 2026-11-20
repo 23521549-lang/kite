@@ -299,7 +299,46 @@ class SandboxActivityBackend:
                 stream.write(f"\n===== check after {after} exit={code} =====\n{output}")
             return code, output, command
         stuck_stops = 0
-        while True:
+        status, code, output = "not_started", None, ""
+        fast_status, fast_seconds = "off", 0.0
+        if self.settings.fast_path and task.task_type == "coding" and test_command:
+            ask = sbx.gateway_asker(self.settings, route.model_id, tag=clean_tag(task.task_id) or slug,
+                                    pin=route.worker_id)
+            if ask is not None:
+                started = time.monotonic()
+                step = asyncio.create_task(asyncio.to_thread(
+                    sbx.fast_attempt, work, goal, graph, ask, test_command, check_template))
+                while True:
+                    done, _ = await asyncio.wait({step}, timeout=self.heartbeat_seconds)
+                    if done:
+                        break
+                    heartbeat({"task_id": task.task_id, "state": "FAST_PATH",
+                               "seconds": round(time.monotonic() - started)})
+                fast = step.result()
+                fast_status = fast.status
+                with (root / "agent.log").open("a", encoding="utf-8") as stream:
+                    stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} fast {fast.status} "
+                                 f"model={route.model_id} =====\n{fast.answer}")
+                if fast.status == "applied":
+                    fast_code, fast_output, _ = await run_tests("fast")
+                    fast_check = await run_check("fast") if fast_code == 0 else (None, "", "")
+                    if fast_code == 0 and fast_check[0] in (None, 0):
+                        fast_status = "passed"
+                        status, code, output = "ok", 0, fast.answer
+                        test_code, test_output = 0, fast_output
+                        check_code, check_output, check_ran = fast_check
+                    else:
+                        fast_status = "tests_failed" if fast_code != 0 else "check_failed"
+                        await asyncio.to_thread(sbx.restore_tree, work, fast.before)
+                        prompt += sbx.fast_note(sbx.FAST_REASONS[fast_status], fast.diff,
+                                                fast_output if fast_code != 0 else fast_check[1])
+                        test_output = fast_output if fast_code != 0 else ""
+                elif fast.status == "not_applied":
+                    prompt += sbx.fast_note(f"{sbx.FAST_REASONS['not_applied']} ({fast.reason})", "", "")
+                fast_seconds = round(time.monotonic() - started, 1)
+                self._trace(task.task_id, "fast_path", outcome=fast_status, seconds=fast_seconds,
+                            reason=fast.reason or None, files=fast.files or None, context_chars=fast.context_chars)
+        while fast_status != "passed":
             kind = "agent" if attempt == 0 else f"fix{attempt}"
             name = sbx.container_name(kind, slug)
             watch = sbx.StuckWatch()
@@ -381,6 +420,11 @@ class SandboxActivityBackend:
                  f"{f', {attempt} vòng sửa sau test lỗi' if attempt else ''}"
                  f"{REVIEW_NOTES.get(review, '')}).",
                  f"Files changed: {', '.join(changed) if changed else 'none'}."]
+        if fast_status == "passed":
+            lines.insert(0, f"Kite fast path: the whole fix came from one model call ({fast_seconds}s) and passed "
+                            "Kite's tests; no agent session was needed.")
+        elif fast_status not in ("off", "skipped"):
+            lines.insert(0, f"Kite fast path: tried ({fast_status}, {fast_seconds}s), then the agent took over.")
         if stuck_stops:
             lines.append(f"Kite stopped the agent {stuck_stops} time(s) for repeating the same steps.")
         if tests_edited:
@@ -413,6 +457,7 @@ class SandboxActivityBackend:
             "changed_files": changed, "test_exit_code": test_code, "fix_rounds_used": attempt,
             "review": review, "stuck_stops": stuck_stops, "tests_edited": tests_edited,
             "check_command": check_ran, "check_exit_code": check_code, "scratch_files": scratch,
+            "fast_path": fast_status, "fast_seconds": fast_seconds,
             "verified": verified,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
@@ -423,6 +468,7 @@ class SandboxActivityBackend:
                "agent_exit": code, "seconds": seconds, "fix_rounds": attempt, "review": review,
                "test_command": test_command, "test_exit": test_code, "stuck_stops": stuck_stops,
                "tests_edited": tests_edited, "check_exit": check_code, "scratch_files": scratch,
+               "fast_path": fast_status, "fast_seconds": fast_seconds,
                "verified": verified,
                "changed_files": changed, "lines_added": added, "lines_removed": removed,
                "context_chars": len(context)}

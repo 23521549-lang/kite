@@ -723,6 +723,149 @@ def test_scratch_files_are_flagged_for_the_review_and_in_the_result(tmp_path):
     assert any("có file trông như file thử: repro_average.py" in line for line in logs)
 
 
+FIX = """Sửa như sau.
+
+calc.py
+<<<<<<< SEARCH
+    return sum(xs) / len(xs) - 1
+=======
+    return sum(xs) / len(xs) if xs else 0
+>>>>>>> REPLACE
+"""
+
+
+def test_edit_blocks_apply_all_or_nothing_and_stay_inside_the_repo(tmp_path):
+    from poc.kaggle_worker import editblocks as eb
+
+    (tmp_path / "a.py").write_text("x = 1\nmax = 10\n\nclass A:\n    def f(self):\n        return 1\n")
+    blocks = eb.parse("```python\na.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE\n```\n"
+                      "<<<<<<< SEARCH\ndef f(self):\n    return 1\n=======\ndef f(self):\n    return 2\n"
+                      ">>>>>>> REPLACE\n\nnew/t.py\n<<<<<<< SEARCH\n=======\nok = True\n>>>>>>> REPLACE\n")
+    assert [b.path for b in blocks] == ["a.py", "a.py", "new/t.py"]          # second block reuses the file
+    assert eb.apply(tmp_path, blocks) == ["a.py", "new/t.py"]
+    assert (tmp_path / "a.py").read_text() == "x = 2\nmax = 10\n\nclass A:\n    def f(self):\n        return 2\n"
+    for bad, why in (("a.py\n<<<<<<< SEARCH\nnope\n=======\ny\n>>>>>>> REPLACE", "not in the file"),
+                     ("../x.py\n<<<<<<< SEARCH\n=======\ny\n>>>>>>> REPLACE", "inside the repository"),
+                     ("a.py\n<<<<<<< SEARCH\n=======\ny\n>>>>>>> REPLACE", "file exists"),
+                     ("a.py\n<<<<<<< SEARCH\nx = 2\n=======\nx = 3\n>>>>>>> REPLACE\n"
+                      "a.py\n<<<<<<< SEARCH\nmissing\n=======\nz\n>>>>>>> REPLACE", "not in the file")):
+        with pytest.raises(eb.EditError, match=why):
+            eb.apply(tmp_path, eb.parse(bad))
+    assert "x = 2" in (tmp_path / "a.py").read_text()                       # nothing half-applied
+    (tmp_path / "d.py").write_text("a = 1\nb = 2\na = 1\n")
+    with pytest.raises(eb.EditError, match="more than one place"):
+        eb.apply(tmp_path, eb.parse("d.py\n<<<<<<< SEARCH\na = 1\n=======\na = 0\n>>>>>>> REPLACE"))
+
+
+def test_fast_context_shows_the_named_code_verbatim(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "svc").mkdir()
+    (repo / "svc" / "base.py").write_text("class Table:\n    def get(self, key):\n        return key\n")
+    (repo / "svc" / "models.py").write_text("from svc.base import Table\n\n\nclass Models(Table):\n"
+                                            "    name = 'models'\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "svc")
+    context = sbx.fast_context(repo, "Sửa average trong calc.py cho list rỗng", None)
+    assert "### calc.py (toàn bộ file, 2 dòng)" in context and "return sum(xs) / len(xs) - 1" in context
+    assert "|" not in context.split("`````")[1]                              # no line numbers to copy wrongly
+    context = sbx.fast_context(repo, "Thêm Models.get_metadata() để đọc metadata", None)
+    assert "svc/models.py, dòng 4-5" in context and "lớp cha Table" in context and "def get(self, key)" in context
+    assert sbx.fast_context(repo, "Làm cho nó tốt hơn", None) == ""         # nothing located: agent explores
+
+
+def test_the_fast_path_fixes_a_task_with_one_model_call_and_skips_the_agent(tmp_path):
+    fake = FakeDocker()
+    prompts: list[str] = []
+    logs: list[str] = []
+    repo = make_repo(tmp_path)
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="f1", runner=fake,
+                       log=logs.append, asker=lambda prompt: prompts.append(prompt) or FIX)
+    assert [fake.kind(c) for c in fake.calls] == ["test", "review"]            # no agent session at all
+    assert run.verified and run.fast_path == "passed" and run.agent_status == "ok" and run.fast_seconds >= 0
+    assert run.changed_files == ["calc.py"] and "if xs else 0" in (tmp_path / "state" / "f1" / "result.patch").read_text()
+    assert "<<<<<<< SEARCH" in prompts[0] and "return sum(xs) / len(xs) - 1" in prompts[0]
+    assert any("đường nhanh: passed" in line and "bỏ qua agent" in line for line in logs)
+    assert "===== fast applied =====" in (tmp_path / "state" / "f1" / "agent.log").read_text()
+
+
+def test_a_fast_fix_that_fails_the_tests_is_dropped_and_the_agent_is_told(tmp_path):
+    fake = FakeDocker(test_returncodes=[1, 0])
+    _, run = run_task(tmp_path, fake, "f2", asker=lambda prompt: FIX)
+    assert [fake.kind(c) for c in fake.calls][:3] == ["test", "agent", "test"]
+    assert run.fast_path == "tests_failed" and run.verified and run.fix_rounds_used == 0
+    agent = fake.call("agent")[-1]
+    assert "Kite đã thử một bản sửa nhanh" in agent and "test của Kite lỗi" in agent and "if xs else 0" in agent
+    assert "ZeroDivisionError" in agent                                       # what the tests said
+    # The clone went back before the agent ran: the agent's own edit is what the patch holds.
+    assert run.changed_files == ["calc.py"]
+
+
+def test_the_fast_path_steps_aside_when_it_cannot_help(tmp_path):
+    for task_id, answer, status in (("f3", "CẦN_AGENT: cần xem thêm file cấu hình", "declined"),
+                                    ("f4", "calc.py\n<<<<<<< SEARCH\nno such line\n=======\nx\n>>>>>>> REPLACE",
+                                     "not_applied")):
+        (tmp_path / task_id).mkdir()
+        fake = FakeDocker()
+        _, run = run_task(tmp_path / task_id, fake, task_id, asker=lambda prompt, a=answer: a)
+        assert run.fast_path == status and fake.kind(fake.calls[0]) == "agent" and run.verified
+        assert ("không áp được" in fake.call("agent")[-1]) == (status == "not_applied")
+
+    def down(prompt):
+        raise sbx.SandboxError("gateway: connection refused")
+
+    (tmp_path / "f7").mkdir()
+    repo = make_repo(tmp_path / "f7")
+    (repo / "test_calc.py").write_text("def test_x():\n    assert False\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "tests")
+    fake = FakeDocker()
+    cheat = "test_calc.py\n<<<<<<< SEARCH\n    assert False\n=======\n    assert True\n>>>>>>> REPLACE\n"
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py", model="qwen3.6", models=["qwen3.6"],
+                       state_dir=tmp_path / "state7", task_id="f7", runner=fake, log=lambda _m: None,
+                       asker=lambda p: FIX + cheat)
+    assert run.fast_path == "not_applied" and "sửa test có sẵn" in fake.call("agent")[-1]
+    assert "assert False" in (tmp_path / "state7" / "f7" / "work" / "test_calc.py").read_text()
+
+    (tmp_path / "f5").mkdir()
+    fake = FakeDocker()
+    _, run = run_task(tmp_path / "f5", fake, "f5", asker=down)
+    assert run.fast_path == "error" and run.verified and fake.kind(fake.calls[0]) == "agent"
+    from dataclasses import replace
+    (tmp_path / "f6").mkdir()
+    fake = FakeDocker()
+    called = []
+    repo = make_repo(tmp_path / "f6")
+    run = sbx.run_task(replace(SETTINGS, fast_path=False), repo=repo, goal="Sửa average", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "state6", task_id="f6", runner=fake,
+                       log=lambda _m: None, asker=lambda p: called.append(p) or FIX)
+    assert run.fast_path == "off" and not called
+
+
+@pytest.mark.gateway_asker
+def test_gateway_asker_sends_one_tagged_request(monkeypatch):
+    import json as _json
+    real = sbx.gateway_asker
+    seen = {}
+
+    class Response:
+        def __init__(self, body): self.body = body
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def read(self): return self.body
+
+    def urlopen(request, timeout):
+        seen.update(url=request.full_url, headers=dict(request.header_items()), body=_json.loads(request.data))
+        return Response(_json.dumps({"choices": [{"message": {"content": FIX}}]}).encode())
+
+    from dataclasses import replace
+    monkeypatch.setattr(sbx.urllib.request, "urlopen", urlopen)
+    ask = real(replace(SETTINGS, host_gateway_url="http://127.0.0.1:8787/v1"), "qwen3.6", tag="t-1", pin="kaggle-han")
+    assert ask("hi") == FIX and seen["url"] == "http://127.0.0.1:8787/v1/chat/completions"
+    assert seen["headers"]["X-kite-task"] == "t-1" and seen["headers"]["X-kite-worker"] == "kaggle-han"
+    assert seen["body"]["model"] == "qwen3.6" and seen["body"]["max_tokens"] == sbx.FAST_MAX_TOKENS
+
+
 def test_changed_existing_tests_are_flagged_for_the_review(tmp_path):
     repo = make_repo(tmp_path)
     (repo / "test_calc.py").write_text("def test_empty():\n    assert True\n")

@@ -519,3 +519,37 @@ def test_backend_never_verifies_a_task_whose_check_keeps_failing(tmp_path):
     assert "review" not in fake.kinds() and "FAILED (exit 1)" in result.summary and "F821" in result.summary
     saved = json.loads((backend.task_dir("task-check-bad") / "result.json").read_text())
     assert saved["verified"] is False and saved["check_exit_code"] == 1 and saved["fix_rounds_used"] == 2
+
+
+def test_backend_fast_path_solves_with_one_call_or_hands_over_to_the_agent(tmp_path, monkeypatch):
+    from poc.kaggle_worker.journal import read_jsonl
+    from test_sandbox import FIX
+
+    asked = []
+
+    def asker(settings, model, *, tag, pin=None, timeout=900):
+        def ask(prompt):
+            asked.append((model, tag, pin, prompt))
+            return FIX
+        return ask
+
+    monkeypatch.setattr(sbx, "gateway_asker", asker)
+    (tmp_path / "ok").mkdir()
+    fake = FakeDocker()
+    backend, result = run_backend_task(tmp_path / "ok", fake, "task-fast")
+    assert fake.kinds() == ["setup", "test", "review"]                  # one model call, then tests and review
+    assert "if xs else 0" in result.patch and "Kite fast path: the whole fix came from one model call" in result.summary
+    assert asked[0][1:3] == ("task-fast", "kaggle-han") and "calc.py" in asked[0][3]
+    (record,) = read_jsonl(backend.state_dir / "journal" / "tasks.jsonl")
+    assert record["fast_path"] == "passed" and record["verified"] and record["agent_status"] == "ok"
+    trace = read_jsonl(backend.task_dir("task-fast") / "trace.jsonl")
+    assert any(e["event"] == "fast_path" and e["outcome"] == "passed" for e in trace)
+
+    (tmp_path / "bad").mkdir()
+    fake = FakeDocker(test_returncodes=[1, 0])
+    backend, result = run_backend_task(tmp_path / "bad", fake, "task-fast-bad")
+    assert fake.kinds()[:4] == ["setup", "test", "agent", "test"]
+    assert "Kite đã thử một bản sửa nhanh" in fake.agent_calls()[0][-1]
+    assert "Kite fast path: tried (tests_failed" in result.summary
+    saved = json.loads((backend.task_dir("task-fast-bad") / "result.json").read_text())
+    assert saved["fast_path"] == "tests_failed" and saved["verified"] is True
