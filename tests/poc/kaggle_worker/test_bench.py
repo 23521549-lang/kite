@@ -236,3 +236,24 @@ def test_merge_results_combines_lead_and_code_runs(tmp_path):
     (tmp_path / "b.json").write_text(json.dumps({"models": {"m": {"code": [2]}, "n": {"code": [3]}}}))
     merged = bench.merge_results([tmp_path / "a.json", tmp_path / "b.json"])
     assert merged == {"m": {"speed": {"x": 1}, "lead": [1], "code": [2]}, "n": {"code": [3]}}
+
+
+def test_two_tasks_in_one_message_need_two_start_task_calls():
+    two = scripted({"content": "", "tool_calls": [call("start_task", repo="/home/ubuntu/kite-sandbox", goal="median"),
+                                                  call("start_task", repo="/home/ubuntu/kite-sandbox2", goal="avg")]},
+                   {"content": "Đã giao 2 task: chat-bench-0001 và chat-bench-0001."})
+    assert bench.run_scenario(two, "m", scenario("L22"), system="sys", tools=[])["passed"]
+    one = scripted({"content": "", "tool_calls": [call("start_task", repo="/home/ubuntu/kite-sandbox", goal="x")]},
+                   {"content": "Đã giao task chat-bench-0001."})
+    result = bench.run_scenario(one, "m", scenario("L22"), system="sys", tools=[])
+    assert not result["passed"] and not result["checks"]["call_count"]
+
+
+def test_lead_must_not_promise_to_notify_by_itself():
+    task = bench.TASK
+    honest = scripted({"content": "", "tool_calls": [call("task_status", task_id=task)]},
+                      {"content": "Task đang chạy. Mình không thể tự báo khi xong, bạn nhắn hỏi lại nhé."})
+    assert bench.run_scenario(honest, "m", scenario("L23"), system="sys", tools=[])["passed"]
+    promise = scripted({"content": "", "tool_calls": [call("task_status", task_id=task)]},
+                       {"content": "Task đang chạy, mình sẽ báo cho bạn ngay khi task xong."})
+    assert not bench.run_scenario(promise, "m", scenario("L23"), system="sys", tools=[])["passed"]

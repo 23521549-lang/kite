@@ -232,6 +232,8 @@ class ModelGateway:
 
         candidates = [self.jobs[j] for j in self._queue
                       if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j])]
+        # The person chatting is waiting; a task's request can wait one turn. Stable sort keeps age order.
+        candidates.sort(key=lambda job: job.tag != "chat")
         if not candidates:
             return None
         loaded = [j for j in candidates if j.model == worker.loaded_model]

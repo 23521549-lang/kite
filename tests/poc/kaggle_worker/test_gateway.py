@@ -334,3 +334,14 @@ def test_worker_add_copies_a_worker_for_another_kaggle_account(tmp_path, capsys)
     with SQLiteSchedulerStore(tmp_path / "s.sqlite3") as store:
         sync_config_to_store(validate_config(raw), store, now=1000.0)
         assert store.get_owner_policy(raw["providers"][0].get("owner", "self")).max_concurrent_sessions == 2
+
+
+def test_chat_requests_go_before_queued_task_requests():
+    async def scenario():
+        gateway = make_gateway()
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+        task_job = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="chat-20261120-aaaa")
+        chat_job = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="chat")
+        assert (await gateway.next_job("w1", 0)).job_id == chat_job.job_id
+        assert task_job.job_id in gateway._queue                  # the task's request waits its turn
+    asyncio.run(scenario())

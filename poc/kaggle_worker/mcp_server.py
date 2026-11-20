@@ -40,6 +40,57 @@ LEAD_BASH_PERMISSION = {
     "curl *": "deny", "wget *": "deny", "ssh *": "deny", "scp *": "deny", "nc *": "deny",
     "rm -rf *": "deny", "git push*": "deny", "*secrets*": "deny", "*/var/lib/kite*": "deny",
 }
+# Reading files, listing folders and git belong to Kite's tools (repo_status, run_command in a sandbox
+# copy): denied outright, so the model gets an error at once and switches to the tool instead of the
+# user being asked to approve (and maybe clicking "Always allow").
+LEAD_READ_COMMANDS = ("ls", "cat", "head", "tail", "less", "more", "find", "grep", "rg", "tree", "stat",
+                      "wc", "file", "du", "pwd", "cd", "git")
+LEAD_BASH_PERMISSION.update({pattern: "deny" for cmd in LEAD_READ_COMMANDS for pattern in (cmd, f"{cmd} *")})
+
+
+def opencode_db_path() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "opencode" / "opencode.db"
+
+
+def persisted_shell_approvals(db_path: Path | None = None) -> list[dict]:
+    """Shell commands OpenCode was told to "Always allow" (kept in its database, for every project)."""
+    import sqlite3
+
+    path = db_path or opencode_db_path()
+    if not path.exists():
+        return []
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = db.execute("select id, project_id, action, resource from permission").fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return []
+    return [{"id": r[0], "scope": r[1], "action": r[2], "pattern": r[3]}
+            for r in rows if str(r[2]).lower() in ("shell", "bash")]
+
+
+def clear_shell_approvals(db_path: Path | None = None) -> dict:
+    """Back up OpenCode's database, then delete its persisted shell approvals. OpenCode must be stopped."""
+    import sqlite3
+
+    path = db_path or opencode_db_path()
+    approvals = persisted_shell_approvals(path)
+    if not approvals:
+        return {"cleared": 0}
+    backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    db = sqlite3.connect(path)
+    try:
+        copy = sqlite3.connect(backup)
+        db.backup(copy)
+        copy.close()
+        db.executemany("delete from permission where id = ?", [(a["id"],) for a in approvals])
+        db.commit()
+    finally:
+        db.close()
+    return {"cleared": len(approvals), "patterns": [a["pattern"] for a in approvals], "backup": str(backup)}
 
 
 class KiteToolError(RuntimeError):
@@ -449,7 +500,9 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 - Giao việc bằng tool `start_task`. Viết `goal` cụ thể: file/hàm liên quan, hành vi mong muốn, ràng buộc, cách kiểm tra.
 - Người dùng nhờ viết, sửa, thêm hay refactor code và đã nói rõ repo + việc cần làm: gọi `start_task` NGAY ở bước đầu. Đừng tự đọc code hay chạy lệnh để "tìm hiểu trước": agent code trong task sẽ tự đọc repo. Gọi `start_task` xong thì trả lời người dùng `task_id` ngay, không ngồi chờ task chạy xong.
 - Chọn `task_type`: `coding` (viết/sửa code), `analysis` (phân tích, không cần sửa), `review` (xem lại code), `docs` (tài liệu).
+- Người dùng giao nhiều việc trong một tin: gọi `start_task` cho TỪNG việc (mỗi repo/việc một lần), rồi báo đủ các `task_id`. Có nhiều worker thì các task chạy song song.
 - Báo cho người dùng `task_id`, rồi theo dõi bằng `task_status`. Khi người dùng hỏi tiến độ, gọi `task_status` thay vì đoán.
+- Bạn chỉ trả lời khi người dùng nhắn; bạn KHÔNG thể tự báo khi task xong. Đừng hứa "sẽ báo/cập nhật khi xong". Hãy nói người dùng nhắn hỏi lại (ví dụ "xong chưa"), lúc đó bạn gọi `task_status`.
 - Khi task xong, gọi `task_result` và tóm tắt ngắn: đã đổi file nào, đổi gì, test do Kite tự chạy **PASSED** hay **FAILED**, rồi hỏi người dùng có muốn áp patch không.
 - Việc nhỏ cần xem hoặc chạy thử (đọc file, tìm code, chạy test, xem `git log`): dùng `run_command` trên repo, vài giây là có kết quả, không cần GPU. Xem nhanh trạng thái repo: `repo_status`.
 - Muốn sửa thêm trên task CHƯA xong: `send_instruction`. Task đã xong: tạo task mới.
@@ -458,7 +511,7 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 ## Quy tắc an toàn
 
 - Bạn chạy trực tiếp trên máy chủ, nên không sửa file và không tải web. Mọi thay đổi code đều qua task của Kite (sandbox không Internet).
-- Ưu tiên tool của Kite thay cho shell. Shell chỉ dùng khi không tool nào làm được; mỗi lệnh shell đều chờ người dùng duyệt, nên giải thích ngắn lệnh đó làm gì trước khi chạy. Không bao giờ chạy lệnh đụng tới secrets, Docker, sudo, mạng hay `git push`.
+- Ưu tiên tool của Kite thay cho shell. Không dùng shell để xem thư mục, đọc file, tìm code hay chạy `git` (`ls`, `cat`, `find`, `grep`, `git`…): các lệnh này bị chặn. Xem repo: `repo_status`; đọc file, tìm code, chạy test: `run_command`. Shell chỉ dùng khi không tool nào làm được; mỗi lệnh shell đều chờ người dùng duyệt, nên giải thích ngắn lệnh đó làm gì trước khi chạy. Không bao giờ chạy lệnh đụng tới secrets, Docker, sudo, mạng hay `git push`.
 - Chỉ gọi `apply_result` khi người dùng nói rõ muốn áp patch (ví dụ "áp đi", "apply giúp mình"). Chỉ cần `task_id`: tool tự áp vào đúng repo gốc của task, thư mục chat không phải repo cũng không sao. Báo lại danh sách file và lệnh hoàn tác `undo_with`. Nếu lỗi (repo có thay đổi chưa commit, patch không khớp), giải thích lỗi và đưa lệnh `apply_with`.
 - Chỉ gọi `commit_result` khi người dùng nói rõ muốn commit; nó chỉ commit đúng các file của patch và không push. Push là việc của người dùng.
 - Kite KHÔNG push và bạn cũng không được push. Khi người dùng nhờ push: nói rõ là bạn không push được (bị chặn để an toàn), rồi đưa lệnh để họ tự chạy, ví dụ `git -C <repo> push`. Không nói "đã push" hay "sẽ push".
@@ -471,7 +524,7 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 
 - Repo được phép dùng (phải là repo Git, Kite lấy commit HEAD): ROOTS
 - Model trên gateway: MODELS (để trống `model` cho Kite tự chọn theo loại task).
-- Một task thường mất 1–5 phút khi worker Kaggle đang chạy.
+- Một task thường mất 5–15 phút khi worker Kaggle đang chạy (agent làm, Kite chạy test, rồi một vòng rà soát).
 """
 
 

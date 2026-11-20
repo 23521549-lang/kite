@@ -417,3 +417,39 @@ def test_chat_and_sandbox_requests_carry_a_task_tag(tmp_path):
     config = agent_config(SandboxSettings(), model="qwen3.6", models=["qwen3.6"], task_tag="chat-1")
     assert config["provider"]["kite"]["options"]["headers"] == {"X-Kite-Task": "chat-1"}
     assert "headers" not in agent_config(SandboxSettings(), model="qwen3.6", models=["qwen3.6"])["provider"]["kite"]["options"]
+
+
+def test_lead_cannot_read_files_with_shell_and_is_told_not_to_promise_notifications(tmp_path):
+    from poc.kaggle_worker.mcp_server import LEAD_BASH_PERMISSION
+
+    for command in ("ls", "ls -la /home/ubuntu/kite-trial", "cat calc.py", "git log", "grep -rn x ."):
+        pattern = command if command in LEAD_BASH_PERMISSION else command.split()[0] + " *"
+        assert LEAD_BASH_PERMISSION[pattern] == "deny", command
+    assert LEAD_BASH_PERMISSION["*"] == "ask"
+    agents = chat_files(make_config(tmp_path), lead_model="qwen3.6", kite_command=["kite"],
+                        allowed_roots=[tmp_path])["AGENTS.md"]
+    assert "KHÔNG thể tự báo" in agents and "TỪNG việc" in agents and "`repo_status`" in agents
+
+
+def test_persisted_always_allow_shell_approvals_are_found_and_cleared(tmp_path):
+    import sqlite3
+
+    from poc.kaggle_worker.mcp_server import clear_shell_approvals, persisted_shell_approvals
+
+    assert persisted_shell_approvals(tmp_path / "missing.db") == []
+    path = tmp_path / "opencode.db"
+    db = sqlite3.connect(path)
+    db.execute("create table permission (id text, project_id text, action text, resource text, "
+               "time_created int, time_updated int)")
+    db.executemany("insert into permission values (?, ?, ?, ?, 1, 1)",
+                   [("psv_1", "global", "shell", "ls *"), ("psv_2", "p1", "edit", "*.py")])
+    db.commit()
+    db.close()
+    assert [a["pattern"] for a in persisted_shell_approvals(path)] == ["ls *"]
+    result = clear_shell_approvals(path)
+    assert result["cleared"] == 1 and result["patterns"] == ["ls *"] and Path(result["backup"]).exists()
+    assert persisted_shell_approvals(path) == []
+    left = sqlite3.connect(path).execute("select id from permission").fetchall()
+    assert left == [("psv_2",)]                                   # only shell approvals are removed
+    assert sqlite3.connect(result["backup"]).execute("select count(*) from permission").fetchone() == (2,)
+    assert clear_shell_approvals(path) == {"cleared": 0}

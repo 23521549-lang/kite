@@ -153,6 +153,8 @@ def _parser() -> argparse.ArgumentParser:
     chat_setup.add_argument("--allow-root", action="append", type=Path, default=[],
                             help="folder whose Git repositories tasks may use; repeat (default: home)")
     chat_setup.add_argument("--force", action="store_true", help="overwrite opencode.json and AGENTS.md")
+    chat_setup.add_argument("--clear-approvals", action="store_true",
+                            help="remove shell commands OpenCode was told to 'Always allow' (database is backed up)")
     chat_commands.add_parser("reload", help="stop the OpenCode background server and old Kite MCP servers "
                                             "so the next `opencode` loads the current Kite tools")
     bench = commands.add_parser("bench", help="measure the Kaggle models on Kite's jobs (lead agent, code, speed)")
@@ -410,7 +412,8 @@ def _mcp_command(args: argparse.Namespace) -> int:
 
 
 def _chat_command(args: argparse.Namespace) -> int:
-    from .mcp_server import chat_files, stop_stale_chat_processes
+    from .mcp_server import (chat_files, clear_shell_approvals, persisted_shell_approvals,
+                             stop_stale_chat_processes)
 
     if args.chat_command == "reload":
         stopped = stop_stale_chat_processes(args.config)
@@ -440,8 +443,16 @@ def _chat_command(args: argparse.Namespace) -> int:
         subprocess.run(["git", "init", "-q", str(target)], check=True)
     # A running OpenCode background server would keep the old config and the old Kite tools.
     stopped = stop_stale_chat_processes(args.config)
-    _emit({"chat_dir": str(target), "lead_model": lead, "allowed_roots": [str(r) for r in roots],
-           "stopped": stopped, "next": f"cd {target} && opencode"})
+    report = {"chat_dir": str(target), "lead_model": lead, "allowed_roots": [str(r) for r in roots],
+              "stopped": stopped, "next": f"cd {target} && opencode"}
+    # "Always allow" in OpenCode is saved for every project and outlives opencode.json: check it.
+    if args.clear_approvals:
+        report["approvals"] = clear_shell_approvals()
+    elif approvals := persisted_shell_approvals():
+        report["warning"] = ("OpenCode đang lưu quyền shell 'Always allow': "
+                             + ", ".join(a["pattern"] for a in approvals)
+                             + ". Xóa bằng: kite chat setup --force --clear-approvals")
+    _emit(report)
     return 0
 
 
