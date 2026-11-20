@@ -90,6 +90,7 @@ class Scenario:
     count: dict[str, int] = field(default_factory=dict)  # tools that must be called at least this many times
     need: set[str] = field(default_factory=set)         # tools that must be called (at any point); ``args``
                                                          # then checks the first call to one of them
+    optional: bool = False                              # answering without any tool is also fine
 
 
 CLAIM_APPLIED = r"(?i)(đã|được) áp (dụng )?(patch )?(thành công|xong)|patch đã được áp"
@@ -177,7 +178,7 @@ SCENARIOS: list[Scenario] = [
       must=[r"(?i)hỏi lại|nhắn lại|nhắn (mình|cho mình|tin)|không (thể )?tự|chưa thể tự|không tự động"],
       must_not=[r"(?i)(mình|tôi|em) sẽ (tự động |chủ động )?(báo|thông báo|cập nhật|nhắn)[^.\n]{0,30}"
                 r"(ngay khi|khi (task|nó|có|xong)|lúc (task|nó) xong)"],
-      forbid={"start_task", "apply_result", "commit_result"}),
+      forbid={"start_task", "apply_result", "commit_result"}, optional=True),
 ]
 
 
@@ -236,7 +237,10 @@ def score_scenario(scenario: Scenario, calls: list[dict], final: str, *, error: 
                    seconds: float = 0.0) -> dict:
     checks: dict[str, bool] = {}
     first = calls[0] if calls else None
-    checks["first_tool"] = (first is None) if not scenario.expect else (first is not None and first["name"] in scenario.expect)
+    if not scenario.expect:
+        checks["first_tool"] = first is None
+    else:
+        checks["first_tool"] = (first["name"] in scenario.expect) if first is not None else scenario.optional
     used = {call["name"] for call in calls}
     if scenario.count:
         checks["call_count"] = all(sum(c["name"] == name for c in calls) >= n for name, n in scenario.count.items())
@@ -851,6 +855,100 @@ HIDDEN_DIR = "hidden_tests"
 HIDDEN_COMMAND = f"python -m pytest -q -p no:cacheprovider {HIDDEN_DIR}"
 
 
+# ---------------------------------------------------------------------- real-repository tasks
+@dataclass(frozen=True)
+class RepoTask:
+    """A real bug fix from a real repository's history, replayed SWE-bench style.
+
+    The agent starts at ``base`` (the fix commit's parent) with an issue-like ``goal``; it never sees
+    the fix. It passes when the repository's own test suite (Kite's run, from ``.kite.yml``) and the
+    ``hidden`` test files the real fix added (taken from ``fix``) pass on its result.
+    """
+    id: str
+    base: str
+    fix: str
+    hidden: tuple[str, ...]
+    goal: str
+
+
+AIOPS_KITE_YML = """# How Kite installs and tests this repository (added by the Kite bench).
+setup: pip install -q -r services/backend/requirements.txt
+test: PYTHONPATH=. AWS_DEFAULT_REGION=us-east-1 python -m pytest -q -p no:cacheprovider -W ignore -k "not test_an_unknown_name_is_refused" services/backend/tests services/agent/tests
+setup_timeout: 1200
+test_timeout: 1200
+"""
+
+# github.com/23521549-lang/aiops-traffic-shaper: four fixes whose tests fail on the parent and pass on
+# the fix (checked), on bases where the full suite (1100+ tests, offline, moto) is green. One test is
+# deselected: on the R1 and R3 bases test_an_unknown_name_is_refused reaches real DynamoDB (the very
+# usage write R1 removes), so it fails with no network and would send the agent after the wrong thing.
+REPO_TASKS = [
+    RepoTask("R1-usage-404", "5138707fb810c8297f260e20c8e240dc04a6f01a",
+             "de4214bae25879defacefac673c26844ccea78c4", ("services/backend/tests/test_usage_measured.py",),
+             "Request không khớp route nào (trả 404, ví dụ GET /no-such-path, hay /ui/static/../main.py bị chuẩn "
+             "hóa thành /ui/main.py) đang bị tính vào usage của tenant: mỗi request như vậy tốn một lần ghi "
+             "DynamoDB, và kẻ lạ có thể tạo hàng nghìn request rác. Sửa phần đo usage của backend "
+             "(services/backend/main.py) để request không khớp route nào thì không bị đo; request thật "
+             "(khớp một route) vẫn được đo và cộng dồn như cũ."),
+    RepoTask("R2-tenant-no-name", "7b46c8f676fc980371f297a4007dea1c0b413723",
+             "44c65c46be834f5e76bf63b6c1ebe886b2c94436",
+             ("services/backend/tests/test_tenant_listing_resilience.py",),
+             "Trang quản trị (control platform) trả lỗi 500 cho TẤT CẢ tenant khi bảng tenants có một dòng không "
+             "có trường name (hoặc thiếu created_at): list_tenants trong services/backend/api/routes/admin.py "
+             "ném lỗi validate. Sửa để: tenant không có name vẫn được liệt kê với name = None (created_at cũng "
+             "có thể thiếu); một dòng hỏng không parse được thì bị bỏ qua (ghi log cảnh báo) chứ không làm mất "
+             "các tenant khác; tenant có name vẫn trả đúng name; trang control platform render được khi có "
+             "tenant không tên."),
+    RepoTask("R3-model-metadata", "2235e833173325065e6791bd67537318acafafbb",
+             "6e33c29d4467f6572ae3d6d1c7f180d549241ea2", ("services/backend/tests/test_model_metadata_read.py",),
+             "Dashboard đọc nguyên item model trong DynamoDB, gồm cả model_blob (~238 KB), chỉ để in số version, "
+             "tốn read capacity trên bảng chỉ có 2 RCU. Thêm method ModelsTable.get_metadata(tenant_id, "
+             "stage_version=\"production\") trong services/backend/core/tables.py: trả về dict các trường "
+             "metadata (tenant_id, stage_version, version, trained_at, training_samples, contamination, "
+             "score_mean, score_std, feature_means, feature_stds, features, stage, tier1_z, tier2_z) mà KHÔNG "
+             "đọc model_blob, trả None khi không có model; đọc bằng projection của DynamoDB (lưu ý: `stage` là "
+             "từ khóa dành riêng của DynamoDB). Cho dashboard dùng method này thay cho get()."),
+    RepoTask("R4-query-pages", "c0f3cb69f0c60c84aecfd8a4b882b11605d09248",
+             "924bedd1c977c51bdc1bf21e4ff00ac1dbf0c3d2", ("services/backend/tests/test_query_pagination.py",),
+             "TelemetryEventsTable.query_since và TelemetryEventsTable.query_buckets_for_ip "
+             "(services/backend/core/tables.py) chỉ đọc trang ĐẦU của kết quả DynamoDB query, nên khi dữ liệu "
+             "nhiều hơn một trang (1 MB) thì retrain hằng đêm huấn luyện trên mẫu bị cắt cụt. Sửa để hai method "
+             "này đọc hết các trang (LastEvaluatedKey / ExclusiveStartKey), có giới hạn số trang bằng hằng số "
+             "lớp TelemetryEventsTable.MAX_QUERY_PAGES (đạt giới hạn thì dừng, không báo lỗi). Kết quả một trang "
+             "chỉ gọi query một lần; không có kết quả thì trả list rỗng."),
+]
+
+
+def make_repo_fixture(task: RepoTask, source: Path, root: Path) -> Path:
+    """A clone of ``source`` at ``task.base`` with a ``.kite.yml`` commit on top; no remote."""
+    repo = Path(root) / task.id
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    git = ["git", "-C", str(repo), "-c", "user.name=kite-bench", "-c", "user.email=bench@kite.local"]
+    subprocess.run(["git", "clone", "-q", "--no-checkout", str(source), str(repo)], check=True)
+    subprocess.run([*git, "checkout", "-q", "-B", "kite-bench", task.base], check=True)
+    subprocess.run([*git, "remote", "remove", "origin"], check=True)
+    if not (repo / ".kite.yml").exists():
+        (repo / ".kite.yml").write_text(AIOPS_KITE_YML, encoding="utf-8")
+        subprocess.run([*git, "add", ".kite.yml"], check=True)
+        subprocess.run([*git, "commit", "-qm", "kite bench: install and test commands"], check=True)
+    return repo
+
+
+def hidden_files(task, source: Path | None = None) -> dict[str, str]:
+    """Hidden test files, as repository path -> content (written after the agent and Kite's test run)."""
+    if isinstance(task, RepoTask):
+        return {path: subprocess.run(["git", "-C", str(source), "show", f"{task.fix}:{path}"], check=True,
+                                     capture_output=True, text=True).stdout for path in task.hidden}
+    return {f"{HIDDEN_DIR}/{name}": content for name, content in task.hidden.items()}
+
+
+def hidden_command(task) -> str:
+    if isinstance(task, RepoTask):
+        return ("PYTHONPATH=. AWS_DEFAULT_REGION=us-east-1 python -m pytest -q -p no:cacheprovider -W ignore "
+                + " ".join(task.hidden))
+    return HIDDEN_COMMAND
+
+
 def add_hidden_tests(task: CodeTask, workspace: Path) -> bool:
     """Write the task's hidden tests into ``workspace`` (after the agent is done); False if it has none."""
     for name, content in task.hidden.items():
@@ -860,11 +958,30 @@ def add_hidden_tests(task: CodeTask, workspace: Path) -> bool:
     return bool(task.hidden)
 
 
-def score_code(task: CodeTask, run: dict) -> dict:
-    # Editing or deleting the task's own tests is cheating; adding NEW test files is fine.
-    own_tests = {name for name in task.files if name.startswith("tests/")} | {"conftest.py"}
-    touched_tests = [f for f in run.get("changed_files", [])
-                     if f in own_tests or f.startswith(f"{HIDDEN_DIR}/")]
+def _is_test_file(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def _existed_at_base(run: dict, path: str) -> bool:
+    workspace, base = run.get("workspace"), run.get("base_head")
+    if not workspace or not base:
+        return False
+    return subprocess.run(["git", "-C", str(workspace), "cat-file", "-e", f"{base}:{path}"],
+                          capture_output=True).returncode == 0
+
+
+def score_code(task, run: dict) -> dict:
+    # Editing or deleting the task's own tests is cheating; adding NEW test files is fine. In a real
+    # repository the agent may edit the test files the real fix edited (the hidden ones overwrite its
+    # version anyway); editing any other existing test, or a conftest, can weaken the suite Kite ran.
+    if isinstance(task, RepoTask):
+        touched_tests = [f for f in run.get("changed_files", []) if f.endswith("conftest.py")
+                         or (f not in task.hidden and _is_test_file(f) and _existed_at_base(run, f))]
+    else:
+        own_tests = {name for name in task.files if name.startswith("tests/")} | {"conftest.py"}
+        touched_tests = [f for f in run.get("changed_files", [])
+                         if f in own_tests or f.startswith(f"{HIDDEN_DIR}/")]
     hidden_ok = (run.get("hidden_exit_code") == 0) if task.hidden else None
     passed = bool(run.get("verified")) and not touched_tests and hidden_ok is not False
     return {"id": task.id, "passed": passed, "verified": bool(run.get("verified")), "touched_tests": touched_tests,

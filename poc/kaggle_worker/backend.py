@@ -163,13 +163,19 @@ class SandboxActivityBackend:
             raise ApplicationError(str(exc), non_retryable=True) from exc
         sbx._git(work, "update-ref", "refs/kite/base", task.repo_head)
         (deps / "cache").mkdir(parents=True, exist_ok=True)
-        if self.settings.setup_command:
+        try:
+            settings = sbx.repo_settings(self.settings, work)
+        except sbx.SandboxError as exc:
+            raise ApplicationError(str(exc), non_retryable=True) from exc
+        if settings is not self.settings:
+            self._trace(task.task_id, "repo_config", setup=settings.setup_command, test=settings.test_command)
+        if settings.setup_command:
             name = sbx.container_name("setup", task_slug(task.task_id))
             code, output, seconds = await self._run_container(
                 name, sbx.docker_run_args(self.settings, name=name, workspace=work,
                                           network=self.settings.setup_network, deps=deps)
-                + ["sh", "-c", self.settings.setup_command],
-                self.settings.setup_timeout_seconds, task_id=task.task_id)
+                + ["sh", "-c", settings.setup_command],
+                settings.setup_timeout_seconds, task_id=task.task_id)
             (root / "setup.log").write_text(output, encoding="utf-8")
             if code != 0:
                 raise ApplicationError(f"setup command failed (exit {code}) after {seconds}s; "
@@ -227,8 +233,9 @@ class SandboxActivityBackend:
     async def _run_agent(self, task: CodingTaskInput, route: RouteLease, work: Path, root: Path, slug: str,
                          deps: Path, patch_base: str, config_file: Path, goal: str, instruction: str,
                          context: str, session_id: str, heartbeat: Callable[[dict], None]) -> CodingRunResult:
-        prompt = sbx.agent_prompt(goal, self.settings.test_command, task_type=task.task_type, context=context)
-        test_command = self.settings.test_command
+        settings = sbx.repo_settings(self.settings, work)   # the repo's .kite.yml (already validated in setup)
+        prompt = sbx.agent_prompt(goal, settings.test_command, task_type=task.task_type, context=context)
+        test_command = settings.test_command
         attempt, seconds, test_code, test_output = 0, 0.0, None, ""
         while True:
             kind = "agent" if attempt == 0 else f"fix{attempt}"
@@ -251,7 +258,7 @@ class SandboxActivityBackend:
             test_code, test_output, _ = await self._run_container(
                 name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
                 + ["sh", "-c", test_command],
-                self.settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
+                settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
             with (root / "test.log").open("a", encoding="utf-8") as stream:
                 stream.write(f"\n===== after {kind} exit={test_code} =====\n{test_output}")
             if test_code == 0 or status != "ok" or attempt >= self.settings.fix_rounds:
@@ -280,7 +287,7 @@ class SandboxActivityBackend:
                 code_after, test_after, _ = await self._run_container(
                     name, sbx.docker_run_args(self.settings, name=name, workspace=work, network="none", deps=deps)
                     + ["sh", "-c", test_command],
-                    self.settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
+                    settings.test_timeout_seconds, heartbeat, "TESTING", task.task_id)
                 with (root / "test.log").open("a", encoding="utf-8") as stream:
                     stream.write(f"\n===== after review exit={code_after} =====\n{test_after}")
                 if review_code == 0 and code_after == 0:
@@ -301,7 +308,7 @@ class SandboxActivityBackend:
             lines.append("Kite test run: skipped (no sandbox.test_command).")
         else:
             verdict = "PASSED" if test_code == 0 else f"FAILED (exit {test_code})"
-            lines.append(f"Kite test run `{self.settings.test_command}` (no network): {verdict}.")
+            lines.append(f"Kite test run `{settings.test_command}` (no network): {verdict}.")
             lines.append(sbx._tail(test_output, 1500).strip())
         # Analysis / review / docs answers live in the agent's output: keep much more of it.
         lines += ["Agent output (tail):", sbx._tail(output, 1500 if task.task_type == "coding" else 6000).strip()]

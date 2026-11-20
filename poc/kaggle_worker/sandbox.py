@@ -93,6 +93,8 @@ class SandboxSettings:
     # After the tests pass (coding tasks): one more agent pass that re-checks the solution against the
     # goal and docstrings (edge cases, every caller). Kept only if the tests still pass afterwards.
     self_review: bool = True
+    # Let a repository declare its own setup/test commands in a committed `.kite.yml` (see repo_settings).
+    repo_config: bool = True
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
     model_context: dict[str, int] = field(default_factory=dict)
 
@@ -251,6 +253,53 @@ TASK_GUIDES = {
         "3. Không đổi code, trừ khi yêu cầu nói vậy.",
     ],
 }
+
+
+REPO_CONFIG = ".kite.yml"
+REPO_CONFIG_KEYS = {"setup": "setup_command", "test": "test_command",
+                    "setup_timeout": "setup_timeout_seconds", "test_timeout": "test_timeout_seconds"}
+
+
+def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings:
+    """Settings for one repository: its committed ``.kite.yml`` overrides the operator's defaults.
+
+    A real project knows how it is installed and tested (``pip install -r services/x/requirements.txt``,
+    ``PYTHONPATH=. pytest services/x/tests``); one global ``sandbox.test_command`` cannot. The file
+    is read from the task's own clone (the committed state), so it travels with the code::
+
+        setup: pip install -r requirements.txt
+        test: python -m pytest -q tests
+        test_timeout: 900          # seconds, optional (60-3600)
+        setup_timeout: 900
+
+    The commands still run in the sandbox (setup with the operator's setup network, tests with none).
+    A malformed file is an error, not a silent fallback: it would otherwise test the wrong thing.
+    """
+    path = Path(workspace) / REPO_CONFIG
+    if not settings.repo_config or not path.is_file():
+        return settings
+    import yaml
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as exc:
+        raise SandboxError(f"{REPO_CONFIG} is not valid YAML: {exc}") from exc
+    if not isinstance(data, dict) or set(data) - set(REPO_CONFIG_KEYS):
+        raise SandboxError(f"{REPO_CONFIG} accepts only {', '.join(sorted(REPO_CONFIG_KEYS))}")
+    changes = {}
+    for key, field_name in REPO_CONFIG_KEYS.items():
+        if key not in data:
+            continue
+        value = data[key]
+        if key.endswith("_timeout"):
+            if not isinstance(value, int) or isinstance(value, bool) or not 60 <= value <= 3600:
+                raise SandboxError(f"{REPO_CONFIG}: {key} must be seconds between 60 and 3600")
+        elif not isinstance(value, str):
+            raise SandboxError(f"{REPO_CONFIG}: {key} must be a shell command string ('' to skip)")
+        changes[field_name] = value
+    from dataclasses import replace
+
+    return replace(settings, **changes)
 
 
 def review_prompt(goal: str, test_command: str) -> str:
@@ -427,6 +476,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     root = Path(state_dir) / task_id
     workspace = root / "work"
     base_head = prepare_clone(Path(repo), workspace)
+    settings = repo_settings(settings, workspace)
     deps = root / "deps"
     (deps / "cache").mkdir(parents=True, exist_ok=True)
     run = SandboxRun(

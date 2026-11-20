@@ -348,3 +348,39 @@ def test_backend_journals_each_run_and_traces_every_step(tmp_path):
     worker = next(e["worker"] for e in trace if e["event"] == "run_start")
     assert worker and config["provider"]["kite"]["options"]["headers"] == {
         "X-Kite-Task": "task-journal", "X-Kite-Worker": worker}
+
+
+def test_backend_uses_the_repository_kite_yml_and_rejects_a_broken_one(tmp_path):
+    from poc.kaggle_worker.journal import read_jsonl
+
+    repo, _ = make_repo(tmp_path)
+    (repo / ".kite.yml").write_text("setup: pip install -q -r svc.txt\ntest: python -m pytest -q svc\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "kite config")
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    store = make_store(tmp_path)
+    fake = FakeDocker()
+    backend = make_backend(tmp_path, store, fake)
+    task = make_task(store, repo, head, "task-kite-yml")
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        return await backend.run_opencode(task, route, work, "", "s", "k4", lambda beat: None)
+
+    result = asyncio.run(scenario())
+    runs = [c for c in fake.calls if c[1] == "run"]
+    setup = next(c for c in runs if c[c.index("--name") + 1].startswith("kite-setup"))
+    test = next(c for c in runs if c[c.index("--name") + 1].startswith("kite-test"))
+    assert setup[-1] == "pip install -q -r svc.txt" and test[-1] == "python -m pytest -q svc"
+    assert "`python -m pytest -q svc`" in result.summary
+    trace = read_jsonl(backend.task_dir("task-kite-yml") / "trace.jsonl")
+    assert any(e["event"] == "repo_config" and e["test"] == "python -m pytest -q svc" for e in trace)
+
+    (repo / ".kite.yml").write_text("test_timeout: 1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "broken")
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    broken = make_task(store, repo, head, "task-kite-yml-broken")
+    with pytest.raises(ApplicationError, match="test_timeout"):
+        asyncio.run(backend.prepare_workspace(broken, "k1"))

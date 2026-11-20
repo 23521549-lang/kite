@@ -164,6 +164,9 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--suites", default="speed,lead,code", help="comma-separated: speed, lead, code")
     bench_run.add_argument("--only", default="", help="comma-separated scenario/task ids, e.g. L04,L16,C1-bugfix")
     bench_run.add_argument("--out", type=Path, help="output folder (default: <state>/bench/<time>)")
+    bench_run.add_argument("--repo-source", type=Path,
+                           help="local clone of github.com/23521549-lang/aiops-traffic-shaper: the code suite "
+                                "then runs the real-repository tasks (R1-R4) instead of C1-C8")
     bench_run.add_argument("--no-harness", action="store_true",
                            help="code suite without fix rounds, self-review and repo context (baseline)")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
@@ -489,7 +492,11 @@ def _bench_command(args: argparse.Namespace) -> int:
         raise ConfigError("--suites takes speed, lead, code")
     only = {x.strip() for x in args.only.split(",") if x.strip()}
     scenarios = [s for s in bench.SCENARIOS if not only or s.id in only]
-    code_tasks = [t for t in bench.CODE_TASKS if not only or t.id in only]
+    source = args.repo_source.expanduser().resolve() if args.repo_source else None
+    if source is not None and not (source / ".git").exists():
+        raise ConfigError(f"--repo-source {source} is not a Git clone")
+    pool = bench.REPO_TASKS if source is not None else bench.CODE_TASKS
+    code_tasks = [t for t in pool if not only or t.id in only]
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = (args.out or args.config.parent / "bench" / stamp).expanduser().resolve()
     post = bench.gateway_post(f"http://{config.gateway.host}:{config.gateway.port}/v1/chat/completions",
@@ -505,19 +512,28 @@ def _bench_command(args: argparse.Namespace) -> int:
 
         def run_code(task, model, out_dir):
             slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
-            repo = bench.make_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
+            if isinstance(task, bench.RepoTask):
+                repo = bench.make_repo_fixture(task, source, out_dir / "repos" / f"{slug}-{stamp}")
+            else:
+                repo = bench.make_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
             task_id = f"bench-{slug}-{task.id.lower()}-{stamp[-6:]}"
             run = sbx.run_task(settings, repo=repo, goal=task.goal, model=model, models=served,
                                state_dir=out_dir / "runs", task_id=task_id, with_context=not args.no_harness,
                                log=lambda line: print(line, file=sys.stderr))
             result = run.to_dict()
-            if run.agent_status == "ok" and bench.add_hidden_tests(task, Path(run.workspace)):
-                # Hidden tests: written only now, run like Kite's own tests (no network).
+            files = bench.hidden_files(task, source) if run.agent_status == "ok" else {}
+            if files:
+                # Hidden tests: written only now, run like Kite's own tests (no network, same deps).
+                workspace = Path(run.workspace)
+                for rel, content in files.items():
+                    (workspace / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (workspace / rel).write_text(content, encoding="utf-8")
                 name = sbx.container_name("hidden", task_id)
                 result["hidden_exit_code"], output = sbx._run_step(
-                    settings, sbx.default_runner, name=name, timeout=settings.test_timeout_seconds,
-                    args=sbx.docker_run_args(settings, name=name, workspace=Path(run.workspace), network="none")
-                    + ["sh", "-c", bench.HIDDEN_COMMAND])
+                    settings, sbx.default_runner, name=name, timeout=max(settings.test_timeout_seconds, 1200),
+                    args=sbx.docker_run_args(settings, name=name, workspace=workspace, network="none",
+                                             deps=workspace.parent / "deps")
+                    + ["sh", "-c", bench.hidden_command(task)])
                 result["hidden_output_tail"] = sbx._tail(output)
             return result
 

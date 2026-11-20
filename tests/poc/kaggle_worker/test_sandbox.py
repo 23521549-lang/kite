@@ -348,3 +348,35 @@ def test_require_worker_fails_fast_without_a_live_worker():
 
     with pytest.raises(sbx.SandboxError, match="cannot reach the gateway"):
         sbx.require_worker(SETTINGS, "qwen3.6", fetch=unreachable)
+
+
+def test_a_repository_declares_its_own_setup_and_test_commands(tmp_path):
+    from dataclasses import replace
+
+    work = tmp_path / "w"
+    work.mkdir()
+    assert sbx.repo_settings(SETTINGS, work) is SETTINGS                 # no .kite.yml: operator defaults
+    (work / ".kite.yml").write_text("setup: pip install -r svc/requirements.txt\n"
+                                    "test: PYTHONPATH=. python -m pytest -q svc/tests\ntest_timeout: 900\n")
+    mine = sbx.repo_settings(SETTINGS, work)
+    assert (mine.setup_command, mine.test_command, mine.test_timeout_seconds) == (
+        "pip install -r svc/requirements.txt", "PYTHONPATH=. python -m pytest -q svc/tests", 900)
+    assert mine.setup_timeout_seconds == SETTINGS.setup_timeout_seconds
+    assert sbx.repo_settings(replace(SETTINGS, repo_config=False), work).test_command == SETTINGS.test_command
+    for bad in ("test: [1, 2]\n", "test_timeout: 5\n", "network: bridge\n", "test: 'unterminated\n", "- x\n"):
+        (work / ".kite.yml").write_text(bad)
+        with pytest.raises(sbx.SandboxError):
+            sbx.repo_settings(SETTINGS, work)
+
+
+def test_run_task_uses_the_repository_test_command(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / ".kite.yml").write_text("test: python -m pytest -q -k average\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "kite config")
+    fake = FakeDocker()
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                       state_dir=tmp_path / "state", task_id="t20", runner=fake, log=lambda _m: None)
+    assert fake.call("test")[-1] == "python -m pytest -q -k average"
+    assert run.test_command == "python -m pytest -q -k average"
+    assert "python -m pytest -q -k average" in fake.call("agent")[-1]   # the agent is told the same command
