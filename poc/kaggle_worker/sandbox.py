@@ -31,7 +31,7 @@ import tempfile
 import time
 import urllib.request
 import uuid
-from typing import Callable
+from typing import Callable, Sequence
 
 from . import codemap, editblocks
 
@@ -122,6 +122,12 @@ class SandboxSettings:
     # After a fast fix passed: review it with one model call too (approve, or SEARCH/REPLACE corrections
     # kept only if the tests and check still pass) instead of a whole agent session.
     fast_review: bool = True
+    # Best-of-N on the fast path (Harness²-style: several cheap candidates, Kite's tests choose). After a
+    # candidate fails, ask again this many times, told why the last one failed (never the reproduction
+    # test itself: the fix stays independent of it).
+    fast_retries: int = 1
+    # With another worker idle on the same model, ask it for a second candidate at the same time.
+    fast_parallel: bool = True
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
     model_context: dict[str, int] = field(default_factory=dict)
 
@@ -167,6 +173,7 @@ class SandboxRun:
     fast_path: str = "off"
     fast_seconds: float = 0.0
     review_mode: str = ""         # agent | one_call
+    fast_attempts: int = 0        # fast-path candidates tried (best-of-N)
     repro: str = "off"            # the fast path's reproduction test: off | none | broken | not_reproduced
     #                               | reproduced
 
@@ -625,7 +632,7 @@ def fast_context(workspace: Path, goal: str, graph: codemap.CodeGraph | None = N
     return "\n\n".join(sections)
 
 
-def fast_prompt(goal: str, context: str, test_command: str, check: str = "") -> str:
+def fast_prompt(goal: str, context: str, test_command: str, check: str = "", feedback: str = "") -> str:
     checks = f"`{test_command}`" + (f" và `{check_hint(check)}`" if check else "")
     return "\n".join([
         goal.strip(), "",
@@ -647,10 +654,25 @@ def fast_prompt(goal: str, context: str, test_command: str, check: str = "") -> 
         f"- Nếu phần code bên dưới chưa đủ để sửa chắc chắn đúng, chỉ trả lời một dòng: {FAST_DECLINE}: <lý do>.",
         "- Chỉ cần các khối sửa, kèm tối đa hai câu tóm tắt.",
         f"Kite sẽ tự áp các khối rồi chạy {checks} (không mạng).",
+        *(["", feedback] if feedback else []),
         "",
         "Code liên quan:",
         context,
     ])
+
+
+def retry_feedback(status: str, diff: str, reason: str, output: str) -> str:
+    """Why the last candidate failed, for the next one. A failed reproduction test is described, never
+    shown: the fix must stay independent of the test that judges it."""
+    head = "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT và đã được gỡ: code bên dưới vẫn là bản GỐC, sửa lại từ đầu."
+    if status == "not_applied":
+        return f"{head} Các khối sửa không áp được ({reason}): phần SEARCH phải chép NGUYÊN VĂN từ code bên dưới."
+    shown = f"\nBản đã thử:\n```diff\n{diff.strip()[:3000]}\n```" if diff.strip() else ""
+    if status == "repro_failed":
+        return (f"{head} Bản đó chưa làm đúng yêu cầu: một kiểm tra độc lập Kite viết từ yêu cầu vẫn lỗi. "
+                f"Đọc lại yêu cầu, nhất là các trường hợp biên và quy tắc nó nêu.{shown}")
+    what = "làm test của repo lỗi" if status == "tests_failed" else "bị bước kiểm tra (lint) báo lỗi"
+    return (f"{head} Bản đó {what}.{shown}\nKết quả:\n```\n{failure_digest(output, 1500).strip()}\n```")
 
 
 def gateway_asker(settings: SandboxSettings, model: str, *, tag: str, pin: str | None = None,
@@ -675,6 +697,24 @@ def gateway_asker(settings: SandboxSettings, model: str, *, tag: str, pin: str |
     return ask
 
 
+def idle_helpers(settings: SandboxSettings, model: str, *, exclude: str | None, limit: int = 1) -> list[str]:
+    """Other workers that are connected, idle and already have ``model`` loaded: they can write a
+    second fast-path candidate at the same time, at no cost in wall time (no model swap, no queue).
+    Only used for a task pinned to a worker, so the two candidates never share one worker."""
+    if not settings.fast_parallel or not exclude or limit <= 0:
+        return []
+    base = (settings.host_gateway_url or settings.gateway_url).rstrip("/")
+    root = base[:-len("/v1")] if base.endswith("/v1") else base
+    try:
+        with urllib.request.urlopen(root + "/status", timeout=5) as response:
+            status = json.loads(response.read())
+    except Exception:
+        return []
+    return [w["worker_id"] for w in status.get("workers") or []
+            if w.get("worker_id") != exclude and w.get("alive") and not w.get("busy") and not w.get("draining")
+            and not w.get("stop_requested") and w.get("loaded_model") == model][:limit]
+
+
 @dataclass
 class FastAttempt:
     status: str                 # skipped | declined | not_applied | applied | error
@@ -687,19 +727,24 @@ class FastAttempt:
 
 
 def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: Callable[[str], str],
-                 test_command: str, check: str = "", context: str | None = None) -> FastAttempt:
+                 test_command: str, check: str = "", context: str | None = None, feedback: str = "") -> FastAttempt:
     """Locate the code, ask once, apply the edit blocks (all or nothing). Tests are the caller's."""
     context = fast_context(workspace, goal, graph) if context is None else context
     if not context:
         return FastAttempt("skipped", reason="không xác định được phần code liên quan")
     try:
-        answer = ask(fast_prompt(goal, context, test_command, check))
+        answer = ask(fast_prompt(goal, context, test_command, check, feedback))
     except Exception as exc:                    # gateway down, timeout: the agent still runs
         return FastAttempt("error", reason=str(exc)[:300], context_chars=len(context))
+    return fast_apply(workspace, answer, len(context))
+
+
+def fast_apply(workspace: Path, answer: str, context_chars: int = 0) -> FastAttempt:
+    """Apply one fast answer's edit blocks (all or nothing); edits to existing tests are refused."""
     visible = re.sub(r"<think>.*?</think>", "", answer, flags=re.S)
     declined = re.search(rf"{FAST_DECLINE}\s*:?\s*(.*)", visible)
     if declined and "<<<<<<<" not in visible:
-        return FastAttempt("declined", answer, declined.group(1).strip()[:300], context_chars=len(context))
+        return FastAttempt("declined", answer, declined.group(1).strip()[:300], context_chars=context_chars)
     before = snapshot_tree(workspace)
     try:
         files = editblocks.apply(workspace, editblocks.parse(answer))
@@ -709,10 +754,10 @@ def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, as
             raise editblocks.EditError(f"sửa test có sẵn ({', '.join(existing_tests)})")
     except editblocks.EditError as exc:
         restore_tree(workspace, before)
-        return FastAttempt("not_applied", answer, str(exc)[:300], before, context_chars=len(context))
+        return FastAttempt("not_applied", answer, str(exc)[:300], before, context_chars=context_chars)
     _git(workspace, "add", "-A")
     diff = _git(workspace, "diff", "--cached", before, check=False)
-    return FastAttempt("applied", answer, "", before, diff, files, len(context))
+    return FastAttempt("applied", answer, "", before, diff, files, context_chars)
 
 
 FAST_REASONS = {"tests_failed": "test của Kite lỗi", "check_failed": "bước kiểm tra lỗi",
@@ -818,6 +863,7 @@ class FastResult:
     status: str                 # off | skipped | declined | not_applied | error | tests_failed | check_failed
     #                             | repro_failed | passed
     repro: str = "off"          # off | none | broken | not_reproduced | reproduced
+    attempts: int = 0           # candidates tried (best-of-N)
     reason: str = ""
     answer: str = ""
     repro_answer: str = ""
@@ -835,7 +881,8 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
               test_command: str, check: str, template: str,
               run_tests: Callable[[str], tuple[int, str, str]],
               run_check: Callable[[str], tuple[int | None, str, str]],
-              run_one: Callable[[str, str], tuple[int, str]]) -> FastResult:
+              run_one: Callable[[str, str], tuple[int, str]],
+              helpers: Sequence[Callable[[str], str]] = (), retries: int = 0) -> FastResult:
     """Agentless-style fix with evidence (Xia et al. 2024, github.com/OpenAutoCoder/Agentless).
 
     1. reproduction test written from the goal alone, run on the current code: it must fail;
@@ -844,6 +891,11 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
     The fix and the test come from the goal independently, so their agreement is evidence that a
     reading-only review can trust; without a reproduction ("not_reproduced"/"none") the caller
     reviews with the agent instead. Anything failing puts the clone back for the agent.
+
+    Best-of-N (the idea of Harness², github.com/google-research/harness2: cheap candidates, a judge
+    picks): ``helpers`` are askers on other idle workers, asked for candidates at the same time as
+    ``ask``; candidates are checked one by one and the first that passes everything wins. Then up to
+    ``retries`` more candidates from ``ask``, each told why the last one failed.
     """
     workspace = Path(workspace)
     context = fast_context(workspace, goal, graph)
@@ -876,37 +928,86 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
             (workspace / repro_file).unlink()
         else:
             result.repro = "none"
-    fast = fast_attempt(workspace, goal, graph, ask, test_command, check, context=context)
-    result.answer, result.files, result.reason = fast.answer, fast.files, fast.reason
     repro_note = ("\nTest tái hiện Kite đã viết từ yêu cầu (có thể sai; yêu cầu gốc mới là chuẩn), "
                   f"`{repro_file}`:\n```python\n{repro_text.strip()[:3000]}\n```\n"
                   f"Kết quả trên code ban đầu:\n```\n{failure_digest(repro_output, 1500).strip()}\n```"
                   if result.repro == "reproduced" else "")
-    if fast.status != "applied":
-        result.status = fast.status
-        if fast.status == "not_applied":
-            result.note = fast_note(f"{FAST_REASONS['not_applied']} ({fast.reason})", "", "") + repro_note
-        elif repro_note:
-            result.note = "\n" + repro_note
-        return result
-    if result.repro in ("reproduced", "not_reproduced"):
-        target = workspace / repro_file
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(repro_text, encoding="utf-8")
-    code, output, _ = run_tests("fast")
-    check_code, check_output, _ = run_check("fast") if code == 0 else (None, "", "")
-    if code == 0 and check_code in (None, 0):
-        result.status, result.test_output = "passed", output
-        result.check_code, result.check_output = check_code, check_output
-        return result
-    restore_tree(workspace, fast.before)              # also drops the reproduction test
-    if code != 0:
-        result.status = "repro_failed" if repro_file and repro_file in output and result.repro != "off" \
-            else "tests_failed"
-        result.failing_output = output
+
+    def judge(fast: FastAttempt, label: str) -> tuple[str, str, int | None, str]:
+        """Kite's tests on one applied candidate: (status, test output, check code, check output)."""
+        if result.repro in ("reproduced", "not_reproduced"):
+            target = workspace / repro_file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(repro_text, encoding="utf-8")
+        code, output, _ = run_tests(label)
+        check_code, check_output, _ = run_check(label) if code == 0 else (None, "", "")
+        if code == 0 and check_code in (None, 0):
+            return "passed", output, check_code, check_output
+        restore_tree(workspace, fast.before)              # also drops the reproduction test
+        if code != 0:
+            status = "repro_failed" if repro_file and repro_file in output and result.repro != "off" \
+                else "tests_failed"
+            return status, output, None, ""
+        return "check_failed", "", check_code, check_output
+
+    prompt = fast_prompt(goal, context, test_command, check)
+    askers = [ask, *helpers]
+    if len(askers) > 1:                                    # one candidate per idle worker, at the same time
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(asker: Callable[[str], str]) -> str | Exception:
+            try:
+                return asker(prompt)
+            except Exception as exc:
+                return exc
+
+        with ThreadPoolExecutor(len(askers)) as pool:
+            replies = list(pool.map(one, askers))
     else:
-        result.status = "check_failed"
-    result.note = fast_note(FAST_REASONS[result.status], fast.diff, output if code != 0 else check_output) + repro_note
+        replies = [None]                                   # asked below, through fast_attempt
+    last = best = None             # (status, attempt, test output, check code, check output)
+    rank = {"tests_failed": 3, "repro_failed": 3, "check_failed": 3, "not_applied": 2}
+    pending = len(replies) + max(0, retries)
+    for n in range(1, pending + 1):
+        if n <= len(replies) and replies[n - 1] is not None:
+            reply = replies[n - 1]
+            fast = (FastAttempt("error", reason=str(reply)[:300], context_chars=len(context))
+                    if isinstance(reply, Exception) else fast_apply(workspace, reply, len(context)))
+        else:
+            why = best or last
+            feedback = (retry_feedback(why[0], why[1].diff, why[1].reason, why[2] or why[4])
+                        if why and why[0] in rank else "")
+            fast = fast_attempt(workspace, goal, graph, ask, test_command, check, context=context, feedback=feedback)
+        result.attempts = n
+        if fast.status == "applied":
+            status, output, check_code, check_output = judge(fast, "fast" if n == 1 else f"fast{n}")
+        else:
+            status, output, check_code, check_output = fast.status, "", None, ""
+        result.answer, result.files, result.reason = fast.answer, fast.files, fast.reason
+        if pending > 1:
+            result.log.append(f"đường nhanh, bản {n}/{pending}: {status}"
+                              + (f" ({fast.reason})" if fast.reason else ""))
+        if status == "passed":
+            result.status, result.test_output = "passed", output
+            result.check_code, result.check_output = check_code, check_output
+            return result
+        last = (status, fast, output, check_code, check_output)
+        if rank.get(status, 0) >= rank.get(best[0] if best else "", 0) and status in rank:
+            best = last
+        if fast.status in ("skipped", "declined", "error") and n >= len(replies):
+            break                         # the model says it cannot, or cannot be asked: stop asking
+    last = best or last
+    status, fast, output, check_code, check_output = last
+    result.status = status
+    if status in ("tests_failed", "repro_failed", "check_failed"):
+        if status != "check_failed":
+            result.failing_output = output
+        result.note = fast_note(FAST_REASONS[status], fast.diff,
+                                output if status != "check_failed" else check_output) + repro_note
+    elif status == "not_applied":
+        result.note = fast_note(f"{FAST_REASONS['not_applied']} ({fast.reason})", "", "") + repro_note
+    elif repro_note:
+        result.note = "\n" + repro_note
     return result
 
 
@@ -1876,12 +1977,17 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         ask = asker if asker is not None else gateway_asker(settings, model, tag=task_id, pin=worker_pin)
         if ask is not None:
             started = time.monotonic()
-            log(f"[{task_id}] đường nhanh: viết test tái hiện, rồi hỏi {model} một lần để có cả bản sửa...")
+            helpers = [] if asker is not None else [
+                gateway_asker(settings, model, tag=f"{task_id}-b{i + 2}", pin=other)
+                for i, other in enumerate(idle_helpers(settings, model, exclude=worker_pin))]
+            log(f"[{task_id}] đường nhanh: viết test tái hiện, rồi hỏi {model} một lần để có cả bản sửa"
+                + (f" (thêm một bản song song trên worker rảnh)" if helpers else "") + "...")
             fast = fast_path(workspace, goal, graph, ask, test_command=run.test_command, check=run.check_command,
-                             template=template, run_tests=run_tests, run_check=run_check, run_one=run_one)
+                             template=template, run_tests=run_tests, run_check=run_check, run_one=run_one,
+                             helpers=helpers, retries=settings.fast_retries)
             agent_log.append(f"===== fast repro {fast.repro} =====\n{fast.repro_answer}")
-            agent_log.append(f"===== fast {fast.status} =====\n{fast.answer}")
-            run.fast_path, run.repro = fast.status, fast.repro
+            agent_log.append(f"===== fast {fast.status} ({fast.attempts} bản) =====\n{fast.answer}")
+            run.fast_path, run.repro, run.fast_attempts = fast.status, fast.repro, fast.attempts
             if fast.status == "passed":
                 run.agent_status, run.agent_exit_code, run.agent_output_tail = "ok", 0, _tail(fast.answer)
                 run.test_exit_code, run.test_output_tail = 0, _tail(fast.test_output)
@@ -1892,7 +1998,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             run.fast_seconds = round(time.monotonic() - started, 1)
             for line in fast.log:
                 log(f"[{task_id}] {line}")
-            log(f"[{task_id}] đường nhanh: {run.fast_path}, test tái hiện: {run.repro}"
+            log(f"[{task_id}] đường nhanh: {run.fast_path} (bản {fast.attempts}), test tái hiện: {run.repro}"
                 f"{f' ({fast.reason})' if fast.reason else ''} sau {run.fast_seconds}s"
                 + ("; bỏ qua agent, sang rà soát" if run.fast_path == "passed" else "; chuyển sang agent"))
 

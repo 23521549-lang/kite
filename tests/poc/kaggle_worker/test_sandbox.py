@@ -337,9 +337,13 @@ def test_sandbox_config_validation_and_settings():
         gateway_host="172.19.0.1", memory="1g", setup_command="pip install -r requirements.txt")))
     assert settings.gateway_url == "http://172.19.0.1:8787/v1" and settings.memory == "1g"
     assert settings.setup_command == "pip install -r requirements.txt" and settings.setup_network == "bridge"
+    assert (settings.fast_retries, settings.fast_parallel) == (1, True)
+    tuned = sandbox_settings_from_config(validate_config(_config(fast_retries=0, fast_parallel=False)))
+    assert (tuned.fast_retries, tuned.fast_parallel) == (0, False)
     for bad in ({"gateway_host": "127.0.0.1"}, {"gateway_host": "8.8.8.8"}, {"network": "host"},
                 {"memory": "lots"}, {"docker_command": []}, {"setup_network": "host"},
-                {"setup_command": 3}, {"self_review": "yes"}, {"deps_cache": "on"}, {"quick_tests": 1}):
+                {"setup_command": 3}, {"self_review": "yes"}, {"deps_cache": "on"}, {"quick_tests": 1},
+                {"fast_retries": 4}, {"fast_retries": True}, {"fast_parallel": "yes"}):
         with pytest.raises(ConfigError):
             validate_config(_config(**bad))
 
@@ -830,7 +834,7 @@ def test_the_fast_path_fixes_a_task_with_one_model_call_and_skips_the_agent(tmp_
     assert "<<<<<<< SEARCH" in prompts[1] and "return sum(xs) / len(xs) - 1" in prompts[1]
     assert any("đường nhanh: passed" in line and "bỏ qua agent" in line for line in logs)
     agent_log = (tmp_path / "state" / "f1" / "agent.log").read_text()
-    assert "===== fast repro reproduced =====" in agent_log and "===== fast passed =====" in agent_log
+    assert "===== fast repro reproduced =====" in agent_log and "===== fast passed (1 bản) =====" in agent_log
 
 
 def test_the_one_call_review_can_correct_a_fast_fix_but_never_break_it(tmp_path):
@@ -922,8 +926,9 @@ def test_a_fix_that_disagrees_with_the_reproduction_test_goes_to_the_agent(tmp_p
                       quick_fail="FAILED test_kite_repro.py::test_empty_list_gives_zero - assert 1 == 0\n1 failed\n")
     logs: list[str] = []
     repo = make_repo(tmp_path)
-    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
-                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="d1", runner=fake,
+    from dataclasses import replace
+    run = sbx.run_task(replace(SETTINGS, fast_retries=0), repo=repo, goal="Sửa average trong calc.py cho list rỗng",
+                       model="qwen3.6", models=["qwen3.6"], state_dir=tmp_path / "state", task_id="d1", runner=fake,
                        log=logs.append, asker=answers(REPRO, FIX))
     assert run.fast_path == "repro_failed" and run.repro == "reproduced" and run.verified
     assert [fake.kind(c) for c in fake.calls][:4] == ["repro", "quick", "agent", "test"]
@@ -932,7 +937,7 @@ def test_a_fix_that_disagrees_with_the_reproduction_test_goes_to_the_agent(tmp_p
     assert "yêu cầu gốc mới là chuẩn" in agent and "if xs else 0" in agent          # both the test and the fix
     work = tmp_path / "state" / "d1" / "work"
     assert not (work / "test_kite_repro.py").exists() or "test_kite_repro.py" in run.changed_files
-    assert any("đường nhanh: repro_failed, test tái hiện: reproduced" in line for line in logs)
+    assert any("đường nhanh: repro_failed (bản 1), test tái hiện: reproduced" in line for line in logs)
 
 
 def test_the_reproduction_test_goes_next_to_the_tests_of_the_named_code(tmp_path):
@@ -949,15 +954,94 @@ def test_the_reproduction_test_goes_next_to_the_tests_of_the_named_code(tmp_path
 
 
 def test_a_fast_fix_that_fails_the_tests_is_dropped_and_the_agent_is_told(tmp_path):
-    fake = FakeDocker(test_returncodes=[1, 0])
-    _, run = run_task(tmp_path, fake, "f2", asker=lambda prompt: FIX)
-    assert [fake.kind(c) for c in fake.calls][:3] == ["test", "agent", "test"]
-    assert run.fast_path == "tests_failed" and run.verified and run.fix_rounds_used == 0
+    # Both candidates fail the tests (the second was told why the first failed): the agent takes over.
+    fake = FakeDocker(test_returncodes=[1, 1, 0])
+    prompts = []
+    _, run = run_task(tmp_path, fake, "f2", asker=lambda prompt: prompts.append(prompt) or FIX)
+    assert [fake.kind(c) for c in fake.calls][:4] == ["test", "test", "agent", "test"]
+    assert run.fast_path == "tests_failed" and run.fast_attempts == 2 and run.verified and run.fix_rounds_used == 0
+    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-1] and "ZeroDivisionError" in prompts[-1]
+    assert "LẦN THỬ TRƯỚC" not in prompts[-2]
     agent = fake.call("agent")[-1]
     assert "Kite đã thử một bản sửa nhanh" in agent and "test của Kite lỗi" in agent and "if xs else 0" in agent
     assert "ZeroDivisionError" in agent                                       # what the tests said
     # The clone went back before the agent ran: the agent's own edit is what the patch holds.
     assert run.changed_files == ["calc.py"]
+
+
+def test_a_second_candidate_told_why_the_first_failed_can_still_spare_the_agent(tmp_path):
+    fake = FakeDocker(test_returncodes=[1, 0])
+    prompts = []
+    _, run = run_task(tmp_path, fake, "f3", asker=lambda prompt: prompts.append(prompt) or FIX)
+    assert run.fast_path == "passed" and run.fast_attempts == 2 and run.verified
+    assert [fake.kind(c) for c in fake.calls] == ["test", "test", "review"]     # no repro test: agent review
+    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-1]
+
+
+def test_a_retry_after_a_failed_reproduction_never_shows_the_test(tmp_path):
+    fake = FakeDocker(quick_returncodes=[1, 1, 0],
+                      quick_fail="FAILED test_kite_repro.py::test_empty_list_gives_zero - assert 1 == 0\n1 failed\n")
+    ask = answers(REPRO, FIX, FIX)
+    _, run = run_task(tmp_path, fake, "f4", asker=ask)
+    assert run.fast_path == "repro_failed" and run.fast_attempts == 2
+    retry = ask.prompts[2]
+    assert "kiểm tra độc lập Kite viết từ yêu cầu vẫn lỗi" in retry and "if xs else 0" in retry   # the tried diff
+    assert "test_empty_list_gives_zero" not in retry and "assert 1 == 0" not in retry          # never the test
+    assert [fake.kind(c) for c in fake.calls][:4] == ["repro", "quick", "quick", "agent"]
+
+
+def test_best_of_n_checks_a_second_workers_candidate_when_the_first_fails(tmp_path):
+    from dataclasses import replace
+
+    bad = FIX.replace("if xs else 0", "if xs else 1")
+    fake = FakeDocker(quick_returncodes=[1, 0],
+                      quick_fail="FAILED test_kite_repro.py::test_empty_list_gives_zero - assert 1 == 0\n1 failed\n")
+    repo = make_repo(tmp_path)
+    workspace = tmp_path / "w"
+    subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
+    main, helper = answers(REPRO, bad), answers(FIX)
+    calls = []
+
+    def run_tests(after):
+        calls.append(after)
+        code = fake.quick_returncodes.pop(0)
+        return code, ("1 passed" if code == 0 else fake.quick_fail), "pytest"
+
+    result = sbx.fast_path(workspace, "Sửa average trong calc.py cho list rỗng", None, main,
+                           test_command="python -m pytest -q", check="", template="python -m pytest -q {tests}",
+                           run_tests=run_tests, run_check=lambda after: (None, "", ""),
+                           run_one=lambda kind, command: (1, "FAILED test_kite_repro.py::t - assert 1 == 0"),
+                           helpers=[helper], retries=1)
+    # The main worker's candidate fails the reproduction; the helper's, written at the same time, passes.
+    assert result.status == "passed" and result.attempts == 2 and calls == ["fast", "fast2"]
+    assert "if xs else 0" in (workspace / "calc.py").read_text()
+    assert len(main.prompts) == 2 and len(helper.prompts) == 1 and helper.prompts[0] == main.prompts[1]
+    assert result.log == ["đường nhanh, bản 1/3: repro_failed", "đường nhanh, bản 2/3: passed"]
+
+
+@pytest.mark.idle_helpers
+def test_idle_helpers_are_other_idle_workers_with_the_model_loaded(monkeypatch):
+    import json as _json
+    from dataclasses import replace
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def read(self):
+            return _json.dumps({"workers": [
+                {"worker_id": "kaggle-han", "alive": True, "busy": False, "loaded_model": "qwen3.6"},
+                {"worker_id": "kaggle-an", "alive": True, "busy": False, "loaded_model": "qwen3.6"},
+                {"worker_id": "kaggle-x", "alive": True, "busy": True, "loaded_model": "qwen3.6"},
+                {"worker_id": "kaggle-y", "alive": True, "busy": False, "loaded_model": "gemma4-26b"},
+            ]}).encode()
+
+    seen = []
+    monkeypatch.setattr(sbx.urllib.request, "urlopen", lambda url, timeout: seen.append(url) or Response())
+    settings = replace(SETTINGS, host_gateway_url="http://127.0.0.1:8787/v1")
+    assert sbx.idle_helpers(settings, "qwen3.6", exclude="kaggle-han") == ["kaggle-an"]
+    assert seen == ["http://127.0.0.1:8787/status"]
+    assert sbx.idle_helpers(settings, "qwen3.6", exclude=None) == []             # unpinned: never
+    assert sbx.idle_helpers(replace(settings, fast_parallel=False), "qwen3.6", exclude="kaggle-han") == []
 
 
 def test_the_fast_path_steps_aside_when_it_cannot_help(tmp_path):

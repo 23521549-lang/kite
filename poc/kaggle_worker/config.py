@@ -157,6 +157,8 @@ class SandboxConfig:
     quick_tests: bool = True
     fast_path: bool = True
     fast_review: bool = True
+    fast_retries: int = 1             # more one-call fixes after a failed one, told why it failed (0-3)
+    fast_parallel: bool = True        # also ask an idle worker that has the model loaded (best-of-N)
 
 
 @dataclass(frozen=True)
@@ -431,7 +433,8 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
     unknown = set(sb) - {"image", "network", "gateway_host", "memory", "cpus", "pids_limit",
                          "agent_timeout_seconds", "test_timeout_seconds", "test_command",
                          "setup_command", "setup_network", "setup_timeout_seconds", "docker_command",
-                         "fix_rounds", "self_review", "code_map", "deps_cache", "quick_tests", "fast_path", "fast_review"}
+                         "fix_rounds", "self_review", "code_map", "deps_cache", "quick_tests", "fast_path", "fast_review",
+                         "fast_retries", "fast_parallel"}
     if unknown:
         raise ConfigError("sandbox has unsupported fields")
     image = sb.get("image", "kite-sandbox:latest")
@@ -479,7 +482,15 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
         quick_tests=_flag(sb.get("quick_tests", True), "sandbox.quick_tests"),
         fast_path=_flag(sb.get("fast_path", True), "sandbox.fast_path"),
         fast_review=_flag(sb.get("fast_review", True), "sandbox.fast_review"),
+        fast_retries=_fast_retries(sb.get("fast_retries", 1)),
+        fast_parallel=_flag(sb.get("fast_parallel", True), "sandbox.fast_parallel"),
     )
+
+
+def _fast_retries(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 3:
+        raise ConfigError("sandbox.fast_retries must be an integer from 0 to 3")
+    return value
 
 
 def _flag(value: Any, name: str) -> bool:
@@ -548,6 +559,7 @@ def sandbox_settings_from_config(config: KiteConfig):
         setup_network=sb.setup_network, setup_timeout_seconds=sb.setup_timeout_seconds,
         docker_command=sb.docker_command, fix_rounds=sb.fix_rounds, self_review=sb.self_review,
         code_map=sb.code_map, deps_cache=sb.deps_cache, quick_tests=sb.quick_tests, fast_path=sb.fast_path, fast_review=sb.fast_review,
+        fast_retries=sb.fast_retries, fast_parallel=sb.fast_parallel,
         model_context=model_contexts(config, gateway_models(config)),
     )
 

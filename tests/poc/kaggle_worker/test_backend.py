@@ -553,10 +553,12 @@ def test_backend_fast_path_solves_with_one_call_or_hands_over_to_the_agent(tmp_p
     assert any(e["event"] == "fast_path" and e["outcome"] == "passed" for e in trace)
 
     (tmp_path / "bad").mkdir()
-    fake = FakeDocker(test_returncodes=[1, 0])
+    fake = FakeDocker(test_returncodes=[1, 1, 0])
     backend, result = run_backend_task(tmp_path / "bad", fake, "task-fast-bad")
-    assert fake.kinds()[:5] == ["setup", "repro", "quick", "test", "agent"]
+    # Two candidates (the second told why the first failed), then the agent.
+    assert fake.kinds()[:7] == ["setup", "repro", "quick", "test", "quick", "test", "agent"]
+    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in asked[-1][3]
     assert "Kite đã thử một bản sửa nhanh" in fake.agent_calls()[0][-1]
     assert "Kite fast path: tried (tests_failed" in result.summary
     saved = json.loads((backend.task_dir("task-fast-bad") / "result.json").read_text())
-    assert saved["fast_path"] == "tests_failed" and saved["verified"] is True
+    assert saved["fast_path"] == "tests_failed" and saved["verified"] is True and saved["fast_attempts"] == 2

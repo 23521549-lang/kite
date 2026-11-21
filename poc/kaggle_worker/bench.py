@@ -9,7 +9,8 @@ Three suites, run model by model so each model is loaded once:
   tool, right arguments, no shell, no forbidden tool, no claim the tool results do not support,
   answer in Vietnamese.
 * ``code``:  the sandboxed coding agent on small fixture repositories with failing tests; a task
-  passes when Kite's own offline test run passes and the agent did not edit the tests.
+  passes when Kite's own offline test run passes and the agent did not edit the tests. With a
+  polyglot-benchmark clone, the Python exercises of Aider's polyglot benchmark instead (pass@1/pass@2).
 
 Results go to ``results.json`` and ``README.md`` in the output folder.
 """
@@ -928,6 +929,130 @@ REPO_TASKS = [
 ]
 
 
+# ------------------------------------------------------------ Aider polyglot benchmark (Python)
+# github.com/Aider-AI/polyglot-benchmark: the 34 hardest Exercism Python exercises, as Aider's
+# leaderboard runs them (aider.chat/docs/leaderboards). Same protocol, so the numbers compare:
+# the model gets the exercise's instructions and its stub file(s), never the tests; the tests run
+# after; on failure a second try gets their output (pass_rate_1 / pass_rate_2). Prompt texts are
+# Aider's own (benchmark/prompts.py).
+POLYGLOT_ADDENDUM = """
+####
+
+Use the above instructions to modify the supplied files: {file_list}
+Don't change the names of existing functions or classes, as they may be referenced from other code like unit tests, etc.
+Only use standard libraries, don't suggest installing any packages.
+"""
+POLYGLOT_TEST_FAILURES = """
+####
+
+See the testing errors above.
+The tests are correct, don't try and change them.
+Fix the code in {file_list} to resolve the errors.
+"""
+# The exercise's tests are hidden, so Kite's own run only sees tests that Kite (its reproduction test)
+# or the agent write: none at first, and pytest's "no tests collected" (exit 5) then counts as a pass.
+POLYGLOT_KITE_YML = """# How Kite tests an Aider polyglot exercise (added by the Kite bench).
+setup: ''
+test: 'python -m pytest -q -p no:cacheprovider; c=$?; [ $c -eq 5 ] && exit 0; exit $c'
+quick_test: 'python -m pytest -q -p no:cacheprovider {tests}'
+test_timeout: 300
+"""
+POLYGLOT_SKIP = (".meta/", ".docs/", ".approaches/", ".articles/")
+
+
+@dataclass(frozen=True)
+class PolyglotTask:
+    id: str                         # P-<exercise>
+    folder: str                     # the exercise folder in the polyglot-benchmark clone
+    goal: str                       # Aider's first message: instructions + addendum
+    solution: tuple[str, ...]
+    tests: tuple[str, ...]          # hidden: written only after Kite is done
+
+    @property
+    def hidden(self) -> tuple[str, ...]:
+        return self.tests
+
+
+def polyglot_tasks(root: Path, count: int | None = None) -> list[PolyglotTask]:
+    """The Python exercises of a polyglot-benchmark clone, in name order (the first ``count``)."""
+    practice = Path(root) / "python" / "exercises" / "practice"
+    if not practice.is_dir():
+        raise FileNotFoundError(f"{practice} not found: clone github.com/Aider-AI/polyglot-benchmark")
+    tasks = []
+    for folder in sorted(p for p in practice.iterdir() if (p / ".meta" / "config.json").is_file()):
+        files = json.loads((folder / ".meta" / "config.json").read_text(encoding="utf-8")).get("files", {})
+        solution, tests = tuple(files.get("solution", [])), tuple(files.get("test", []))
+        instructions = "".join((folder / ".docs" / name).read_text(encoding="utf-8")
+                               for name in ("introduction.md", "instructions.md", "instructions.append.md")
+                               if (folder / ".docs" / name).is_file())
+        goal = instructions + POLYGLOT_ADDENDUM.format(file_list=" ".join(Path(f).name for f in solution))
+        tasks.append(PolyglotTask(f"P-{folder.name}", str(folder), goal, solution, tests))
+    return tasks[:count] if count else tasks
+
+
+def make_polyglot_fixture(task: PolyglotTask, root: Path) -> Path:
+    """A Git repository with the exercise's stub files (no tests, no example solution) and a .kite.yml."""
+    folder, repo = Path(task.folder), Path(root) / task.id
+    repo.mkdir(parents=True)
+    hidden = set(task.tests)
+    for path in sorted(folder.rglob("*")):
+        rel = path.relative_to(folder).as_posix()
+        if path.is_file() and rel not in hidden and not rel.startswith(POLYGLOT_SKIP):
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_bytes(path.read_bytes())
+    (repo / ".kite.yml").write_text(POLYGLOT_KITE_YML, encoding="utf-8")
+    git = ["git", "-C", str(repo), "-c", "user.name=kite-bench", "-c", "user.email=bench@kite.local"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", f"polyglot exercise {task.id}"], check=True)
+    return repo
+
+
+POLYGLOT_TEST_TIMEOUT = 180     # Aider: 3 minutes, then "Tests timed out!"
+
+
+def carry_solution(task: PolyglotTask, workspace: Path, repo: Path) -> bool:
+    """Aider's second try starts from the files as the first try left them: copy the solution files
+    from the first run's workspace into the fixture and commit them. False if nothing changed."""
+    changed = False
+    for name in task.solution:
+        source, target = Path(workspace) / name, Path(repo) / name
+        if source.is_file() and (not target.is_file() or source.read_bytes() != target.read_bytes()):
+            target.write_bytes(source.read_bytes())
+            changed = True
+    if changed:
+        git = ["git", "-C", str(repo), "-c", "user.name=kite-bench", "-c", "user.email=bench@kite.local"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", f"{task.id}: first try"], check=True)
+    return changed
+
+
+def polyglot_retry_goal(task: PolyglotTask, output: str) -> str:
+    """Aider's second try: the test errors, then its test_failures text (the instructions stay)."""
+    files = " ".join(Path(f).name for f in task.solution)
+    return f"{task.goal}\n{output.strip()[-4000:]}\n{POLYGLOT_TEST_FAILURES.format(file_list=files)}"
+
+
+def run_polyglot(task: PolyglotTask, repo: Path, task_id: str,
+                 attempt: Callable[[str, str], tuple[Path, dict]], log: Callable[[str], None] = print) -> dict:
+    """Aider's two tries on one exercise. ``attempt(goal, task_id)`` runs Kite on ``repo`` and then the
+    exercise's tests, returning (workspace, result with hidden_exit_code / hidden_output_tail)."""
+    workspace, result = attempt(task.goal, task_id)
+    result.update(tries=1, pass_1=result.get("hidden_exit_code") == 0)
+    if result["pass_1"]:
+        return result
+    if not carry_solution(task, workspace, repo):
+        log(f"{task.id}: lần 1 không đổi file bài; lần 2 chạy lại từ file khung")
+    log(f"{task.id}: lần 1 trượt test của bài, chạy lần 2 kèm lỗi test")
+    first = {k: result.get(k) for k in ("wall_seconds", "agent_status", "fast_path", "repro", "fast_attempts",
+                                        "hidden_exit_code", "task_id")}
+    _, second = attempt(polyglot_retry_goal(task, result.get("hidden_output_tail") or "Tests timed out!"),
+                        f"{task_id}-t2")
+    second.update(tries=2, pass_1=False, first_try=first,
+                  wall_seconds=round((first["wall_seconds"] or 0) + (second.get("wall_seconds") or 0), 1))
+    return second
+
+
 def make_repo_fixture(task: RepoTask, source: Path, root: Path) -> Path:
     """A clone of ``source`` at ``task.base`` with a ``.kite.yml`` commit on top; no remote."""
     repo = Path(root) / task.id
@@ -945,6 +1070,8 @@ def make_repo_fixture(task: RepoTask, source: Path, root: Path) -> Path:
 
 def hidden_files(task, source: Path | None = None) -> dict[str, str]:
     """Hidden test files, as repository path -> content (written after the agent and Kite's test run)."""
+    if isinstance(task, PolyglotTask):
+        return {name: (Path(task.folder) / name).read_text(encoding="utf-8") for name in task.tests}
     if isinstance(task, RepoTask):
         return {path: subprocess.run(["git", "-C", str(source), "show", f"{task.fix}:{path}"], check=True,
                                      capture_output=True, text=True).stdout for path in task.hidden}
@@ -952,6 +1079,10 @@ def hidden_files(task, source: Path | None = None) -> dict[str, str]:
 
 
 def hidden_command(task) -> str:
+    if isinstance(task, PolyglotTask):
+        # The exercise's own tests only (Kite's reproduction test may sit next to them); the other
+        # listed files are helpers they import (paasio: test_utils.py).
+        return "python -m pytest -q -p no:cacheprovider " + " ".join(t for t in task.tests if t.endswith("_test.py"))
     if isinstance(task, RepoTask):
         return ("PYTHONPATH=. AWS_DEFAULT_REGION=us-east-1 python -m pytest -q -p no:cacheprovider -W ignore "
                 + " ".join(task.hidden))
@@ -984,6 +1115,15 @@ def score_code(task, run: dict) -> dict:
     # Editing or deleting the task's own tests is cheating; adding NEW test files is fine. In a real
     # repository the agent may edit the test files the real fix edited (the hidden ones overwrite its
     # version anyway); editing any other existing test, or a conftest, can weaken the suite Kite ran.
+    if isinstance(task, PolyglotTask):
+        # Aider's scoring: the exercise's tests pass (they are hidden, so they cannot be edited).
+        # A conftest.py written by Kite or the agent could still change how they run: that fails.
+        hidden_ok = run.get("hidden_exit_code") == 0
+        outcome = score_code(CodeTask(task.id, task.goal, {}, {}), run)
+        outcome.update(passed=hidden_ok and not outcome["touched_tests"], hidden_passed=hidden_ok,
+                       pass_1=bool(run.get("pass_1")), tries=run.get("tries", 1), polyglot=True,
+                       first_try=run.get("first_try"))
+        return outcome
     if isinstance(task, RepoTask):
         touched_tests = [f for f in run.get("changed_files", []) if f.endswith("conftest.py")
                          or (f not in task.hidden and _is_test_file(f) and _existed_at_base(run, f))]
@@ -1008,7 +1148,7 @@ def score_code(task, run: dict) -> dict:
             "check_runs": run.get("check_runs"), "check_seconds": run.get("check_seconds"),
             "scratch_files": run.get("scratch_files"), "fast_path": run.get("fast_path"),
             "fast_seconds": run.get("fast_seconds"), "review_mode": run.get("review_mode"),
-            "repro": run.get("repro")}
+            "repro": run.get("repro"), "fast_attempts": run.get("fast_attempts")}
 
 
 # --------------------------------------------------------------------------------------- driver
@@ -1047,7 +1187,9 @@ def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, sy
                     f" | dừng vì lặp {outcome.get('stuck_stops') or 0} | kiểm tra {outcome.get('check_exit_code')}"
                     f" | file thử {outcome.get('scratch_files') or '-'}"
                     f" | đường nhanh {outcome.get('fast_path')} {outcome.get('fast_seconds') or 0}s"
-                    f" (test tái hiện {outcome.get('repro')})")
+                    f" (bản {outcome.get('fast_attempts') or 0}, test tái hiện {outcome.get('repro')})"
+                    + (f" | polyglot lần {outcome.get('tries')}, pass@1 {outcome.get('pass_1')}"
+                       if outcome.get("polyglot") else ""))
         (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     results["finished"] = time.strftime("%Y-%m-%d %H:%M")
     (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1079,6 +1221,9 @@ def summarize(entry: dict) -> dict:
         "code_hidden_failed": sum(item.get("hidden_passed") is False for item in code),
         "code_seconds": round(sum(item.get("agent_seconds") or 0 for item in code) / len(code), 1) if code else None,
         "code_wall_median": _median([item["wall_seconds"] for item in code if item.get("wall_seconds")]),
+        "polyglot_total": len(polyglot := [item for item in code if item.get("polyglot")]),
+        "polyglot_pass_1": sum(bool(item.get("pass_1")) for item in polyglot),
+        "polyglot_pass_2": sum(bool(item.get("passed")) for item in polyglot),
         "gen_tps": (speed.get("second") or {}).get("gen_tps"), "prompt_tps": (speed.get("second") or {}).get("prompt_tps"),
         "swap_seconds": speed.get("swap_seconds"),
     }
@@ -1107,6 +1252,22 @@ def render_report(results: dict) -> str:
         for model, entry in results["models"].items():
             s = summarize(entry)
             lines.append(f"| `{model}` | " + " | ".join(str(s["categories"].get(c, "")) for c in cats) + " |")
+    polyglot = {model: summarize(entry) for model, entry in results["models"].items()}
+    polyglot = {model: s for model, s in polyglot.items() if s["polyglot_total"]}
+    if polyglot:
+        def rate(n, total):
+            return f"{n}/{total} ({100 * n / total:.1f}%)"
+
+        lines += ["", "## Aider polyglot (Python)", "",
+                  "Cùng giao thức với bảng xếp hạng Aider: model nhận hướng dẫn của bài và file khung, không thấy "
+                  "test; lần 2 nhận lỗi test của lần 1. Chỉ phần Python (34 bài), nên không so thẳng với điểm "
+                  "6 ngôn ngữ (225 bài) trên bảng xếp hạng.", "",
+                  "| Model | pass@1 (lần 1) | pass@2 (sau lần 2) | s tổng/bài (trung vị) |", "|---|---|---|---|"]
+        for model, s in polyglot.items():
+            items = [i for i in results["models"][model].get("code") or [] if i.get("polyglot")]
+            lines.append(f"| `{model}` | {rate(s['polyglot_pass_1'], s['polyglot_total'])} "
+                         f"| {rate(s['polyglot_pass_2'], s['polyglot_total'])} "
+                         f"| {_median([i['wall_seconds'] for i in items if i.get('wall_seconds')])} |")
     timed = [(model, item) for model, entry in results["models"].items() for item in entry.get("code") or []
              if item.get("wall_seconds")]
     if timed:
@@ -1121,8 +1282,9 @@ def render_report(results: dict) -> str:
             repro = {"reproduced": "tái hiện ✓", "not_reproduced": "không tái hiện", "none": "không có test",
                      "broken": "test hỏng"}.get(
                 item.get("repro") or "", "")
+            tries = f", bản {item['fast_attempts']}" if (item.get("fast_attempts") or 0) > 1 else ""
             fast = "-" if fast in ("off", "skipped") else \
-                f"{fast} ({item.get('fast_seconds')}{', ' + repro if repro else ''})"
+                f"{fast} ({item.get('fast_seconds')}{', ' + repro if repro else ''}{tries})"
             lines.append(f"| `{model}` | {item['id']} | {'✓' if item['passed'] else '✗'} | {item['wall_seconds']} "
                          f"| {setup} | {fast} | {item.get('agent_seconds')} | {item.get('test_seconds')} "
                          f"({item.get('full_test_runs')}) | {item.get('quick_test_seconds')} "
@@ -1154,6 +1316,9 @@ def render_report(results: dict) -> str:
               "C1–C4 dễ; C5 lần lỗi qua 3 file, C6 nhiều trường hợp biên, C7 refactor phải sửa mọi chỗ gọi, "
               "C8 test hiện có quá sơ sài. R1–R4: repo thật (aiops-traffic-shaper), test ẩn lấy từ commit sửa thật; "
               "`.kite.yml` của bench có thêm `check:` (ruff: lỗi cú pháp, tên chưa định nghĩa), cũng phải qua.",
+              "- **P-***: bài Python của Aider polyglot benchmark (github.com/Aider-AI/polyglot-benchmark). Đạt khi "
+              "test chính thức của bài (Kite và agent không thấy) qua, không thêm conftest; lần 1 trượt thì Kite "
+              "chạy lần 2 từ code lần 1 để lại, kèm lỗi test và câu nhắc của Aider. pass@1 / pass@2 như Aider.",
               "- **Tốc độ**: `timings` của llama.cpp ở lần gọi thứ hai; thời gian đổi model = lần một trừ lần hai."]
     return "\n".join(lines) + "\n"
 

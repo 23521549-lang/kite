@@ -194,6 +194,11 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--repo-source", type=Path,
                            help="local clone of github.com/23521549-lang/aiops-traffic-shaper: the code suite "
                                 "then runs the real-repository tasks (R1-R4) instead of C1-C8")
+    bench_run.add_argument("--polyglot", type=Path,
+                           help="local clone of github.com/Aider-AI/polyglot-benchmark: the code suite then "
+                                "runs its Python exercises (P-<name>) the way Aider's leaderboard does")
+    bench_run.add_argument("--polyglot-count", type=int, default=0,
+                           help="only the first N polyglot exercises (by name; default: all 34)")
     bench_run.add_argument("--no-harness", action="store_true",
                            help="code suite without fix rounds, self-review and repo context (baseline)")
     bench_run.add_argument("--no-code-map", action="store_true",
@@ -649,8 +654,21 @@ def _bench_command(args: argparse.Namespace) -> int:
     source = args.repo_source.expanduser().resolve() if args.repo_source else None
     if source is not None and not (source / ".git").exists():
         raise ConfigError(f"--repo-source {source} is not a Git clone")
-    pool = bench.REPO_TASKS if source is not None else bench.CODE_TASKS
+    polyglot = args.polyglot.expanduser().resolve() if args.polyglot else None
+    if polyglot is not None and source is not None:
+        raise ConfigError("--polyglot and --repo-source pick different code suites: use one")
+    if args.polyglot_count < 0:
+        raise ConfigError("--polyglot-count must be 0 (all) or more")
+    if polyglot is not None:
+        try:
+            pool = bench.polyglot_tasks(polyglot)
+        except FileNotFoundError as exc:
+            raise ConfigError(str(exc)) from exc
+    else:
+        pool = bench.REPO_TASKS if source is not None else bench.CODE_TASKS
     code_tasks = [t for t in pool if not only or t.id in only]
+    if polyglot is not None and args.polyglot_count:
+        code_tasks = code_tasks[:args.polyglot_count]
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = (args.out or args.config.parent / "bench" / stamp).expanduser().resolve()
     post = bench.gateway_post(f"http://{config.gateway.host}:{config.gateway.port}/v1/chat/completions",
@@ -670,35 +688,51 @@ def _bench_command(args: argparse.Namespace) -> int:
             if args.no_fast_path:
                 settings = dataclasses.replace(settings, fast_path=False)
 
-        def run_code(task, model, out_dir):
-            slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
-            if isinstance(task, bench.RepoTask):
-                repo = bench.make_repo_fixture(task, source, out_dir / "repos" / f"{slug}-{stamp}")
-            else:
-                repo = bench.make_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
-            task_id = f"bench-{slug}-{task.id.lower()}-{stamp[-6:]}"
+        def kite_run(task, model, repo, goal, task_id, out_dir):
             started = time.monotonic()
-            run = sbx.run_task(settings, repo=repo, goal=task.goal, model=model, models=served,
+            run = sbx.run_task(settings, repo=repo, goal=goal, model=model, models=served,
                                state_dir=out_dir / "runs", task_id=task_id, with_context=not args.no_harness,
                                log=lambda line: print(line, file=sys.stderr), worker_pin=args.worker or None,
                                deps_cache=args.config.parent / "deps-cache" if settings.deps_cache else None)
             result = run.to_dict()
             result["wall_seconds"] = round(time.monotonic() - started, 1)
-            files = bench.hidden_files(task, source) if run.agent_status == "ok" else {}
+            # Hidden tests: written only now, run like Kite's own tests (no network, same deps). The
+            # polyglot exercises are scored like Aider: their tests run whatever state Kite ended in.
+            polyglot_task = isinstance(task, bench.PolyglotTask)
+            ran = run.agent_status == "ok" or (polyglot_task and run.agent_status != "skipped")
+            files = bench.hidden_files(task, source) if ran else {}
             if files:
-                # Hidden tests: written only now, run like Kite's own tests (no network, same deps).
                 workspace = Path(run.workspace)
                 for rel, content in files.items():
                     (workspace / rel).parent.mkdir(parents=True, exist_ok=True)
                     (workspace / rel).write_text(content, encoding="utf-8")
                 name = sbx.container_name("hidden", task_id)
+                timeout = bench.POLYGLOT_TEST_TIMEOUT if polyglot_task else max(settings.test_timeout_seconds, 1200)
                 result["hidden_exit_code"], output = sbx._run_step(
-                    settings, sbx.default_runner, name=name, timeout=max(settings.test_timeout_seconds, 1200),
+                    settings, sbx.default_runner, name=name, timeout=timeout,
                     args=sbx.docker_run_args(settings, name=name, workspace=workspace, network="none",
                                              deps=workspace.parent / "deps")
                     + ["sh", "-c", bench.hidden_command(task)])
                 result["hidden_output_tail"] = sbx._tail(output)
-            return result
+            return run, result
+
+        def run_code(task, model, out_dir):
+            slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+            if isinstance(task, bench.PolyglotTask):
+                repo = bench.make_polyglot_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
+            elif isinstance(task, bench.RepoTask):
+                repo = bench.make_repo_fixture(task, source, out_dir / "repos" / f"{slug}-{stamp}")
+            else:
+                repo = bench.make_fixture(task, out_dir / "repos" / f"{slug}-{stamp}")
+            task_id = f"bench-{slug}-{task.id.lower()}-{stamp[-6:]}"
+            if isinstance(task, bench.PolyglotTask):
+                # Aider's protocol: a second try from where the first left the files, told the test errors.
+                def attempt(goal, attempt_id):
+                    run, result = kite_run(task, model, repo, goal, attempt_id, out_dir)
+                    return Path(run.workspace), result
+
+                return bench.run_polyglot(task, repo, task_id, attempt, log=lambda line: log(f"[{model}] {line}"))
+            return kite_run(task, model, repo, task.goal, task_id, out_dir)[1]
 
     log = lambda line: print(line, file=sys.stderr, flush=True)
     harness_settings = sandbox_settings_from_config(config)

@@ -300,7 +300,7 @@ class SandboxActivityBackend:
             return code, output, command
         stuck_stops = 0
         status, code, output = "not_started", None, ""
-        fast_status, fast_seconds, ask, repro = "off", 0.0, None, "off"
+        fast_status, fast_seconds, ask, repro, fast_attempts = "off", 0.0, None, "off", 0
         if self.settings.fast_path and task.task_type == "coding" and test_command:
             ask = sbx.gateway_asker(self.settings, route.model_id, tag=clean_tag(task.task_id) or slug,
                                     pin=route.worker_id)
@@ -322,11 +322,18 @@ class SandboxActivityBackend:
                         stream.write(f"\n===== {kind} exit={code_} =====\n{output_}")
                     return code_, output_
 
+                # Best-of-N: another idle worker with the same model writes a second candidate meanwhile.
+                others = await asyncio.to_thread(sbx.idle_helpers, self.settings, route.model_id,
+                                                 exclude=route.worker_id)
+                helpers = [sbx.gateway_asker(self.settings, route.model_id,
+                                             tag=f"{clean_tag(task.task_id) or slug}-b{i + 2}", pin=other)
+                           for i, other in enumerate(others)]
                 step = asyncio.create_task(asyncio.to_thread(
                     sbx.fast_path, work, goal, graph, ask, test_command=test_command, check=check_template,
                     template=template, run_tests=lambda after: in_loop(run_tests(after)),
                     run_check=lambda after: in_loop(run_check(after)),
-                    run_one=lambda kind, command: in_loop(one(kind, command))))
+                    run_one=lambda kind, command: in_loop(one(kind, command)),
+                    helpers=helpers, retries=self.settings.fast_retries))
                 while True:
                     done, _ = await asyncio.wait({step}, timeout=self.heartbeat_seconds)
                     if done:
@@ -334,12 +341,14 @@ class SandboxActivityBackend:
                     heartbeat({"task_id": task.task_id, "state": "FAST_PATH",
                                "seconds": round(time.monotonic() - started)})
                 fast = step.result()
-                fast_status, repro = fast.status, fast.repro
+                fast_status, repro, fast_attempts = fast.status, fast.repro, fast.attempts
                 with (root / "agent.log").open("a", encoding="utf-8") as stream:
                     stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} fast repro {fast.repro} "
                                  f"model={route.model_id} =====\n{fast.repro_answer}")
                     stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} fast {fast.status} "
-                                 f"model={route.model_id} =====\n{fast.answer}")
+                                 f"({fast.attempts} bản) model={route.model_id} =====\n{fast.answer}")
+                    for line in fast.log:
+                        stream.write(f"\n{line}")
                 if fast.status == "passed":
                     status, code, output = "ok", 0, fast.answer
                     test_code, test_output = 0, fast.test_output
@@ -350,6 +359,7 @@ class SandboxActivityBackend:
                     test_output = fast.failing_output
                 fast_seconds = round(time.monotonic() - started, 1)
                 self._trace(task.task_id, "fast_path", outcome=fast_status, repro=repro, seconds=fast_seconds,
+                            attempts=fast_attempts, parallel=len(helpers),
                             reason=fast.reason or None, files=fast.files or None, context_chars=fast.context_chars)
         while fast_status != "passed":
             kind = "agent" if attempt == 0 else f"fix{attempt}"
@@ -458,7 +468,9 @@ class SandboxActivityBackend:
                         "broken": "its reproduction test failed for setup reasons (sandbox, fixtures), not the bug, "
                                   "so the agent reviewed it",
                         }.get(repro, "no reproduction test, so the agent reviewed it")
-            lines.insert(0, f"Kite fast path: the fix came from one model call ({fast_seconds}s in all) and passed "
+            lines.insert(0, f"Kite fast path: the fix came from "
+                            f"{'one model call' if fast_attempts <= 1 else f'candidate {fast_attempts} of a few one-call fixes'}"
+                            f" ({fast_seconds}s in all) and passed "
                             f"Kite's tests; {evidence}; no agent session was needed to write it.")
         elif fast_status not in ("off", "skipped"):
             lines.insert(0, f"Kite fast path: tried ({fast_status}, {fast_seconds}s), then the agent took over.")
@@ -495,6 +507,7 @@ class SandboxActivityBackend:
             "review": review, "stuck_stops": stuck_stops, "tests_edited": tests_edited,
             "check_command": check_ran, "check_exit_code": check_code, "scratch_files": scratch,
             "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode, "repro": repro,
+            "fast_attempts": fast_attempts,
             "verified": verified,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
@@ -506,7 +519,7 @@ class SandboxActivityBackend:
                "test_command": test_command, "test_exit": test_code, "stuck_stops": stuck_stops,
                "tests_edited": tests_edited, "check_exit": check_code, "scratch_files": scratch,
                "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode,
-               "repro": repro, "verified": verified,
+               "repro": repro, "fast_attempts": fast_attempts, "verified": verified,
                "changed_files": changed, "lines_added": added, "lines_removed": removed,
                "context_chars": len(context)}
         self._trace(task.task_id, "run_end", **{k: v for k, v in run.items() if k not in ("task_id", "goal")})

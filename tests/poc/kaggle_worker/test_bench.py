@@ -303,3 +303,111 @@ def test_a_real_repository_task_starts_at_the_base_and_is_judged_by_the_fix_test
     assert not edited["passed"] and edited["touched_tests"] == ["tests/test_other.py"]
     assert bench.score_code(task, {**at, "changed_files": ["app.py", "tests/test_new.py"]})["passed"]
     assert all(t.base != t.fix and t.hidden for t in bench.REPO_TASKS)
+
+
+# ------------------------------------------------------------------- Aider polyglot (Python)
+def polyglot_clone(root: Path) -> Path:
+    """A two-exercise stand-in for github.com/Aider-AI/polyglot-benchmark (same layout)."""
+    for name, solution, tests in (("two-fer", "two_fer.py", ["two_fer_test.py"]),
+                                  ("paasio", "paasio.py", ["paasio_test.py", "test_utils.py"])):
+        folder = root / "python" / "exercises" / "practice" / name
+        (folder / ".meta").mkdir(parents=True)
+        (folder / ".docs").mkdir()
+        (folder / ".meta" / "config.json").write_text(json.dumps({"files": {
+            "solution": [solution], "test": tests, "example": [".meta/example.py"]}}))
+        (folder / ".meta" / "example.py").write_text("SECRET = 'reference solution'\n")
+        (folder / ".docs" / "instructions.md").write_text(f"# Instructions\n\nSolve {name}.\n")
+        (folder / solution).write_text("def two_fer(name='you'):\n    pass\n")
+        for test in tests:
+            (folder / test).write_text("from two_fer import two_fer\n\n\ndef test_default():\n"
+                                       "    assert two_fer() == 'One for you, one for me.'\n")
+    (root / "python" / "exercises" / "practice" / "two-fer" / ".docs" / "instructions.append.md").write_text(
+        "\n# Append\n\nUse a default argument.\n")
+    return root
+
+
+def test_polyglot_tasks_use_aiders_prompt_and_hide_the_tests(tmp_path):
+    clone = polyglot_clone(tmp_path / "pg")
+    tasks = bench.polyglot_tasks(clone)
+    assert [t.id for t in tasks] == ["P-paasio", "P-two-fer"]
+    assert [t.id for t in bench.polyglot_tasks(clone, 1)] == ["P-paasio"]
+    task = tasks[1]
+    assert task.goal.startswith("# Instructions\n\nSolve two-fer.\n\n# Append")
+    assert task.goal.endswith("modify the supplied files: two_fer.py\nDon't change the names of existing functions "
+                              "or classes, as they may be referenced from other code like unit tests, etc.\n"
+                              "Only use standard libraries, don't suggest installing any packages.\n")
+    assert task.solution == ("two_fer.py",) and task.tests == ("two_fer_test.py",)
+    with pytest.raises(FileNotFoundError):
+        bench.polyglot_tasks(tmp_path / "missing")
+
+    repo = bench.make_polyglot_fixture(task, tmp_path / "out")
+    tracked = subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True).stdout.split()
+    assert sorted(tracked) == [".kite.yml", "two_fer.py"]                  # no tests, no docs, no example
+    assert subprocess.run(["git", "-C", str(repo), "status", "--short"], capture_output=True, text=True).stdout == ""
+    from poc.kaggle_worker import sandbox
+
+    settings = sandbox.repo_settings(sandbox.SandboxSettings(uid=1000), repo)
+    assert settings.setup_command == "" and settings.test_timeout_seconds == 300
+    # No tests yet (Kite has not written its reproduction test): pytest's "nothing collected" passes.
+    ok = subprocess.run(["sh", "-c", settings.test_command.replace("python", sys.executable, 1)], cwd=repo,
+                        capture_output=True, text=True)
+    assert ok.returncode == 0
+
+    paasio = tasks[0]
+    assert set(bench.hidden_files(paasio)) == {"paasio_test.py", "test_utils.py"}
+    assert bench.hidden_command(paasio) == "python -m pytest -q -p no:cacheprovider paasio_test.py"
+
+
+def test_polyglot_scores_like_aider_and_reports_pass_at_1_and_2(tmp_path):
+    task = bench.polyglot_tasks(polyglot_clone(tmp_path / "pg"))[1]
+    run = {"verified": False, "changed_files": ["two_fer.py"], "hidden_exit_code": 0, "pass_1": True, "tries": 1}
+    first = bench.score_code(task, run)
+    assert first["passed"] and first["pass_1"] and first["polyglot"]        # Kite's own verdict does not count
+    assert not bench.score_code(task, {**run, "changed_files": ["two_fer.py", "conftest.py"]})["passed"]
+    assert not bench.score_code(task, {**run, "hidden_exit_code": 1})["passed"]
+    second = bench.score_code(task, {**run, "pass_1": False, "tries": 2})
+    assert second["passed"] and not second["pass_1"]
+
+    def run_code(t, model, out):
+        return {"hidden_exit_code": 0 if t.id == "P-two-fer" else 1, "pass_1": False, "tries": 2,
+                "changed_files": ["x.py"], "wall_seconds": 30.0}
+
+    tasks = bench.polyglot_tasks(tmp_path / "pg")
+    results = bench.run_bench(models=["qwen3.6"], suites=["code"], post=lambda body: {}, out=tmp_path / "o",
+                              system="", tools=[], run_code=run_code, code_tasks=tasks, log=lambda line: None)
+    summary = bench.summarize(results["models"]["qwen3.6"])
+    assert (summary["polyglot_total"], summary["polyglot_pass_1"], summary["polyglot_pass_2"]) == (2, 0, 1)
+    report = (tmp_path / "o" / "README.md").read_text(encoding="utf-8")
+    assert "## Aider polyglot (Python)" in report and "| `qwen3.6` | 0/2 (0.0%) | 1/2 (50.0%) | 30.0 |" in report
+
+
+def test_polyglot_second_try_starts_from_the_first_and_sees_the_test_errors(tmp_path):
+    task = bench.polyglot_tasks(polyglot_clone(tmp_path / "pg"))[1]
+    repo = bench.make_polyglot_fixture(task, tmp_path / "out")
+    calls = []
+
+    def attempt(goal, task_id):
+        calls.append((goal, task_id, (repo / "two_fer.py").read_text()))
+        workspace = tmp_path / f"ws{len(calls)}"
+        workspace.mkdir()
+        (workspace / "two_fer.py").write_text(f"def two_fer(name='you'):\n    return {len(calls)}\n")
+        failed = len(calls) == 1
+        return workspace, {"hidden_exit_code": 1 if failed else 0, "wall_seconds": 10.0 * len(calls),
+                           "hidden_output_tail": "E   assert 1 == 'One for you, one for me.'" if failed else "",
+                           "agent_status": "ok", "task_id": task_id}
+
+    result = bench.run_polyglot(task, repo, "bench-q-p-two-fer-1", attempt, log=lambda line: None)
+    assert [c[1] for c in calls] == ["bench-q-p-two-fer-1", "bench-q-p-two-fer-1-t2"]
+    goal, _, code = calls[1]
+    assert "return 1" in code                                                # the first try's file, committed
+    assert subprocess.run(["git", "-C", str(repo), "status", "--short"], capture_output=True, text=True).stdout == ""
+    assert goal.startswith(task.goal) and "assert 1 == 'One for you" in goal
+    assert goal.endswith("See the testing errors above.\nThe tests are correct, don't try and change them.\n"
+                         "Fix the code in two_fer.py to resolve the errors.\n")
+    assert result["tries"] == 2 and result["pass_1"] is False and result["wall_seconds"] == 30.0
+    assert result["first_try"]["hidden_exit_code"] == 1 and bench.score_code(task, result)["passed"]
+
+    calls.clear()
+    once = bench.run_polyglot(task, bench.make_polyglot_fixture(task, tmp_path / "out2"), "t",
+                              lambda goal, task_id: (tmp_path, {"hidden_exit_code": 0}), log=lambda line: None)
+    assert once["tries"] == 1 and once["pass_1"] is True
