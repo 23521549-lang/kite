@@ -150,7 +150,9 @@ def _parser() -> argparse.ArgumentParser:
                        help="push a new run even if one seems to be starting or failed recently")
     stop = worker_commands.add_parser("stop", help="ask a worker to finish its job and end its Kaggle session")
     stop.add_argument("worker_id")
-    worker_commands.add_parser("status", help="connected workers and autostart state (from the gateway)")
+    worker_status = worker_commands.add_parser("status", help="connected workers and autostart state "
+                                                              "(from the gateway)")
+    worker_status.add_argument("--json", action="store_true", help="the gateway's full report")
     sandbox = commands.add_parser("sandbox", help="run the coding agent in an isolated Docker sandbox")
     sandbox_commands = sandbox.add_subparsers(dest="sandbox_command", required=True)
     sandbox_commands.add_parser("build", help="create the internal network and build the sandbox image")
@@ -333,6 +335,9 @@ def _worker_remote(args: argparse.Namespace) -> int:
     config = _load_operator_config(args)
     if args.worker_command == "status":
         report = _gateway_call(config, "GET", "/status")
+        if not args.json:
+            print(_worker_status_text(report))
+            return 0
     elif args.worker_command == "start":
         report = _gateway_call(config, "POST", "/kite/wake",
                                {"worker": args.worker_id, "model": args.model, "reason": "manual",
@@ -341,6 +346,31 @@ def _worker_remote(args: argparse.Namespace) -> int:
         report = _gateway_call(config, "POST", "/kite/stop", {"worker": args.worker_id})
     _emit(report)
     return 0
+
+
+def _worker_status_text(report: dict) -> str:
+    minutes = lambda seconds: f"{round((seconds or 0) / 60)} phút"   # noqa: E731
+    lines = []
+    for worker in report.get("workers") or []:
+        if worker.get("alive"):
+            state = f"sống, model {worker.get('loaded_model') or 'chưa nạp'}"
+            state += ", đang làm việc" if worker.get("busy") else ", rảnh"
+        else:
+            state = "đang dừng (draining)" if worker.get("draining") else "chưa kết nối"
+        lines.append(f"{worker.get('worker_id')}: {state}")
+        launch = worker.get("launch")
+        if launch:
+            line = f"  tự bật: {launch.get('state')}"
+            if launch.get("seconds") is not None and launch.get("state") != "idle":
+                line += f" ({minutes(launch.get('seconds'))})"
+            if launch.get("kaggle"):
+                line += f", Kaggle: {launch['kaggle']}" + (f" ({minutes(launch['kaggle_seconds'])})"
+                                                          if launch.get("kaggle_seconds") is not None else "")
+            lines.append(line)
+            if launch.get("detail"):
+                lines.append(f"  {launch['detail']}")
+    lines.append(f"{report.get('queued_jobs', 0)} request đang chờ worker")
+    return "\n".join(lines)
 
 
 def _journal_command(args: argparse.Namespace) -> int:

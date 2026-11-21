@@ -567,7 +567,7 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 - Muốn sửa thêm trên task CHƯA xong: `send_instruction`. Task đã xong: tạo task mới.
 - Người dùng nhận xét kết quả một task (đúng, sai, dùng được, phải sửa lại…): gọi `note_task` với `verdict` `good` hoặc `bad`, `reason` là lời người dùng, rồi xác nhận ngắn là đã ghi. Không hỏi lại.
 - Kết quả `start_task` có `kite_yml_suggestion` nghĩa là repo chưa có `.kite.yml` nên Kite có thể cài thư viện hoặc chạy test chưa đúng. Báo `task_id` như thường, rồi đưa khối YAML đề xuất và nói người dùng kiểm tra rồi tự commit file `.kite.yml` vào gốc repo. Bạn không tự tạo file đó.
-- Hỏi về GPU/worker: `worker_status`. Worker có `launch` thì Kite tự bật notebook Kaggle khi có việc: `launch.state` là `launching`/`starting` nghĩa là đang bật (thường 5–10 phút), báo người dùng chờ; `error` thì báo đúng `launch.detail`. Không có worker nào `alive` và cũng không có `launch`: nhắc người dùng bật notebook Kaggle (mục Worker mode). Task vẫn được giữ và sẽ chạy khi worker kết nối.
+- Hỏi về GPU/worker: `worker_status`. Worker có `launch` thì Kite tự bật notebook Kaggle khi có việc: `launch.state` là `launching`/`starting` nghĩa là đang bật (thường 5–10 phút), báo người dùng chờ; `launch.kaggle` là `queued` nghĩa là Kaggle đang xếp hàng GPU (Kite không đẩy nhanh được): báo số phút trong `launch.kaggle_seconds` và gợi ý chạy tay notebook nếu gấp; `error` thì báo đúng `launch.detail`. Không có worker nào `alive` và cũng không có `launch`: nhắc người dùng bật notebook Kaggle (mục Worker mode). Task vẫn được giữ và sẽ chạy khi worker kết nối.
 
 ## Quy tắc an toàn
 

@@ -130,7 +130,8 @@ def test_a_request_with_no_connected_worker_pushes_the_notebook_with_the_request
     launcher, fake = asyncio.run(scenario())
     assert [c[:2] for c in fake.calls] == [["kernels", "status"], ["kernels", "pull"], ["kernels", "push"]]
     push = fake.calls[-1]
-    assert push[push.index("--accelerator") + 1] == "NvidiaTeslaT4" and push[push.index("-t") + 1] == "41400"
+    # Like "Save & Run All" in the UI: GPU T4 x2, no session-timeout flag.
+    assert push[push.index("--accelerator") + 1] == "NvidiaTeslaT4" and "-t" not in push
     # The datasets attached in the Kaggle UI are kept; GPU and Internet are switched on.
     assert fake.metadata["dataset_sources"] == ["han/kite-gguf-qwen3-6", "han/kite-llama-bin"]
     assert fake.metadata["enable_gpu"] is True and fake.metadata["enable_internet"] is True
@@ -189,18 +190,65 @@ def test_a_failed_push_is_reported_and_not_retried_at_once(tmp_path):
     assert later["state"] == "starting"
 
 
-def test_a_start_that_never_connects_asks_kaggle_and_reports_the_failure(tmp_path):
+def test_while_starting_kite_follows_the_kaggle_run_and_reports_a_stop_at_once(tmp_path):
     async def scenario():
         fake = FakeKaggle()
-        _config, _gateway, launcher, _fake, clock = make(tmp_path, fake=fake)
+        _config, gateway, launcher, _fake, clock = make(tmp_path, fake=fake)
         await launcher.wake(model="qwen3.6")
+        seen = []
+        fake.status = "QUEUED"
+        clock["now"] += 60
+        await launcher.check_starting()
+        clock["now"] += 14 * 60
+        await launcher.check_starting()
+        seen.append(launcher.status()["kaggle-han"])
+        fake.status = "RUNNING"
+        clock["now"] += 60
+        await launcher.check_starting()
+        seen.append(launcher.status()["kaggle-han"])
         fake.status = "ERROR"
-        clock["now"] += 1600
+        clock["now"] += 60                      # long before the old 25-minute wait
+        await launcher.check_starting()
+        seen.append(launcher.status()["kaggle-han"])
+        return seen
+
+    queued, running, stopped = asyncio.run(scenario())
+    assert queued["state"] == "starting" and queued["kaggle"] == "queued" and queued["kaggle_seconds"] == 15 * 60
+    assert "xếp hàng GPU cho version 12 (15 phút)" in queued["detail"] and "Run All" in queued["detail"]
+    assert running["kaggle"] == "running" and running["kaggle_seconds"] == 0 and "đang nạp model" in running["detail"]
+    assert stopped["state"] == "error" and stopped["kaggle"] == "error" and "per-launch" in stopped["detail"]
+
+
+def test_a_run_cancelled_on_kaggle_is_reported_without_the_secret_hint(tmp_path):
+    async def scenario():
+        fake = FakeKaggle()
+        _config, _gateway, launcher, _fake, _clock = make(tmp_path, fake=fake)
+        await launcher.wake(model="qwen3.6")
+        fake.status = "CANCEL_ACKNOWLEDGED"
         await launcher.check_starting()
         return launcher.status()["kaggle-han"]
 
     state = asyncio.run(scenario())
-    assert state["state"] == "error" and "per-launch" in state["detail"]
+    assert state["state"] == "error" and "cancel_acknowledged" in state["detail"] and "per-launch" not in state["detail"]
+
+
+def test_worker_status_reads_like_a_sentence(tmp_path, capsys, monkeypatch):
+    raw = raw_config(tmp_path, launch={"kernel": "hanle/kite-worker"})
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw))
+    report = {"queued_jobs": 1, "workers": [
+        {"worker_id": "kaggle-han", "alive": False, "loaded_model": None, "busy": False,
+         "launch": {"state": "starting", "seconds": 900, "kaggle": "queued", "kaggle_seconds": 840,
+                    "detail": "Kaggle đang xếp hàng GPU cho version 5 (14 phút)", "version": "5"}},
+        {"worker_id": "kaggle-an", "alive": True, "loaded_model": "qwen3.6", "busy": True}]}
+    monkeypatch.setattr(cli, "_gateway_call", lambda *a, **k: report)
+    assert cli.main(["--config", str(path), "worker", "status"]) == 0
+    text = capsys.readouterr().out
+    assert "kaggle-han: chưa kết nối" in text and "tự bật: starting (15 phút), Kaggle: queued (14 phút)" in text
+    assert "xếp hàng GPU cho version 5" in text and "kaggle-an: sống, model qwen3.6, đang làm việc" in text
+    assert "1 request đang chờ" in text
+    assert cli.main(["--config", str(path), "worker", "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == report
 
 
 def test_per_launch_token_is_accepted_until_the_run_ends_and_survives_a_gateway_restart(tmp_path):

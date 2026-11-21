@@ -187,13 +187,13 @@ KITE_GATEWAY_DOMAIN=1-2-3-4.sslip.io sudo -E docker compose -f deploy/gateway.co
 
 ### Autostart (Kite runs the notebook)
 
-With `launch` on a pull worker, nobody has to open the notebook. When a request arrives and no connected worker serves its model, when the chat opens (`kite mcp serve` starts), when a task starts, or on `kite worker start`, the gateway pulls the owner's notebook metadata from Kaggle (attached datasets and settings stay as set in the Kaggle UI), puts this repository's `kaggle_model_worker.ipynb` in its place with `KITE_LAUNCH` filled in, and pushes it as a new version that runs on GPU T4 x2 ("Save & Run All"). The run loads the requested model first, skips the sample task, and ends after `idle_minutes` without a job so the weekly GPU quota is not spent idle. Opening that notebook by hand later runs it as a manual run (`KITE_LAUNCH` is ignored in interactive sessions and once the run's start window has passed). A worker that is heartbeating (also while it swaps models) is never started twice; right after a gateway restart Kite waits one heartbeat timeout for running workers to reconnect.
+With `launch` on a pull worker, nobody has to open the notebook. When a request arrives and no connected worker serves its model, when the chat opens (`kite mcp serve` starts), when a task starts, or on `kite worker start`, the gateway pulls the owner's notebook metadata from Kaggle (attached datasets and settings stay as set in the Kaggle UI), puts this repository's `kaggle_model_worker.ipynb` in its place with `KITE_LAUNCH` filled in, and pushes it as a new version that runs on GPU T4 x2 ("Save & Run All"). The run loads the requested model first, skips the sample task, and ends after `idle_minutes` without a job so the weekly GPU quota is not spent idle. While a start has not connected, the gateway asks Kaggle every minute what the run is doing: queued (Kaggle has not given it a GPU yet, which Kite cannot speed up), running (loading the model), or stopped, which is reported at once with Kaggle's failure message. The push carries no session-timeout flag, like "Save & Run All" in the UI. Opening that notebook by hand later runs it as a manual run (`KITE_LAUNCH` is ignored in interactive sessions and once the run's start window has passed). A worker that is heartbeating (also while it swaps models) is never started twice; right after a gateway restart Kite waits one heartbeat timeout for running workers to reconnect.
 
 ```sh
 kite worker autostart kaggle-han --kernel <kaggle user>/<notebook slug>   # asks for the Kaggle API token (hidden), 0600 file
 sudo systemctl restart kite-gateway
 kite worker start kaggle-han      # or just open the chat / start a task
-kite worker status                # launch.state: launching | starting | alive | error (+ detail)
+kite worker status                # one line per worker; while starting: Kaggle queued/running and for how long (--json: full report)
 kite worker stop kaggle-han       # finish the current job, then end the Kaggle session
 ```
 

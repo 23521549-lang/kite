@@ -101,12 +101,20 @@ class LaunchState:
     detail: str = ""
     version: str | None = None
     reason: str = ""
+    kaggle: str | None = None      # last status Kaggle reported for the run: queued | running | error | ...
+    kaggle_since: float = 0.0      # when Kaggle first reported that status
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def report(self, now: float) -> dict[str, Any]:
         return {"state": self.state, "seconds": round(now - self.since) if self.since else None,
                 "detail": self.detail, "kernel": self.spec.kernel, "version": self.version,
+                "kaggle": self.kaggle,
+                "kaggle_seconds": round(now - self.kaggle_since) if self.kaggle and self.kaggle_since else None,
                 "reason": self.reason, "idle_minutes": self.spec.idle_minutes, "token": self.spec.token}
+
+    def saw(self, status: str | None, now: float) -> None:
+        if status != self.kaggle:
+            self.kaggle, self.kaggle_since = status, now
 
 
 class KaggleLauncher:
@@ -220,9 +228,11 @@ class KaggleLauncher:
             meta.update(code_file=code_file.name, enable_gpu=True, enable_internet=True, is_private=True)
             meta.pop("enable_tpu", None)
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            # Like "Save & Run All" in the Kaggle UI: no session-timeout flag (the notebook drains itself
+            # before Kaggle's 12 h limit). Bench v5 day: a push with -t 41400 sat in Kaggle's queue for
+            # 30 minutes while UI runs started at once.
             code, output = self._kaggle(worker_id, [
-                "kernels", "push", "-p", folder, "--accelerator", spec.accelerator,
-                "-t", str(int(spec.max_hours * 3600))], 300)
+                "kernels", "push", "-p", folder, "--accelerator", spec.accelerator], 300)
         version = re.search(r"Kernel version (\d+) successfully pushed", output)
         if code != 0 or not version:
             return False, "Kaggle không nhận notebook: " + output.strip()[-300:], None
@@ -294,6 +304,7 @@ class KaggleLauncher:
             state.state, state.since, state.reason, state.detail = "launching", self.clock(), reason, ""
             try:
                 status, detail = await asyncio.to_thread(self.kernel_status, state.worker_id)
+                state.saw(status, self.clock())
                 if status in RUNNING and not force:
                     # A run already exists (pushed earlier, or Kite restarted): let it connect.
                     state.state, state.detail = "starting", f"Kaggle đang chạy notebook ({status})"
@@ -303,7 +314,9 @@ class KaggleLauncher:
                     ok, error, version = await asyncio.to_thread(self._push, state.worker_id, model, reason)
                     if ok:
                         state.state, state.version = "starting", version
-                        state.detail = f"đã đẩy notebook version {version}; worker kết nối sau ~5–10 phút"
+                        state.saw("queued", self.clock())
+                        state.detail = (f"đã đẩy notebook version {version}; chờ Kaggle cấp GPU rồi "
+                                        "worker kết nối sau ~5–10 phút")
                     else:
                         state.state, state.detail = "error", error
             except Exception as exc:
@@ -314,21 +327,33 @@ class KaggleLauncher:
             return {"worker": state.worker_id, **state.report(self.clock())}
 
     async def check_starting(self) -> None:
-        """A start that never connected: ask Kaggle what happened (run in the gateway's background loop)."""
+        """While a start has not connected, ask Kaggle every minute what the run is doing: say how long it
+        has been queued or running, and report a run that stopped at once instead of waiting it out."""
         for state in self.states.values():
             self._refresh(state)
-            if state.state != "starting" or self.clock() - state.since < self.startup_seconds:
+            if state.state != "starting":
                 continue
+            now = self.clock()
             status, detail = await asyncio.to_thread(self.kernel_status, state.worker_id)
-            if status in RUNNING:
-                state.since = self.clock() - self.startup_seconds / 2      # still booting: look again later
-                state.detail = f"Kaggle vẫn đang chạy notebook ({status}) nhưng worker chưa kết nối"
+            if status is None:
+                state.detail = "không hỏi được Kaggle trạng thái notebook: " + detail[-200:]
+                continue
+            state.saw(status, now)
+            minutes = (now - state.kaggle_since) / 60
+            if status == "queued" or status == "new_script":
+                state.detail = (f"Kaggle đang xếp hàng GPU cho version {state.version or '?'} ({minutes:.0f} phút); "
+                                "Kite không đẩy nhanh được, chạy tay (Run All) nếu cần gấp")
+            elif status == "running":
+                state.detail = (f"notebook đang chạy {minutes:.0f} phút, worker chưa kết nối"
+                                + (" (quá lâu: xem log version trên Kaggle)" if now - state.kaggle_since
+                                   > self.startup_seconds else " (đang nạp model)"))
             else:
-                state.state, state.since = "error", self.clock()
-                state.detail = (f"notebook dừng ({status or 'không rõ'}) trước khi worker kết nối"
+                state.state, state.since = "error", now
+                state.detail = (f"notebook dừng ({status}) trước khi worker kết nối"
                                 + (f": {detail}" if detail else "")
-                                + ("; nếu lỗi ở Secrets, đặt launch.token: per-launch" if state.spec.token ==
-                                   "kaggle-secret" else ""))
+                                + ("; nếu log báo lỗi Secret, đặt launch.token: per-launch"
+                                   if state.spec.token == "kaggle-secret" and status == "error" else ""))
+                print(f"kite gateway: autostart {state.worker_id}: {state.detail}", file=sys.stderr)
 
     async def watch(self, every: float = 60.0) -> None:
         while True:
