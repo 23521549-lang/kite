@@ -28,6 +28,7 @@ import shutil
 import sys
 import time
 from typing import Any, Callable, Mapping
+import urllib.request
 
 from temporalio.exceptions import ApplicationError
 
@@ -42,9 +43,30 @@ from .temporal_workflow import CodingRunResult, CodingTaskInput, RouteLease
 
 HEARTBEAT_SECONDS = 20.0
 NO_CHANGES_PATCH = "# Kite: the agent made no changes\n"
+CANCEL_MARKER = "cancel_requested"     # in the task folder: written by `cancel_task` / `kite workflow cancel`
+ACTION_TRACE_SECONDS = 10.0            # at most one agent_action line per this many seconds in trace.jsonl
+
+
+class TaskCancelled(Exception):
+    """The person cancelled the task: stop at the next step instead of running the rest."""
+
+
+def cancel_marker(state_dir: Path, task_id: str) -> Path:
+    return Path(state_dir) / "tasks" / task_slug(task_id) / CANCEL_MARKER
+
+
+def request_cancel(state_dir: Path, task_id: str) -> Path:
+    """Mark a task cancelled before the workflow's cancel signal: the run activity then stops at once
+    (containers killed, model requests dropped) instead of finishing the steps it is in (step 2 of
+    the full-test day: a cancelled task kept the worker for 15 more minutes)."""
+    path = cancel_marker(state_dir, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
+    return path
 
 
 STEP_LABELS = {"setup": "cài thư viện (có mạng)", "repro": "chạy test tái hiện", "quick": "chạy các test liên quan",
+               "fast": "chạy test trên bản sửa nhanh",
                "test": "chạy bộ test của repo", "check": "kiểm tra code", "agent": "agent viết code",
                "review": "agent rà soát lại bản sửa"}
 FAST_OUTCOMES = {"passed": "bản sửa qua hết test", "tests_failed": "bản sửa trượt test, chuyển cho agent",
@@ -80,6 +102,7 @@ def task_progress(trace: list[dict], now: float, limit: int = 8) -> dict:
     the step running now and for how long, and the last ``limit`` finished steps."""
     lines: list[str] = []
     phase = step = None           # (label, started at): the fast path / one-call review; a container
+    action, actions = "", 0       # what the agent did last in the running step, and how many tool calls
 
     def add(text: str, at: Any) -> None:
         offset = f"{duration_vi(at - trace[0]['ts'])}: " if isinstance(at, (int, float)) else ""
@@ -89,8 +112,12 @@ def task_progress(trace: list[dict], now: float, limit: int = 8) -> dict:
         event, at = record.get("event"), record.get("ts")
         if event == "step_start":
             step = (_step_label(record.get("step", "")), at)
+            action, actions = "", 0
+        elif event == "agent_action":
+            action, actions = str(record.get("action") or ""), int(record.get("count") or 0)
         elif event == "step":
             step = None
+            action, actions = "", 0
             code = record.get("exit")
             label, took = _step_label(record.get("step", "")), duration_vi(record.get("seconds") or 0)
             text = f"xong {label} ({took})" if code == 0 else f"{label}: lỗi, exit {code} ({took})"
@@ -120,11 +147,18 @@ def task_progress(trace: list[dict], now: float, limit: int = 8) -> dict:
         elif event == "run_error":
             phase = step = None
             add(f"dừng vì lỗi: {record.get('error')}", at)
+        elif event == "run_cancelled":
+            phase = step = None
+            add("đã hủy theo yêu cầu: dừng mọi bước đang chạy", at)
+        elif event == "continue_from":
+            add(f"tiếp tục từ kết quả task {record.get('task')} (bản sửa trước đã có sẵn)", at)
     current = step or phase
     report: dict[str, Any] = {"elapsed": duration_vi(now - trace[0]["ts"]) if trace else None,
                               "progress": lines[-limit:]}
     if current is not None:
         report["now"] = f"{current[0]} (đã {duration_vi(now - current[1])})"
+        if step is not None and action:
+            report["now"] += f"; vừa {action} ({actions} thao tác)"
     return report
 
 
@@ -179,14 +213,17 @@ class SandboxActivityBackend:
     def _small_model(self, model: str) -> str | None:
         return next((alias for alias, base in self.aliases.items() if base == model), None)
 
-    def _docker(self, *args: str) -> None:
-        self.runner([*self.settings.docker_command, *args], timeout=60)
+    def _docker(self, *args: str) -> str:
+        result = self.runner([*self.settings.docker_command, *args], timeout=60)
+        return str(getattr(result, "stdout", "") or "")
 
     async def _run_container(self, name: str, args: list[str], timeout: int,
                              heartbeat: Callable[[dict], None] | None = None,
                              state: str = "RUNNING", task_id: str = "",
                              watch: sbx.StuckWatch | None = None) -> tuple[int, str, float]:
         """Run one sandbox container, heartbeating Temporal while it works; kill it if cancelled."""
+        if task_id:
+            self._check_cancelled(task_id)
         await asyncio.to_thread(self._docker, "rm", "-f", name)     # leftover from a crashed attempt
         if task_id:
             self._trace(task_id, "step_start", step=name.split("-")[1], state=state)
@@ -207,10 +244,48 @@ class SandboxActivityBackend:
         code, output = step.result()
         seconds = round(time.monotonic() - started, 1)
         if task_id:
+            self._check_cancelled(task_id)
             self._trace(task_id, "step", step=name.split("-")[1], state=state, seconds=seconds, exit=code,
                         output_chars=len(output), tail=output[-400:] if code != 0 else None,
                         stuck=watch.reason if watch is not None and watch.reason else None)
         return code, output, seconds
+
+    def _check_cancelled(self, task_id: str) -> None:
+        if cancel_marker(self.state_dir, task_id).exists():
+            raise TaskCancelled(task_id)
+
+    def _cancellable(self, task_id: str, ask: Callable[[str], str] | None) -> Callable[[str], str] | None:
+        """A model asker that refuses to start a request once the task is cancelled."""
+        if ask is None:
+            return None
+
+        def guarded(prompt: str) -> str:
+            self._check_cancelled(task_id)
+            return ask(prompt)
+        return guarded
+
+    def _action_tracer(self, task_id: str, kind: str) -> Callable[[str], None]:
+        """The agent's tool calls into trace.jsonl, at most one line per ACTION_TRACE_SECONDS."""
+        state = {"count": 0, "last": 0.0}
+
+        def on_action(action: str) -> None:
+            state["count"] += 1
+            now = time.monotonic()
+            if now - state["last"] >= ACTION_TRACE_SECONDS:
+                state["last"] = now
+                self._trace(task_id, "agent_action", step=kind, action=action, count=state["count"])
+        return on_action
+
+    def _gateway_cancel(self, tag: str) -> None:
+        """Drop the task's model requests at the gateway (queued ones and the one generating)."""
+        base = (self.settings.host_gateway_url or self.settings.gateway_url).rstrip("/")
+        root = base[:-len("/v1")] if base.endswith("/v1") else base
+        request = urllib.request.Request(root + "/kite/cancel", json.dumps({"tag": tag}).encode(),
+                                         {"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(request, timeout=10).read()
+        except Exception:                 # the gateway may be down: the containers are killed anyway
+            pass
 
     def _worker_result(self, task: CodingTaskInput, route: RouteLease, result: CodingRunResult) -> WorkerResult:
         return WorkerResult(task.task_id, route.lease_id, route.worker_id, result.base_repo_head,
@@ -264,7 +339,7 @@ class SandboxActivityBackend:
         sbx._git(work, "update-ref", "refs/kite/base", task.repo_head)
         (deps / "cache").mkdir(parents=True, exist_ok=True)
         try:
-            settings = sbx.repo_settings(self.settings, work)
+            settings = sbx.repo_settings(self.settings, work, memory.repo_config_path(self.state_dir, task.repo_path))
         except sbx.SandboxError as exc:
             raise ApplicationError(str(exc), non_retryable=True) from exc
         if settings is not self.settings:
@@ -279,11 +354,14 @@ class SandboxActivityBackend:
         elif settings.setup_command:
             before = sbx.workspace_state(work)
             name = sbx.container_name("setup", task_slug(task.task_id))
-            code, output, seconds = await self._run_container(
-                name, sbx.docker_run_args(self.settings, name=name, workspace=work,
-                                          network=self.settings.setup_network, deps=deps)
-                + ["sh", "-c", settings.setup_command],
-                settings.setup_timeout_seconds, task_id=task.task_id)
+            try:
+                code, output, seconds = await self._run_container(
+                    name, sbx.docker_run_args(self.settings, name=name, workspace=work,
+                                              network=self.settings.setup_network, deps=deps)
+                    + ["sh", "-c", settings.setup_command],
+                    settings.setup_timeout_seconds, task_id=task.task_id)
+            except TaskCancelled:
+                return str(work)              # the workflow sees the cancel and ends before any run
             (root / "setup.log").write_text(output, encoding="utf-8")
             if code != 0:
                 raise ApplicationError(f"setup command failed (exit {code}) after {seconds}s; "
@@ -292,6 +370,14 @@ class SandboxActivityBackend:
                 self._trace(task.task_id, "deps_stored", key=key)
         patch_base = sbx.commit_setup_changes(work)
         sbx._git(work, "update-ref", "refs/kite/patch-base", patch_base)
+        if task.base_patch:
+            # "Sửa tiếp": the previous task's result goes into the clone as uncommitted changes, so the
+            # agent builds on it and this task's patch holds both (it applies to the same commit).
+            applied = await asyncio.to_thread(sbx.apply_patch_file, work, Path(task.base_patch))
+            if applied:
+                raise ApplicationError(f"the previous result does not apply to {task.repo_head[:12]}: {applied}",
+                                       non_retryable=True)
+            self._trace(task.task_id, "continue_from", task=task.base_task or None)
         return str(work)
 
     async def reserve_route(self, task: CodingTaskInput, key: str) -> RouteLease | None:
@@ -338,6 +424,13 @@ class SandboxActivityBackend:
         try:
             return await self._run_agent(task, route, work, root, slug, deps, patch_base, config_file, goal,
                                          instruction, context, session_id, heartbeat, graph)
+        except TaskCancelled:
+            self._trace(task.task_id, "run_cancelled")
+            self.journal.write("tasks", {"task_id": task.task_id, "task_type": task.task_type,
+                                         "repo": task.repo_path, "model": route.model_id,
+                                         "worker": route.worker_id, "status": "cancelled"})
+            return CodingRunResult(task.task_id, task.repo_head, session_id, "", "Task đã bị hủy theo yêu cầu.",
+                                   (), 0)
         except BaseException as exc:
             # A crash (or cancel) mid-run still leaves a line saying how far it got.
             self._trace(task.task_id, "run_error", error=short(f"{type(exc).__name__}: {exc}", 500))
@@ -353,7 +446,8 @@ class SandboxActivityBackend:
                          deps: Path, patch_base: str, config_file: Path, goal: str, instruction: str,
                          context: str, session_id: str, heartbeat: Callable[[dict], None],
                          graph: sbx.codemap.CodeGraph | None = None) -> CodingRunResult:
-        settings = sbx.repo_settings(self.settings, work)   # the repo's .kite.yml (already validated in setup)
+        # The repo's .kite.yml, or the config Kite keeps for it (already validated in setup).
+        settings = sbx.repo_settings(self.settings, work, memory.repo_config_path(self.state_dir, task.repo_path))
         template = sbx.quick_template(settings)
         test_command = settings.test_command
         check_template = settings.check_command if test_command else ""
@@ -411,8 +505,8 @@ class SandboxActivityBackend:
         status, code, output = "not_started", None, ""
         fast_status, fast_seconds, ask, repro, fast_attempts = "off", 0.0, None, "off", 0
         if self.settings.fast_path and task.task_type == "coding" and test_command:
-            ask = sbx.gateway_asker(self.settings, route.model_id, tag=clean_tag(task.task_id) or slug,
-                                    pin=route.worker_id)
+            ask = self._cancellable(task.task_id, sbx.gateway_asker(
+                self.settings, route.model_id, tag=clean_tag(task.task_id) or slug, pin=route.worker_id))
             if ask is not None:
                 started = time.monotonic()
                 loop = asyncio.get_running_loop()
@@ -434,9 +528,9 @@ class SandboxActivityBackend:
                 # Best-of-N: another idle worker with the same model writes a second candidate meanwhile.
                 others = await asyncio.to_thread(sbx.idle_helpers, self.settings, route.model_id,
                                                  exclude=route.worker_id)
-                helpers = [sbx.gateway_asker(self.settings, route.model_id,
-                                             tag=f"{clean_tag(task.task_id) or slug}-b{i + 2}", pin=other)
-                           for i, other in enumerate(others)]
+                helpers = [self._cancellable(task.task_id, sbx.gateway_asker(
+                    self.settings, route.model_id, tag=f"{clean_tag(task.task_id) or slug}-b{i + 2}", pin=other))
+                    for i, other in enumerate(others)]
                 self._trace(task.task_id, "fast_start", helpers=len(helpers))
                 step = asyncio.create_task(asyncio.to_thread(
                     sbx.fast_path, work, goal, graph, ask, test_command=test_command, check=check_template,
@@ -475,7 +569,7 @@ class SandboxActivityBackend:
         while fast_status != "passed":
             kind = "agent" if attempt == 0 else f"fix{attempt}"
             name = sbx.container_name(kind, slug)
-            watch = sbx.StuckWatch()
+            watch = sbx.StuckWatch(on_action=self._action_tracer(task.task_id, kind))
             code, output, step_seconds = await self._run_container(
                 name, sbx.docker_run_args(self.settings, name=name, workspace=work, network=self.settings.network,
                                           config_file=config_file, deps=deps)
@@ -516,7 +610,13 @@ class SandboxActivityBackend:
         review, review_mode = "skipped", ""
         if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code) and check_code in (None, 0):
             before = await asyncio.to_thread(sbx.snapshot_tree, work)
-            if fast_status == "passed" and repro == "reproduced" and self.settings.fast_review and ask is not None:
+            # A fast fix with a real reproduction, or a small agent patch whose tests pass, gets the one-call
+            # review; a second agent session (5-10 minutes) is kept for big agent changes.
+            small = (fast_status != "passed" and status == "ok" and test_code == 0
+                     and sum(sbx.patch_size(sbx._git(work, "diff", patch_base, before, check=False)))
+                     <= sbx.SMALL_REVIEW_LINES)
+            if (fast_status == "passed" and repro == "reproduced" or small) and self.settings.fast_review \
+                    and ask is not None:
                 review_mode = "one_call"
                 self._trace(task.task_id, "review_start", mode=review_mode)
                 started = time.monotonic()
@@ -545,7 +645,8 @@ class SandboxActivityBackend:
                            sbx.codemap.impact, graph, work, patch_base) if graph is not None else "", quick=template,
                            edited=await asyncio.to_thread(sbx.edited_tests, work, patch_base), check=check_template,
                            scratch=await asyncio.to_thread(sbx.scratch_files, work, patch_base))],
-                    self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id, sbx.StuckWatch())
+                    self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id,
+                    sbx.StuckWatch(on_action=self._action_tracer(task.task_id, "review")))
             seconds = round(seconds + step_seconds, 1)
             if review_mode == "agent":
                 count_tools(review_output)
@@ -655,6 +756,14 @@ class SandboxActivityBackend:
 
     async def interrupt_opencode(self, task: CodingTaskInput, route: RouteLease, session_id: str, key: str) -> None:
         slug = task_slug(task.task_id)
+        if cancel_marker(self.state_dir, task.task_id).exists():
+            # Cancelled: every container of the task (fast path, repro, tests, agent...) and every model
+            # request it has at the gateway; the run then stops at its next step (TaskCancelled).
+            await asyncio.to_thread(self._gateway_cancel, clean_tag(task.task_id) or slug)
+            names = await asyncio.to_thread(self._docker, "ps", "-q", "--filter", f"name=-{slug}")
+            for container in (names or "").split():
+                await asyncio.to_thread(self._docker, "kill", container)
+            return
         for kind in ("agent", "test", "setup", "review",
                      *(f"fix{i}" for i in range(1, self.settings.fix_rounds + 1))):
             await asyncio.to_thread(self._docker, "kill", sbx.container_name(kind, slug))

@@ -100,6 +100,13 @@ def _parser() -> argparse.ArgumentParser:
     memory_commands = memory_parser.add_subparsers(dest="memory_command", required=True)
     memory_show = memory_commands.add_parser("show", help="the lessons for one repository and their file")
     memory_show.add_argument("repo", help="path of the repository")
+    memory_forget = memory_commands.add_parser("forget", help="remove one lesson (its number in `memory show`)")
+    memory_forget.add_argument("repo", help="path of the repository")
+    memory_forget.add_argument("number", type=int, help="1 = the oldest lesson")
+    update = commands.add_parser("update", help="update Kite on this machine: git pull, run the tests, restart the "
+                                                "services (the old commit comes back if the tests fail)")
+    update.add_argument("--yes", action="store_true", help="do it (default: only show what is new)")
+    update.add_argument("--no-restart", action="store_true", help="pull and test, but restart nothing")
     model = commands.add_parser("model", help="models the workers serve")
     model_commands = model.add_subparsers(dest="model_command", required=True)
     model_add = model_commands.add_parser(
@@ -179,6 +186,12 @@ def _parser() -> argparse.ArgumentParser:
                        help="push a new run even if one seems to be starting or failed recently")
     stop = worker_commands.add_parser("stop", help="ask a worker to finish its job and end its Kaggle session")
     stop.add_argument("worker_id")
+    restart = worker_commands.add_parser(
+        "restart", help="end the worker's Kaggle session and start it again with this repository's notebook "
+                        "(after an update, or when doctor says the notebook is old)")
+    restart.add_argument("worker_id")
+    restart.add_argument("--model", default=None, help="model to load first")
+    restart.add_argument("--wait-minutes", type=float, default=20, help="how long to wait for the session to end")
     worker_status = worker_commands.add_parser("status", help="connected workers and autostart state "
                                                               "(from the gateway)")
     worker_status.add_argument("--json", action="store_true", help="the gateway's full report")
@@ -201,6 +214,8 @@ def _parser() -> argparse.ArgumentParser:
                            help="folder whose Git repositories tasks may use; repeat (default: home)")
     mcp_serve.add_argument("--lead-model", default=None,
                            help="model the chat uses: started on a worker as soon as the chat opens")
+    mcp_serve.add_argument("--chat-dir", type=Path, default=None,
+                           help="the chat folder (its AGENTS.md gets what the person asks the chat to remember)")
     chat = commands.add_parser("chat", help="Vietnamese chat with the Kite lead agent (OpenCode)")
     chat_commands = chat.add_subparsers(dest="chat_command", required=True)
     chat_setup = chat_commands.add_parser("setup", help="create a chat folder with opencode.json and AGENTS.md")
@@ -209,6 +224,8 @@ def _parser() -> argparse.ArgumentParser:
     chat_setup.add_argument("--allow-root", action="append", type=Path, default=[],
                             help="folder whose Git repositories tasks may use; repeat (default: home)")
     chat_setup.add_argument("--force", action="store_true", help="overwrite opencode.json and AGENTS.md")
+    chat_setup.add_argument("--no-reload", action="store_true",
+                            help="only write the files (do not stop a running OpenCode: used by kite update)")
     chat_setup.add_argument("--clear-approvals", action="store_true",
                             help="remove shell commands OpenCode was told to 'Always allow' (database is backed up)")
     chat_commands.add_parser("reload", help="stop the OpenCode background server and old Kite MCP servers "
@@ -241,7 +258,8 @@ def _parser() -> argparse.ArgumentParser:
                                 "the other worker stays free for real tasks")
     bench_history = bench_commands.add_parser(
         "history", help="every bench run so far as one table (markdown): what each change did")
-    bench_history.add_argument("--root", type=Path, help="folder of bench runs (default: <state>/bench)")
+    bench_history.add_argument("--root", type=Path, help="folder of bench runs (default: <state>/bench and the "
+                                                         "home folder)")
     bench_history.add_argument("--json", action="store_true", help="the rows as JSON instead")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
                                                           "unless --write)")
@@ -352,7 +370,7 @@ def _cleanup(args: argparse.Namespace) -> int:
     from . import cleanup
 
     state = args.config.parent
-    items = cleanup.plan(state, days=args.days, deps_cache=args.deps_cache)
+    items = cleanup.plan(state, days=args.days, deps_cache=args.deps_cache, extra_roots=[Path.home()])
     by_kind: dict[str, list] = {}
     for item in items:
         by_kind.setdefault(item.kind, []).append(item)
@@ -456,13 +474,80 @@ def _worker_remote(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_restart(args: argparse.Namespace) -> int:
+    """Stop the worker's Kaggle session (it finishes its current request), wait until it is gone, then
+    start it again through autostart, which pushes this repository's notebook."""
+    config = _load_operator_config(args)
+    _gateway_call(config, "POST", "/kite/stop", {"worker": args.worker_id})
+    deadline = time.monotonic() + args.wait_minutes * 60
+    print(f"Đã yêu cầu {args.worker_id} dừng; chờ phiên Kaggle kết thúc...", flush=True)
+    while True:
+        report = _gateway_call(config, "GET", "/status")
+        worker = next((w for w in report.get("workers") or [] if w.get("worker_id") == args.worker_id), None)
+        if worker is None:
+            raise ConfigError(f"không có worker {args.worker_id}")
+        if not worker.get("alive"):
+            break
+        if time.monotonic() > deadline:
+            raise ConfigError(f"{args.worker_id} vẫn chạy sau {args.wait_minutes:g} phút (đang làm một request dài?)")
+        time.sleep(10)
+    print("Worker đã dừng; bật lại với notebook mới...", flush=True)
+    _emit(_gateway_call(config, "POST", "/kite/wake", {"worker": args.worker_id, "model": args.model,
+                                                      "reason": "restart", "force": True}, timeout=600))
+    return 0
+
+
+def _chat_setup_again(config_path: Path) -> dict:
+    """After an update: rewrite the chat's files with the NEW code (a new process), keeping its roots
+    and lead model, without stopping the OpenCode that may be running this very update."""
+    chat_dir = Path.home() / "kite-chat"
+    try:
+        command = json.loads((chat_dir / "opencode.json").read_text(encoding="utf-8"))["mcp"]["kite"]["command"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"chat": "chưa có ~/kite-chat (bỏ qua)"}
+    extra = []
+    for i, value in enumerate(command[:-1]):
+        if value == "--lead-model":
+            extra += ["--model", command[i + 1]]
+        elif value == "--allow-root":
+            extra += ["--allow-root", command[i + 1]]
+    done = subprocess.run([*_kite_executable(), "--config", str(config_path), "chat", "setup", "--force",
+                           "--no-reload", "--dir", str(chat_dir), *extra], capture_output=True, text=True)
+    return {"chat": "đã viết lại opencode.json và AGENTS.md" if done.returncode == 0
+            else "chat setup lỗi: " + (done.stderr or done.stdout).strip()[-300:]}
+
+
+def _update_command(args: argparse.Namespace) -> int:
+    from . import update
+
+    if not args.yes:
+        report = update.plan()
+        if not report.get("error"):
+            report["next"] = ("kite update --yes" if report["behind"] else "Kite đã là bản mới nhất")
+        _emit(report)
+        return 0
+    report = update.run(restart=not args.no_restart, after=lambda: _chat_setup_again(args.config.resolve()))
+    if report.get("updated"):
+        report["next"] = ["thoát opencode, chạy `kite chat reload`, rồi mở lại để có tool mới"]
+        if report.get("notebook_changed"):
+            report["next"].append("notebook worker đổi: kite worker restart <worker> (hoặc nhờ chat)")
+    _emit(report)
+    return 0 if report.get("updated") or not report.get("error") else 1
+
+
 def _worker_status_text(report: dict) -> str:
     minutes = lambda seconds: f"{round((seconds or 0) / 60)} phút"   # noqa: E731
     lines = []
     for worker in report.get("workers") or []:
         if worker.get("alive"):
+            from .pull_worker import WORKER_VERSION
+
             state = f"sống, model {worker.get('loaded_model') or 'chưa nạp'}"
-            state += ", đang làm việc" if worker.get("busy") else ", rảnh"
+            slots = worker.get("slots") or 1
+            state += (f", đang làm {worker.get('running') or 1}/{slots} việc" if worker.get("busy")
+                      else f", rảnh ({slots} việc cùng lúc)" if slots > 1 else ", rảnh")
+            if worker.get("version") != WORKER_VERSION:
+                state += f"; notebook cũ (chạy: kite worker restart {worker.get('worker_id')})"
         else:
             state = "đang dừng (draining)" if worker.get("draining") else "chưa kết nối"
         lines.append(f"{worker.get('worker_id')}: {state}")
@@ -678,6 +763,12 @@ def _memory_command(args: argparse.Namespace) -> int:
     from . import memory
 
     path = memory.memory_path(args.config.parent, args.repo)
+    if args.memory_command == "forget":
+        removed = memory.forget(path, args.number)
+        if removed is None:
+            raise ConfigError(f"không có lưu ý số {args.number} trong {path}")
+        _emit({"file": str(path), "removed": removed})
+        return 0
     _emit({"repo": str(Path(args.repo).expanduser().resolve()), "file": str(path),
            "lessons": memory.lessons(args.config.parent, args.repo, limit=1000, chars=10**9),
            "used_in_tasks": memory.lessons(args.config.parent, args.repo)})
@@ -734,11 +825,19 @@ def _mcp_command(args: argparse.Namespace) -> int:
 
     config = _load_operator_config(args)
     ops = KiteOps(config, db_path=_db_path(args), state_dir=args.config.parent,
-                  allowed_roots=args.allow_root or [Path.home()])
+                  allowed_roots=args.allow_root or [Path.home()], chat_dir=args.chat_dir,
+                  kite_command=[*_kite_executable(), "--config", str(args.config.resolve())],
+                  config_path=args.config.resolve())
     # The chat just opened: start a worker for the lead model now, while the person types.
     ops.wake_soon(model=getattr(args, "lead_model", None), reason="chat")
     build_server(ops).run(transport="stdio")
     return 0
+
+
+def _kite_executable() -> list[str]:
+    """How to run this Kite again (the chat's MCP server, detached jobs started from the chat)."""
+    kite = Path(sys.argv[0]).resolve() if Path(sys.argv[0]).exists() else Path(shutil.which("kite") or "kite")
+    return [str(kite)]
 
 
 def _chat_command(args: argparse.Namespace) -> int:
@@ -761,18 +860,19 @@ def _chat_command(args: argparse.Namespace) -> int:
     if lead not in models:
         raise ConfigError(f"model {lead} is not served by the gateway ({', '.join(models)})")
     roots = [Path(root).expanduser().resolve() for root in (args.allow_root or [Path.home()])]
-    kite = Path(sys.argv[0]).resolve() if Path(sys.argv[0]).exists() else Path(shutil.which("kite") or "kite")
-    command = [str(kite), "--config", str(args.config.resolve()), "mcp", "serve", "--lead-model", lead]
+    command = [*_kite_executable(), "--config", str(args.config.resolve()), "mcp", "serve", "--lead-model", lead,
+               "--chat-dir", str(target)]
     for root in roots:
         command += ["--allow-root", str(root)]
     target.mkdir(parents=True, exist_ok=True)
-    for name, content in chat_files(config, lead_model=lead, kite_command=command, allowed_roots=roots).items():
+    for name, content in chat_files(config, lead_model=lead, kite_command=command, allowed_roots=roots,
+                                    state_dir=args.config.parent).items():
         (target / name).write_text(content, encoding="utf-8")
     if not (target / ".git").exists():
         # OpenCode only reads a project's opencode.json inside a Git repository.
         subprocess.run(["git", "init", "-q", str(target)], check=True)
     # A running OpenCode background server would keep the old config and the old Kite tools.
-    stopped = stop_stale_chat_processes(args.config)
+    stopped = [] if args.no_reload else stop_stale_chat_processes(args.config)
     report = {"chat_dir": str(target), "lead_model": lead, "allowed_roots": [str(r) for r in roots],
               "stopped": stopped, "next": f"cd {target} && opencode"}
     # "Always allow" in OpenCode is saved for every project and outlives opencode.json: check it.
@@ -792,12 +892,13 @@ def _bench_command(args: argparse.Namespace) -> int:
     from .mcp_server import KiteOps, build_server, chat_files
 
     if args.bench_command == "history":
-        root = (args.root or args.config.parent / "bench").expanduser()
-        text, rows = bench.history(root)
+        # Runs written with --out somewhere else (~/bench-repo-v5) count too: the home folder is read.
+        roots = [args.root.expanduser()] if args.root else [args.config.parent / "bench", Path.home()]
+        text, rows = bench.history(roots)
         if args.json:
-            _emit({"root": str(root), "runs": rows})
+            _emit({"roots": [str(r) for r in roots], "runs": rows})
         else:
-            print(text if rows else f"Chưa có lần đo nào trong {root}.")
+            print(text if rows else f"Chưa có lần đo nào trong {', '.join(str(r) for r in roots)}.")
         return 0
     config = _load_operator_config(args)
     if args.bench_command == "apply":
@@ -1007,6 +1108,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _notify_command(args)
     if args.command == "memory":
         return _memory_command(args)
+    if args.command == "update":
+        return _update_command(args)
     if args.command == "model":
         return _model_add(args)
     if args.command == "doctor":
@@ -1102,6 +1205,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _worker_add(args)
     if args.command == "worker" and args.worker_command == "autostart":
         return _worker_autostart(args)
+    if args.command == "worker" and args.worker_command == "restart":
+        return _worker_restart(args)
     if args.command == "worker" and args.worker_command in ("start", "stop", "status"):
         return _worker_remote(args)
     if args.command == "worker":
@@ -1137,6 +1242,11 @@ def _operator_command(args: argparse.Namespace) -> int:
             return _run_workflow_worker(args, config)
         from temporalio.client import Client
         from .temporal_workflow import CodingTaskInput, CodingTaskWorkflow
+
+        if args.workflow_command == "cancel":
+            from .backend import request_cancel
+
+            request_cancel(args.config.parent, args.workflow_id)
 
         async def operate():
             client = await Client.connect(config.temporal_endpoint)
@@ -1223,7 +1333,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
-                        "mcp", "chat", "bench", "journal", "cleanup", "model", "notify", "memory"}:
+                        "mcp", "chat", "bench", "journal", "cleanup", "model", "notify", "memory", "update"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

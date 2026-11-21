@@ -85,3 +85,101 @@ def remember_note(state_dir: Path, task_id: str, verdict: str, text: str) -> str
     if repo is None:
         return None
     return str(remember(state_dir, repo, task_id, text))
+
+
+def lesson_lines(state_dir: Path, repo: str | Path) -> list[str]:
+    """Every lesson line kept for ``repo`` (``- date (task): text``), oldest first."""
+    try:
+        text = memory_path(state_dir, repo).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines() if line.startswith("- ")]
+
+
+def forget(path: Path, number: int) -> str | None:
+    """Remove the ``number``-th (from 1) ``- `` line of a memory file; returns it, or None."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return None
+    items = [i for i, line in enumerate(lines) if line.startswith("- ")]
+    if not 1 <= number <= len(items):
+        return None
+    removed = lines.pop(items[number - 1])
+    Path(path).write_text("".join(lines), encoding="utf-8")
+    return removed.strip()
+
+
+# ---------------------------------------------------------------------- what the person prefers
+# Like a person's memory in Claude: things the person asked the chat to keep in mind for every
+# conversation ("hỏi trước khi tạo task", "trả lời ngắn"). The lead agent saves them with the
+# ``remember`` tool; they go into the chat's AGENTS.md, so every new chat session starts with them.
+
+PREFERENCE_LINES = 30
+
+
+def preferences_path(state_dir: Path) -> Path:
+    return Path(state_dir) / "memory" / "_nguoi-dung.md"
+
+
+def preferences(state_dir: Path) -> list[str]:
+    try:
+        text = preferences_path(state_dir).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines() if line.startswith("- ")][-PREFERENCE_LINES:]
+
+
+def add_preference(state_dir: Path, text: str, *, clock=time.time) -> Path:
+    path = preferences_path(state_dir)
+    line = " ".join(text.split())[:LINE_CHARS]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("# Kite: điều người dùng dặn chat nhớ\n\nMỗi dòng một điều. Sửa hoặc xoá tuỳ ý.\n\n",
+                        encoding="utf-8")
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"- {time.strftime('%Y-%m-%d', time.localtime(clock()))}: {line}\n")
+    return path
+
+
+PREFERENCES_START = "<!-- kite:nguoi-dung -->"
+PREFERENCES_END = "<!-- /kite:nguoi-dung -->"
+
+
+def preferences_block(state_dir: Path) -> str:
+    """The AGENTS.md section with what the person asked to keep in mind ("" when nothing)."""
+    found = preferences(state_dir)
+    if not found:
+        return ""
+    return (f"\n{PREFERENCES_START}\n## Người dùng đã dặn (luôn làm theo)\n\n" + "\n".join(found)
+            + f"\n{PREFERENCES_END}\n")
+
+
+def refresh_agents_file(agents: Path, state_dir: Path) -> bool:
+    """Put the current preferences into an existing chat AGENTS.md (replacing the old section)."""
+    try:
+        text = Path(agents).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    text = re.sub(re.escape("\n" + PREFERENCES_START) + r".*?" + re.escape(PREFERENCES_END) + r"\n?", "", text,
+                  flags=re.S)
+    Path(agents).write_text(text.rstrip("\n") + "\n" + preferences_block(state_dir), encoding="utf-8")
+    return True
+
+
+# ---------------------------------------------------------------------- how a repository is tested
+# A repository without a committed .kite.yml gets one kept by Kite instead (same keys), so nobody
+# writes and commits the file by hand: start_task saves Kite's proposal the first time, the chat
+# shows and changes it (repo_config tool), and a committed .kite.yml always wins.
+
+def repo_config_path(state_dir: Path, repo: str | Path) -> Path:
+    return Path(state_dir) / "memory" / f"{repo_key(repo)}.kite.yml"
+
+
+def save_repo_config(state_dir: Path, repo: str | Path, text: str) -> Path:
+    path = repo_config_path(state_dir, repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = f"# Kite: cách cài và chạy test của {Path(repo).expanduser().resolve()} (repo chưa có .kite.yml)\n"
+    body = "\n".join(line for line in text.strip().splitlines() if not line.startswith("# Kite: cách cài"))
+    path.write_text(header + body + "\n", encoding="utf-8")
+    return path

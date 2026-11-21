@@ -31,6 +31,25 @@ TOOL_COMPLETION = {
 }
 
 
+async def sse_reply(request: web.Request, completion: dict, *, delay: float = 0.0) -> web.StreamResponse:
+    """A fake llama-server answer: the worker always asks for a stream."""
+    message = completion["choices"][0]["message"]
+    chunks = [{"id": completion["id"], "model": completion["model"], "choices": [{"index": 0, "delta": {
+        "role": "assistant", **({"content": message["content"]} if message.get("content") else {}),
+        **({"tool_calls": [{"index": i, **call} for i, call in enumerate(message["tool_calls"])]}
+           if message.get("tool_calls") else {})}, "finish_reason": None}]},
+              {"choices": [{"index": 0, "delta": {}, "finish_reason": completion["choices"][0]["finish_reason"]}],
+               "usage": completion.get("usage")}]
+    response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+    await response.prepare(request)
+    for chunk in chunks:
+        await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+        if delay:
+            await asyncio.sleep(delay)
+    await response.write(b"data: [DONE]\n\n")
+    return response
+
+
 def make_gateway(**kwargs) -> ModelGateway:
     return ModelGateway(
         [WorkerAuth("w1", TOKEN_A, ("qwen3.6", "devstral")), WorkerAuth("w2", TOKEN_B, ("qwen3.6",))],
@@ -144,9 +163,9 @@ def test_pull_worker_serves_a_request_end_to_end_and_switches_model():
         gateway = make_gateway()
         llama_bodies = []
 
-        async def fake_llama(request: web.Request) -> web.Response:
+        async def fake_llama(request: web.Request) -> web.StreamResponse:
             llama_bodies.append(await request.json())
-            return web.json_response(COMPLETION)
+            return await sse_reply(request, COMPLETION)
 
         llama_app = web.Application()
         llama_app.router.add_post("/v1/chat/completions", fake_llama)
@@ -162,19 +181,22 @@ def test_pull_worker_serves_a_request_end_to_end_and_switches_model():
                     llama_url=str(llama.make_url("/")),
                     poll_wait_seconds=1, heartbeat_seconds=0.2, log=lambda _msg: None)
                 running = asyncio.create_task(asyncio.to_thread(worker.run))
-                answer = await client.post("/v1/chat/completions", json={
-                    "model": "qwen3.6", "messages": [{"role": "user", "content": "chào"}]})
-                assert answer.status == 200
-                assert (await answer.json())["choices"][0]["message"]["content"] == "xin chào"
-                worker.stop()
-                await running
+                try:
+                    answer = await client.post("/v1/chat/completions", json={
+                        "model": "qwen3.6", "messages": [{"role": "user", "content": "chào"}]})
+                    assert answer.status == 200
+                    assert (await answer.json())["choices"][0]["message"]["content"] == "xin chào"
+                finally:
+                    worker.stop()
+                    await running
         finally:
             await llama.close()
         return llama_bodies, loaded["model"]
 
     bodies, model = asyncio.run(scenario())
     assert model == "qwen3.6"
-    assert bodies[0]["stream"] is False and bodies[0]["model"] == "qwen3.6"
+    # The client asked for one piece; the worker still streams from llama-server (so a cancel stops it).
+    assert bodies[0]["stream"] is True and bodies[0]["model"] == "qwen3.6"
 
 
 def _base_config(tmp_path, **extra):
@@ -490,19 +512,21 @@ def test_pull_worker_streams_from_llama_server_and_journals_the_assembled_answer
                                     poll_wait_seconds=1, heartbeat_seconds=0.2, stream_flush_seconds=0.02,
                                     log=lambda _msg: None)
                 running = asyncio.create_task(asyncio.to_thread(worker.run))
-                streamed = await (await client.post("/v1/chat/completions", json={
-                    "model": "qwen3.6", "stream": True, "messages": []})).text()
-                plain = await (await client.post("/v1/chat/completions", json={
-                    "model": "qwen3.6", "messages": []})).json()
-                worker.stop()
-                await running
+                try:
+                    streamed = await (await client.post("/v1/chat/completions", json={
+                        "model": "qwen3.6", "stream": True, "messages": []})).text()
+                    plain = await (await client.post("/v1/chat/completions", json={
+                        "model": "qwen3.6", "messages": []})).json()
+                finally:
+                    worker.stop()
+                    await running
         finally:
             await llama.close()
         return bodies, streamed, plain
 
     bodies, streamed, plain = asyncio.run(scenario())
     assert bodies[0]["stream"] is True and bodies[0]["stream_options"] == {"include_usage": True}
-    assert bodies[1]["stream"] is False and plain["choices"][0]["message"]["content"] == "xin chào"
+    assert bodies[1]["stream"] is True and plain["choices"][0]["message"]["content"] == "xin chào"
     data = _data(streamed)
     assert data[-1] == "[DONE]" and len(data) == len(STREAM) + 1
     assert records[0]["outcome"] == "ok" and records[0]["completion_tokens"] == 4
@@ -544,3 +568,106 @@ def test_model_add_puts_a_chat_only_model_on_the_named_workers(tmp_path, capsys)
     assert cli.main(["--config", str(config_path), "model", "add", "x", "--provider", "kaggle-han",
                      "--context", "100"]) == 1                              # validated before writing
     assert "x" not in json.loads(config_path.read_text())["providers"][0]["models"]
+
+
+def test_a_worker_with_two_slots_runs_a_chat_while_a_task_request_generates():
+    # Bench day, step 2: the person waited 1 min 47 s for the lead's answer behind a task's request.
+    async def scenario():
+        gateway = make_gateway(keepalive_seconds=0.05)
+        order = []
+        release = asyncio.Event()
+
+        async def fake_llama(request: web.Request) -> web.StreamResponse:
+            body = await request.json()
+            name = body["messages"][0]["content"]
+            order.append(f"start {name}")
+            if name == "task":
+                await release.wait()
+            reply = await sse_reply(request, COMPLETION)
+            order.append(f"end {name}")
+            if name == "chat":
+                release.set()
+            return reply
+
+        llama_app = web.Application()
+        llama_app.router.add_post("/v1/chat/completions", fake_llama)
+        llama = TestServer(llama_app)
+        await llama.start_server()
+        try:
+            async with TestClient(TestServer(create_app(gateway))) as client:
+                worker = PullWorker(str(client.make_url("/")), TOKEN_A, ensure_model=lambda model: None,
+                                    loaded_model=lambda: "qwen3.6", llama_url=str(llama.make_url("/")),
+                                    poll_wait_seconds=1, heartbeat_seconds=0.2, stream_flush_seconds=0.02,
+                                    slots=lambda: 2, log=lambda _msg: None)
+                running = asyncio.create_task(asyncio.to_thread(worker.run))
+                try:
+                    task = asyncio.create_task(client.post("/v1/chat/completions", headers={"X-Kite-Task": "t1"},
+                                                           json={"model": "qwen3.6", "messages": [
+                                                               {"role": "user", "content": "task"}]}))
+                    while "start task" not in order:
+                        await asyncio.sleep(0.02)
+                    chat = await client.post("/v1/chat/completions", headers={"X-Kite-Task": "chat"}, json={
+                        "model": "qwen3.6", "messages": [{"role": "user", "content": "chat"}]})
+                    assert chat.status == 200 and (await task).status == 200
+                    status = (await (await client.get("/status")).json())["workers"][0]
+                finally:
+                    worker.stop()
+                    await running
+        finally:
+            await llama.close()
+        return order, status
+
+    order, status = asyncio.run(scenario())
+    assert order.index("end chat") < order.index("end task")      # the chat did not wait for the task
+    assert status["slots"] == 2 and status["version"]
+
+
+def test_a_busy_worker_only_takes_more_requests_for_the_model_it_has_loaded():
+    async def scenario():
+        gateway = make_gateway()
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6", "slots": 2})
+        first = await gateway.submit({"model": "qwen3.6", "messages": []})
+        other = await gateway.submit({"model": "devstral", "messages": []})
+        assert (await gateway.next_job("w1", 0)).job_id == first.job_id
+        assert await gateway.next_job("w1", 0) is None          # devstral would swap the model under it
+        same = await gateway.submit({"model": "qwen3.6", "messages": []})
+        assert (await gateway.next_job("w1", 0)).job_id == same.job_id
+        assert await gateway.next_job("w1", 0) is None          # both slots taken
+        gateway.complete("w1", first.job_id, {"status": "ok", "response": COMPLETION})
+        gateway.complete("w1", same.job_id, {"status": "ok", "response": COMPLETION})
+        assert (await gateway.next_job("w1", 0)).job_id == other.job_id   # idle: now it may switch
+        return gateway.status()["workers"][0]
+
+    worker = asyncio.run(scenario())
+    assert worker["busy"] and worker["running"] == 1 and worker["slots"] == 2
+
+
+def test_cancelling_a_task_drops_its_queued_and_running_requests_and_stops_the_worker_generating():
+    async def scenario():
+        gateway = make_gateway()
+        async with TestClient(TestServer(create_app(gateway))) as client:
+            headers = {"Authorization": f"Bearer {TOKEN_A}"}
+            await client.post("/worker/heartbeat", json={"ready": True, "loaded_model": "qwen3.6"}, headers=headers)
+            running = asyncio.create_task(client.post("/v1/chat/completions", headers={"X-Kite-Task": "t9"},
+                                                      json={"model": "qwen3.6", "messages": []}))
+            job = await (await client.get("/worker/jobs?wait=5", headers=headers)).json()
+            helper = asyncio.create_task(client.post("/v1/chat/completions", headers={"X-Kite-Task": "t9-b2"},
+                                                     json={"model": "qwen3.6", "messages": []}))
+            other = asyncio.create_task(client.post("/v1/chat/completions", headers={"X-Kite-Task": "t10"},
+                                                    json={"model": "qwen3.6", "messages": []}))
+            await asyncio.sleep(0.1)
+            # A non-streamed job still takes chunks while it is wanted (the worker always streams).
+            alive = await client.post(f"/worker/jobs/{job['job_id']}/chunks", headers=headers,
+                                      json={"start": 0, "chunks": [{"choices": []}]})
+            refused = await client.post("/kite/cancel", json={"tag": ""})
+            cancelled = await (await client.post("/kite/cancel", json={"tag": "t9"})).json()
+            gone = await client.post(f"/worker/jobs/{job['job_id']}/chunks", headers=headers,
+                                     json={"start": 1, "chunks": [{"choices": []}]})
+            answers = [await running, await helper]
+            left = [gateway.jobs[j].tag for j in gateway._queue]
+            other.cancel()
+            return alive.status, refused.status, cancelled, gone.status, [a.status for a in answers], left
+
+    alive, refused, cancelled, gone, answers, left = asyncio.run(scenario())
+    assert alive == 200 and refused == 400 and cancelled == {"tag": "t9", "dropped": 2}
+    assert gone == 409 and all(code >= 500 for code in answers) and left == ["t10"]

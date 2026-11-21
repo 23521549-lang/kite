@@ -240,12 +240,14 @@ def test_worker_status_reads_like_a_sentence(tmp_path, capsys, monkeypatch):
         {"worker_id": "kaggle-han", "alive": False, "loaded_model": None, "busy": False,
          "launch": {"state": "starting", "seconds": 900, "kaggle": "queued", "kaggle_seconds": 840,
                     "detail": "Kaggle đang xếp hàng GPU cho version 5 (14 phút)", "version": "5"}},
-        {"worker_id": "kaggle-an", "alive": True, "loaded_model": "qwen3.6", "busy": True}]}
+        {"worker_id": "kaggle-an", "alive": True, "loaded_model": "qwen3.6", "busy": True, "running": 1, "slots": 2,
+         "version": "old"}]}
     monkeypatch.setattr(cli, "_gateway_call", lambda *a, **k: report)
     assert cli.main(["--config", str(path), "worker", "status"]) == 0
     text = capsys.readouterr().out
     assert "kaggle-han: chưa kết nối" in text and "tự bật: starting (15 phút), Kaggle: queued (14 phút)" in text
-    assert "xếp hàng GPU cho version 5" in text and "kaggle-an: sống, model qwen3.6, đang làm việc" in text
+    assert "xếp hàng GPU cho version 5" in text and "kaggle-an: sống, model qwen3.6, đang làm 1/2 việc" in text
+    assert "notebook cũ (chạy: kite worker restart kaggle-an)" in text
     assert "1 request đang chờ" in text
     assert cli.main(["--config", str(path), "worker", "status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == report
@@ -384,6 +386,26 @@ def test_notebook_worker_cell_is_pull_worker_py_and_has_the_launch_line():
     assert "stop_when_idle_seconds=IDLE_MINUTES * 60" in worker_cell
     with pytest.raises(ValueError):
         inject_launch({"cells": []}, {})
+
+
+def notebook_worker_version(nb: dict) -> str:
+    """What pull_worker.WORKER_VERSION must be: a hash of the notebook's code cells."""
+    import hashlib
+    import re
+
+    sources = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
+    text = "\n\0\n".join(re.sub(r'^WORKER_VERSION = "[0-9a-f]*"$', 'WORKER_VERSION = ""', s, flags=re.M)
+                          for s in sources)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def test_worker_version_names_the_notebook_code_so_a_stale_notebook_shows():
+    from poc.kaggle_worker import pull_worker
+
+    nb = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    expected = notebook_worker_version(nb)
+    assert pull_worker.WORKER_VERSION == expected, (
+        f"a notebook cell changed: set WORKER_VERSION = \"{expected}\" in pull_worker.py (and its cell)")
 
 
 def test_parse_status():

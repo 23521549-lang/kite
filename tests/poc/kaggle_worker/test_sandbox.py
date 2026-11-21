@@ -1054,13 +1054,15 @@ def test_a_fix_the_repository_accepts_but_the_reproduction_partly_disputes_stays
                                  "1 failed, 1 passed\n")
     logs: list[str] = []
     repo = make_repo(tmp_path)
-    ask = answers(REPRO_TWO, FIX)
+    ask = answers(REPRO_TWO, FIX, "ỔN")
     run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
                        models=["qwen3.6"], state_dir=tmp_path / "state", task_id="p2", runner=fake,
                        log=logs.append, asker=ask)
-    # The repository's tests ran without the reproduction test (and passed), then no retry: the agent.
-    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "agent", "quick", "test", "review"]
-    assert run.fast_path == "repro_disputed" and run.fast_attempts == 1 and len(ask.prompts) == 2
+    # The repository's tests ran without the reproduction test (and passed), then no retry: the agent,
+    # then the one-call review of its small patch.
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "agent", "quick", "test"]
+    assert run.fast_path == "repro_disputed" and run.fast_attempts == 1 and len(ask.prompts) == 3
+    assert "Đây là bước RÀ SOÁT cuối" in ask.prompts[-1]
     agent = fake.call("agent")[-1]
     assert "GIỮ nó trong /work" in agent and "test_empty_list_gives_none" in agent and "CÓ THỂ SAI" in agent
     assert "qua 1 ca từng lỗi trên code cũ (test_empty_list_gives_zero)" in agent and "if xs else 0" in agent
@@ -1121,8 +1123,11 @@ def test_a_fast_fix_that_fails_the_tests_is_dropped_and_the_agent_is_told(tmp_pa
     _, run = run_task(tmp_path, fake, "f2", asker=lambda prompt: prompts.append(prompt) or FIX)
     assert [fake.kind(c) for c in fake.calls][:4] == ["test", "test", "agent", "test"]
     assert run.fast_path == "tests_failed" and run.fast_attempts == 2 and run.verified and run.fix_rounds_used == 0
-    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-1] and "ZeroDivisionError" in prompts[-1]
-    assert "LẦN THỬ TRƯỚC" not in prompts[-2]
+    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-2] and "ZeroDivisionError" in prompts[-2]
+    assert "LẦN THỬ TRƯỚC" not in prompts[-3]
+    # The agent's patch is small and passes: a one-call review, not a second agent session.
+    assert "Đây là bước RÀ SOÁT cuối" in prompts[-1] and run.review_mode == "one_call" and "review" not in [
+        fake.kind(c) for c in fake.calls]
     agent = fake.call("agent")[-1]
     assert "Kite đã thử một bản sửa nhanh" in agent and "test của Kite lỗi" in agent and "if xs else 0" in agent
     assert "ZeroDivisionError" in agent                                       # what the tests said
@@ -1302,3 +1307,36 @@ def test_changed_existing_tests_are_flagged_for_the_review(tmp_path):
     prompt = sbx.review_prompt("g", "pytest", edited=["test_calc.py"])
     assert "Bạn đã sửa hoặc xóa test có sẵn: test_calc.py" in prompt and "trả file test về như cũ" in prompt
     assert "Bạn đã sửa hoặc xóa" not in sbx.review_prompt("g", "pytest")
+
+
+def test_adding_tests_to_an_existing_test_file_is_allowed_but_changing_or_skipping_tests_is_not(tmp_path):
+    # Full-test day, step 2: "add tests" put new functions into services/agent/tests/test_cli.py; the fast
+    # path refused any change to an existing test file and the task went to the agent (about 20 minutes).
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "calc.py").write_text("def average(xs):\n    return sum(xs) / len(xs)\n")
+    (repo / "tests" / "test_calc.py").write_text("from calc import average\n\n\ndef test_one():\n"
+                                                 "    assert average([2]) == 2\n")
+    (repo / "tests" / "conftest.py").write_text("")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "i"],
+                   check=True)
+    added = ("calc.py\n<<<<<<< SEARCH\n    return sum(xs) / len(xs)\n=======\n"
+             "    return sum(xs) / len(xs) if xs else 0\n>>>>>>> REPLACE\n\n"
+             "tests/test_calc.py\n<<<<<<< SEARCH\n    assert average([2]) == 2\n=======\n    assert average([2]) == 2\n"
+             "\n\ndef test_empty():\n    assert average([]) == 0\n>>>>>>> REPLACE\n")
+    fast = sbx.fast_apply(repo, added)
+    assert fast.status == "applied" and set(fast.files) == {"calc.py", "tests/test_calc.py"}
+    sbx.restore_tree(repo, fast.before)
+    changed = added.replace("    assert average([2]) == 2\n\n\ndef test_empty", "    assert average([2]) > 0\n\n\ndef test_empty")
+    assert sbx.fast_apply(repo, changed).reason.startswith("sửa test có sẵn (tests/test_calc.py)")
+    skipping = ("tests/conftest.py\n<<<<<<< SEARCH\n=======\nimport pytest\n>>>>>>> REPLACE\n")
+    # An empty conftest.py exists: a block "creating" it is refused by editblocks; an edit is refused as a test edit.
+    (repo / "tests" / "conftest.py").write_text("import os\n")
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qam", "c"],
+                   check=True)
+    hook = ("tests/conftest.py\n<<<<<<< SEARCH\nimport os\n=======\nimport os\n\n\ndef pytest_collection_modifyitems"
+            "(items):\n    items.clear()\n>>>>>>> REPLACE\n")
+    assert "conftest.py" in sbx.fast_apply(repo, hook).reason
+    assert sbx.fast_apply(repo, skipping).status == "not_applied"

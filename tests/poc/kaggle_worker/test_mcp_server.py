@@ -124,6 +124,7 @@ def test_repositories_must_be_git_and_inside_the_allowed_folders(tmp_path):
 
 def test_instruction_pause_resume_and_cancel_become_workflow_signals(tmp_path):
     client = FakeClient()
+    client.state["t1"] = "RUNNING"
     ops = make_ops(tmp_path, client)
     asyncio.run(ops.send_instruction("t1", " Thêm docstring "))
     asyncio.run(ops.pause_task("t1"))
@@ -358,7 +359,10 @@ def test_mcp_server_exposes_every_tool(tmp_path):
     names = {tool.name for tool in asyncio.run(server.list_tools())}
     assert names == {"start_task", "task_status", "task_result", "apply_result", "commit_result", "repo_status",
                      "run_command", "send_instruction", "pause_task",
-                     "resume_task", "cancel_task", "list_tasks", "worker_status", "note_task"}
+                     "resume_task", "cancel_task", "list_tasks", "worker_status", "note_task",
+                     # Chat-first: nothing the full-test day needed a terminal for is left out.
+                     "wait_task", "task_log", "remember", "memory_show", "memory_forget", "repo_config",
+                     "doctor", "cleanup", "worker_restart", "update_kite", "bench_start", "bench_history"}
 
 
 def fake_process(proc: Path, pid: int, argv: list[str], namespace: str = "pid:[1]") -> None:
@@ -444,7 +448,8 @@ def test_lead_cannot_read_files_with_shell_and_is_told_not_to_promise_notificati
     assert LEAD_BASH_PERMISSION["*"] == "ask"
     agents = chat_files(make_config(tmp_path), lead_model="qwen3.6", kite_command=["kite"],
                         allowed_roots=[tmp_path])["AGENTS.md"]
-    assert "KHÔNG thể tự báo" in agents and "TỪNG việc" in agents and "`repo_status`" in agents
+    assert "`wait_task`" in agents and "mỗi việc một `start_task`" in agents and "`repo_status`" in agents
+    assert "KHÔNG BAO GIỜ nói đã làm xong một việc khi tool của việc đó báo lỗi" in agents
 
 
 def test_persisted_always_allow_shell_approvals_are_found_and_cleared(tmp_path):
@@ -484,7 +489,7 @@ def test_note_task_records_the_users_verdict_in_the_journal(tmp_path):
         with pytest.raises(KiteToolError):
             asyncio.run(ops.note_task(*bad))
     from poc.kaggle_worker.mcp_server import LEAD_INSTRUCTIONS as agents
-    assert "`note_task`" in agents and "kite_yml_suggestion" in agents and "kite_note_task" in agents
+    assert "`note_task`" in agents and "`continue_from`" in agents and "tiền tố `kite_`" in agents
 
 
 def test_a_repo_without_kite_yml_gets_a_proposal_and_never_a_file(tmp_path):
@@ -501,17 +506,22 @@ def test_a_repo_without_kite_yml_gets_a_proposal_and_never_a_file(tmp_path):
     client = FakeClient()
     ops = make_ops(tmp_path, client)
     started = asyncio.run(ops.start_task(str(repo), "Thêm endpoint /health"))
-    proposal = started["kite_yml_suggestion"]
+    proposal = started["repo_config"]["config"]
+    assert started["repo_config"]["new"] is True
     assert "setup: pip install -q -r svc/api/requirements.txt" in proposal
     assert "test: PYTHONPATH=. python -m pytest -q svc/api/tests" in proposal and "{tests}" in proposal
-    assert not (repo / ".kite.yml").exists()                                    # only a proposal
+    assert not (repo / ".kite.yml").exists()                                    # never a file in the repo
+    # Kite keeps it, so the task installs and tests the right way without anyone writing .kite.yml.
+    saved = Path(started["repo_config"]["file"])
+    assert saved.is_file() and "svc/api/requirements.txt" in saved.read_text()
+    assert "new" not in asyncio.run(ops.start_task(str(repo), "Thêm endpoint /ready"))["repo_config"]
     status = asyncio.run(ops.repo_status(str(repo)))
     assert status["kite_yml"] == {"present": False, "suggestion": proposal}
     (repo / ".kite.yml").write_text("test: python -m pytest -q svc\n")
     run("add", "-A")
     run("commit", "-qm", "kite")
     assert asyncio.run(ops.repo_status(str(repo)))["kite_yml"]["present"] is True
-    assert "kite_yml_suggestion" not in asyncio.run(ops.start_task(str(repo), "x y"))
+    assert "repo_config" not in asyncio.run(ops.start_task(str(repo), "x y"))
     # Nothing to install and tests at the root: Kite's defaults fit, no proposal.
     assert suggest_repo_config(["calc.py", "tests/test_calc.py"]) == ""
     assert "pip install -q -e '.[test]'" in suggest_repo_config(

@@ -215,13 +215,28 @@ kite chat setup --force && kite chat reload
 
 ### Disk
 
-Every task, sandbox run and bench run keeps a clone of the repository, its installed libraries and the code map next to its results and logs. `kite cleanup` lists those big folders for runs unchanged for `--days` (default 7) and removes them with `--yes`; `result.json`, `result.patch`, the logs, `trace.jsonl` and bench `results.json`/`README.md` stay. A task cleaned up this way can no longer be continued with `send_instruction`. `--deps-cache` also removes cached libraries that no kept task links to (they are installed again when needed). Do not use `docker system prune`: it also removes the sandbox network while no container uses it.
+Every task, sandbox run and bench run keeps a clone of the repository, its installed libraries and the code map next to its results and logs. `kite cleanup` lists those big folders for runs unchanged for `--days` (default 7), including bench folders written with `--out` into the home folder, and removes them with `--yes`; `result.json`, `result.patch`, the logs, `trace.jsonl` and bench `results.json`/`README.md` stay. A task cleaned up this way can no longer be continued with `send_instruction`. `--deps-cache` also removes cached libraries that no kept task links to (they are installed again when needed). Do not use `docker system prune`: it also removes the sandbox network while no container uses it.
 
 ### Notifications, repository memory, cost per task
 
 - `kite notify setup` picks a random ntfy topic (the only key to it), keeps it in a 0600 secret file and turns on one push message per finished or failed task: task id, outcome, minutes, GPU minutes; never code or the goal. Subscribe to the printed topic in the ntfy app, restart `kite-workflow-worker`, then `kite notify test`. `--off` turns it off.
 - A `bad` note on a task (chat `note_task`, or `kite journal note TASK --bad "why"`) becomes a line in `<state>/memory/<repo>.md`; later tasks on the same repository get the newest lines in their goal. `kite memory show <repo>` prints them; edit or delete lines in that file freely.
 - Each task's `result.json`, summary and journal line carry its cost: model calls, GPU seconds on the workers (Kaggle's quota), tokens, the agent's turns, tool calls and re-reads of something it had already read, and the patch size. `kite bench` reports them per task (patch size next to the real fix's) and `kite bench history` per run.
+
+### Everything from the chat
+
+The full-test day (step 2) needed a terminal for half of it. The lead agent now has a tool for each of those jobs, and asks before any that changes the machine (`confirm=true`):
+
+- Task IDs: an empty `task_id` means the newest task, and any unique part of an ID works (its last 4 characters, `short_id`); a wrong ID gets the recent IDs back instead of a bare "not found".
+- `cancel_task` (and `kite workflow cancel`) first writes `<task>/cancel_requested`: every container of the task is killed, its model requests are dropped at the gateway (`POST /kite/cancel`, loopback only) and the run stops at its next step, so the worker is free within seconds. Pause still only stops the agent.
+- `wait_task` answers when a task ends ("xong thì báo"); `task_status` says what a queued task waits for and what the agent did last (`vừa sửa services/agent/cli.py (12 thao tác)`); `task_log` tells the whole story.
+- `start_task` refuses a repository with uncommitted changes to tracked files (the task would run on the old version without saying so) and says how to go on. `continue_from=<task>` starts a follow-up from that task's result (its patch goes into the clone first): "chưa tốt, sửa X" no longer means apply, commit and start over. `apply_result` of the follow-up swaps out the previous patch if it is applied.
+- A repository without `.kite.yml` gets the config Kite proposes saved in `<state>/memory/<repo>.kite.yml` (never in the repository); `repo_config` shows it and saves a corrected one. A committed `.kite.yml` always wins.
+- `remember` keeps what the person asks the chat to keep in mind: for every chat (`<state>/memory/_nguoi-dung.md`, written into the chat's AGENTS.md) or as a lesson for one repository. `memory_show` and `memory_forget` (and `kite memory forget <repo> <n>`) manage them.
+- `doctor`, `cleanup`, `worker_restart`, `update_kite`, `bench_start`, `bench_history`: the same as the CLI. `kite update` pulls, runs the tests (the old commit comes back if they fail), restarts the services and rewrites the chat files; `kite worker restart <worker>` ends the Kaggle session and starts it again with this repository's notebook.
+- The lead agent has no Code Mode (`"execute": "deny"`), so OpenCode lists Kite's tools directly: through Code Mode the model wrote invalid JavaScript to call them.
+
+The worker reports `WORKER_VERSION` (a hash of the notebook's code cells): `kite doctor` and `kite worker status` say when a notebook started by hand runs older code. Models with `"parallel": 2` in the roster (qwen3.6) start llama-server with `--parallel 2 --kv-unified` (one 128K KV cache shared by two requests; back to 1 if this llama-server refuses the flag) and the worker takes two jobs at once on the loaded model, so a chat answer does not wait behind a task's long request. Every request is streamed from llama-server, so a cancelled task or a gone client stops generating at once.
 
 ## Sandboxed runs
 

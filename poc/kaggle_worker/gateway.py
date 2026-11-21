@@ -63,7 +63,10 @@ class WorkerState:
     loaded_model: str | None = None
     cached_models: tuple[str, ...] = ()
     last_seen: float = 0.0
-    current_job: str | None = None
+    # Jobs running now: up to ``slots`` at once (llama-server's --parallel), all on the loaded model.
+    current_jobs: set[str] = field(default_factory=set)
+    slots: int = 1
+    version: str | None = None      # WORKER_VERSION of the notebook code the worker runs
 
 
 @dataclass
@@ -232,9 +235,8 @@ class ModelGateway:
         return job
 
     def _finish(self, job: Job, *, result: dict[str, Any] | None = None, error: str | None = None) -> None:
-        if job.worker_id and self.workers.get(job.worker_id) and \
-                self.workers[job.worker_id].current_job == job.job_id:
-            self.workers[job.worker_id].current_job = None
+        if job.worker_id and self.workers.get(job.worker_id):
+            self.workers[job.worker_id].current_jobs.discard(job.job_id)
         if job.job_id in self._queue:
             self._queue.remove(job.job_id)
         self.jobs.pop(job.job_id, None)
@@ -259,6 +261,18 @@ class ModelGateway:
     def cancel(self, job: Job) -> None:
         self._finish(job, error="client disconnected")
 
+    def cancel_tag(self, tag: str) -> int:
+        """Drop every request of one task (its tag, and its best-of-N helpers ``<tag>-bN``): queued
+        ones never run, and a worker generating one stops at its next chunk (the gateway refuses it)."""
+        if not tag:
+            return 0
+        dropped = 0
+        for job in list(self.jobs.values()):
+            if job.tag == tag or (job.tag or "").startswith(tag + "-b"):
+                self._finish(job, error="task cancelled")
+                dropped += 1
+        return dropped
+
     # ------------------------------------------------------------------ worker side
     async def heartbeat(self, worker_id: str, payload: Mapping[str, Any]) -> WorkerState:
         worker = self.workers[worker_id]
@@ -269,6 +283,10 @@ class ModelGateway:
         worker.loaded_model = loaded if isinstance(loaded, str) and loaded else None
         cached = payload.get("cached_models", [])
         worker.cached_models = tuple(m for m in cached if isinstance(m, str)) if isinstance(cached, list) else ()
+        slots = payload.get("slots", 1)
+        worker.slots = min(max(slots, 1), 8) if isinstance(slots, int) and not isinstance(slots, bool) else 1
+        version = payload.get("version")
+        worker.version = version[:40] if isinstance(version, str) and version else None
         worker.last_seen = self.clock()
         if worker.draining:
             self.stop_requested.discard(worker_id)      # the worker got the stop request
@@ -279,7 +297,7 @@ class ModelGateway:
         self._notify()
         return worker
 
-    def _pick_job(self, worker: WorkerState) -> Job | None:
+    def _pick_job(self, worker: WorkerState, *, busy: bool = False) -> Job | None:
         """Prefer jobs for the model already loaded, then the oldest job this worker can serve.
 
         A job pinned to another worker (a task's requests go to the worker its route reserved) is
@@ -302,7 +320,9 @@ class ModelGateway:
             return True
 
         candidates = [self.jobs[j] for j in self._queue
-                      if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j])]
+                      if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j])
+                      # A worker already running a job only takes more for the loaded model (no swap).
+                      and (not busy or self.jobs[j].model == worker.loaded_model)]
         # The person chatting is waiting; a task's request can wait one turn. Stable sort keeps age order.
         candidates.sort(key=lambda job: job.tag != "chat")
         if not candidates:
@@ -330,9 +350,9 @@ class ModelGateway:
         deadline = self.clock() + wait_seconds
         while True:
             self.reap()
-            if worker.ready and not worker.draining and worker.current_job is None \
+            if worker.ready and not worker.draining and len(worker.current_jobs) < worker.slots \
                     and worker_id not in self.stop_requested:
-                job = self._pick_job(worker)
+                job = self._pick_job(worker, busy=bool(worker.current_jobs))
                 if job is not None:
                     self._queue.remove(job.job_id)
                     job.worker_id = worker_id
@@ -343,7 +363,7 @@ class ModelGateway:
                         while len(self.affinity) > 1000:
                             self.affinity.pop(next(iter(self.affinity)))
                     job.attempts += 1
-                    worker.current_job = job.job_id
+                    worker.current_jobs.add(job.job_id)
                     return job
             remaining = deadline - self.clock()
             if remaining <= 0:
@@ -359,8 +379,10 @@ class ModelGateway:
         reply was lost) is skipped where already passed on; False if the job is gone or not this
         worker's (the client went away: the worker stops generating)."""
         job = self.jobs.get(job_id)
-        if job is None or job.worker_id != worker_id or job.chunks is None:
+        if job is None or job.worker_id != worker_id:
             return False
+        if job.chunks is None:
+            return True     # the client wants one piece: the chunks only tell that the job is still wanted
         if not isinstance(start, int) or isinstance(start, bool) or not 0 <= start <= job.sent \
                 or not isinstance(chunks, list):
             return False
@@ -398,8 +420,7 @@ class ModelGateway:
             overran = job.assigned_at is not None and now - job.assigned_at > self.job_timeout_seconds
             if not (stale or overran):
                 continue
-            if worker.current_job == job.job_id:
-                worker.current_job = None
+            worker.current_jobs.discard(job.job_id)
             if job.sent:                      # the client already has part of this answer: no retry
                 self._finish(job, error="worker stopped in the middle of the answer")
             elif job.attempts >= self.max_attempts:
@@ -417,7 +438,8 @@ class ModelGateway:
                 "worker_id": w.worker_id, "alive": self._alive(w, now), "draining": w.draining,
                 "models": list(w.model_ids),
                 "loaded_model": w.loaded_model, "cached_models": list(w.cached_models),
-                "busy": w.current_job is not None,
+                "busy": bool(w.current_jobs), "running": len(w.current_jobs), "slots": w.slots,
+                "version": w.version,
                 "stop_requested": w.worker_id in self.stop_requested,
                 "seconds_since_heartbeat": round(now - w.last_seen, 1) if w.last_seen else None,
             } for w in self.workers.values()],
@@ -613,6 +635,17 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
             return _error(400, str(exc))
         return web.json_response(result)
 
+    async def cancel(request: web.Request) -> web.Response:
+        local_only(request)
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _error(400, "body must be JSON")
+        tag = body.get("tag") if isinstance(body, dict) else None
+        if not isinstance(tag, str) or not tag.strip():
+            return _error(400, "tag is required")
+        return web.json_response({"tag": tag, "dropped": gateway.cancel_tag(tag.strip())})
+
     async def stop(request: web.Request) -> web.Response:
         local_only(request)
         try:
@@ -632,6 +665,7 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
     app.router.add_get("/status", status)
     app.router.add_post("/kite/wake", wake)
     app.router.add_post("/kite/stop", stop)
+    app.router.add_post("/kite/cancel", cancel)
     app.router.add_post("/worker/heartbeat", heartbeat)
     app.router.add_get("/worker/jobs", jobs)
     app.router.add_post("/worker/jobs/{job_id}/chunks", chunks)

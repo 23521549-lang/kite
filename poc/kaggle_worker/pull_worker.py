@@ -6,9 +6,13 @@ Loop: send a heartbeat, long-poll ``GET /worker/jobs``, make sure the requested 
 forward the request to the local llama-server, post the answer back. A background thread keeps
 heartbeating while a long request runs, so the gateway does not think the worker died.
 
-When the client asked for streaming, the answer is read from llama-server as it is generated and
-its chunks go to the gateway about twice a second (``POST /worker/jobs/<id>/chunks``); if the
-gateway no longer wants them (the client went away), generation stops.
+Every answer is read from llama-server as it is generated and its chunks go to the gateway about
+twice a second (``POST /worker/jobs/<id>/chunks``); if the gateway no longer wants them (the client
+went away, the task was cancelled), generation stops at once instead of running to the end.
+
+With ``slots`` > 1 (llama-server started with ``--parallel N``), up to N jobs run at the same time
+on the loaded model: the person chatting is answered while a task's long request is generating.
+A job that needs another model waits until the worker is idle, then switches.
 """
 
 from __future__ import annotations
@@ -19,6 +23,12 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable
+
+# Version of the worker code in the Kaggle notebook: a hash of all its code cells (this line written
+# as ``WORKER_VERSION = ""``). The worker reports it in its heartbeat, so EC2 can tell when a notebook
+# started by hand runs older code than the repository (``kite doctor``, ``kite worker status``).
+# tests/poc/kaggle_worker/test_launcher.py checks it and prints the right value when a cell changes.
+WORKER_VERSION = "024cf8ecfa01"
 
 
 class PullWorker:
@@ -37,6 +47,7 @@ class PullWorker:
         stop_after_seconds: float | None = None,
         stop_when_idle_seconds: float | None = None,
         stream_flush_seconds: float = 0.5,
+        slots: int | Callable[[], int] = 1,
         log: Callable[[str], None] = print,
     ) -> None:
         self.gateway_url = gateway_url.rstrip("/")
@@ -59,6 +70,17 @@ class PullWorker:
         self.draining = False
         self._stop = threading.Event()
         self.jobs_done = 0
+        self._slots = slots                  # or a callable: llama-server's --parallel of the loaded model
+        self._busy = threading.Condition()
+        self._running = 0
+        self._threads: list[threading.Thread] = []
+
+    @property
+    def slots(self) -> int:
+        try:
+            return max(1, int(self._slots() if callable(self._slots) else self._slots))
+        except (TypeError, ValueError):
+            return 1
 
     # ------------------------------------------------------------------ HTTP
     def _call(self, method: str, url: str, body: Any = None, *, timeout: float = 70,
@@ -85,6 +107,9 @@ class PullWorker:
             "draining": self.draining,
             "loaded_model": self.loaded_model(),
             "cached_models": self.cached_models(),
+            "version": WORKER_VERSION,
+            "slots": self.slots,
+            "running": self._running,
         }, timeout=30)
         if status == 401:
             raise PermissionError("gateway rejected the worker token")
@@ -112,20 +137,17 @@ class PullWorker:
         started = time.monotonic()
         try:
             if self.loaded_model() != model:
+                with self._busy:            # never swap the model under another slot's request
+                    self._busy.wait_for(lambda: self._running <= 1 or self._stop.is_set())
                 self.log(f"[{job_id[:8]}] nạp model {model}...")
                 self.ready = False
                 self._safe_heartbeat()
                 self.ensure_model(model)
                 self.ready = True
                 self._safe_heartbeat()
-            if job.get("stream"):
-                payload = {"status": "ok", **self._stream(job_id, job["body"])}
-            else:
-                status, response = self._call("POST", f"{self.llama_url}/v1/chat/completions", job["body"],
-                                              timeout=self.request_timeout_seconds, auth=False)
-                if status != 200 or not isinstance(response, dict):
-                    raise RuntimeError(f"llama-server HTTP {status}: {str(response)[:500]}")
-                payload = {"status": "ok", "response": response}
+            # Always streamed from llama-server, even when the client wants one piece: a cancelled
+            # task or a gone client then stops generation at once (the gateway refuses the chunks).
+            payload = {"status": "ok", **self._stream(job_id, job["body"])}
         except Exception as exc:
             self.ready = True
             payload = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:2000]}
@@ -134,6 +156,33 @@ class PullWorker:
         self.jobs_done += 1
         self.last_job_at = time.monotonic()
         self.log(f"[{job_id[:8]}] {model} {payload['status']} sau {seconds:.1f}s (gateway: HTTP {status})")
+
+    def _start_job(self, job: dict[str, Any]) -> None:
+        """Run a job; with more than one slot in a thread, so the next one can be fetched meanwhile."""
+        with self._busy:
+            self._running += 1
+
+        def work() -> None:
+            try:
+                self.run_job(job)
+            finally:
+                with self._busy:
+                    self._running -= 1
+                    self._busy.notify_all()
+
+        if self.slots == 1:
+            work()
+            return
+        thread = threading.Thread(target=work, name=f"kite-job-{job['job_id'][:8]}", daemon=True)
+        self._threads = [t for t in self._threads if t.is_alive()] + [thread]
+        thread.start()
+
+    def _wait_for_slot(self) -> bool:
+        """Block until a slot is free; False when the worker is stopping."""
+        with self._busy:
+            while self._running >= self.slots and not self._stop.is_set():
+                self._busy.wait(1.0)
+        return not self._stop.is_set()
 
     def _stream(self, job_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Stream the answer from llama-server, passing its chunks to the gateway as they come.
@@ -228,8 +277,10 @@ class PullWorker:
                     self.draining = True
                     self._safe_heartbeat()
                     break
+                if not self._wait_for_slot():
+                    break
                 idle = time.monotonic() - self.last_job_at
-                if self.stop_when_idle_seconds and idle > self.stop_when_idle_seconds:
+                if self.stop_when_idle_seconds and idle > self.stop_when_idle_seconds and not self._running:
                     self.log(f"Không có việc {idle / 60:.0f} phút: tự tắt để đỡ tốn quota GPU "
                              "(Kite sẽ tự bật lại khi có việc).")
                     self.draining = True
@@ -253,10 +304,12 @@ class PullWorker:
                     self.log(f"GET /worker/jobs trả HTTP {status}: {body}")
                     self._stop.wait(5)
                     continue
-                self.run_job(body)
+                self._start_job(body)
         finally:
             self.ready = False
             self._stop.set()
+            for thread in self._threads:              # jobs already running finish first
+                thread.join(timeout=self.request_timeout_seconds)
             try:
                 self.heartbeat_after_stop()
             except Exception:

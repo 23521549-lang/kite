@@ -1366,11 +1366,22 @@ def render_report(results: dict) -> str:
 
 
 # --------------------------------------------------------------------------------------- history
-def history(root: Path) -> tuple[str, list[dict]]:
-    """Every bench run under ``root`` (one folder each, with results.json), oldest first, as one
-    markdown table: the evidence of what each change did, run by run."""
+def json_started(path: Path) -> str:
+    """When a bench run started (its results.json), for ordering runs kept in different folders."""
+    try:
+        return str(json.loads(path.read_text(encoding="utf-8")).get("started") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def history(root: Path | list[Path]) -> tuple[str, list[dict]]:
+    """Every bench run under ``root`` (one folder each, with results.json; several roots allowed),
+    oldest first, as one markdown table: the evidence of what each change did, run by run."""
     runs = []
-    for path in sorted(Path(root).glob("*/results.json")):
+    roots = [Path(r) for r in (root if isinstance(root, (list, tuple)) else [root])]
+    paths = sorted({path for r in roots for path in r.glob("*/results.json")},
+                   key=lambda path: (json_started(path), path.parent.name))
+    for path in paths:
         try:
             results = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1386,7 +1397,8 @@ def history(root: Path) -> tuple[str, list[dict]]:
                 "tasks": ",".join(item.get("id", "?") for item in code),
                 "failed": ",".join(item.get("id", "?") for item in code if not item.get("passed")),
                 "wall_median": s["code_wall_median"],
-                "wall_total": round(sum(item.get("wall_seconds") or 0 for item in code), 1) if code else None,
+                "wall_total": (round(sum(item.get("wall_seconds") or 0 for item in code), 1)
+                               if any(item.get("wall_seconds") for item in code) else None),
                 "fast_passed": sum(item.get("fast_path") == "passed" for item in code),
                 "reproduced": sum(item.get("repro") == "reproduced" for item in code),
                 "one_call_review": sum(item.get("review_mode") == "one_call" for item in code),

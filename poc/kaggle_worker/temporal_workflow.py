@@ -29,6 +29,10 @@ class CodingTaskInput:
     # already validated and prepared by the earlier run, so the new run reuses it.
     prepared_workspace: str | None = None
     route_wait_count: int = 0
+    # "Sửa tiếp" (continue_from in the chat): the previous task's result.patch, applied to the clone
+    # before the agent starts, so this task builds on it; and that task's ID, for the progress.
+    base_patch: str = ""
+    base_task: str = ""
 
 
 @dataclass(frozen=True)

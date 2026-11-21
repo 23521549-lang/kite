@@ -59,8 +59,20 @@ def last_change(folder: Path) -> float:
     return max(times)
 
 
-def plan(state_dir: Path, *, days: float = 7, now: float | None = None, deps_cache: bool = False) -> list[Item]:
-    """What ``cleanup`` would remove under the Kite state folder, biggest first."""
+def bench_folders(root: Path) -> list[Path]:
+    """Bench run folders directly under ``root`` (they hold a results.json): ``kite bench run --out
+    ~/bench-repo-v5`` writes outside the state folder, where most of the disk went (2.1 GiB each)."""
+    try:
+        return sorted(p for p in Path(root).iterdir() if p.is_dir() and not p.is_symlink()
+                      and (p / "results.json").is_file())
+    except OSError:
+        return []
+
+
+def plan(state_dir: Path, *, days: float = 7, now: float | None = None, deps_cache: bool = False,
+         extra_roots: tuple[Path, ...] | list[Path] = ()) -> list[Item]:
+    """What ``cleanup`` would remove under the Kite state folder (and the bench run folders directly
+    under ``extra_roots``, e.g. the home folder), biggest first."""
     state_dir, now = Path(state_dir), time.time() if now is None else now
     limit = days * 86400
     items: list[Item] = []
@@ -81,8 +93,11 @@ def plan(state_dir: Path, *, days: float = 7, now: float | None = None, deps_cac
             for run in sorted(parent.iterdir()):
                 heavy_of(run, kind)
     bench = state_dir / "bench"
-    if bench.is_dir():
-        for stamp in sorted(p for p in bench.iterdir() if p.is_dir()):
+    stamps = sorted(p for p in bench.iterdir() if p.is_dir()) if bench.is_dir() else []
+    for root in extra_roots:
+        stamps += [p for p in bench_folders(root) if p not in stamps]
+    if stamps:
+        for stamp in stamps:
             if (stamp / "runs").is_dir():
                 for run in sorted((stamp / "runs").iterdir()):
                     heavy_of(run, "bench")

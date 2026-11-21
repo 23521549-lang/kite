@@ -21,7 +21,7 @@ import errno
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
@@ -330,7 +330,7 @@ REPO_CONFIG_KEYS = {"setup": "setup_command", "test": "test_command", "quick_tes
                     "setup_timeout": "setup_timeout_seconds", "test_timeout": "test_timeout_seconds"}
 
 
-def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings:
+def repo_settings(settings: SandboxSettings, workspace: Path, saved: Path | None = None) -> SandboxSettings:
     """Settings for one repository: its committed ``.kite.yml`` overrides the operator's defaults.
 
     A real project knows how it is installed and tested (``pip install -r services/x/requirements.txt``,
@@ -349,18 +349,31 @@ def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings
     nothing to check there, the check is skipped. Its tool must be installed by ``setup``.
     The commands still run in the sandbox (setup with the operator's setup network, tests with none).
     A malformed file is an error, not a silent fallback: it would otherwise test the wrong thing.
+
+    ``saved``: the same keys kept by Kite for a repository without its own ``.kite.yml`` (the
+    chat saves one, so nobody has to write and commit the file by hand); the committed file wins.
     """
     path = Path(workspace) / REPO_CONFIG
-    if not settings.repo_config or not path.is_file():
+    if not settings.repo_config:
         return settings
+    if not path.is_file():
+        if saved is None or not Path(saved).is_file():
+            return settings
+        path = Path(saved)
+    return apply_repo_config(settings, path.read_text(encoding="utf-8"),
+                             REPO_CONFIG if path.name == REPO_CONFIG else f"Kite's saved config {path.name}")
+
+
+def apply_repo_config(settings: SandboxSettings, text: str, label: str = REPO_CONFIG) -> SandboxSettings:
+    """``settings`` with one repository config (YAML text) applied; SandboxError says what is wrong."""
     import yaml
 
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(text) or {}
     except (yaml.YAMLError, UnicodeDecodeError) as exc:
-        raise SandboxError(f"{REPO_CONFIG} is not valid YAML: {exc}") from exc
+        raise SandboxError(f"{label} is not valid YAML: {exc}") from exc
     if not isinstance(data, dict) or set(data) - set(REPO_CONFIG_KEYS):
-        raise SandboxError(f"{REPO_CONFIG} accepts only {', '.join(sorted(REPO_CONFIG_KEYS))}")
+        raise SandboxError(f"{label} accepts only {', '.join(sorted(REPO_CONFIG_KEYS))}")
     changes = {}
     for key, field_name in REPO_CONFIG_KEYS.items():
         if key not in data:
@@ -368,20 +381,20 @@ def repo_settings(settings: SandboxSettings, workspace: Path) -> SandboxSettings
         value = data[key]
         if key.endswith("_timeout"):
             if not isinstance(value, int) or isinstance(value, bool) or not 60 <= value <= 3600:
-                raise SandboxError(f"{REPO_CONFIG}: {key} must be seconds between 60 and 3600")
+                raise SandboxError(f"{label}: {key} must be seconds between 60 and 3600")
         elif not isinstance(value, str):
-            raise SandboxError(f"{REPO_CONFIG}: {key} must be a shell command string ('' to skip)")
+            raise SandboxError(f"{label}: {key} must be a shell command string ('' to skip)")
         elif key == "quick_test" and value and "{tests}" not in value:
-            raise SandboxError(f"{REPO_CONFIG}: quick_test must contain {{tests}} (where Kite puts the test files)")
+            raise SandboxError(f"{label}: quick_test must contain {{tests}} (where Kite puts the test files)")
         elif key == "check" and value and "{tests}" in value:
-            raise SandboxError(f"{REPO_CONFIG}: check takes {{files}} or {{py_files}}, not {{tests}}")
+            raise SandboxError(f"{label}: check takes {{files}} or {{py_files}}, not {{tests}}")
         changes[field_name] = value
     from dataclasses import replace
 
     return replace(settings, **changes)
 
 
-def suggest_repo_config(files: list[str], pyproject: str = "") -> str:
+def suggest_repo_config(files: list[str], pyproject: str = "", aws: bool = False) -> str:
     """A ``.kite.yml`` proposal from a repository's file list, or "" when Kite's defaults fit
     (nothing to install, tests found by ``python -m pytest -q``). For the user to check and commit:
     Kite never writes it into a repository itself."""
@@ -403,14 +416,17 @@ def suggest_repo_config(files: list[str], pyproject: str = "") -> str:
             folders.append(folder)
     nested = [f for f in folders if "/" in f]
     ruff = "ruff.toml" in files or ".ruff.toml" in files or "[tool.ruff" in pyproject
-    if not setup and not nested and not ruff:
+    env = "AWS_DEFAULT_REGION=us-east-1 " if aws else ""
+    if not setup and not nested and not ruff and not env:
         return ""
     lines = ["# Đề xuất của Kite: kiểm tra lại (nhất là biến môi trường test cần) rồi commit vào gốc repo"]
     if setup:
         lines.append(f"setup: {setup}")
     if nested:
-        lines += [f"test: PYTHONPATH=. python -m pytest -q {' '.join(sorted(folders)[:6])}",
-                  "quick_test: PYTHONPATH=. python -m pytest -q {tests}"]
+        lines += [f"test: PYTHONPATH=. {env}python -m pytest -q {' '.join(sorted(folders)[:6])}",
+                  f"quick_test: PYTHONPATH=. {env}python -m pytest -q {{tests}}"]
+    elif env:
+        lines += [f"test: {env}python -m pytest -q", f"quick_test: {env}python -m pytest -q {{tests}}"]
     if ruff:
         lines += ["# setup phải cài ruff (vd. thêm `ruff` vào lệnh pip ở trên)",
                   "check: ruff check {py_files}"]
@@ -449,8 +465,8 @@ def review_prompt(goal: str, test_command: str, impact: str = "", quick: str = "
         "3. Tìm mọi chỗ khác trong repo dùng tới phần đã đổi (`grep -rn <tên> .`) và sửa cho nhất quán"
         + (" (bắt đầu từ danh sách bên dưới)." if impact else "."),
         "4. Rà phần đã đổi theo danh sách dưới đây.",
-        "5. Nếu thấy sai thì sửa code. Không sửa hay xóa file test có sẵn và conftest.py; được THÊM file test mới "
-        "cho các trường hợp biên vừa kiểm tra.",
+        "5. Nếu thấy sai thì sửa code. Không sửa hay xóa test có sẵn và conftest.py; được THÊM test mới (file mới, "
+        "hoặc hàm test mới ở cuối file test có sẵn) cho các trường hợp biên vừa kiểm tra.",
         f"6. Chạy lại `{test_command}`" + (f" và `{check_hint(check)}`" if check else "") + ", đảm bảo vẫn qua.",
         "7. Kết thúc bằng: các quy tắc đã kiểm tra, chỗ đã sửa thêm (hoặc \"không cần sửa\").",
     ]
@@ -673,7 +689,8 @@ def fast_prompt(goal: str, context: str, test_command: str, check: str = "", fee
         "- SEARCH chép đúng từng ký tự từ phần code bên dưới; giữ khối ngắn, chỉ quanh chỗ cần đổi.",
         "- Tạo file mới: để SEARCH trống.",
         "- Sửa đủ mọi chỗ yêu cầu cần (kể cả nơi gọi tới), không đổi thứ không liên quan; diff càng nhỏ càng tốt.",
-        "- Không sửa hay xóa test có sẵn; được thêm file test mới.",
+        "- Không sửa hay xóa test có sẵn và conftest.py; được THÊM test mới (file mới, hoặc hàm test mới ở cuối "
+        "một file test có sẵn).",
         f"- Nếu phần code bên dưới chưa đủ để sửa chắc chắn đúng, chỉ trả lời một dòng: {FAST_DECLINE}: <lý do>.",
         "- Chỉ cần các khối sửa, kèm tối đa hai câu tóm tắt.",
         f"Kite sẽ tự áp các khối rồi chạy {checks} (không mạng).",
@@ -781,8 +798,7 @@ def fast_apply(workspace: Path, answer: str, context_chars: int = 0, shown: Sequ
     fixed: list[str] = []
     try:
         files = editblocks.apply(workspace, editblocks.parse(answer), search_tiers(workspace, shown), fixed)
-        existing_tests = [f for f in files if codemap.is_test_path(f) and subprocess.run(
-            ["git", "-C", str(workspace), "cat-file", "-e", f"{before}:{f}"], capture_output=True).returncode == 0]
+        existing_tests = edited_tests(workspace, before, files)
         if existing_tests:
             raise editblocks.EditError(f"sửa test có sẵn ({', '.join(existing_tests)})")
     except editblocks.EditError as exc:
@@ -1137,8 +1153,7 @@ def fast_review(workspace: Path, goal: str, base: str, graph: codemap.CodeGraph 
         files = editblocks.apply(workspace, blocks, search_tiers(workspace, context_files(context)))
     except editblocks.EditError as exc:
         return 1, f"không áp được khối sửa của rà soát: {exc}\n{answer}"
-    edited = [f for f in files if codemap.is_test_path(f) and subprocess.run(
-        ["git", "-C", str(workspace), "cat-file", "-e", f"{base}:{f}"], capture_output=True).returncode == 0]
+    edited = edited_tests(workspace, base, files)
     if edited:
         return 1, f"rà soát sửa test có sẵn ({', '.join(edited)}): bỏ\n{answer}"
     return 0, answer
@@ -1236,7 +1251,8 @@ def fast_review_prompt(goal: str, diff: str, context: str, test_command: str, ch
         "thật của file, như tiêu đề `###` bên dưới)",
         example_path(context), "<<<<<<< SEARCH", "các dòng chép nguyên văn từ code hiện tại", "=======",
         "các dòng mới", ">>>>>>> REPLACE",
-        "Không sửa hay xóa test có sẵn. Kite sẽ chạy lại test; khối sửa làm hỏng test sẽ bị bỏ.", "",
+        "Không sửa hay xóa test có sẵn (được thêm hàm test mới). Kite sẽ chạy lại test; khối sửa làm hỏng test sẽ "
+        "bị bỏ.", "",
         "Code hiện tại:", context,
     ])
 
@@ -1289,11 +1305,14 @@ class StuckWatch:
     same will not help: v1 of the real-repo bench lost 50 minutes of a 60-minute step that way.
     """
 
-    def __init__(self, repeats: int = STUCK_REPEATS, cycle: int = STUCK_CYCLE):
+    def __init__(self, repeats: int = STUCK_REPEATS, cycle: int = STUCK_CYCLE,
+                 on_action: Callable[[str], None] | None = None):
         self.repeats, self.cycle = repeats, cycle
         self.steps: list[str] = []
         self.current: list[str] | None = None
         self.reason = ""
+        # Each tool call as it happens ("sửa services/agent/cli.py"), for the task's progress.
+        self.on_action = on_action
 
     @staticmethod
     def _normal(line: str) -> str:
@@ -1304,6 +1323,13 @@ class StuckWatch:
         if self.reason:
             return self.reason
         line = self._normal(line)
+        if self.on_action is not None:
+            action = tool_action(line)
+            if action:
+                try:
+                    self.on_action(action)
+                except Exception:          # progress reporting never stops the agent
+                    pass
         if line.startswith("> "):
             if self.current:
                 self.steps.append("\n".join(self.current).strip())
@@ -1335,6 +1361,21 @@ class StuckWatch:
 TOOL_LINE = re.compile(r"^(→|←|\$|✱|⚙|%|◇)\s+(\S+)\s*(.*)$")
 
 
+TOOL_VERBS = {"read": "đọc", "edit": "sửa", "write": "viết", "patch": "sửa", "grep": "tìm", "glob": "tìm file",
+              "list": "xem thư mục", "bash": "chạy", "todowrite": "lập danh sách việc", "webfetch": "tải web"}
+
+
+def tool_action(line: str) -> str:
+    """One ``opencode run`` tool line in a few words: ``→ Read a.py`` -> ``đọc a.py``; "" otherwise."""
+    match = TOOL_LINE.match(line.strip())
+    if match is None:
+        return ""
+    symbol, name, rest = match.groups()
+    if symbol == "$":
+        return f"chạy {' '.join([name, rest]).strip()}"[:120]
+    return f"{TOOL_VERBS.get(name.lower(), name)} {rest.strip()}".strip()[:120]
+
+
 def tool_stats(text: str) -> dict:
     """What an ``opencode run`` did, from its output: model turns (``> agent · model`` headers), tool
     calls (``→ Read x``, ``← Edit x``, ``$ cmd``, ``✱ Grep ...``) and reads of something already read
@@ -1363,16 +1404,43 @@ def patch_size(patch: str) -> tuple[int, int]:
             sum(1 for line in lines if line.startswith("-") and not line.startswith("---")))
 
 
-def edited_tests(workspace: Path, base: str) -> list[str]:
-    """Test files that existed at ``base`` and the agent changed or deleted (adding tests is fine)."""
-    rows = _git(Path(workspace), "diff", "--name-status", base, check=False).splitlines()
-    return sorted(row.split("\t")[-1] for row in rows
-                  if row[:1] in ("M", "D", "R") and codemap.is_test_path(row.split("\t")[1]))
+def apply_patch_file(workspace: Path, patch: Path) -> str:
+    """``git apply`` a patch to the working tree (not committed); "" when it applied, else why not."""
+    if not Path(patch).is_file():
+        return f"{patch} does not exist"
+    result = subprocess.run(["git", "-C", str(workspace), "apply", "--whitespace=nowarn", str(patch)],
+                            capture_output=True, text=True)
+    return "" if result.returncode == 0 else (result.stderr.strip() or "git apply failed")[-500:]
+
+
+def edited_tests(workspace: Path, base: str, files: Sequence[str] | None = None) -> list[str]:
+    """Test files that existed at ``base`` and were changed or deleted since (``base`` a commit or a
+    tree; the working tree is compared). Adding tests is fine, also to an existing test file: a file
+    whose diff only adds lines is not edited (step 2 of the full-test day: "add tests for this" put new
+    test functions into services/agent/tests/test_cli.py, and the fast path threw the fix away twice).
+    ``conftest.py`` counts whenever it changes: a few added lines there can skip any test."""
+    workspace = Path(workspace)
+    edited = []
+    for row in _git(workspace, "diff", "--numstat", "-M", base, "--", *(files or []), check=False).splitlines():
+        parts = row.split("\t")
+        if len(parts) != 3:
+            continue
+        added, removed, path = parts
+        path = path.split(" => ")[-1].rstrip("}") if " => " in path else path
+        if not codemap.is_test_path(path) and PurePosixPath(path).name != "conftest.py":
+            continue
+        existed = subprocess.run(["git", "-C", str(workspace), "cat-file", "-e", f"{base}:{path}"],
+                                 capture_output=True).returncode == 0
+        if existed and (removed != "0" or PurePosixPath(path).name == "conftest.py"
+                        or not (workspace / path).is_file()):
+            edited.append(path)
+    return sorted(edited)
 
 
 SCRATCH_FILE = re.compile(
     r"(^|/)((repro|reproduce|reproduction|debug|scratch|tmp|temp|playground)([_.-][^/]*)?\.(py|sh|js|ts|txt|json)"
     r"|[^/]+\.(orig|rej|bak|log))$", re.I)
+SMALL_REVIEW_LINES = 120     # an agent patch this small gets the one-call review, not a second agent session
 CHECK_UNAVAILABLE = (126, 127)     # the check's tool is not installed or not runnable: setup's job, not the agent's
 
 
@@ -2224,7 +2292,12 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             and run.check_exit_code in (None, 0)):
         before = snapshot_tree(workspace)
         started = time.monotonic()
-        if run.fast_path == "passed" and run.repro == "reproduced" and settings.fast_review and ask is not None:
+        # A small agent patch whose tests pass gets the same one-call review as a fast fix (the backend
+        # does the same for real tasks): a second agent session costs 5-10 minutes.
+        small = (run.fast_path != "passed" and run.agent_status == "ok" and run.test_exit_code == 0
+                 and sum(patch_size(_git(workspace, "diff", run.patch_base, before, check=False))) <= SMALL_REVIEW_LINES)
+        if (run.fast_path == "passed" and run.repro == "reproduced" or small) and settings.fast_review \
+                and ask is not None:
             # A one-call fix gets a one-call review: approve, or corrections kept only if tests still pass.
             run.review_mode = "one_call"
             log(f"[{task_id}] vòng rà soát (một lần gọi): {model} đọc lại bản sửa theo yêu cầu và chỗ gọi...")

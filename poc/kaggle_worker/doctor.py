@@ -160,8 +160,18 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
             launch = worker.get("launch") or {}
             name = f"worker {worker.get('worker_id')}"
             if worker.get("alive"):
-                add(name, OK, f"sống, đang nạp {worker.get('loaded_model') or 'chưa có model'}"
-                    + (", đang bận" if worker.get("busy") else ""))
+                from .pull_worker import WORKER_VERSION
+
+                add(name, OK, f"sống, đã nạp {worker.get('loaded_model') or 'chưa có model'}"
+                    + (f", {worker.get('running')}/{worker.get('slots')} request đang chạy" if worker.get("busy") else "")
+                    + (f", {worker.get('slots')} request cùng lúc" if (worker.get("slots") or 1) > 1
+                       and not worker.get("busy") else ""))
+                if worker.get("version") != WORKER_VERSION:
+                    # A notebook started by hand runs whatever was saved on Kaggle: step 2 of the full-test
+                    # day had no streaming because the session predated the new worker code.
+                    add(f"notebook {worker.get('worker_id')}", WARN,
+                        f"chạy code worker cũ ({worker.get('version') or 'chưa báo phiên bản'}, mới là {WORKER_VERSION})",
+                        f"kite worker restart {worker.get('worker_id')} (Kite đẩy notebook mới lên Kaggle rồi bật lại)")
             elif launch.get("state") == "error":
                 add(name, FAIL, f"tự bật lỗi: {launch.get('detail')}",
                     f"sửa theo lỗi rồi: kite worker start {worker.get('worker_id')} --force")

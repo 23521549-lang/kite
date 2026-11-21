@@ -567,7 +567,9 @@ def test_backend_fast_path_solves_with_one_call_or_hands_over_to_the_agent(tmp_p
     backend, result = run_backend_task(tmp_path / "bad", fake, "task-fast-bad")
     # Two candidates (the second told why the first failed), then the agent.
     assert fake.kinds()[:7] == ["setup", "repro", "quick", "test", "quick", "test", "agent"]
-    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in asked[-1][3]
+    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in asked[-2][3]
+    # The agent's patch is small and its tests pass: a one-call review, not a second agent session.
+    assert "Đây là bước RÀ SOÁT cuối" in asked[-1][3] and "review" not in fake.kinds()
     assert "Kite đã thử một bản sửa nhanh" in fake.agent_calls()[0][-1]
     assert "Kite fast path: tried (tests_failed" in result.summary
     saved = json.loads((backend.task_dir("task-fast-bad") / "result.json").read_text())
@@ -610,3 +612,119 @@ def test_backend_uses_repo_lessons_reports_cost_and_notifies_when_done(tmp_path)
     (title, message, kw), = sent
     assert title == "Kite: task xong, test qua" and "task-cost" in message and "2.5 phút GPU" in message
     assert "average" not in message and kw["tags"] == ("white_check_mark",)       # no code, no goal text
+
+
+class CancellingDocker(FakeDocker):
+    """The person cancels while the agent works: the cancel tool writes the marker."""
+
+    def __init__(self, state_dir: Path, task_id: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.state_dir, self.task_id = state_dir, task_id
+
+    def __call__(self, cmd, *, timeout=None):
+        cmd = list(cmd)
+        if cmd[1] == "ps":
+            self.calls.append(cmd)
+            return CP(cmd, 0, "c1\nc2\n", "")
+        result = super().__call__(cmd, timeout=timeout)
+        if cmd[1] == "run" and "opencode" in cmd:
+            from poc.kaggle_worker.backend import request_cancel
+
+            request_cancel(self.state_dir, self.task_id)
+        return result
+
+
+def test_a_cancelled_task_stops_at_its_next_step_and_drops_its_model_requests(tmp_path):
+    # Step 2 of the full-test day: a cancelled task kept the worker for 15 more minutes.
+    from poc.kaggle_worker.backend import request_cancel, task_progress
+    from poc.kaggle_worker.journal import read_jsonl
+
+    repo, head = make_repo(tmp_path)
+    store = make_store(tmp_path)
+    fake = CancellingDocker(tmp_path / "state", "task-cancel")
+    backend = make_backend(tmp_path, store, fake, settings=sbx.SandboxSettings(uid=1000, fast_path=False))
+    task = make_task(store, repo, head, "task-cancel")
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        return await backend.run_opencode(task, route, work, "", "s1", "k4", lambda beat: None)
+
+    result = asyncio.run(scenario())
+    assert fake.kinds() == ["agent"]                      # no test, no fix round, no review after the cancel
+    assert result.patch == "" and "hủy" in result.summary
+    trace = read_jsonl(backend.task_dir("task-cancel") / "trace.jsonl")
+    assert trace[-1]["event"] == "run_cancelled"
+    assert task_progress(trace, time.time())["progress"][-1].endswith("đã hủy theo yêu cầu: dừng mọi bước đang chạy")
+    assert read_jsonl(backend.state_dir / "journal" / "tasks.jsonl")[-1]["status"] == "cancelled"
+
+    # The workflow's interrupt: with the marker, every container of the task and its gateway requests go.
+    dropped = []
+    backend._gateway_cancel = dropped.append
+    route = asyncio.run(backend.reserve_route(make_task(store, repo, head, "task-other"), "k9"))
+    asyncio.run(backend.interrupt_opencode(task, route, "s1", "k5"))
+    assert dropped == ["task-cancel"]
+    slug = task_slug("task-cancel")
+    assert [c[1:] for c in fake.calls if c[1] in ("ps", "kill")][-3:] == [
+        ["ps", "-q", "--filter", f"name=-{slug}"], ["kill", "c1"], ["kill", "c2"]]
+    # Without the marker (pause), only the agent's own containers are stopped, as before.
+    fake.calls.clear()
+    other = make_task(store, repo, head, "task-paused")
+    asyncio.run(backend.interrupt_opencode(other, route, "s2", "k6"))
+    assert not any(c[1] == "ps" for c in fake.calls) and dropped == ["task-cancel"]
+    assert request_cancel(backend.state_dir, "x").name == "cancel_requested"
+
+
+def test_the_agents_last_action_shows_in_the_task_progress(tmp_path):
+    from poc.kaggle_worker.backend import task_progress
+    from poc.kaggle_worker.journal import read_jsonl
+
+    backend = make_backend(tmp_path, make_store(tmp_path), FakeDocker())
+    trace = backend._action_tracer("t1", "agent")
+    backend._trace("t1", "step_start", step="agent", state="AGENT_RUNNING")
+    for line in ("→ Read calc.py", "← Edit calc.py", "$ python -m pytest -q"):
+        trace(sbx.tool_action(line))
+    events = read_jsonl(backend.task_dir("t1") / "trace.jsonl")
+    assert [e["event"] for e in events].count("agent_action") == 1     # at most one line per 10 s
+    events.append({**events[-1], "action": "chạy python -m pytest -q", "count": 3})
+    report = task_progress(events, events[0]["ts"] + 75)
+    assert report["now"] == "agent viết code (đã 1 phút 15 giây); vừa chạy python -m pytest -q (3 thao tác)"
+    assert sbx.tool_action("→ Read services/agent/cli.py") == "đọc services/agent/cli.py"
+    assert sbx.tool_action("← Edit a.py") == "sửa a.py" and sbx.tool_action("Đã sửa calc.py") == ""
+
+
+def test_a_follow_up_task_starts_from_the_previous_result_and_a_saved_repo_config_is_used(tmp_path):
+    from poc.kaggle_worker import memory
+    from poc.kaggle_worker.journal import read_jsonl
+
+    repo, head = make_repo(tmp_path)
+    store, fake = make_store(tmp_path), FakeDocker()
+    backend = make_backend(tmp_path, store, fake, settings=sbx.SandboxSettings(uid=1000, fast_path=False))
+    # The previous task's result: a new helper file (the patch applies to the same commit).
+    previous = tmp_path / "previous.patch"
+    previous.write_text("diff --git a/helpers.py b/helpers.py\nnew file mode 100644\n--- /dev/null\n"
+                        "+++ b/helpers.py\n@@ -0,0 +1 @@\n+ZERO = 0\n")
+    memory.save_repo_config(backend.state_dir, repo, "setup: pip install -q pytest\ntest: python -m pytest -q\n")
+    store.enqueue(ScheduledTask("task-next", "coder", None, head, "agent/t", json.dumps({"goal": "g"}), 900, 0,
+                                time.time()))
+    task = CodingTaskInput("task-next", "Sửa average", str(repo), head, "agent/t", (), None, 900,
+                           base_patch=str(previous), base_task="task-prev")
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        return await backend.run_opencode(task, route, work, "", "s1", "k4", lambda beat: None)
+
+    result = asyncio.run(scenario())
+    setup = next(c for c in fake.calls if c[1] == "run" and "kite-setup-" in " ".join(c))
+    assert setup[-1] == "pip install -q pytest"                         # Kite's saved config, no .kite.yml
+    assert set(result.changed_files) == {"calc.py", "helpers.py"}        # this patch holds both results
+    trace = read_jsonl(backend.task_dir("task-next") / "trace.jsonl")
+    assert any(e["event"] == "continue_from" and e["task"] == "task-prev" for e in trace)
+    # A previous result that does not apply is refused before any model time is spent.
+    bad = tmp_path / "bad.patch"
+    bad.write_text("diff --git a/calc.py b/calc.py\n--- a/calc.py\n+++ b/calc.py\n@@ -1 +1 @@\n-nope\n+x\n")
+    store.enqueue(ScheduledTask("task-bad", "coder", None, head, "agent/t", "{}", 900, 0, time.time()))
+    with pytest.raises(ApplicationError, match="does not apply"):
+        asyncio.run(backend.prepare_workspace(
+            CodingTaskInput("task-bad", "g", str(repo), head, "agent/t", (), None, 900, base_patch=str(bad)), "k1"))
