@@ -79,7 +79,9 @@ def _parser() -> argparse.ArgumentParser:
     result.add_argument("--expected-task", required=True)
     result.add_argument("--expected-lease", required=True)
     result.add_argument("--expected-worker", required=True)
-    commands.add_parser("doctor", help="check local configuration and installation prerequisites")
+    doctor = commands.add_parser("doctor", help="check that Kite works on this machine: services, gateway, "
+                                                "workers, Temporal, Docker, ports, secrets, disk")
+    doctor.add_argument("--json", action="store_true", help="machine-readable output")
     setup = commands.add_parser("setup", help="prepare local secret reference files without printing values")
     setup.add_argument("--secret-name", help="optional secret to capture without echo, e.g. KAGGLE_TOKEN")
     provider = commands.add_parser("provider", help="validate and manage configured providers")
@@ -128,6 +130,27 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("worker_id", help="new worker id, e.g. kaggle-an (lowercase, digits, '-')")
     add.add_argument("--owner", required=True, help="who owns the account (its GPU quota is counted per owner)")
     add.add_argument("--like", default=None, help="existing worker to copy (default: the first pull worker)")
+    autostart = worker_commands.add_parser(
+        "autostart", help="let Kite run this worker's Kaggle notebook when work arrives (asks for the "
+                          "Kaggle API token without echo; edits the config, keeps a backup)")
+    autostart.add_argument("worker_id")
+    autostart.add_argument("--kernel", required=True,
+                           help="<kaggle user>/<notebook slug> from the notebook URL kaggle.com/code/...")
+    autostart.add_argument("--idle-minutes", type=int, default=30,
+                           help="a notebook Kite started ends after this long without a job (default 30)")
+    autostart.add_argument("--token", choices=["kaggle-secret", "per-launch"], default="kaggle-secret",
+                           help="worker token: the notebook's Kaggle Secret (default) or a short-lived "
+                                "token Kite writes into the notebook it pushes")
+    autostart.add_argument("--model", default=None, help="model to load first when nothing asks for one")
+    autostart.add_argument("--off", action="store_true", help="remove autostart from this worker")
+    start = worker_commands.add_parser("start", help="start the worker's Kaggle notebook now (autostart)")
+    start.add_argument("worker_id")
+    start.add_argument("--model", default=None, help="model to load first")
+    start.add_argument("--force", action="store_true",
+                       help="push a new run even if one seems to be starting or failed recently")
+    stop = worker_commands.add_parser("stop", help="ask a worker to finish its job and end its Kaggle session")
+    stop.add_argument("worker_id")
+    worker_commands.add_parser("status", help="connected workers and autostart state (from the gateway)")
     sandbox = commands.add_parser("sandbox", help="run the coding agent in an isolated Docker sandbox")
     sandbox_commands = sandbox.add_subparsers(dest="sandbox_command", required=True)
     sandbox_commands.add_parser("build", help="create the internal network and build the sandbox image")
@@ -145,6 +168,8 @@ def _parser() -> argparse.ArgumentParser:
     mcp_serve = mcp_commands.add_parser("serve", help="serve Kite tools over stdio (started by OpenCode)")
     mcp_serve.add_argument("--allow-root", action="append", type=Path, default=[],
                            help="folder whose Git repositories tasks may use; repeat (default: home)")
+    mcp_serve.add_argument("--lead-model", default=None,
+                           help="model the chat uses: started on a worker as soon as the chat opens")
     chat = commands.add_parser("chat", help="Vietnamese chat with the Kite lead agent (OpenCode)")
     chat_commands = chat.add_subparsers(dest="chat_command", required=True)
     chat_setup = chat_commands.add_parser("setup", help="create a chat folder with opencode.json and AGENTS.md")
@@ -237,6 +262,87 @@ def _worker_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_autostart(args: argparse.Namespace) -> int:
+    """Add (or remove) ``launch`` for a pull worker and store its Kaggle API token as a 0600 file."""
+    import yaml
+
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    providers = raw.get("providers") or []
+    provider = next((p for p in providers if args.worker_id in (p.get("id"), p.get("worker_id"))), None)
+    if provider is None or provider.get("adapter") != "pull":
+        raise ConfigError(f"no pull worker {args.worker_id} in the config")
+    report: dict[str, object] = {"worker": args.worker_id}
+    if args.off:
+        provider.pop("launch", None)
+        report["autostart"] = False
+    else:
+        secrets_dir = args.config.parent / "secrets"
+        token_path = secrets_dir / f"kaggle_api_token_{args.worker_id}"
+        reference = (provider.get("secrets") or {}).get("kaggle_api_token")
+        if reference is None and not token_path.exists():
+            print("Kaggle API token của tài khoản sở hữu notebook (kaggle.com/settings/api -> "
+                  "Generate New Token). Nội dung không hiện ra màn hình.", file=sys.stderr)
+            value = getpass.getpass("Kaggle API token: ").strip()
+            if not value:
+                raise ConfigError("token is empty")
+            secrets_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(secrets_dir, 0o700)
+            fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(value + "\n")
+            report["token_file"] = str(token_path)
+        if reference is None:
+            provider.setdefault("secrets", {})["kaggle_api_token"] = f"file:{token_path.resolve()}"
+        launch = {"kernel": args.kernel, "idle_minutes": args.idle_minutes, "token": args.token}
+        if args.model:
+            launch["model"] = args.model
+        provider["launch"] = launch
+        report.update(autostart=True, launch=launch)
+    validate_config(raw)
+    backup = args.config.with_name(f"{args.config.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(args.config, backup)
+    text = (json.dumps(raw, ensure_ascii=False, indent=2) + "\n" if args.config.suffix == ".json"
+            else yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    args.config.write_text(text, encoding="utf-8")
+    report["backup"] = str(backup)
+    report["next"] = ["sudo systemctl restart kite-gateway", f"kite worker start {args.worker_id}",
+                      "kite worker status"] if not args.off else ["sudo systemctl restart kite-gateway"]
+    _emit(report)
+    return 0
+
+
+def _gateway_call(config, method: str, path: str, body: dict | None = None, timeout: float = 30) -> dict:
+    """Call the gateway's local-only routes (/status, /kite/*) on loopback."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{config.gateway.host}:{config.gateway.port}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise ConfigError(f"gateway HTTP {exc.code}: {detail}") from exc
+    except OSError as exc:
+        raise ConfigError(f"không gọi được gateway {url}: {exc} (sudo systemctl status kite-gateway)") from exc
+
+
+def _worker_remote(args: argparse.Namespace) -> int:
+    config = _load_operator_config(args)
+    if args.worker_command == "status":
+        report = _gateway_call(config, "GET", "/status")
+    elif args.worker_command == "start":
+        report = _gateway_call(config, "POST", "/kite/wake",
+                               {"worker": args.worker_id, "model": args.model, "reason": "manual",
+                                "force": args.force}, timeout=600)
+    else:
+        report = _gateway_call(config, "POST", "/kite/stop", {"worker": args.worker_id})
+    _emit(report)
+    return 0
+
+
 def _journal_command(args: argparse.Namespace) -> int:
     state_dir = args.config.parent
     journal = Journal(state_dir / "journal")
@@ -321,7 +427,15 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
         on_worker_status=on_status,
         journal=lambda record: Journal(args.config.parent / "journal").write("gateway", record),
     )
-    runner = web.AppRunner(create_app(gateway))
+    launcher = None
+    if any(p.launch is not None for p in config.providers if p.adapter == "pull" and p.enabled):
+        from .launcher import KaggleLauncher
+
+        launcher = KaggleLauncher(config, gateway, state_dir=args.config.parent)
+        launcher.load_tokens()
+        gateway.on_demand = launcher.on_demand
+        watcher = asyncio.get_running_loop().create_task(launcher.watch())   # noqa: F841 (kept alive)
+    runner = web.AppRunner(create_app(gateway, launcher=launcher))
     await runner.setup()
     hosts = [config.gateway.host]
     if config.sandbox is not None:
@@ -337,7 +451,8 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
                 "`kite sandbox build` first (it creates the Docker network)") from exc
     _emit({"listening": [f"http://{h}:{config.gateway.port}" for h in hosts],
            "public_url": config.gateway.public_url,
-           "workers": [w.worker_id for w in workers], "models": gateway.served_models()})
+           "workers": [w.worker_id for w in workers], "models": gateway.served_models(),
+           "autostart": sorted(launcher.states) if launcher else []})
     sys.stdout.flush()
     try:
         await asyncio.Event().wait()
@@ -417,6 +532,8 @@ def _mcp_command(args: argparse.Namespace) -> int:
     config = _load_operator_config(args)
     ops = KiteOps(config, db_path=_db_path(args), state_dir=args.config.parent,
                   allowed_roots=args.allow_root or [Path.home()])
+    # The chat just opened: start a worker for the lead model now, while the person types.
+    ops.wake_soon(model=getattr(args, "lead_model", None), reason="chat")
     build_server(ops).run(transport="stdio")
     return 0
 
@@ -442,7 +559,7 @@ def _chat_command(args: argparse.Namespace) -> int:
         raise ConfigError(f"model {lead} is not served by the gateway ({', '.join(models)})")
     roots = [Path(root).expanduser().resolve() for root in (args.allow_root or [Path.home()])]
     kite = Path(sys.argv[0]).resolve() if Path(sys.argv[0]).exists() else Path(shutil.which("kite") or "kite")
-    command = [str(kite), "--config", str(args.config.resolve()), "mcp", "serve"]
+    command = [str(kite), "--config", str(args.config.resolve()), "mcp", "serve", "--lead-model", lead]
     for root in roots:
         command += ["--allow-root", str(root)]
     target.mkdir(parents=True, exist_ok=True)
@@ -641,17 +758,16 @@ def _operator_command(args: argparse.Namespace) -> int:
             _emit({"secrets_directory": str(secrets_dir.resolve()), "created": True})
         return 0
     if args.command == "doctor":
+        from .doctor import render, run_checks, summary
+
         config = _load_operator_config(args)
-        checks = {
-            "config": "ok",
-            "temporal_endpoint": config.temporal_endpoint,
-            "task_queue": config.temporal_task_queue,
-            "opencode_executable": config.opencode_executable,
-            "harness2_checkout_exists": Path(config.harness2_checkout).exists(),
-            "providers_enabled": [p.id for p in config.providers if p.enabled],
-        }
-        _emit({"status": "ok" if checks["harness2_checkout_exists"] else "needs_setup", "checks": checks})
-        return 0
+        checks = run_checks(config, args.config)
+        report = summary(checks)
+        if args.json:
+            _emit(report)
+        else:
+            print(render(checks, args.config))
+        return 0 if report["status"] == "ok" else 1
     if args.command == "provider":
         config = _load_operator_config(args)
         if args.provider_command == "validate":
@@ -732,6 +848,10 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _bench_command(args)
     if args.command == "worker" and args.worker_command == "add":
         return _worker_add(args)
+    if args.command == "worker" and args.worker_command == "autostart":
+        return _worker_autostart(args)
+    if args.command == "worker" and args.worker_command in ("start", "stop", "status"):
+        return _worker_remote(args)
     if args.command == "worker":
         config = _load_operator_config(args)
         provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)

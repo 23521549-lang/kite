@@ -31,6 +31,7 @@ class PullWorker:
         heartbeat_seconds: float = 20.0,
         request_timeout_seconds: float = 1800.0,
         stop_after_seconds: float | None = None,
+        stop_when_idle_seconds: float | None = None,
         log: Callable[[str], None] = print,
     ) -> None:
         self.gateway_url = gateway_url.rstrip("/")
@@ -43,6 +44,10 @@ class PullWorker:
         self.heartbeat_seconds = heartbeat_seconds
         self.request_timeout_seconds = request_timeout_seconds
         self.deadline = time.monotonic() + stop_after_seconds if stop_after_seconds else None
+        # Started by Kite (not by hand): stop after this long without a job so the GPU quota is not
+        # spent on an idle session. Kite starts the notebook again when work arrives.
+        self.stop_when_idle_seconds = stop_when_idle_seconds
+        self.last_job_at = time.monotonic()
         self.log = log
         self.ready = True
         self.draining = False
@@ -79,6 +84,11 @@ class PullWorker:
             raise PermissionError("gateway rejected the worker token")
         if status != 200:
             raise RuntimeError(f"heartbeat failed: HTTP {status} {body}")
+        if isinstance(body, dict) and body.get("stop") and not self._stop.is_set():
+            # `kite worker stop` on EC2: finish the current job, then end the session.
+            self.log("Gateway yêu cầu dừng worker (kite worker stop).")
+            self.draining = True
+            self._stop.set()
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self.heartbeat_seconds):
@@ -113,6 +123,7 @@ class PullWorker:
         status, body = self._call("POST", f"{self.gateway_url}/worker/jobs/{job_id}/result", payload)
         seconds = time.monotonic() - started
         self.jobs_done += 1
+        self.last_job_at = time.monotonic()
         self.log(f"[{job_id[:8]}] {model} {payload['status']} sau {seconds:.1f}s (gateway: HTTP {status})")
 
     def _safe_heartbeat(self) -> None:
@@ -136,6 +147,13 @@ class PullWorker:
             while not self._stop.is_set():
                 if self.deadline is not None and time.monotonic() > self.deadline:
                     self.log("Hết thời gian session dự kiến: chuyển sang draining và dừng.")
+                    self.draining = True
+                    self._safe_heartbeat()
+                    break
+                idle = time.monotonic() - self.last_job_at
+                if self.stop_when_idle_seconds and idle > self.stop_when_idle_seconds:
+                    self.log(f"Không có việc {idle / 60:.0f} phút: tự tắt để đỡ tốn quota GPU "
+                             "(Kite sẽ tự bật lại khi có việc).")
                     self.draining = True
                     self._safe_heartbeat()
                     break

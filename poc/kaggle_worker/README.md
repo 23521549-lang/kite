@@ -22,7 +22,7 @@ python -m poc.kaggle_worker.cli task prepare <task-id> --repo <clean-local-repo>
 python -m poc.kaggle_worker.cli task cancel <task-id>
 ```
 
-Operator config is schema-versioned YAML or JSON. `kite provider validate` validates references without resolving secret values; `kite provider refresh` reports providers as unknown until a live adapter is registered, never starts provider workloads, and never enables one. `kite setup --secret-name <NAME>` captures one local value without echoing it and writes a `file:` reference under the config directory with mode `0600`. `kite doctor` reports local setup checks. Temporal workflow commands are `kite workflow start|status|pause|resume|cancel`; start takes the pinned task inputs and the other actions accept a workflow ID. Set `--config <path>` before the command to select a config file.
+Operator config is schema-versioned YAML or JSON. `kite provider validate` validates references without resolving secret values; `kite provider refresh` reports providers as unknown until a live adapter is registered, never starts provider workloads, and never enables one. `kite setup --secret-name <NAME>` captures one local value without echoing it and writes a `file:` reference under the config directory with mode `0600`. `kite doctor` checks that Kite really works on this machine (systemd services, gateway and connected workers or their autostart state, Temporal reachable, Kite's ports not listening on public addresses, Docker with the sandbox image and internal network, secret files present and 0600, free disk, graphify, OpenCode, the Kaggle CLI when autostart is on) and prints the command to run for each problem; `--json` for scripts, exit code 1 when something fails. Temporal workflow commands are `kite workflow start|status|pause|resume|cancel`; start takes the pinned task inputs and the other actions accept a workflow ID. Set `--config <path>` before the command to select a config file.
 
 The `kaggle` adapter is a disabled config stub. Validation and refresh do not invoke Kaggle. `kite provider enable` intentionally fails until an actual adapter implementation and its policy/interaction review are installed; entering a token alone does not make Kaggle execution available.
 
@@ -184,6 +184,20 @@ KITE_GATEWAY_DOMAIN=1-2-3-4.sslip.io sudo -E docker compose -f deploy/gateway.co
 5. Point OpenCode at the gateway: `kite gateway opencode-config` prints the block for `opencode.json`.
 
 `qwen3.6-fast` is the same model with thinking disabled, for chat and simple tool steps. `GET /status` lists each worker's models, whether it is alive, and what it has loaded; `kite sandbox run` checks it first and stops immediately when no live worker serves the model, instead of waiting for the job timeout.
+
+### Autostart (Kite runs the notebook)
+
+With `launch` on a pull worker, nobody has to open the notebook. When a request arrives and no connected worker serves its model, when the chat opens (`kite mcp serve` starts), when a task starts, or on `kite worker start`, the gateway pulls the owner's notebook metadata from Kaggle (attached datasets and settings stay as set in the Kaggle UI), puts this repository's `kaggle_model_worker.ipynb` in its place with `KITE_LAUNCH` filled in, and pushes it as a new version that runs on GPU T4 x2 ("Save & Run All"). The run loads the requested model first, skips the sample task, and ends after `idle_minutes` without a job so the weekly GPU quota is not spent idle. Opening that notebook by hand later runs it as a manual run (`KITE_LAUNCH` is ignored in interactive sessions and once the run's start window has passed). A worker that is heartbeating (also while it swaps models) is never started twice; right after a gateway restart Kite waits one heartbeat timeout for running workers to reconnect.
+
+```sh
+kite worker autostart kaggle-han --kernel <kaggle user>/<notebook slug>   # asks for the Kaggle API token (hidden), 0600 file
+sudo systemctl restart kite-gateway
+kite worker start kaggle-han      # or just open the chat / start a task
+kite worker status                # launch.state: launching | starting | alive | error (+ detail)
+kite worker stop kaggle-han       # finish the current job, then end the Kaggle session
+```
+
+The Kaggle CLI (`.[kaggle]` extra) gets `KAGGLE_API_TOKEN` as the path of the secret file, in its own environment and a temporary config folder. Worker token: by default the notebook keeps reading its Kaggle Secret `KITE_WORKER_TOKEN`. Kaggle may not attach Secrets to a version pushed through the API; the run then stops at the worker cell and `kite worker status` says so. `launch.token: per-launch` instead writes a fresh token into the pushed (private) notebook; the gateway keeps only its SHA-256 and accepts it until that run's time is up (`max_hours` + 30 min) or the next start. `/kite/*` answers loopback callers only and is not published by Caddy.
 
 Known limitation: the gateway waits for the worker's complete answer and replays it as one SSE stream (no token-by-token streaming yet). Clients therefore see the whole answer at once, and throughput figures they display (OpenCode's `tok/s`) are not real generation speed; on 2×T4 qwen3.6 generates about 54–58 tokens/s.
 

@@ -41,6 +41,8 @@ class ProviderConfig:
     worker_id: str | None = None
     roles: tuple[str, ...] = ("coder",)
     models: tuple[str, ...] = ()
+    # Autostart (pull workers on Kaggle): Kite runs the owner's notebook when work arrives. See launcher.py.
+    launch: "LaunchConfig | None" = None
 
     @property
     def model_ids(self) -> tuple[str, ...]:
@@ -50,6 +52,55 @@ class ProviderConfig:
     @property
     def effective_worker_id(self) -> str:
         return self.worker_id or self.id
+
+
+@dataclass(frozen=True)
+class LaunchConfig:
+    kernel: str                         # "<kaggle user>/<notebook slug>" of the owner's worker notebook
+    idle_minutes: int = 30              # a notebook Kite started ends after this long without a job
+    token: str = "kaggle-secret"        # or "per-launch": a short-lived token written into the pushed notebook
+    accelerator: str = "NvidiaTeslaT4"  # Kaggle CLI name of "GPU T4 x2"
+    max_hours: float = 11.5             # Kaggle ends sessions at 12 h
+    model: str | None = None            # model to load first when no request names one
+    kaggle_username: str | None = None  # only with a legacy key (secrets.kaggle_key)
+
+
+LAUNCH_TOKEN_MODES = ("kaggle-secret", "per-launch")
+_KERNEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}/[a-z0-9][a-z0-9-]{0,99}$")
+_ACCELERATOR = re.compile(r"^[A-Za-z0-9]{2,40}$")
+
+
+def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tuple[str, ...]) -> LaunchConfig:
+    launch = _mapping(raw, label)
+    unknown = set(launch) - {"kernel", "idle_minutes", "token", "accelerator", "max_hours", "model",
+                             "kaggle_username"}
+    if unknown:
+        raise ConfigError(f"{label} has unsupported fields")
+    kernel = launch.get("kernel")
+    if not isinstance(kernel, str) or not _KERNEL.fullmatch(kernel):
+        raise ConfigError(f"{label}.kernel must be <kaggle user>/<notebook slug> as in the notebook URL")
+    idle = launch.get("idle_minutes", 30)
+    if not isinstance(idle, int) or isinstance(idle, bool) or not 5 <= idle <= 720:
+        raise ConfigError(f"{label}.idle_minutes must be between 5 and 720")
+    token = launch.get("token", "kaggle-secret")
+    if token not in LAUNCH_TOKEN_MODES:
+        raise ConfigError(f"{label}.token must be one of {', '.join(LAUNCH_TOKEN_MODES)}")
+    accelerator = launch.get("accelerator", "NvidiaTeslaT4")
+    if not isinstance(accelerator, str) or not _ACCELERATOR.fullmatch(accelerator):
+        raise ConfigError(f"{label}.accelerator is malformed")
+    hours = _number(launch.get("max_hours", 11.5), f"{label}.max_hours", minimum=0.5)
+    if hours > 12:
+        raise ConfigError(f"{label}.max_hours cannot exceed Kaggle's 12 hours")
+    model = launch.get("model")
+    if model is not None and model not in models:
+        raise ConfigError(f"{label}.model must be one of this worker's models")
+    username = launch.get("kaggle_username")
+    if username is not None and (not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", username)):
+        raise ConfigError(f"{label}.kaggle_username is malformed")
+    if not secrets.get("kaggle_api_token") and not (secrets.get("kaggle_key") and username):
+        raise ConfigError(f"{label} needs secrets.kaggle_api_token (or secrets.kaggle_key with "
+                          "launch.kaggle_username) to run the notebook through the Kaggle API")
+    return LaunchConfig(kernel, idle, token, accelerator, hours, model, username)
 
 
 @dataclass(frozen=True)
@@ -205,7 +256,7 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
     for i, item in enumerate(providers_raw):
         p = _mapping(item, f"providers[{i}]")
         unknown_keys = set(p) - {"id", "adapter", "enabled", "model", "capabilities", "quota", "secrets",
-                                 "owner", "worker_id", "roles", "models"}
+                                 "owner", "worker_id", "roles", "models", "launch"}
         if unknown_keys:
             raise ConfigError(f"providers[{i}] has unsupported fields")
         pid, adapter, model = p.get("id"), p.get("adapter"), p.get("model")
@@ -250,9 +301,15 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
         extra_models = p.get("models", [])
         if not isinstance(extra_models, list) or any(not isinstance(x, str) or not _MODEL.fullmatch(x) for x in extra_models):
             raise ConfigError(f"providers[{i}].models contains malformed values")
+        launch = None
+        if p.get("launch") is not None:
+            if adapter != "pull":
+                raise ConfigError(f"providers[{i}].launch is only for adapter 'pull'")
+            all_models = (model, *[m for m in extra_models if m != model])
+            launch = _validate_launch(p["launch"], f"providers[{i}].launch", secrets, all_models)
         providers.append(ProviderConfig(
             pid, adapter, enabled, model, tuple(caps), seconds, concurrency, dict(secrets),
-            owner=owner, worker_id=worker_id, roles=tuple(roles), models=tuple(extra_models),
+            owner=owner, worker_id=worker_id, roles=tuple(roles), models=tuple(extra_models), launch=launch,
         ))
     worker_ids = [p.effective_worker_id for p in providers]
     if len(set(worker_ids)) != len(worker_ids):
@@ -597,7 +654,10 @@ def redact_config(config: KiteConfig) -> dict[str, Any]:
                        "models": list(p.model_ids), "owner": p.owner, "worker_id": p.effective_worker_id,
                        "roles": list(p.roles),
                        "capabilities": list(p.capabilities), "quota": {"gpu_seconds": p.quota_gpu_seconds, "concurrency": p.concurrency},
-                       "secrets": {k: "<reference-redacted>" for k in p.secrets}} for p in config.providers],
+                       "secrets": {k: "<reference-redacted>" for k in p.secrets},
+                       **({"launch": {"kernel": p.launch.kernel, "idle_minutes": p.launch.idle_minutes,
+                                      "token": p.launch.token}} if p.launch else {})}
+                      for p in config.providers],
         "routing": {"swap_penalty_per_second": config.routing.swap_penalty_per_second,
                     "load_seconds_cached": config.routing.load_seconds_cached,
                     "load_seconds_cold": config.routing.load_seconds_cold,

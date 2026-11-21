@@ -23,6 +23,12 @@ test = [
 codemap = [
     "graphifyy==0.9.113",
 ]
+# Autostart (launcher.py): the Kaggle CLI pushes and checks the worker notebook. kaggle 2.2.5 imports
+# six without declaring it.
+kaggle = [
+    "kaggle==2.2.5",
+    "six>=1.16",
+]
 
 [project.scripts]
 kite = "poc.kaggle_worker.cli:console_main"

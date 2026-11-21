@@ -98,6 +98,7 @@ class ModelGateway:
         on_worker_status: StatusHook | None = None,
         journal: Callable[[dict], None] | None = None,
         affinity_seconds: float = 20.0,
+        on_demand: Callable[[str], None] | None = None,
     ) -> None:
         if not workers:
             raise ValueError("at least one worker must be configured")
@@ -110,6 +111,10 @@ class ModelGateway:
         if any(len(w.token) < 24 for w in workers):
             raise ValueError("worker tokens must be at least 24 characters")
         self._tokens = {self._digest(w.token): w.worker_id for w in workers}
+        # Short-lived tokens Kite put into a notebook it started itself (launch.token: per-launch):
+        # digest -> (worker_id, expires_at). The worker's own long-lived token keeps working.
+        self._launch_tokens: dict[str, tuple[str, float]] = {}
+        self.stop_requested: set[str] = set()     # `kite worker stop`: told to the worker on its next heartbeat
         self.workers = {w.worker_id: WorkerState(w.worker_id, tuple(w.model_ids)) for w in workers}
         self.aliases = {a.name: a for a in aliases}
         self.job_timeout_seconds = job_timeout_seconds
@@ -124,6 +129,9 @@ class ModelGateway:
         # shared prefix (system prompt, tools, history). Another worker would re-read all of it.
         self.affinity_seconds = affinity_seconds
         self.affinity: dict[str, str] = {}
+        # Called with a base model when a request arrives and no live worker serves it (autostart).
+        self.on_demand = on_demand
+        self.started_at = clock()
         self.jobs: dict[str, Job] = {}
         self._queue: list[str] = []
         self._changed = asyncio.Event()
@@ -140,7 +148,37 @@ class ModelGateway:
         for known, worker_id in self._tokens.items():
             if hmac.compare_digest(known, digest):
                 return worker_id
+        now = self.clock()
+        for known, (worker_id, expires_at) in list(self._launch_tokens.items()):
+            if hmac.compare_digest(known, digest):
+                return worker_id if now < expires_at else None
         return None
+
+    def set_launch_token(self, worker_id: str, digest: str, expires_at: float) -> None:
+        """Accept one more token for ``worker_id`` until ``expires_at``; replaces its previous one."""
+        if worker_id not in self.workers:
+            raise ValueError(f"unknown worker {worker_id}")
+        for known, (owner, _expires) in list(self._launch_tokens.items()):
+            if owner == worker_id:
+                del self._launch_tokens[known]
+        self._launch_tokens[digest] = (worker_id, expires_at)
+
+    def request_stop(self, worker_id: str) -> None:
+        if worker_id not in self.workers:
+            raise ValueError(f"unknown worker {worker_id}")
+        self.stop_requested.add(worker_id)
+        self._notify()
+
+    def present(self, worker_id: str) -> bool:
+        """Connected and staying: heartbeating (also while it loads a model, when it is not ready),
+        not draining, not asked to stop."""
+        w = self.workers[worker_id]
+        return (bool(w.last_seen) and self.clock() - w.last_seen <= self.heartbeat_timeout_seconds
+                and not w.draining and worker_id not in self.stop_requested)
+
+    def serving(self, model: str) -> bool:
+        """A connected worker that may serve ``model`` exists (it may still be loading a model)."""
+        return any(model in w.model_ids and self.present(w.worker_id) for w in self.workers.values())
 
     def served_models(self) -> list[str]:
         base = sorted({m for w in self.workers.values() for m in w.model_ids})
@@ -175,6 +213,11 @@ class ModelGateway:
         self.jobs[job.job_id] = job
         self._queue.append(job.job_id)
         self._notify()
+        if self.on_demand is not None and not self.serving(model):
+            try:
+                self.on_demand(model)
+            except Exception as exc:          # starting a worker must never fail the request
+                print(f"kite gateway: autostart error: {exc}", file=sys.stderr)
         return job
 
     def _finish(self, job: Job, *, result: dict[str, Any] | None = None, error: str | None = None) -> None:
@@ -214,6 +257,8 @@ class ModelGateway:
         cached = payload.get("cached_models", [])
         worker.cached_models = tuple(m for m in cached if isinstance(m, str)) if isinstance(cached, list) else ()
         worker.last_seen = self.clock()
+        if worker.draining:
+            self.stop_requested.discard(worker_id)      # the worker got the stop request
         if self.on_worker_status is not None:
             outcome = self.on_worker_status(worker, not was_ready and self._alive(worker, self.clock()))
             if asyncio.iscoroutine(outcome):
@@ -233,7 +278,8 @@ class ModelGateway:
         def allowed(job: Job) -> bool:
             if job.pinned is not None and job.pinned != worker.worker_id:
                 holder = self.workers.get(job.pinned)
-                return holder is None or holder.draining or not self._alive(holder, now)
+                return (holder is None or holder.draining or not self._alive(holder, now)
+                        or holder.worker_id in self.stop_requested)
             owner = self.affinity.get(job.tag) if job.pinned is None and job.tag else None
             if owner and owner != worker.worker_id and now - job.created_at < self.affinity_seconds:
                 holder = self.workers.get(owner)
@@ -271,7 +317,8 @@ class ModelGateway:
         deadline = self.clock() + wait_seconds
         while True:
             self.reap()
-            if worker.ready and not worker.draining and worker.current_job is None:
+            if worker.ready and not worker.draining and worker.current_job is None \
+                    and worker_id not in self.stop_requested:
                 job = self._pick_job(worker)
                 if job is not None:
                     self._queue.remove(job.job_id)
@@ -336,6 +383,7 @@ class ModelGateway:
                 "models": list(w.model_ids),
                 "loaded_model": w.loaded_model, "cached_models": list(w.cached_models),
                 "busy": w.current_job is not None,
+                "stop_requested": w.worker_id in self.stop_requested,
                 "seconds_since_heartbeat": round(now - w.last_seen, 1) if w.last_seen else None,
             } for w in self.workers.values()],
             "queued_jobs": len(self._queue),
@@ -379,7 +427,10 @@ def _error(status: int, message: str) -> web.Response:
     return web.json_response({"error": {"message": message, "type": "kite_gateway"}}, status=status)
 
 
-def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024) -> web.Application:
+def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
+               launcher: Any = None) -> web.Application:
+    """``launcher`` (optional) starts workers on demand: ``wake(model=, worker=, reason=)``,
+    ``status()``; see launcher.py."""
     app = web.Application(client_max_size=max_body_bytes)
 
     async def models(_request: web.Request) -> web.Response:
@@ -444,7 +495,8 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024)
         if not isinstance(payload, dict):
             return _error(400, "heartbeat must be a JSON object")
         worker = await gateway.heartbeat(worker_id, payload)
-        return web.json_response({"worker_id": worker_id, "models": list(worker.model_ids)})
+        return web.json_response({"worker_id": worker_id, "models": list(worker.model_ids),
+                                  "stop": worker_id in gateway.stop_requested})
 
     async def jobs(request: web.Request) -> web.Response:
         worker_id = worker_id_or_401(request)
@@ -467,11 +519,59 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024)
         return web.json_response({"accepted": True})
 
     async def status(_request: web.Request) -> web.Response:
-        return web.json_response(gateway.status())
+        report = gateway.status()
+        if launcher is not None:
+            launches = launcher.status()
+            for worker in report["workers"]:
+                if worker["worker_id"] in launches:
+                    worker["launch"] = launches[worker["worker_id"]]
+        return web.json_response(report)
+
+    def local_only(request: web.Request) -> None:
+        # /kite/* is for tools on this machine (CLI, chat). Caddy never publishes it, and the sandbox
+        # network (which can reach the gateway's second address) must not start or stop workers.
+        if request.remote not in ("127.0.0.1", "::1"):
+            raise web.HTTPForbidden(text="local only")
+
+    async def wake(request: web.Request) -> web.Response:
+        local_only(request)
+        if launcher is None:
+            return _error(404, "autostart is not configured (providers[].launch)")
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _error(400, "body must be JSON")
+        body = body if isinstance(body, dict) else {}
+        model = body.get("model") if isinstance(body.get("model"), str) else None
+        if model:
+            model = gateway.resolve_model(model)[0]
+        try:
+            result = await launcher.wake(model=model, worker=body.get("worker"),
+                                         reason=str(body.get("reason") or "manual")[:40],
+                                         force=bool(body.get("force")))
+        except ValueError as exc:
+            return _error(400, str(exc))
+        return web.json_response(result)
+
+    async def stop(request: web.Request) -> web.Response:
+        local_only(request)
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _error(400, "body must be JSON")
+        worker_id = body.get("worker") if isinstance(body, dict) else None
+        try:
+            gateway.request_stop(str(worker_id))
+        except ValueError as exc:
+            return _error(400, str(exc))
+        return web.json_response({"worker": worker_id, "stop_requested": True,
+                                  "note": "worker finishes its current job, then ends the session"})
 
     app.router.add_get("/v1/models", models)
     app.router.add_post("/v1/chat/completions", chat)
     app.router.add_get("/status", status)
+    app.router.add_post("/kite/wake", wake)
+    app.router.add_post("/kite/stop", stop)
     app.router.add_post("/worker/heartbeat", heartbeat)
     app.router.add_get("/worker/jobs", jobs)
     app.router.add_post("/worker/jobs/{job_id}/result", result)

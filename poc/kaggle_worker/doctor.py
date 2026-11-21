@@ -1,0 +1,292 @@
+"""`kite doctor`: check that the Kite installation on this machine actually works.
+
+Each check reads real state (services, sockets, gateway, Docker, files) and says what to run when
+something is wrong. Nothing here changes the system, prints a secret, or starts a GPU session.
+`kite sandbox doctor` is the deeper isolation test (it starts containers).
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import importlib.util
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+from typing import Any, Callable
+
+from .config import KiteConfig
+
+OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
+MARK = {OK: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
+
+
+@dataclass
+class Check:
+    name: str
+    status: str
+    detail: str
+    fix: str = ""
+
+
+@dataclass
+class Probes:
+    """Everything that touches the machine, replaceable in tests."""
+    run: Callable[[list[str], float], tuple[int, str]]
+    http_json: Callable[[str, float], Any]
+    tcp: Callable[[str, int, float], bool]
+    disk_free: Callable[[Path], float]            # GiB
+    which: Callable[[str], str | None]
+    has_module: Callable[[str], bool]
+
+
+def _run(command: list[str], timeout: float) -> tuple[int, str]:
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, str(exc)
+    return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+
+def _http_json(url: str, timeout: float) -> Any:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def _tcp(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def default_probes() -> Probes:
+    return Probes(run=_run, http_json=_http_json, tcp=_tcp,
+                  disk_free=lambda path: shutil.disk_usage(path).free / 1024**3,
+                  which=shutil.which, has_module=lambda name: importlib.util.find_spec(name) is not None)
+
+
+def _host_port(endpoint: str, default_port: int) -> tuple[str, int]:
+    host, _, port = endpoint.rpartition(":")
+    if not host:
+        return endpoint, default_port
+    try:
+        return host.strip("[]"), int(port)
+    except ValueError:
+        return endpoint, default_port
+
+
+def classify_address(address: str) -> str:
+    """'loopback' | 'private' | 'all' (wildcard) | 'public' for a listening address."""
+    address = address.strip("[]").split("%")[0]
+    if address in ("*", "0.0.0.0", "::"):
+        return "all"
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return "public"
+    if ip.is_loopback:
+        return "loopback"
+    return "private" if ip.is_private or ip.is_link_local else "public"
+
+
+def listeners(output: str) -> list[tuple[str, int]]:
+    """Parse `ss -ltnH`: (address, port) of each listening TCP socket."""
+    found = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[3]
+        address, _, port = local.rpartition(":")
+        if port.isdigit():
+            found.append((address, int(port)))
+    return found
+
+
+def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = None) -> list[Check]:
+    p = probes or default_probes()
+    checks: list[Check] = []
+    add = lambda *args: checks.append(Check(*args))   # noqa: E731
+    state_dir = Path(config_path).parent
+    pulls = [pr for pr in config.providers if pr.adapter == "pull" and pr.enabled]
+    autostart = [pr.effective_worker_id for pr in pulls if pr.launch is not None]
+
+    add("cấu hình", OK, f"{config_path}: {len(pulls)} worker ({', '.join(pr.effective_worker_id for pr in pulls) or 'không có'})"
+        + (f"; tự bật: {', '.join(autostart)}" if autostart else ""))
+
+    # ---- secrets: present, private
+    for provider in config.providers:
+        if not provider.enabled:
+            continue
+        for key, reference in sorted(provider.secrets.items()):
+            label = f"secret {provider.id}.{key}"
+            if reference.startswith("env:"):
+                status = OK if os.environ.get(reference[4:]) else WARN
+                add(label, status, f"biến môi trường {reference[4:]}" + ("" if status == OK else " chưa có trong shell này"),
+                    "" if status == OK else "kiểm tra biến này trong unit systemd của dịch vụ")
+                continue
+            path = Path(reference[5:])
+            if not path.exists():
+                fix = (f"kite worker token {provider.effective_worker_id}" if key == "worker_token"
+                       else f"kite worker autostart {provider.effective_worker_id} --kernel <user>/<slug>"
+                       if key == "kaggle_api_token" else f"tạo file {path} (chmod 600)")
+                add(label, FAIL, f"thiếu file {path}", fix)
+            elif path.stat().st_mode & 0o077:
+                add(label, WARN, f"{path} có quyền {path.stat().st_mode & 0o777:o}: người khác đọc được",
+                    f"chmod 600 {path}")
+            else:
+                add(label, OK, f"{path} (0600)")
+
+    # ---- gateway and workers
+    gateway_url = f"http://{config.gateway.host}:{config.gateway.port}"
+    status: dict | None = None
+    if pulls:
+        try:
+            status = p.http_json(gateway_url + "/status", 5)
+        except Exception as exc:
+            add("gateway", FAIL, f"không gọi được {gateway_url}/status: {exc}",
+                "sudo systemctl status kite-gateway; journalctl -u kite-gateway -n 50")
+    if status is not None:
+        workers = status.get("workers") or []
+        alive = [w for w in workers if w.get("alive")]
+        add("gateway", OK, f"chạy; {len(alive)}/{len(workers)} worker sống, {status.get('queued_jobs', 0)} request chờ")
+        for worker in workers:
+            launch = worker.get("launch") or {}
+            name = f"worker {worker.get('worker_id')}"
+            if worker.get("alive"):
+                add(name, OK, f"sống, đang nạp {worker.get('loaded_model') or 'chưa có model'}"
+                    + (", đang bận" if worker.get("busy") else ""))
+            elif launch.get("state") == "error":
+                add(name, FAIL, f"tự bật lỗi: {launch.get('detail')}",
+                    f"sửa theo lỗi rồi: kite worker start {worker.get('worker_id')} --force")
+            elif launch.get("state") in ("launching", "starting"):
+                add(name, OK, f"đang bật trên Kaggle ({launch.get('state')}, {launch.get('seconds')} giây)")
+            elif launch:
+                add(name, OK, "chưa chạy; Kite tự bật khi có việc")
+            else:
+                add(name, WARN, "chưa kết nối", "mở notebook Kaggle và chạy tới ô Worker mode "
+                    f"(hoặc cấu hình tự bật: kite worker autostart {worker.get('worker_id')} --kernel <user>/<slug>)")
+    if autostart:
+        from .launcher import kaggle_command
+
+        command = kaggle_command()
+        found = Path(command).exists() or p.which(command)
+        add("kaggle CLI", OK if found else FAIL, command if found else "chưa cài (cần cho tự bật worker)",
+            "" if found else '"$(command -v uv || echo ~/.local/bin/uv)" pip install --python .venv/bin/python '
+                             '-e ".[codemap,kaggle]"')
+
+    # ---- Temporal
+    host, port = _host_port(config.temporal_endpoint, 7233)
+    if p.tcp(host, port, 3):
+        add("temporal", OK, f"{host}:{port} nhận kết nối")
+    else:
+        add("temporal", FAIL, f"không kết nối được {host}:{port}",
+            "sudo docker ps --filter name=temporal; xem lại docker compose của Temporal")
+
+    # ---- systemd services
+    if p.which("systemctl"):
+        for unit in ("kite-gateway", "kite-workflow-worker"):
+            code, output = p.run(["systemctl", "is-active", unit], 10)
+            state = output.strip().splitlines()[-1] if output.strip() else "unknown"
+            add(f"dịch vụ {unit}", OK if code == 0 else FAIL, state,
+                "" if code == 0 else f"sudo systemctl restart {unit}; journalctl -u {unit} -n 50")
+
+    # ---- listening sockets: Kite's ports must not listen on public addresses
+    if p.which("ss"):
+        code, output = p.run(["ss", "-ltnH"], 10)
+        ports = {config.gateway.port: "gateway", port: "temporal", config.opencode_port: "opencode"}
+        if code == 0:
+            for wanted, label in ports.items():
+                found = [(addr, classify_address(addr)) for addr, prt in listeners(output) if prt == wanted]
+                if not found:
+                    continue
+                public = [a for a, kind in found if kind == "public"]
+                wide = [a for a, kind in found if kind == "all"]
+                where = ", ".join(a for a, _ in found)
+                if public:
+                    add(f"cổng {wanted} ({label})", FAIL, f"nghe trên địa chỉ public {', '.join(public)}",
+                        "chỉ cho nghe ở 127.0.0.1 hoặc mạng nội bộ")
+                elif wide:
+                    add(f"cổng {wanted} ({label})", WARN, f"nghe trên mọi địa chỉ ({where})",
+                        "Docker publish cổng thì ufw không chặn: bind 127.0.0.1:<cổng> trong compose, "
+                        "và giữ security group đóng cổng này")
+                else:
+                    add(f"cổng {wanted} ({label})", OK, f"chỉ nội bộ ({where})")
+
+    # ---- sandbox: Docker, image, network
+    if config.sandbox is not None:
+        docker = list(config.sandbox.docker_command)
+        code, output = p.run([*docker, "version", "--format", "{{.Server.Version}}"], 20)
+        if code != 0:
+            add("docker", FAIL, output.strip()[-200:] or "không chạy được docker",
+                "sudo systemctl status docker; user phải thuộc nhóm docker")
+        else:
+            add("docker", OK, f"server {output.strip()}")
+            code, _ = p.run([*docker, "image", "inspect", "-f", "{{.Id}}", config.sandbox.image], 20)
+            add("sandbox image", OK if code == 0 else FAIL, config.sandbox.image,
+                "" if code == 0 else "kite sandbox build")
+            code, output = p.run([*docker, "network", "inspect", "-f", "{{.Internal}}", config.sandbox.network], 20)
+            internal = code == 0 and output.strip() == "true"
+            add("sandbox network", OK if internal else FAIL,
+                f"{config.sandbox.network} " + ("internal (không Internet)" if internal else "thiếu hoặc không internal"),
+                "" if internal else "kite sandbox build")
+        if config.sandbox.code_map:
+            ok = p.has_module("graphify")
+            add("bản đồ code (graphify)", OK if ok else WARN, "đã cài" if ok else "chưa cài: task chạy không có bản đồ code",
+                "" if ok else '"$(command -v uv || echo ~/.local/bin/uv)" pip install --python .venv/bin/python '
+                              '-e ".[codemap,kaggle]"')
+        if config.sandbox.deps_cache:
+            cache = state_dir / "deps-cache"
+            sets = [d for d in cache.iterdir() if d.is_dir()] if cache.is_dir() else []
+            add("cache thư viện", OK, f"{cache}: {len(sets)} bộ đã lưu" if cache.is_dir()
+                else f"{cache}: chưa có (tạo ở task đầu tiên)")
+
+    # ---- disk
+    for label, path in (("đĩa dữ liệu", state_dir), ("đĩa home", Path.home())):
+        try:
+            free = p.disk_free(path)
+        except OSError as exc:
+            add(label, WARN, f"không đọc được {path}: {exc}")
+            continue
+        status_ = FAIL if free < 1 else WARN if free < 5 else OK
+        add(label, status_, f"{path}: còn {free:.1f} GiB",
+            "" if status_ == OK else "docker system prune; xóa ~/bench-repo-* cũ, /tmp/kite-*")
+
+    # ---- tools
+    executable = config.opencode_executable
+    found = Path(executable).exists() or p.which(executable)
+    add("opencode", OK if found else FAIL, executable, "" if found else "cài OpenCode hoặc sửa opencode.executable")
+    journal = state_dir / "journal"
+    writable = os.access(journal if journal.exists() else state_dir, os.W_OK)
+    add("journal", OK if writable else WARN, str(journal), "" if writable else f"sudo chown -R $USER {state_dir}")
+    if not Path(config.harness2_checkout).exists():
+        add("harness2", SKIP, f"{config.harness2_checkout} chưa có (chỉ cần cho Harness²)")
+    return checks
+
+
+def summary(checks: list[Check]) -> dict[str, Any]:
+    fails = sum(c.status == FAIL for c in checks)
+    warns = sum(c.status == WARN for c in checks)
+    return {"status": "ok" if not fails else "needs_attention", "fail": fails, "warn": warns,
+            "checks": [asdict(c) for c in checks]}
+
+
+def render(checks: list[Check], config_path: Path) -> str:
+    width = max((len(c.name) for c in checks), default=10) + 2
+    lines = [f"Kite doctor — {config_path}"]
+    for check in checks:
+        lines.append(f"{MARK[check.status]} {check.name.ljust(width)}{check.detail}")
+        if check.fix and check.status in (FAIL, WARN):
+            lines.append(f"  {' ' * width}→ {check.fix}")
+    fails = sum(c.status == FAIL for c in checks)
+    warns = sum(c.status == WARN for c in checks)
+    lines.append("Kết quả: " + ("mọi thứ ổn" if not fails and not warns
+                                 else f"{fails} lỗi, {warns} cảnh báo")
+                 + ". Kiểm tra sâu sandbox (chạy container): kite sandbox doctor")
+    return "\n".join(lines)

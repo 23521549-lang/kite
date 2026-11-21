@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
@@ -235,6 +236,7 @@ class KiteOps:
                 id=task_id, task_queue=self.config.temporal_task_queue)
         except Exception as exc:
             raise KiteToolError(f"không khởi động được workflow: {exc}") from exc
+        self.wake_soon(model=model, reason="task")
         result = {"task_id": task_id, "repo": str(path), "commit": head, "task_type": task_type,
                   "model": model or "Kite tự chọn", "status": "started"}
         suggestion = self._kite_yml(path).get("suggestion")
@@ -423,6 +425,31 @@ class KiteOps:
                            "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(task["created_at"]))})
         return listed
 
+    def wake_soon(self, *, model: str | None = None, reason: str = "chat") -> None:
+        """Ask the gateway (in the background) to start a worker if none is connected (autostart).
+
+        Never blocks or fails a tool, and never prints: stdout carries the MCP protocol."""
+        if not any(p.launch is not None for p in self.config.providers if p.adapter == "pull" and p.enabled):
+            return
+
+        def call() -> None:
+            url = f"http://{self.config.gateway.host}:{self.config.gateway.port}/kite/wake"
+            body = json.dumps({"model": model, "reason": reason}).encode()
+            request = urllib.request.Request(url, data=body, method="POST",
+                                             headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    result = json.loads(response.read() or b"{}")
+            except Exception as exc:
+                result = {"error": short(f"{type(exc).__name__}: {exc}", 200)}
+            try:
+                self.journal.write("actions", {"tool": "autostart", "args": {"model": model, "reason": reason},
+                                               "ok": "error" not in result, "result": short(result, 300)})
+            except Exception:
+                pass
+
+        threading.Thread(target=call, name="kite-wake", daemon=True).start()
+
     async def worker_status(self) -> dict:
         if self._gateway_status is not None:
             return self._gateway_status()
@@ -540,7 +567,7 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 - Muốn sửa thêm trên task CHƯA xong: `send_instruction`. Task đã xong: tạo task mới.
 - Người dùng nhận xét kết quả một task (đúng, sai, dùng được, phải sửa lại…): gọi `note_task` với `verdict` `good` hoặc `bad`, `reason` là lời người dùng, rồi xác nhận ngắn là đã ghi. Không hỏi lại.
 - Kết quả `start_task` có `kite_yml_suggestion` nghĩa là repo chưa có `.kite.yml` nên Kite có thể cài thư viện hoặc chạy test chưa đúng. Báo `task_id` như thường, rồi đưa khối YAML đề xuất và nói người dùng kiểm tra rồi tự commit file `.kite.yml` vào gốc repo. Bạn không tự tạo file đó.
-- Hỏi về GPU/worker: `worker_status`. Nếu không có worker nào `alive`, nhắc người dùng bật notebook Kaggle (mục Worker mode); task vẫn được giữ và sẽ chạy khi worker kết nối.
+- Hỏi về GPU/worker: `worker_status`. Worker có `launch` thì Kite tự bật notebook Kaggle khi có việc: `launch.state` là `launching`/`starting` nghĩa là đang bật (thường 5–10 phút), báo người dùng chờ; `error` thì báo đúng `launch.detail`. Không có worker nào `alive` và cũng không có `launch`: nhắc người dùng bật notebook Kaggle (mục Worker mode). Task vẫn được giữ và sẽ chạy khi worker kết nối.
 
 ## Quy tắc an toàn
 
