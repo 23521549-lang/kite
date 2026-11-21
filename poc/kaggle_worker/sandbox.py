@@ -169,7 +169,8 @@ class SandboxRun:
     check_runs: int = 0
     check_output_tail: str = ""
     scratch_files: list[str] = field(default_factory=list)  # new files that look like experiments
-    # off | skipped | passed | declined | not_applied | tests_failed | check_failed | error
+    # off | skipped | passed | declined | not_applied | tests_failed | check_failed | repro_failed
+    # | repro_disputed (the fix stays in the clone for the agent) | error
     fast_path: str = "off"
     fast_seconds: float = 0.0
     review_mode: str = ""         # agent | one_call
@@ -638,6 +639,20 @@ def fast_context(workspace: Path, goal: str, graph: codemap.CodeGraph | None = N
     return "\n\n".join(sections)
 
 
+CONTEXT_FILE = re.compile(r"^### (\S+?)(?:,| \(|$)", re.M)
+
+
+def context_files(context: str) -> list[str]:
+    """The files a context shows, in order (from its ``### path ...`` section titles)."""
+    return list(dict.fromkeys(CONTEXT_FILE.findall(context or "")))
+
+
+def example_path(context: str) -> str:
+    """A real file of the context for the edit-block example. Bench v5: with the made-up example
+    path "đường/dẫn/tới/file.py", qwen wrote exactly that above its blocks in 3 of 4 tasks."""
+    return next(iter(context_files(context)), "app/main.py")
+
+
 def fast_prompt(goal: str, context: str, test_command: str, check: str = "", feedback: str = "") -> str:
     checks = f"`{test_command}`" + (f" và `{check_hint(check)}`" if check else "")
     return "\n".join([
@@ -645,7 +660,7 @@ def fast_prompt(goal: str, context: str, test_command: str, check: str = "", fee
         "Kite đã tìm sẵn phần code liên quan (bên dưới, đúng nội dung hiện tại của file). Hãy đưa ra bản sửa "
         "HOÀN CHỈNH bằng các khối SEARCH/REPLACE theo đúng mẫu sau, mỗi khối một chỗ sửa:",
         "",
-        "đường/dẫn/tới/file.py",
+        example_path(context),
         "<<<<<<< SEARCH",
         "các dòng chép NGUYÊN VĂN từ file hiện tại (cả thụt lề), vừa đủ để chỉ khớp một chỗ",
         "=======",
@@ -653,6 +668,8 @@ def fast_prompt(goal: str, context: str, test_command: str, check: str = "", fee
         ">>>>>>> REPLACE",
         "",
         "Quy tắc:",
+        "- Dòng ngay trên `<<<<<<< SEARCH` là đường dẫn thật của file được sửa, chép từ tiêu đề `###` của "
+        "phần code bên dưới (mẫu trên chỉ là ví dụ).",
         "- SEARCH chép đúng từng ký tự từ phần code bên dưới; giữ khối ngắn, chỉ quanh chỗ cần đổi.",
         "- Tạo file mới: để SEARCH trống.",
         "- Sửa đủ mọi chỗ yêu cầu cần (kể cả nơi gọi tới), không đổi thứ không liên quan; diff càng nhỏ càng tốt.",
@@ -730,6 +747,8 @@ class FastAttempt:
     diff: str = ""
     files: list[str] = field(default_factory=list)
     context_chars: int = 0
+    fixed: list[str] = field(default_factory=list)   # what Kite set right in the blocks (editblocks notes)
+    kept: str = ""              # tree with this candidate and the reproduction test (repro_disputed)
 
 
 def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: Callable[[str], str],
@@ -742,18 +761,26 @@ def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, as
         answer = ask(fast_prompt(goal, context, test_command, check, feedback))
     except Exception as exc:                    # gateway down, timeout: the agent still runs
         return FastAttempt("error", reason=str(exc)[:300], context_chars=len(context))
-    return fast_apply(workspace, answer, len(context))
+    return fast_apply(workspace, answer, len(context), context_files(context))
 
 
-def fast_apply(workspace: Path, answer: str, context_chars: int = 0) -> FastAttempt:
-    """Apply one fast answer's edit blocks (all or nothing); edits to existing tests are refused."""
+def search_tiers(workspace: Path, shown: Sequence[str]) -> list[list[str]]:
+    """Where a block that names the wrong file is looked for: the files the model was shown, then
+    every tracked file."""
+    return [list(shown), [f for f in _git(workspace, "ls-files", check=False).splitlines() if f]]
+
+
+def fast_apply(workspace: Path, answer: str, context_chars: int = 0, shown: Sequence[str] = ()) -> FastAttempt:
+    """Apply one fast answer's edit blocks (all or nothing); edits to existing tests are refused.
+    ``shown``: the files in the model's context, where a block naming a wrong file is looked for first."""
     visible = re.sub(r"<think>.*?</think>", "", answer, flags=re.S)
     declined = re.search(rf"{FAST_DECLINE}\s*:?\s*(.*)", visible)
     if declined and "<<<<<<<" not in visible:
         return FastAttempt("declined", answer, declined.group(1).strip()[:300], context_chars=context_chars)
     before = snapshot_tree(workspace)
+    fixed: list[str] = []
     try:
-        files = editblocks.apply(workspace, editblocks.parse(answer))
+        files = editblocks.apply(workspace, editblocks.parse(answer), search_tiers(workspace, shown), fixed)
         existing_tests = [f for f in files if codemap.is_test_path(f) and subprocess.run(
             ["git", "-C", str(workspace), "cat-file", "-e", f"{before}:{f}"], capture_output=True).returncode == 0]
         if existing_tests:
@@ -763,11 +790,26 @@ def fast_apply(workspace: Path, answer: str, context_chars: int = 0) -> FastAtte
         return FastAttempt("not_applied", answer, str(exc)[:300], before, context_chars=context_chars)
     _git(workspace, "add", "-A")
     diff = _git(workspace, "diff", "--cached", before, check=False)
-    return FastAttempt("applied", answer, "", before, diff, files, context_chars)
+    return FastAttempt("applied", answer, "", before, diff, files, context_chars, fixed)
 
 
 FAST_REASONS = {"tests_failed": "test của Kite lỗi", "check_failed": "bước kiểm tra lỗi",
                 "not_applied": "không áp được vào code", "repro_failed": "test tái hiện lỗi trên bản sửa"}
+FAILING_NODE = re.compile(r"^(?:FAILED|ERROR) ([\w./-]+\.py)(?:::(\S+))?", re.M)
+
+
+def failing_tests(output: str, path: str) -> set[str] | None:
+    """Names of the failing tests of the file ``path`` in a pytest output; None when something else
+    failed too (another file, or this whole file at collection). Node ids may be relative to a
+    rootdir below the repository root (``tests/x.py`` for ``svc/tests/x.py``)."""
+    names: set[str] = set()
+    for file, name in FAILING_NODE.findall(clean_output(output)):
+        if not (file == path or path.endswith("/" + file)) or not name:
+            return None
+        names.add(name.split("[", 1)[0])
+    return names
+
+
 REPRO_FILE = "test_kite_repro.py"
 
 
@@ -867,7 +909,7 @@ def repro_outcome(code: int, output: str) -> str:
 @dataclass
 class FastResult:
     status: str                 # off | skipped | declined | not_applied | error | tests_failed | check_failed
-    #                             | repro_failed | passed
+    #                             | repro_failed | repro_disputed | passed
     repro: str = "off"          # off | none | broken | not_reproduced | reproduced
     attempts: int = 0           # candidates tried (best-of-N)
     reason: str = ""
@@ -884,6 +926,7 @@ class FastResult:
 
 
 FAST_STATUS_VI = {"passed": "qua hết test", "tests_failed": "trượt test", "repro_failed": "trượt test tái hiện",
+                  "repro_disputed": "qua test của repo, lệch một phần test tái hiện",
                   "check_failed": "trượt bước kiểm tra", "not_applied": "không áp được vào code",
                   "declined": "model nói không sửa được", "skipped": "bỏ qua", "error": "lỗi khi gọi model"}
 
@@ -908,6 +951,14 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
     picks): ``helpers`` are askers on other idle workers, asked for candidates at the same time as
     ``ask``; candidates are checked one by one and the first that passes everything wins. Then up to
     ``retries`` more candidates from ``ask``, each told why the last one failed.
+
+    "repro_disputed": the repository's tests and the check pass, and the candidate turns some of the
+    reproduction's failing cases green but not all. The reproduction test is a model's reading of the
+    goal too, and it can be wrong (bench v5, R2: one case wanted a tenant without a name listed with
+    name None, another wanted it skipped as corrupt). Such a candidate is kept in the clone with the
+    test, with no retry (a retry told "an independent check still fails" bends a right fix toward a
+    wrong test),
+    and the agent settles the remaining cases: fix the code, or fix the case that contradicts the goal.
     ``progress`` gets one line per finished step (for ``task_status`` while the task runs).
     """
     def note(line: str) -> None:
@@ -957,6 +1008,20 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
                   f"Kết quả trên code ban đầu:\n```\n{failure_digest(repro_output, 1500).strip()}\n```"
                   if result.repro == "reproduced" else "")
 
+    originally = failing_tests(repro_output, repro_file) if result.repro == "reproduced" else None
+
+    def disputed(fast: FastAttempt, label: str, output: str) -> tuple[int | None, str] | None:
+        """(check code, check output) when only some of the reproduction's failing cases still fail
+        and the repository's own tests and the check pass without the reproduction test."""
+        still = failing_tests(output, repro_file)
+        if not originally or not still or not still < originally:
+            return None
+        fast.kept = snapshot_tree(workspace)
+        (workspace / repro_file).unlink()
+        code, _, _ = run_tests(f"{label}-repo")
+        check_code, check_output, _ = run_check(f"{label}-repo") if code == 0 else (None, "", "")
+        return (check_code, check_output) if code == 0 and check_code in (None, 0) else None
+
     def judge(fast: FastAttempt, label: str) -> tuple[str, str, int | None, str]:
         """Kite's tests on one applied candidate: (status, test output, check code, check output)."""
         if result.repro in ("reproduced", "not_reproduced"):
@@ -967,7 +1032,10 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
         check_code, check_output, _ = run_check(label) if code == 0 else (None, "", "")
         if code == 0 and check_code in (None, 0):
             return "passed", output, check_code, check_output
+        split = disputed(fast, label, output) if code != 0 else None
         restore_tree(workspace, fast.before)              # also drops the reproduction test
+        if split is not None:
+            return "repro_disputed", output, split[0], split[1]
         if code != 0:
             status = "repro_failed" if repro_file and repro_file in output and result.repro != "off" \
                 else "tests_failed"
@@ -990,19 +1058,25 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
     else:
         replies = [None]                                   # asked below, through fast_attempt
     last = best = None             # (status, attempt, test output, check code, check output)
-    rank = {"tests_failed": 3, "repro_failed": 3, "check_failed": 3, "not_applied": 2}
+    rank = {"repro_disputed": 4, "tests_failed": 3, "repro_failed": 3, "check_failed": 3, "not_applied": 2}
     pending = len(replies) + max(0, retries)
     for n in range(1, pending + 1):
+        if n > len(replies) and best and best[0] == "repro_disputed":
+            break                         # no blind retry against a test that may be wrong: the agent decides
         if n <= len(replies) and replies[n - 1] is not None:
             reply = replies[n - 1]
             fast = (FastAttempt("error", reason=str(reply)[:300], context_chars=len(context))
-                    if isinstance(reply, Exception) else fast_apply(workspace, reply, len(context)))
+                    if isinstance(reply, Exception) else fast_apply(workspace, reply, len(context),
+                                                                     context_files(context)))
         else:
             why = best or last
             feedback = (retry_feedback(why[0], why[1].diff, why[1].reason, why[2] or why[4])
                         if why and why[0] in rank else "")
             fast = fast_attempt(workspace, goal, graph, ask, test_command, check, context=context, feedback=feedback)
         result.attempts = n
+        if fast.fixed:
+            result.log.append(f"đường nhanh, bản {n}: Kite chỉnh khối sửa (sai tên file hoặc chép lệch dòng): "
+                              + "; ".join(fast.fixed))
         if fast.status == "applied":
             status, output, check_code, check_output = judge(fast, "fast" if n == 1 else f"fast{n}")
         else:
@@ -1024,6 +1098,14 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
     last = best or last
     status, fast, output, check_code, check_output = last
     result.status = status
+    if status == "repro_disputed":
+        restore_tree(workspace, fast.kept)               # the candidate and the reproduction test, together
+        result.answer, result.files, result.reason = fast.answer, fast.files, fast.reason
+        result.failing_output, result.test_output = output, output
+        result.check_code, result.check_output = check_code, check_output
+        still = failing_tests(output, repro_file) or set()
+        result.note = disputed_note(repro_file, fast.diff, output, sorted(originally - still), sorted(still))
+        return result
     if status in ("tests_failed", "repro_failed", "check_failed"):
         if status != "check_failed":
             result.failing_output = output
@@ -1052,7 +1134,7 @@ def fast_review(workspace: Path, goal: str, base: str, graph: codemap.CodeGraph 
     if not blocks:
         return 0, answer
     try:
-        files = editblocks.apply(workspace, blocks)
+        files = editblocks.apply(workspace, blocks, search_tiers(workspace, context_files(context)))
     except editblocks.EditError as exc:
         return 1, f"không áp được khối sửa của rà soát: {exc}\n{answer}"
     edited = [f for f in files if codemap.is_test_path(f) and subprocess.run(
@@ -1150,12 +1232,31 @@ def fast_review_prompt(goal: str, diff: str, context: str, test_command: str, ch
         "- Mọi chỗ gọi tới phần đã đổi vẫn đúng (code bên dưới).",
         *REVIEW_CHECKLIST, "",
         f"Nếu bản sửa đã đúng và đủ: chỉ trả lời một dòng: {FAST_APPROVE}",
-        "Nếu còn sai hoặc thiếu: đưa các khối sửa trên code HIỆN TẠI bên dưới, đúng mẫu",
-        "đường/dẫn/file.py", "<<<<<<< SEARCH", "các dòng chép nguyên văn từ code hiện tại", "=======",
+        "Nếu còn sai hoặc thiếu: đưa các khối sửa trên code HIỆN TẠI bên dưới, đúng mẫu (dòng đầu là đường dẫn "
+        "thật của file, như tiêu đề `###` bên dưới)",
+        example_path(context), "<<<<<<< SEARCH", "các dòng chép nguyên văn từ code hiện tại", "=======",
         "các dòng mới", ">>>>>>> REPLACE",
         "Không sửa hay xóa test có sẵn. Kite sẽ chạy lại test; khối sửa làm hỏng test sẽ bị bỏ.", "",
         "Code hiện tại:", context,
     ])
+
+
+def disputed_note(repro_file: str, diff: str, output: str, fixed: list[str], failing: list[str]) -> str:
+    """What the agent hears when a fast fix passes the repository's tests and only some of the
+    reproduction's cases: the fix and the test stay in /work, and either may be the wrong one."""
+    lines = ["", f"Kite đã thử một bản sửa nhanh (một lần gọi model) và GIỮ nó trong /work: test của repo và bước "
+             f"kiểm tra đều qua. Test tái hiện Kite tự viết từ yêu cầu, `{repro_file}` (cũng đang ở /work), "
+             f"nay qua {len(fixed)} ca từng lỗi trên code cũ ({', '.join(fixed)}) nhưng vẫn lỗi "
+             f"{len(failing)} ca: {', '.join(failing)}.",
+             "Test tái hiện cũng do model viết nên CÓ THỂ SAI; yêu cầu gốc mới là chuẩn. Đọc lại yêu cầu rồi, với "
+             "từng ca còn lỗi:",
+             "- nếu ca đó đúng với yêu cầu: sửa code cho nó qua, giữ những gì bản sửa đã làm đúng;",
+             f"- nếu ca đó mâu thuẫn với yêu cầu hoặc với ca khác: sửa hoặc xóa riêng ca đó trong `{repro_file}` "
+             "(file Kite viết, không phải test có sẵn) và nói rõ lý do trong câu trả lời.",
+             "Các file trong bản sửa đã khác phần code in ở trên: đọc lại trước khi sửa tiếp.",
+             "Bản sửa đang giữ:", "```diff", diff.strip()[:3000], "```",
+             "Kết quả test tái hiện trên bản sửa:", "```", failure_digest(output, 2000).strip(), "```"]
+    return "\n".join(lines)
 
 
 def fast_note(reason: str, diff: str, output: str) -> str:
@@ -2064,7 +2165,9 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                 log(f"[{task_id}] {line}")
             log(f"[{task_id}] đường nhanh: {run.fast_path} (bản {fast.attempts}), test tái hiện: {run.repro}"
                 f"{f' ({fast.reason})' if fast.reason else ''} sau {run.fast_seconds}s"
-                + ("; bỏ qua agent, sang rà soát" if run.fast_path == "passed" else "; chuyển sang agent"))
+                + ("; bỏ qua agent, sang rà soát" if run.fast_path == "passed" else
+                   "; giữ bản sửa, agent xem các ca test tái hiện còn lỗi" if run.fast_path == "repro_disputed"
+                   else "; chuyển sang agent"))
 
     while run.fast_path != "passed":
         kind = "agent" if attempt == 0 else f"fix{attempt}"

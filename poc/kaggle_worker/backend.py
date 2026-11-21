@@ -49,6 +49,8 @@ STEP_LABELS = {"setup": "cài thư viện (có mạng)", "repro": "chạy test t
                "review": "agent rà soát lại bản sửa"}
 FAST_OUTCOMES = {"passed": "bản sửa qua hết test", "tests_failed": "bản sửa trượt test, chuyển cho agent",
                  "repro_failed": "bản sửa trượt test tái hiện, chuyển cho agent",
+                 "repro_disputed": "bản sửa qua test của repo nhưng lệch một phần test tái hiện, giữ lại để agent "
+                                   "xem ca nào sai",
                  "check_failed": "bản sửa trượt bước kiểm tra, chuyển cho agent",
                  "not_applied": "bản sửa không áp được, chuyển cho agent",
                  "declined": "model nói không sửa được trong một lần, chuyển cho agent",

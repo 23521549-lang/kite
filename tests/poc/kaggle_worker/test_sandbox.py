@@ -770,6 +770,81 @@ def test_edit_blocks_apply_all_or_nothing_and_stay_inside_the_repo(tmp_path):
         eb.apply(tmp_path, eb.parse("d.py\n<<<<<<< SEARCH\na = 1\n=======\na = 0\n>>>>>>> REPLACE"))
 
 
+
+def test_a_block_that_names_the_wrong_file_goes_to_the_one_file_with_its_search_text(tmp_path):
+    from poc.kaggle_worker import editblocks as eb
+
+    (tmp_path / "svc").mkdir()
+    (tmp_path / "svc" / "main.py").write_text("def meter(r):\n    if r in (401, 403):\n        return False\n")
+    (tmp_path / "svc" / "tables.py").write_text("PAGES = 1\n\n\ndef query():\n    return []\n")
+    (tmp_path / "svc" / "copy.py").write_text("def query():\n    return []\n")
+    # Bench v5: the prompt's made-up example path above the blocks (3 of 4 tasks), SEARCH text right.
+    answer = ("đường/dẫn/tới/file.py\n<<<<<<< SEARCH\n    if r in (401, 403):\n=======\n"
+              "    if r in (401, 403, 404):\n>>>>>>> REPLACE\n\n"
+              "svc/main.py\n<<<<<<< SEARCH\nPAGES = 1\n=======\nPAGES = 100\n>>>>>>> REPLACE\n")
+    with pytest.raises(eb.EditError, match="does not exist"):
+        eb.apply(tmp_path, eb.parse(answer))                     # nowhere to look: as before
+    every = ["svc/copy.py", "svc/main.py", "svc/tables.py"]
+    notes: list[str] = []
+    assert eb.apply(tmp_path, eb.parse(answer), [["svc/main.py"], every], notes) == ["svc/main.py", "svc/tables.py"]
+    assert notes == ["đường/dẫn/tới/file.py → svc/main.py", "svc/main.py → svc/tables.py"]
+    assert "(401, 403, 404)" in (tmp_path / "svc" / "main.py").read_text()
+    assert (tmp_path / "svc" / "tables.py").read_text().startswith("PAGES = 100\n")
+    # The same text in two files: no guess, unless the files the model was shown settle it.
+    twice = "x.py\n<<<<<<< SEARCH\ndef query():\n    return []\n=======\ndef query():\n    return [1]\n>>>>>>> REPLACE"
+    with pytest.raises(eb.EditError, match="several files"):
+        eb.apply(tmp_path, eb.parse(twice), [["svc/main.py"], every])
+    assert eb.apply(tmp_path, eb.parse(twice), [["svc/copy.py"], every]) == ["svc/copy.py"]
+    assert (tmp_path / "svc" / "tables.py").read_text().endswith("return []\n")
+
+
+
+def test_a_long_search_with_a_slip_on_a_line_the_block_keeps_still_applies(tmp_path):
+    from poc.kaggle_worker import editblocks as eb
+
+    # Bench v5, R3: a 13-line SEARCH that added a method copied `{LIMIT} — reduce` as `{LIMIT — reduce`,
+    # the same way in SEARCH and REPLACE: everything else was right.
+    body = ["class Models:", "    LIMIT = 400", "", "    def put(self, blob):", "        if len(blob) > self.LIMIT:",
+            "            raise ValueError(", '                f"blob {len(blob)} bytes "',
+            '                f"{self.LIMIT} — reduce n_estimators"', "            )", "        self.save(blob)"]
+    (tmp_path / "t.py").write_text("\n".join(["import os", "", *body, ""]))
+    slipped = [line.replace("{self.LIMIT} —", "{self.LIMIT —") for line in body]
+    added = ["    def get_metadata(self):", "        return self.read()", ""]
+    block = lambda search, replace: ("t.py\n<<<<<<< SEARCH\n" + "\n".join(search) + "\n=======\n"
+                                     + "\n".join(replace) + "\n>>>>>>> REPLACE\n")
+    notes: list[str] = []
+    eb.apply(tmp_path, eb.parse(block(slipped, slipped[:3] + added + slipped[3:])), notes=notes)
+    text = (tmp_path / "t.py").read_text()
+    assert "def get_metadata(self):" in text and 'f"{self.LIMIT} — reduce n_estimators"' in text
+    assert notes == ["t.py: line 10 kept as in the file (SEARCH had it slightly different)"]
+    (tmp_path / "t.py").write_text("\n".join(["import os", "", *body, ""]))
+    for search, replace in ((slipped, [l.replace("reduce", "lower") for l in slipped]),   # changes the slipped line
+                            (slipped[5:], slipped[5:] + ["        return True"])):            # too short to guess
+        with pytest.raises(eb.EditError, match="not in the file"):
+            eb.apply(tmp_path, eb.parse(block(search, replace)))
+
+
+def test_the_fast_prompts_show_a_real_file_of_the_context_as_the_example_path():
+    context = ("### svc/main.py (toàn bộ file, 3 dòng)\n`````\nx = 1\n`````\n\n"
+               "### svc/tables.py, dòng 4-9 (lớp cha Table)\n`````\ny = 2\n`````")
+    assert sbx.context_files(context) == ["svc/main.py", "svc/tables.py"]
+    for prompt in (sbx.fast_prompt("Sửa meter", context, "pytest"),
+                   sbx.fast_review_prompt("Sửa meter", "+x", context, "pytest")):
+        assert "đường/dẫn" not in prompt and "svc/main.py\n<<<<<<< SEARCH" in prompt
+        assert "đường dẫn thật" in prompt
+
+
+def test_failing_tests_reads_the_reproduction_cases_out_of_a_pytest_run():
+    path = "svc/tests/test_kite_repro.py"
+    out = (f"FAILED {path}::test_a - assert 1 == 0\nFAILED {path}::test_b[none] - KeyError\n"
+           f"FAILED {path}::TestX::test_c - e\n3 failed, 1 passed\n")
+    assert sbx.failing_tests(out, path) == {"test_a", "test_b", "TestX::test_c"}
+    assert sbx.failing_tests("FAILED tests/test_kite_repro.py::test_a - e", path) == {"test_a"}   # rootdir svc/
+    assert sbx.failing_tests(out + "FAILED svc/tests/test_api.py::test_d - e\n", path) is None    # another file
+    assert sbx.failing_tests(f"ERROR {path} - ImportError: x\n", path) is None                   # the whole file
+    assert sbx.failing_tests("2 passed\n", path) == set()
+
+
 def test_fast_context_shows_the_named_code_verbatim(tmp_path):
     repo = make_repo(tmp_path)
     (repo / "svc").mkdir()
@@ -938,6 +1013,92 @@ def test_a_fix_that_disagrees_with_the_reproduction_test_goes_to_the_agent(tmp_p
     work = tmp_path / "state" / "d1" / "work"
     assert not (work / "test_kite_repro.py").exists() or "test_kite_repro.py" in run.changed_files
     assert any("đường nhanh: repro_failed (bản 1), test tái hiện: reproduced" in line for line in logs)
+
+
+
+def test_a_fast_fix_written_under_the_example_path_still_lands_in_the_right_file(tmp_path):
+    fake = FakeDocker()
+    logs: list[str] = []
+    repo = make_repo(tmp_path)
+    lost = FIX.replace("calc.py\n<<<<<<<", "đường/dẫn/tới/file.py\n<<<<<<<")
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="p1", runner=fake,
+                       log=logs.append, asker=answers(REPRO, lost, "ỔN"))
+    assert run.fast_path == "passed" and run.verified and "calc.py" in run.changed_files
+    assert "if xs else 0" in (tmp_path / "state" / "p1" / "work" / "calc.py").read_text()
+    assert any("Kite chỉnh khối sửa" in line and "đường/dẫn/tới/file.py → calc.py" in line for line in logs)
+
+
+REPRO_TWO = """test_kite_repro.py
+<<<<<<< SEARCH
+=======
+from calc import average
+
+
+def test_empty_list_gives_zero():
+    assert average([]) == 0
+
+
+def test_empty_list_gives_none():
+    assert average([]) is None
+>>>>>>> REPLACE
+"""
+
+
+def test_a_fix_the_repository_accepts_but_the_reproduction_partly_disputes_stays_for_the_agent(tmp_path):
+    # Bench v5, R2: the reproduction test contradicted itself; the right fix passed every case but one.
+    both = ("FAILED test_kite_repro.py::test_empty_list_gives_zero - ZeroDivisionError\n"
+            "FAILED test_kite_repro.py::test_empty_list_gives_none - ZeroDivisionError\n2 failed\n")
+    fake = FakeDocker(repro_fail=both, quick_returncodes=[1, 0],
+                      quick_fail="FAILED test_kite_repro.py::test_empty_list_gives_none - assert 0 is None\n"
+                                 "1 failed, 1 passed\n")
+    logs: list[str] = []
+    repo = make_repo(tmp_path)
+    ask = answers(REPRO_TWO, FIX)
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="p2", runner=fake,
+                       log=logs.append, asker=ask)
+    # The repository's tests ran without the reproduction test (and passed), then no retry: the agent.
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "agent", "quick", "test", "review"]
+    assert run.fast_path == "repro_disputed" and run.fast_attempts == 1 and len(ask.prompts) == 2
+    agent = fake.call("agent")[-1]
+    assert "GIỮ nó trong /work" in agent and "test_empty_list_gives_none" in agent and "CÓ THỂ SAI" in agent
+    assert "qua 1 ca từng lỗi trên code cũ (test_empty_list_gives_zero)" in agent and "if xs else 0" in agent
+    # The agent starts from the fix and the test, and its first test run is the disputed case.
+    assert [c for c in fake.calls if fake.kind(c) == "quick"][1][-1].startswith(
+        "python -m pytest -q test_kite_repro.py::test_empty_list_gives_none")
+    assert run.verified and "test_kite_repro.py" in run.changed_files
+    assert any("đường nhanh: repro_disputed (bản 1)" in line for line in logs)
+
+
+def test_a_fix_is_not_disputed_when_it_breaks_a_case_or_fails_without_the_reproduction(tmp_path):
+    repo = make_repo(tmp_path)
+    before = ("FAILED test_kite_repro.py::test_empty_list_gives_zero - ZeroDivisionError\n"
+              "FAILED test_kite_repro.py::test_empty_list_gives_none - ZeroDivisionError\n")
+    one = "FAILED test_kite_repro.py::test_empty_list_gives_none - assert 0 is None\n"
+    for name, after, repo_code, status in (
+            ("same", before, 0, "repro_failed"),             # nothing it was meant to fix got better
+            ("other", one + "FAILED test_calc.py::test_x - e\n", 0, "repro_failed"),   # another test fails too
+            ("suite", one, 1, "repro_failed"),               # the repository's tests fail without the repro
+            ("split", one, 0, "repro_disputed")):
+        workspace = tmp_path / name
+        subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
+        runs = []
+
+        def run_tests(after_label, _after=after, _code=repo_code):
+            runs.append(after_label)
+            if after_label.endswith("-repo"):
+                assert not (workspace / "test_kite_repro.py").exists()
+                return _code, "x", "pytest"
+            return 1, _after, "pytest"
+
+        result = sbx.fast_path(workspace, "Sửa average trong calc.py cho list rỗng", None, answers(REPRO_TWO, FIX),
+                               test_command="python -m pytest -q", check="", template="python -m pytest -q {tests}",
+                               run_tests=run_tests, run_check=lambda label: (None, "", ""),
+                               run_one=lambda kind, command: (1, before), retries=0)
+        assert result.status == status, name
+        kept = (workspace / "test_kite_repro.py").exists(), "if xs else 0" in (workspace / "calc.py").read_text()
+        assert kept == ((True, True) if status == "repro_disputed" else (False, False)), name
 
 
 def test_the_reproduction_test_goes_next_to_the_tests_of_the_named_code(tmp_path):
