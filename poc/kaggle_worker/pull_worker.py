@@ -5,6 +5,10 @@ Standard library only, so it can be pasted into a notebook cell without installi
 Loop: send a heartbeat, long-poll ``GET /worker/jobs``, make sure the requested model is loaded,
 forward the request to the local llama-server, post the answer back. A background thread keeps
 heartbeating while a long request runs, so the gateway does not think the worker died.
+
+When the client asked for streaming, the answer is read from llama-server as it is generated and
+its chunks go to the gateway about twice a second (``POST /worker/jobs/<id>/chunks``); if the
+gateway no longer wants them (the client went away), generation stops.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ class PullWorker:
         request_timeout_seconds: float = 1800.0,
         stop_after_seconds: float | None = None,
         stop_when_idle_seconds: float | None = None,
+        stream_flush_seconds: float = 0.5,
         log: Callable[[str], None] = print,
     ) -> None:
         self.gateway_url = gateway_url.rstrip("/")
@@ -48,6 +53,7 @@ class PullWorker:
         # spent on an idle session. Kite starts the notebook again when work arrives.
         self.stop_when_idle_seconds = stop_when_idle_seconds
         self.last_job_at = time.monotonic()
+        self.stream_flush_seconds = stream_flush_seconds
         self.log = log
         self.ready = True
         self.draining = False
@@ -112,11 +118,14 @@ class PullWorker:
                 self.ensure_model(model)
                 self.ready = True
                 self._safe_heartbeat()
-            status, response = self._call("POST", f"{self.llama_url}/v1/chat/completions", job["body"],
-                                          timeout=self.request_timeout_seconds, auth=False)
-            if status != 200 or not isinstance(response, dict):
-                raise RuntimeError(f"llama-server HTTP {status}: {str(response)[:500]}")
-            payload = {"status": "ok", "response": response}
+            if job.get("stream"):
+                payload = {"status": "ok", **self._stream(job_id, job["body"])}
+            else:
+                status, response = self._call("POST", f"{self.llama_url}/v1/chat/completions", job["body"],
+                                              timeout=self.request_timeout_seconds, auth=False)
+                if status != 200 or not isinstance(response, dict):
+                    raise RuntimeError(f"llama-server HTTP {status}: {str(response)[:500]}")
+                payload = {"status": "ok", "response": response}
         except Exception as exc:
             self.ready = True
             payload = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:2000]}
@@ -125,6 +134,75 @@ class PullWorker:
         self.jobs_done += 1
         self.last_job_at = time.monotonic()
         self.log(f"[{job_id[:8]}] {model} {payload['status']} sau {seconds:.1f}s (gateway: HTTP {status})")
+
+    def _stream(self, job_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Stream the answer from llama-server, passing its chunks to the gateway as they come.
+
+        Returns the whole answer assembled as a normal (non-streamed) completion, for the gateway's
+        journal, plus the chunks the gateway has not acknowledged yet (``start`` = index of the first).
+        """
+        pending: list[dict] = []            # chunks the gateway has not acknowledged yet
+        state = {"sent": 0, "gone": False}
+        lock = threading.Lock()
+        finished = threading.Event()
+
+        def flush() -> None:
+            with lock:
+                batch, start = list(pending), state["sent"]
+            if not batch:
+                return
+            status, _ = self._call("POST", f"{self.gateway_url}/worker/jobs/{job_id}/chunks",
+                                   {"start": start, "chunks": batch}, timeout=30)
+            if status == 200:
+                with lock:
+                    del pending[:len(batch)]
+                    state["sent"] = start + len(batch)
+            elif status in (404, 409):
+                state["gone"] = True        # the client went away or the job was given up
+
+        def flusher() -> None:
+            while not finished.wait(self.stream_flush_seconds):
+                try:
+                    flush()
+                except Exception:           # a network blip: the chunks stay pending, sent next time
+                    pass
+
+        request = urllib.request.Request(
+            f"{self.llama_url}/v1/chat/completions", method="POST",
+            data=json.dumps({**body, "stream": True, "stream_options": {"include_usage": True}}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        chunks: list[dict] = []
+        thread = threading.Thread(target=flusher, daemon=True)
+        thread.start()
+        try:
+            try:
+                response = urllib.request.urlopen(request, timeout=self.request_timeout_seconds)
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(f"llama-server HTTP {exc.code}: "
+                                   f"{exc.read().decode('utf-8', 'replace')[:500]}") from exc
+            with response:
+                for raw in response:
+                    if state["gone"]:
+                        raise RuntimeError("the gateway no longer wants this answer (client gone)")
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = json.loads(data)
+                    if not isinstance(chunk, dict):
+                        continue
+                    if "error" in chunk:
+                        raise RuntimeError(f"llama-server: {str(chunk['error'])[:500]}")
+                    chunks.append(chunk)
+                    with lock:
+                        pending.append(chunk)
+        finally:
+            finished.set()
+            thread.join()
+        with lock:
+            return {"response": assemble_stream(chunks), "start": state["sent"], "chunks": list(pending)}
 
     def _safe_heartbeat(self) -> None:
         try:
@@ -188,3 +266,43 @@ class PullWorker:
         self._call("POST", f"{self.gateway_url}/worker/heartbeat", {
             "ready": False, "draining": True, "loaded_model": self.loaded_model(),
             "cached_models": self.cached_models()}, timeout=10)
+
+
+def assemble_stream(chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    """The chunks of a streamed chat completion, put back together as one non-streamed completion."""
+    content: list[str] = []
+    reasoning: list[str] = []
+    calls: dict[int, dict[str, Any]] = {}
+    finish, usage, timings, first = None, None, None, (chunks[0] if chunks else {})
+    for chunk in chunks:
+        usage = chunk.get("usage") or usage
+        timings = chunk.get("timings") or timings
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                content.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning.append(delta["reasoning_content"])
+            for call in delta.get("tool_calls") or []:
+                slot = calls.setdefault(call.get("index", 0), {
+                    "id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                function = call.get("function") or {}
+                slot["id"] = slot["id"] or call.get("id")
+                if function.get("name") and not slot["function"]["name"]:
+                    slot["function"]["name"] = function["name"]
+                slot["function"]["arguments"] += function.get("arguments") or ""
+            finish = choice.get("finish_reason") or finish
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(content) or None}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
+    if calls:
+        message["tool_calls"] = [{**calls[i], "id": calls[i]["id"] or f"call_{i}"} for i in sorted(calls)]
+    response: dict[str, Any] = {
+        "id": first.get("id") or "chatcmpl-kite", "object": "chat.completion",
+        "created": first.get("created") or int(time.time()), "model": first.get("model") or "",
+        "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}]}
+    if usage:
+        response["usage"] = usage
+    if timings:
+        response["timings"] = timings
+    return response

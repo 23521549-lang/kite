@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -141,6 +142,21 @@ def test_status_and_result_report_progress_then_the_review_bundle(tmp_path):
     task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
     status = asyncio.run(ops.task_status(task_id))
     assert (status["workflow"], status["step"], status["queue_state"]) == ("RUNNING", "CODING", "QUEUED")
+    assert "progress" not in status                     # nothing has run yet
+    from poc.kaggle_worker.backend import task_slug
+    from poc.kaggle_worker.journal import append_jsonl
+
+    trace = tmp_path / "state" / "tasks" / task_slug(task_id) / "trace.jsonl"
+    started = time.time() - 200
+    for at, record in ((0, {"event": "deps_cached"}), (5, {"event": "run_start", "model": "qwen3.6",
+                                                            "worker": "kaggle-han"}),
+                       (6, {"event": "fast_start", "helpers": 0}),
+                       (90, {"event": "fast_path", "outcome": "tests_failed", "seconds": 84}),
+                       (95, {"event": "step_start", "step": "agent", "state": "AGENT_RUNNING"})):
+        append_jsonl(trace, record, clock=lambda at=at: started + at)
+    status = asyncio.run(ops.task_status(task_id))
+    assert status["elapsed"].startswith("3 phút") and status["now"].startswith("agent viết code (đã 1 phút")
+    assert status["progress"][-1] == "1 phút 30 giây: đường nhanh: bản sửa trượt test, chuyển cho agent (1 phút 24 giây)"
     assert asyncio.run(ops.task_result(task_id))["ready"] is False
 
     checkpoint = tmp_path / "checkpoint.json"

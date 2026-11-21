@@ -1323,6 +1323,57 @@ def render_report(results: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --------------------------------------------------------------------------------------- history
+def history(root: Path) -> tuple[str, list[dict]]:
+    """Every bench run under ``root`` (one folder each, with results.json), oldest first, as one
+    markdown table: the evidence of what each change did, run by run."""
+    runs = []
+    for path in sorted(Path(root).glob("*/results.json")):
+        try:
+            results = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for model, entry in (results.get("models") or {}).items():
+            s = summarize(entry)
+            code = entry.get("code") or []
+            runs.append({
+                "run": results.get("label") or path.parent.name, "folder": path.parent.name,
+                "started": results.get("started"), "model": model, "harness": results.get("harness") or "",
+                "lead": f"{s['lead_passed']}/{s['lead_total']}" if s["lead_total"] else "",
+                "code": f"{s['code_passed']}/{s['code_total']}" if s["code_total"] else "",
+                "tasks": ",".join(item.get("id", "?") for item in code),
+                "failed": ",".join(item.get("id", "?") for item in code if not item.get("passed")),
+                "wall_median": s["code_wall_median"],
+                "wall_total": round(sum(item.get("wall_seconds") or 0 for item in code), 1) if code else None,
+                "fast_passed": sum(item.get("fast_path") == "passed" for item in code),
+                "reproduced": sum(item.get("repro") == "reproduced" for item in code),
+                "one_call_review": sum(item.get("review_mode") == "one_call" for item in code),
+                "hidden_failed": s["code_hidden_failed"],
+                "polyglot": (f"{s['polyglot_pass_1']}/{s['polyglot_total']} → {s['polyglot_pass_2']}/"
+                             f"{s['polyglot_total']}" if s["polyglot_total"] else ""),
+                "gen_tps": s["gen_tps"]})
+    runs.sort(key=lambda r: (r["started"] or "", r["folder"]))
+    lines = ["# Kite bench: các lần đo", "",
+             "Mỗi dòng là một model trong một lần đo (`kite bench run`), cũ trước. Số liệu lấy từ `results.json` "
+             "của từng thư mục.", "",
+             "| Lần đo | Bắt đầu | Model | Code đạt | Task trượt | s/task (trung vị) | s tổng | Đường nhanh qua "
+             "| Tái hiện ✓ | Rà soát 1 lần gọi | Trượt test ẩn | Agent trưởng | Polyglot pass@1 → @2 | Sinh tok/s |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for r in runs:
+        lines.append(f"| {r['run']} | {r['started']} | `{r['model']}` | {r['code'] or '-'} | {r['failed'] or '-'} "
+                     f"| {r['wall_median'] if r['wall_median'] is not None else '-'} "
+                     f"| {r['wall_total'] if r['wall_total'] is not None else '-'} "
+                     f"| {r['fast_passed'] if r['tasks'] else '-'} | {r['reproduced'] if r['tasks'] else '-'} "
+                     f"| {r['one_call_review'] if r['tasks'] else '-'} | {r['hidden_failed'] if r['tasks'] else '-'} "
+                     f"| {r['lead'] or '-'} | {r['polyglot'] or '-'} | {r['gen_tps'] or '-'} |")
+    harnesses = {}
+    for r in runs:
+        harnesses.setdefault(r["run"], (r["tasks"], r["harness"]))
+    lines += ["", "## Task và harness của từng lần đo", ""]
+    lines += [f"- **{run}**: task {tasks or '-'}; harness {harness or '?'}" for run, (tasks, harness) in harnesses.items()]
+    return "\n".join(lines) + "\n", runs
+
+
 # --------------------------------------------------------------------------------------- apply
 SKILL_TASK_TYPES = ("coding", "analysis", "review", "docs")
 

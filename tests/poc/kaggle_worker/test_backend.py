@@ -350,7 +350,8 @@ def test_backend_journals_each_run_and_traces_every_step(tmp_path):
     trace = read_jsonl(backend.task_dir("task-journal") / "trace.jsonl")
     steps = [e["step"] for e in trace if e["event"] == "step"]
     assert steps == ["setup", "agent", "test", "fix1", "test", "review", "test"]
-    assert trace[1]["event"] == "run_start" and trace[-1]["event"] == "run_end"
+    events = [e["event"] for e in trace if e["event"] != "step_start"]     # step_start: progress only
+    assert events[1] == "run_start" and events[-1] == "run_end"
     failed_test = next(e for e in trace if e["event"] == "step" and e["exit"] == 1)
     assert "AssertionError" in failed_test["tail"]                    # failing output kept for tracing
     config = json.loads((backend.task_dir("task-journal") / "opencode.json").read_text())
@@ -551,6 +552,15 @@ def test_backend_fast_path_solves_with_one_call_or_hands_over_to_the_agent(tmp_p
     assert record["repro"] == "reproduced"
     trace = read_jsonl(backend.task_dir("task-fast") / "trace.jsonl")
     assert any(e["event"] == "fast_path" and e["outcome"] == "passed" for e in trace)
+    # Progress for task_status: the steps as they happened, in Vietnamese.
+    from poc.kaggle_worker.backend import task_progress
+
+    report = task_progress(trace, trace[-1]["ts"] + 5)
+    joined = "\n".join(report["progress"])
+    assert "đường nhanh, test tái hiện viết từ yêu cầu: lỗi trên code cũ" in joined
+    assert "đường nhanh, bản sửa 1/2: qua hết test" in joined and "rà soát một lần gọi xong" in joined
+    assert "kết thúc: Kite đã tự chạy test và qua" in report["progress"][-1] and "now" not in report
+    assert [e["event"] for e in trace].count("step_start") == [e["event"] for e in trace].count("step")
 
     (tmp_path / "bad").mkdir()
     fake = FakeDocker(test_returncodes=[1, 1, 0])

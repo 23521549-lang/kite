@@ -411,3 +411,27 @@ def test_polyglot_second_try_starts_from_the_first_and_sees_the_test_errors(tmp_
     once = bench.run_polyglot(task, bench.make_polyglot_fixture(task, tmp_path / "out2"), "t",
                               lambda goal, task_id: (tmp_path, {"hidden_exit_code": 0}), log=lambda line: None)
     assert once["tries"] == 1 and once["pass_1"] is True
+
+
+def test_history_puts_every_run_in_one_table_oldest_first(tmp_path, capsys):
+    def write(folder, started, models, **meta):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "results.json").write_text(json.dumps({"started": started, **meta, "models": models}))
+
+    code = [{"id": "R1", "passed": True, "wall_seconds": 400.0, "fast_path": "passed", "repro": "reproduced",
+             "review_mode": "one_call"},
+            {"id": "R2", "passed": False, "wall_seconds": 900.0, "fast_path": "tests_failed", "hidden_passed": False}]
+    write("20261121-090000", "2026-11-21 09:00", {"qwen3.6": {"code": code}}, harness="bật", label="v5")
+    write("20261118-090000", "2026-11-18 09:00", {"gemma4-26b": {"code": code[:1]}})
+    (tmp_path / "empty").mkdir()
+    text, rows = bench.history(tmp_path)
+    assert [r["run"] for r in rows] == ["20261118-090000", "v5"]
+    assert rows[1]["code"] == "1/2" and rows[1]["failed"] == "R2" and rows[1]["wall_total"] == 1300.0
+    assert (rows[1]["fast_passed"], rows[1]["reproduced"], rows[1]["one_call_review"], rows[1]["hidden_failed"]) \
+        == (1, 1, 1, 1)
+    assert "| v5 | 2026-11-21 09:00 | `qwen3.6` | 1/2 | R2 | 650.0 | 1300.0 | 1 | 1 | 1 | 1 | - | - | - |" in text
+    assert "- **v5**: task R1,R2; harness bật" in text
+
+    from poc.kaggle_worker import cli
+    assert cli.main(["--config", str(tmp_path / "config.yaml"), "bench", "history", "--root", str(tmp_path)]) == 0
+    assert "| v5 |" in capsys.readouterr().out

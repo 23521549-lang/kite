@@ -5,6 +5,12 @@ loopback. The gateway queues the request; a worker that has long-polled ``GET /w
 takes it, runs it on its own llama-server and posts the answer back. Workers only make outbound
 HTTPS calls, so nothing has to be opened on the worker side.
 
+Streaming: when the client asks for ``stream: true``, the worker posts the answer's chunks to
+``POST /worker/jobs/<id>/chunks`` as llama-server produces them (a batch about twice a second)
+and the gateway passes them on as SSE, so the person chatting sees the answer (and the model's
+thinking) appear instead of waiting for all of it. A worker without streaming posts the whole
+answer at the end; the gateway then replays it as SSE, as before.
+
 Client routes (``/v1/*``) are meant to stay on loopback; only ``/worker/*`` is published through
 the reverse proxy. Every worker call carries ``Authorization: Bearer <token>`` and the token
 decides which worker is calling.
@@ -73,6 +79,9 @@ class Job:
     tag: str | None = None          # X-Kite-Task: which task (or "chat", "bench-...") asked
     pinned: str | None = None       # X-Kite-Worker: the worker the task's route reserved
     requested: str = ""             # model name as the client asked (alias included)
+    stream: bool = False            # the client asked for stream: true
+    chunks: asyncio.Queue | None = None   # streamed chunks for the client; None marks the end
+    sent: int = 0                   # chunks accepted from the worker (the next index expected)
 
 
 StatusHook = Callable[[WorkerState, bool], Awaitable[None] | None]
@@ -198,7 +207,8 @@ class ModelGateway:
         self._changed = asyncio.Event()
 
     # ------------------------------------------------------------------ client side
-    async def submit(self, body: dict[str, Any], *, tag: str | None = None, pin: str | None = None) -> Job:
+    async def submit(self, body: dict[str, Any], *, tag: str | None = None, pin: str | None = None,
+                     stream: bool = False) -> Job:
         requested = body.get("model")
         if not isinstance(requested, str) or not requested.strip():
             raise GatewayError("request must name a model")
@@ -209,7 +219,8 @@ class ModelGateway:
         forwarded.pop("stream_options", None)
         job = Job(uuid.uuid4().hex, model, forwarded, self.clock(),
                   asyncio.get_running_loop().create_future(), tag=tag, requested=requested,
-                  pinned=pin if pin in self.workers else None)
+                  pinned=pin if pin in self.workers else None, stream=stream,
+                  chunks=asyncio.Queue() if stream else None)
         self.jobs[job.job_id] = job
         self._queue.append(job.job_id)
         self._notify()
@@ -241,6 +252,8 @@ class ModelGateway:
                 job.future.set_exception(GatewayError(error))
             else:
                 job.future.set_result(result)
+        if job.chunks is not None:
+            job.chunks.put_nowait(None)
         self._notify()
 
     def cancel(self, job: Job) -> None:
@@ -341,10 +354,30 @@ class ModelGateway:
             except asyncio.TimeoutError:
                 pass
 
+    def add_chunks(self, worker_id: str, job_id: str, start: Any, chunks: Any) -> bool:
+        """Streamed chunks ``start``, ``start + 1``, ... of a job's answer. A batch sent again (its
+        reply was lost) is skipped where already passed on; False if the job is gone or not this
+        worker's (the client went away: the worker stops generating)."""
+        job = self.jobs.get(job_id)
+        if job is None or job.worker_id != worker_id or job.chunks is None:
+            return False
+        if not isinstance(start, int) or isinstance(start, bool) or not 0 <= start <= job.sent \
+                or not isinstance(chunks, list):
+            return False
+        for chunk in chunks[job.sent - start:]:
+            if isinstance(chunk, dict):
+                job.chunks.put_nowait(chunk)
+            job.sent += 1
+        return True
+
     def complete(self, worker_id: str, job_id: str, payload: Mapping[str, Any]) -> bool:
         job = self.jobs.get(job_id)
         if job is None or job.worker_id != worker_id:
             return False
+        if payload.get("chunks") and job.chunks is not None and not self.add_chunks(
+                worker_id, job_id, payload.get("start", 0), payload["chunks"]):
+            self._finish(job, error="worker sent the end of the answer out of order")
+            return True
         if payload.get("status") == "ok" and isinstance(payload.get("response"), dict):
             self._finish(job, result=payload["response"])
         else:
@@ -367,7 +400,9 @@ class ModelGateway:
                 continue
             if worker.current_job == job.job_id:
                 worker.current_job = None
-            if job.attempts >= self.max_attempts:
+            if job.sent:                      # the client already has part of this answer: no retry
+                self._finish(job, error="worker stopped in the middle of the answer")
+            elif job.attempts >= self.max_attempts:
                 self._finish(job, error="worker stopped responding")
             else:
                 job.worker_id = None
@@ -422,6 +457,11 @@ def completion_to_sse(response: Mapping[str, Any]) -> list[bytes]:
         + [b"data: [DONE]\n\n"]
 
 
+def sse_chunk(chunk: Mapping[str, Any], model: str) -> bytes:
+    """One streamed chunk from llama-server, as SSE, named with the model the client asked for."""
+    return f"data: {json.dumps({**chunk, 'model': model}, ensure_ascii=False)}\n\n".encode()
+
+
 # ---------------------------------------------------------------------- aiohttp app
 def _error(status: int, message: str) -> web.Response:
     return web.json_response({"error": {"message": message, "type": "kite_gateway"}}, status=status)
@@ -446,7 +486,8 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
             return _error(400, "body must be a JSON object")
         try:
             job = await gateway.submit(body, tag=clean_tag(request.headers.get("X-Kite-Task")),
-                                       pin=clean_tag(request.headers.get("X-Kite-Worker")))
+                                       pin=clean_tag(request.headers.get("X-Kite-Worker")),
+                                       stream=bool(body.get("stream")))
         except GatewayError as exc:
             return _error(404, str(exc))
         if not body.get("stream"):
@@ -464,22 +505,30 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
                                              "Cache-Control": "no-cache"})
         await stream.prepare(request)
         try:
-            while True:
+            while True:            # the worker's chunks as they come; None once the job is finished
                 try:
-                    result = await asyncio.wait_for(asyncio.shield(job.future), gateway.keepalive_seconds)
-                    break
+                    chunk = await asyncio.wait_for(job.chunks.get(), gateway.keepalive_seconds)
                 except asyncio.TimeoutError:
                     await stream.write(b": waiting for worker\n\n")   # SSE comment keeps the connection open
-        except GatewayError as exc:
-            error = {"error": {"message": str(exc), "type": "kite_gateway"}}
-            await stream.write(f"data: {json.dumps(error)}\n\n".encode())
-            await stream.write_eof()
-            return stream
+                    continue
+                if chunk is None:
+                    break
+                await stream.write(sse_chunk(chunk, body["model"]))
+            try:
+                result = job.future.result()
+            except GatewayError as exc:
+                error = {"error": {"message": str(exc), "type": "kite_gateway"}}
+                await stream.write(f"data: {json.dumps(error)}\n\n".encode())
+                await stream.write_eof()
+                return stream
+            if job.sent:                               # streamed: the chunks carried the whole answer
+                await stream.write(b"data: [DONE]\n\n")
+            else:                                      # a worker that does not stream: replay the answer
+                for chunk in completion_to_sse({**result, "model": body["model"]}):
+                    await stream.write(chunk)
         except (asyncio.CancelledError, ConnectionResetError):
             gateway.cancel(job)
             raise
-        for chunk in completion_to_sse({**result, "model": body["model"]}):
-            await stream.write(chunk)
         await stream.write_eof()
         return stream
 
@@ -507,7 +556,18 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
         job = await gateway.next_job(worker_id, wait)
         if job is None:
             return web.Response(status=204)
-        return web.json_response({"job_id": job.job_id, "model": job.model, "body": job.body})
+        return web.json_response({"job_id": job.job_id, "model": job.model, "body": job.body,
+                                  "stream": job.stream})
+
+    async def chunks(request: web.Request) -> web.Response:
+        worker_id = worker_id_or_401(request)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return _error(400, "chunks must be a JSON object")
+        if not gateway.add_chunks(worker_id, request.match_info["job_id"], payload.get("start"),
+                                  payload.get("chunks")):
+            return _error(409, "job is not streaming to this worker (the client may have gone)")
+        return web.json_response({"accepted": True})
 
     async def result(request: web.Request) -> web.Response:
         worker_id = worker_id_or_401(request)
@@ -574,6 +634,7 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
     app.router.add_post("/kite/stop", stop)
     app.router.add_post("/worker/heartbeat", heartbeat)
     app.router.add_get("/worker/jobs", jobs)
+    app.router.add_post("/worker/jobs/{job_id}/chunks", chunks)
     app.router.add_post("/worker/jobs/{job_id}/result", result)
     return app
 

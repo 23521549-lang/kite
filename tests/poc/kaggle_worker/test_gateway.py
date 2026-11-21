@@ -378,3 +378,147 @@ def test_a_conversation_waits_briefly_for_the_worker_that_has_it_cached():
         fourth = await gateway.submit(body, tag="chat")             # w2 switched models: its cache is gone
         assert (await gateway.next_job("w1", 0)).job_id == fourth.job_id
     asyncio.run(scenario())
+
+
+# ------------------------------------------------------------------ real streaming
+def _delta(content=None, *, reasoning=None, call=None, finish=None, usage=None, timings=None):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    if reasoning is not None:
+        delta["reasoning_content"] = reasoning
+    if call is not None:
+        delta["tool_calls"] = [call]
+    chunk = {"id": "chatcmpl-s", "object": "chat.completion.chunk", "created": 1, "model": "/kaggle/qwen.gguf",
+             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    if usage:
+        chunk["usage"] = usage
+    if timings:
+        chunk["timings"] = timings
+    return chunk
+
+
+STREAM = [_delta(reasoning="Nghĩ "), _delta(reasoning="đã."), _delta("xin "), _delta("chào"),
+          _delta(finish="stop", usage={"prompt_tokens": 5, "completion_tokens": 4},
+                 timings={"predicted_per_second": 41.0})]
+
+
+def _data(text):
+    return [line[len("data: "):] for line in text.splitlines() if line.startswith("data: ")]
+
+
+def test_streamed_chunks_reach_the_client_before_the_answer_is_finished():
+    async def scenario():
+        gateway = make_gateway(keepalive_seconds=0.05)
+        async with TestClient(TestServer(create_app(gateway))) as client:
+            headers = {"Authorization": f"Bearer {TOKEN_A}"}
+            await client.post("/worker/heartbeat", json={"ready": True, "loaded_model": "qwen3.6"}, headers=headers)
+            response_task = asyncio.create_task(client.post("/v1/chat/completions", json={
+                "model": "qwen3.6-fast", "stream": True, "messages": []}))
+            job = await (await client.get("/worker/jobs?wait=5", headers=headers)).json()
+            assert job["stream"] is True and job["body"]["stream"] is False
+            url = f"/worker/jobs/{job['job_id']}/chunks"
+            assert (await client.post(url, json={"start": 0, "chunks": STREAM[:3]}, headers=headers)).status == 200
+            response = await response_task                    # headers are out: read what has come so far
+            first = await asyncio.wait_for(response.content.readuntil(b"\n\n"), 5)
+            assert json.loads(first[len(b"data: "):])["choices"][0]["delta"]["reasoning_content"] == "Nghĩ "
+            # A batch sent again (its reply was lost) is not passed on twice; a gap is refused.
+            assert (await client.post(url, json={"start": 2, "chunks": STREAM[2:4]}, headers=headers)).status == 200
+            assert (await client.post(url, json={"start": 9, "chunks": STREAM[4:]}, headers=headers)).status == 409
+            done = await client.post(f"/worker/jobs/{job['job_id']}/result", headers=headers, json={
+                "status": "ok", "response": COMPLETION, "start": 4, "chunks": STREAM[4:]})
+            assert done.status == 200
+            return first + await response.content.read()
+    data = _data(asyncio.run(scenario()).decode())
+    chunks = [json.loads(d) for d in data[:-1]]
+    assert data[-1] == "[DONE]" and len(chunks) == 5                  # no replay of the whole answer
+    assert "".join(c["choices"][0]["delta"].get("content", "") for c in chunks) == "xin chào"
+    assert {c["model"] for c in chunks} == {"qwen3.6-fast"}               # not the GGUF path
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a_streamed_answer_is_not_retried_on_another_worker_and_a_gone_client_stops_the_worker():
+    now = [1000.0]
+
+    async def scenario():
+        gateway = make_gateway(clock=lambda: now[0])
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+        job = await gateway.submit({"model": "qwen3.6", "messages": []}, stream=True)
+        await gateway.next_job("w1", 0)
+        assert gateway.add_chunks("w1", job.job_id, 0, STREAM[:2])
+        assert not gateway.add_chunks("w2", job.job_id, 2, STREAM[2:3])       # not w2's job
+        now[0] += 200                                                       # w1 dies mid-answer
+        gateway.reap()
+        with pytest.raises(GatewayError, match="middle of the answer"):
+            await job.future
+        other = await gateway.submit({"model": "qwen3.6", "messages": []}, stream=True)
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+        await gateway.next_job("w1", 0)
+        gateway.cancel(other)                                               # the person closed the chat
+        assert not gateway.add_chunks("w1", other.job_id, 0, STREAM[:1])
+    asyncio.run(scenario())
+
+
+def test_pull_worker_streams_from_llama_server_and_journals_the_assembled_answer():
+    records = []
+
+    async def scenario():
+        gateway = make_gateway(journal=records.append, keepalive_seconds=0.05)
+        bodies = []
+
+        async def fake_llama(request: web.Request) -> web.StreamResponse:
+            body = await request.json()
+            bodies.append(body)
+            if not body.get("stream"):
+                return web.json_response(COMPLETION)
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            for chunk in STREAM:
+                await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                await asyncio.sleep(0.05)
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        llama_app = web.Application()
+        llama_app.router.add_post("/v1/chat/completions", fake_llama)
+        llama = TestServer(llama_app)
+        await llama.start_server()
+        try:
+            async with TestClient(TestServer(create_app(gateway))) as client:
+                worker = PullWorker(str(client.make_url("/")), TOKEN_A, ensure_model=lambda model: None,
+                                    loaded_model=lambda: "qwen3.6", llama_url=str(llama.make_url("/")),
+                                    poll_wait_seconds=1, heartbeat_seconds=0.2, stream_flush_seconds=0.02,
+                                    log=lambda _msg: None)
+                running = asyncio.create_task(asyncio.to_thread(worker.run))
+                streamed = await (await client.post("/v1/chat/completions", json={
+                    "model": "qwen3.6", "stream": True, "messages": []})).text()
+                plain = await (await client.post("/v1/chat/completions", json={
+                    "model": "qwen3.6", "messages": []})).json()
+                worker.stop()
+                await running
+        finally:
+            await llama.close()
+        return bodies, streamed, plain
+
+    bodies, streamed, plain = asyncio.run(scenario())
+    assert bodies[0]["stream"] is True and bodies[0]["stream_options"] == {"include_usage": True}
+    assert bodies[1]["stream"] is False and plain["choices"][0]["message"]["content"] == "xin chào"
+    data = _data(streamed)
+    assert data[-1] == "[DONE]" and len(data) == len(STREAM) + 1
+    assert records[0]["outcome"] == "ok" and records[0]["completion_tokens"] == 4
+    assert records[0]["gen_tps"] == 41.0 and records[0]["reasoning_chars"] == len("Nghĩ đã.")
+
+
+def test_assemble_stream_rebuilds_tool_calls_split_over_chunks():
+    from poc.kaggle_worker.pull_worker import assemble_stream
+
+    answer = assemble_stream([
+        _delta(call={"index": 0, "id": "c1", "type": "function", "function": {"name": "read", "arguments": ""}}),
+        _delta(call={"index": 0, "function": {"arguments": "{\"path\": "}}),
+        _delta(call={"index": 1, "function": {"name": "grep", "arguments": "{}"}}),
+        _delta(call={"index": 0, "function": {"arguments": "\"a.py\"}"}}),
+        _delta(finish="tool_calls")])
+    message = answer["choices"][0]["message"]
+    assert answer["choices"][0]["finish_reason"] == "tool_calls" and message["content"] is None
+    assert [(c["id"], c["function"]["name"], c["function"]["arguments"]) for c in message["tool_calls"]] == [
+        ("c1", "read", "{\"path\": \"a.py\"}"), ("call_1", "grep", "{}")]

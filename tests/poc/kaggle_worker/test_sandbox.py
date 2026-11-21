@@ -1000,7 +1000,7 @@ def test_best_of_n_checks_a_second_workers_candidate_when_the_first_fails(tmp_pa
     workspace = tmp_path / "w"
     subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
     main, helper = answers(REPRO, bad), answers(FIX)
-    calls = []
+    calls, notes = [], []
 
     def run_tests(after):
         calls.append(after)
@@ -1011,12 +1011,14 @@ def test_best_of_n_checks_a_second_workers_candidate_when_the_first_fails(tmp_pa
                            test_command="python -m pytest -q", check="", template="python -m pytest -q {tests}",
                            run_tests=run_tests, run_check=lambda after: (None, "", ""),
                            run_one=lambda kind, command: (1, "FAILED test_kite_repro.py::t - assert 1 == 0"),
-                           helpers=[helper], retries=1)
+                           helpers=[helper], retries=1, progress=notes.append)
     # The main worker's candidate fails the reproduction; the helper's, written at the same time, passes.
     assert result.status == "passed" and result.attempts == 2 and calls == ["fast", "fast2"]
     assert "if xs else 0" in (workspace / "calc.py").read_text()
     assert len(main.prompts) == 2 and len(helper.prompts) == 1 and helper.prompts[0] == main.prompts[1]
     assert result.log == ["đường nhanh, bản 1/3: repro_failed", "đường nhanh, bản 2/3: passed"]
+    assert notes == ["test tái hiện viết từ yêu cầu: lỗi trên code cũ, đúng như mong đợi",
+                     "bản sửa 1/3: trượt test tái hiện", "bản sửa 2/3: qua hết test"]
 
 
 @pytest.mark.idle_helpers

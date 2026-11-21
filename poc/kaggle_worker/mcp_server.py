@@ -24,7 +24,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from .config import KiteConfig, gateway_models, model_contexts, model_policy_from_config
-from .journal import Journal, short
+from .journal import Journal, read_jsonl, short
 from .protocol import ScheduledTask
 from .store import SQLiteSchedulerStore, StoreError
 
@@ -285,6 +285,12 @@ class KiteOps:
                 result["queue_state"] = store.get_task(task_id)["state"]
             except StoreError:
                 pass
+        # What it has done so far, step by step (written by the sandbox backend as it goes).
+        from .backend import task_progress, task_slug
+
+        trace = read_jsonl(self.state_dir / "tasks" / task_slug(task_id) / "trace.jsonl")
+        if trace:
+            result.update(task_progress(trace, time.time()))
         return result
 
     async def task_result(self, task_id: str) -> dict:
@@ -560,7 +566,7 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 - Người dùng nhờ viết, sửa, thêm hay refactor code và đã nói rõ repo + việc cần làm: gọi `start_task` NGAY ở bước đầu. Đừng tự đọc code hay chạy lệnh để "tìm hiểu trước": agent code trong task sẽ tự đọc repo. Gọi `start_task` xong thì trả lời người dùng `task_id` ngay, không ngồi chờ task chạy xong.
 - Chọn `task_type`: `coding` (viết/sửa code), `analysis` (phân tích, không cần sửa), `review` (xem lại code), `docs` (tài liệu).
 - Người dùng giao nhiều việc trong một tin: gọi `start_task` cho TỪNG việc (mỗi repo/việc một lần), rồi báo đủ các `task_id`. Có nhiều worker thì các task chạy song song.
-- Báo cho người dùng `task_id`, rồi theo dõi bằng `task_status`. Khi người dùng hỏi tiến độ, gọi `task_status` thay vì đoán.
+- Báo cho người dùng `task_id`, rồi theo dõi bằng `task_status`. Khi người dùng hỏi tiến độ, gọi `task_status` thay vì đoán. Kể ngắn theo đúng kết quả tool: đã chạy bao lâu (`elapsed`), đang làm gì (`now`, nếu có) và 2–3 dòng cuối của `progress`; không thêm bước mà `progress` không có.
 - Bạn chỉ trả lời khi người dùng nhắn; bạn KHÔNG thể tự báo khi task xong. Đừng hứa "sẽ báo/cập nhật khi xong". Hãy nói người dùng nhắn hỏi lại (ví dụ "xong chưa"), lúc đó bạn gọi `task_status`.
 - Khi task xong, gọi `task_result` và tóm tắt ngắn: đã đổi file nào, đổi gì, test do Kite tự chạy **PASSED** hay **FAILED**, rồi hỏi người dùng có muốn áp patch không.
 - Việc nhỏ cần xem hoặc chạy thử (đọc file, tìm code, chạy test, xem `git log`): dùng `run_command` trên repo, vài giây là có kết quả, không cần GPU. Xem nhanh trạng thái repo: `repo_status`.

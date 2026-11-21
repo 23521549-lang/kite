@@ -27,7 +27,7 @@ import re
 import shutil
 import sys
 import time
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from temporalio.exceptions import ApplicationError
 
@@ -41,6 +41,88 @@ from .temporal_workflow import CodingRunResult, CodingTaskInput, RouteLease
 
 HEARTBEAT_SECONDS = 20.0
 NO_CHANGES_PATCH = "# Kite: the agent made no changes\n"
+
+
+STEP_LABELS = {"setup": "cài thư viện (có mạng)", "repro": "chạy test tái hiện", "quick": "chạy các test liên quan",
+               "test": "chạy bộ test của repo", "check": "kiểm tra code", "agent": "agent viết code",
+               "review": "agent rà soát lại bản sửa"}
+FAST_OUTCOMES = {"passed": "bản sửa qua hết test", "tests_failed": "bản sửa trượt test, chuyển cho agent",
+                 "repro_failed": "bản sửa trượt test tái hiện, chuyển cho agent",
+                 "check_failed": "bản sửa trượt bước kiểm tra, chuyển cho agent",
+                 "not_applied": "bản sửa không áp được, chuyển cho agent",
+                 "declined": "model nói không sửa được trong một lần, chuyển cho agent",
+                 "skipped": "không tìm được đoạn code liên quan, chuyển cho agent",
+                 "error": "lỗi khi gọi model, chuyển cho agent"}
+
+
+def duration_vi(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds} giây"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} phút" + (f" {seconds} giây" if seconds else "")
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} giờ" + (f" {minutes} phút" if minutes else "")
+
+
+def _step_label(step: str) -> str:
+    if re.fullmatch(r"fix\d+", step or ""):
+        return f"agent sửa theo lỗi test (vòng {step[3:]})"
+    return STEP_LABELS.get(step, step or "bước")
+
+
+def task_progress(trace: list[dict], now: float, limit: int = 8) -> dict:
+    """What a running (or finished) task has done, from its trace.jsonl, in Vietnamese: total time,
+    the step running now and for how long, and the last ``limit`` finished steps."""
+    lines: list[str] = []
+    phase = step = None           # (label, started at): the fast path / one-call review; a container
+
+    def add(text: str, at: Any) -> None:
+        offset = f"{duration_vi(at - trace[0]['ts'])}: " if isinstance(at, (int, float)) else ""
+        lines.append(offset + text)
+
+    for record in trace:
+        event, at = record.get("event"), record.get("ts")
+        if event == "step_start":
+            step = (_step_label(record.get("step", "")), at)
+        elif event == "step":
+            step = None
+            code = record.get("exit")
+            label, took = _step_label(record.get("step", "")), duration_vi(record.get("seconds") or 0)
+            text = f"xong {label} ({took})" if code == 0 else f"{label}: lỗi, exit {code} ({took})"
+            add(text + (f"; Kite dừng agent vì lặp: {record['stuck']}" if record.get("stuck") else ""), at)
+        elif event == "fast_start":
+            phase = ("đường nhanh: model viết bản sửa trong một lần gọi"
+                     + (f" (thêm {record['helpers']} worker rảnh viết song song)" if record.get("helpers") else ""), at)
+        elif event == "fast_note":
+            add(f"đường nhanh, {record.get('note')}", at)
+        elif event == "fast_path":
+            phase = None
+            add(f"đường nhanh: {FAST_OUTCOMES.get(record.get('outcome'), record.get('outcome'))} "
+                f"({duration_vi(record.get('seconds') or 0)})", at)
+        elif event == "review_start":
+            phase = ("rà soát bản sửa (một lần gọi model)", at)
+        elif event == "review_end":
+            phase = None
+            add(f"rà soát một lần gọi xong ({duration_vi(record.get('seconds') or 0)})", at)
+        elif event == "deps_cached":
+            add("dùng lại thư viện đã cài, bỏ qua bước cài", at)
+        elif event == "run_start":
+            add(f"bắt đầu: model {record.get('model')} trên worker {record.get('worker')}", at)
+        elif event == "run_end":
+            phase = step = None
+            add("kết thúc: " + ("Kite đã tự chạy test và qua" if record.get("verified") else
+                                "chưa qua được test của Kite") + f" (agent: {record.get('agent_status')})", at)
+        elif event == "run_error":
+            phase = step = None
+            add(f"dừng vì lỗi: {record.get('error')}", at)
+    current = step or phase
+    report: dict[str, Any] = {"elapsed": duration_vi(now - trace[0]["ts"]) if trace else None,
+                              "progress": lines[-limit:]}
+    if current is not None:
+        report["now"] = f"{current[0]} (đã {duration_vi(now - current[1])})"
+    return report
 
 
 def task_slug(task_id: str) -> str:
@@ -94,6 +176,8 @@ class SandboxActivityBackend:
                              watch: sbx.StuckWatch | None = None) -> tuple[int, str, float]:
         """Run one sandbox container, heartbeating Temporal while it works; kill it if cancelled."""
         await asyncio.to_thread(self._docker, "rm", "-f", name)     # leftover from a crashed attempt
+        if task_id:
+            self._trace(task_id, "step_start", step=name.split("-")[1], state=state)
         started = time.monotonic()
         step = asyncio.create_task(asyncio.to_thread(
             sbx._run_step, self.settings, self.runner, name=name, args=args, timeout=timeout, watch=watch))
@@ -328,12 +412,14 @@ class SandboxActivityBackend:
                 helpers = [sbx.gateway_asker(self.settings, route.model_id,
                                              tag=f"{clean_tag(task.task_id) or slug}-b{i + 2}", pin=other)
                            for i, other in enumerate(others)]
+                self._trace(task.task_id, "fast_start", helpers=len(helpers))
                 step = asyncio.create_task(asyncio.to_thread(
                     sbx.fast_path, work, goal, graph, ask, test_command=test_command, check=check_template,
                     template=template, run_tests=lambda after: in_loop(run_tests(after)),
                     run_check=lambda after: in_loop(run_check(after)),
                     run_one=lambda kind, command: in_loop(one(kind, command)),
-                    helpers=helpers, retries=self.settings.fast_retries))
+                    helpers=helpers, retries=self.settings.fast_retries,
+                    progress=lambda line: self._trace(task.task_id, "fast_note", note=line)))
                 while True:
                     done, _ = await asyncio.wait({step}, timeout=self.heartbeat_seconds)
                     if done:
@@ -406,6 +492,7 @@ class SandboxActivityBackend:
             before = await asyncio.to_thread(sbx.snapshot_tree, work)
             if fast_status == "passed" and repro == "reproduced" and self.settings.fast_review and ask is not None:
                 review_mode = "one_call"
+                self._trace(task.task_id, "review_start", mode=review_mode)
                 started = time.monotonic()
                 step = asyncio.create_task(asyncio.to_thread(
                     sbx.fast_review, work, goal, patch_base, graph, ask, test_command, check_template))
@@ -417,6 +504,7 @@ class SandboxActivityBackend:
                                "seconds": round(time.monotonic() - started)})
                 review_code, review_output = step.result()
                 step_seconds = round(time.monotonic() - started, 1)
+                self._trace(task.task_id, "review_end", mode=review_mode, exit=review_code, seconds=step_seconds)
                 if review_code != 0:
                     await asyncio.to_thread(sbx.restore_tree, work, before)
             else:

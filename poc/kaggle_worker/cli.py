@@ -194,6 +194,8 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--repo-source", type=Path,
                            help="local clone of github.com/23521549-lang/aiops-traffic-shaper: the code suite "
                                 "then runs the real-repository tasks (R1-R4) instead of C1-C8")
+    bench_run.add_argument("--label", default="",
+                           help="name of this run in `kite bench history`, e.g. v6 (default: its folder name)")
     bench_run.add_argument("--polyglot", type=Path,
                            help="local clone of github.com/Aider-AI/polyglot-benchmark: the code suite then "
                                 "runs its Python exercises (P-<name>) the way Aider's leaderboard does")
@@ -208,6 +210,10 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--worker", default="",
                            help="send every request to this worker (e.g. kaggle-han): comparable timings, and "
                                 "the other worker stays free for real tasks")
+    bench_history = bench_commands.add_parser(
+        "history", help="every bench run so far as one table (markdown): what each change did")
+    bench_history.add_argument("--root", type=Path, help="folder of bench runs (default: <state>/bench)")
+    bench_history.add_argument("--json", action="store_true", help="the rows as JSON instead")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
                                                           "unless --write)")
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
@@ -623,6 +629,14 @@ def _bench_command(args: argparse.Namespace) -> int:
     from . import sandbox as sbx
     from .mcp_server import KiteOps, build_server, chat_files
 
+    if args.bench_command == "history":
+        root = (args.root or args.config.parent / "bench").expanduser()
+        text, rows = bench.history(root)
+        if args.json:
+            _emit({"root": str(root), "runs": rows})
+        else:
+            print(text if rows else f"Chưa có lần đo nào trong {root}.")
+        return 0
     config = _load_operator_config(args)
     if args.bench_command == "apply":
         import yaml
@@ -748,7 +762,7 @@ def _bench_command(args: argparse.Namespace) -> int:
         f" | harness {harness}")
     results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
                               run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log,
-                              meta={"harness": harness})
+                              meta={"harness": harness, **({"label": args.label} if args.label else {})})
     _emit({"out": str(out), "report": str(out / "README.md"),
            "summary": {m: bench.summarize(entry) for m, entry in results["models"].items()}})
     return 0

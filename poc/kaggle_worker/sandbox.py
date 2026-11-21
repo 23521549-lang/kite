@@ -877,12 +877,18 @@ class FastResult:
     log: list[str] = field(default_factory=list)
 
 
+FAST_STATUS_VI = {"passed": "qua hết test", "tests_failed": "trượt test", "repro_failed": "trượt test tái hiện",
+                  "check_failed": "trượt bước kiểm tra", "not_applied": "không áp được vào code",
+                  "declined": "model nói không sửa được", "skipped": "bỏ qua", "error": "lỗi khi gọi model"}
+
+
 def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: Callable[[str], str], *,
               test_command: str, check: str, template: str,
               run_tests: Callable[[str], tuple[int, str, str]],
               run_check: Callable[[str], tuple[int | None, str, str]],
               run_one: Callable[[str, str], tuple[int, str]],
-              helpers: Sequence[Callable[[str], str]] = (), retries: int = 0) -> FastResult:
+              helpers: Sequence[Callable[[str], str]] = (), retries: int = 0,
+              progress: Callable[[str], None] | None = None) -> FastResult:
     """Agentless-style fix with evidence (Xia et al. 2024, github.com/OpenAutoCoder/Agentless).
 
     1. reproduction test written from the goal alone, run on the current code: it must fail;
@@ -896,7 +902,15 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
     picks): ``helpers`` are askers on other idle workers, asked for candidates at the same time as
     ``ask``; candidates are checked one by one and the first that passes everything wins. Then up to
     ``retries`` more candidates from ``ask``, each told why the last one failed.
+    ``progress`` gets one line per finished step (for ``task_status`` while the task runs).
     """
+    def note(line: str) -> None:
+        if progress is not None:
+            try:
+                progress(line)
+            except Exception:
+                pass
+
     workspace = Path(workspace)
     context = fast_context(workspace, goal, graph)
     if not context:
@@ -928,6 +942,10 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
             (workspace / repro_file).unlink()
         else:
             result.repro = "none"
+        note({"reproduced": "test tái hiện viết từ yêu cầu: lỗi trên code cũ, đúng như mong đợi",
+              "not_reproduced": "test tái hiện viết từ yêu cầu: qua ngay trên code cũ (không làm bằng chứng)",
+              "broken": "test tái hiện hỏng vì môi trường (không làm bằng chứng)",
+              "none": "không viết được test tái hiện"}.get(result.repro, f"test tái hiện: {result.repro}"))
     repro_note = ("\nTest tái hiện Kite đã viết từ yêu cầu (có thể sai; yêu cầu gốc mới là chuẩn), "
                   f"`{repro_file}`:\n```python\n{repro_text.strip()[:3000]}\n```\n"
                   f"Kết quả trên code ban đầu:\n```\n{failure_digest(repro_output, 1500).strip()}\n```"
@@ -987,6 +1005,7 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
         if pending > 1:
             result.log.append(f"đường nhanh, bản {n}/{pending}: {status}"
                               + (f" ({fast.reason})" if fast.reason else ""))
+        note(f"bản sửa {n}/{pending}: {FAST_STATUS_VI.get(status, status)}")
         if status == "passed":
             result.status, result.test_output = "passed", output
             result.check_code, result.check_output = check_code, check_output
