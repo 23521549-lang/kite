@@ -162,6 +162,13 @@ class SandboxConfig:
 
 
 @dataclass(frozen=True)
+class NotifyConfig:
+    """Push notifications when a task finishes (``kite notify setup``); ``ntfy`` is a secret reference
+    (file:PATH or env:NAME) holding the topic URL, e.g. https://ntfy.sh/kite-<random>."""
+    ntfy: str | None = None
+
+
+@dataclass(frozen=True)
 class KiteConfig:
     schema_version: int
     temporal_endpoint: str
@@ -176,6 +183,7 @@ class KiteConfig:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     sandbox: SandboxConfig | None = None
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
 
 @dataclass(frozen=True)
@@ -320,7 +328,19 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
     gateway = _validate_gateway(root.get("gateway", {}))
     sandbox = _validate_sandbox(root.get("sandbox"))
     return KiteConfig(1, endpoint, queue, executable, host, port, checkout, harness_cli,
-                      tuple(providers), routing=routing, gateway=gateway, sandbox=sandbox)
+                      tuple(providers), routing=routing, gateway=gateway, sandbox=sandbox,
+                      notify=_validate_notify(root.get("notify", {})))
+
+
+def _validate_notify(raw: Any) -> NotifyConfig:
+    notify = _mapping(raw, "notify")
+    if set(notify) - {"ntfy"}:
+        raise ConfigError("notify accepts only ntfy")
+    ref = notify.get("ntfy")
+    if ref is not None and (not isinstance(ref, str)
+                            or not (_ENV_REF.fullmatch(ref) or (ref.startswith("file:") and len(ref) > 5))):
+        raise ConfigError("notify.ntfy must be an env:NAME or file:PATH reference to the topic URL")
+    return NotifyConfig(ntfy=ref)
 
 
 def _number(value: Any, label: str, *, minimum: float | None = None) -> float:

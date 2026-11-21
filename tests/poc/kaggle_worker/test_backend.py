@@ -572,3 +572,41 @@ def test_backend_fast_path_solves_with_one_call_or_hands_over_to_the_agent(tmp_p
     assert "Kite fast path: tried (tests_failed" in result.summary
     saved = json.loads((backend.task_dir("task-fast-bad") / "result.json").read_text())
     assert saved["fast_path"] == "tests_failed" and saved["verified"] is True and saved["fast_attempts"] == 2
+
+
+def test_backend_uses_repo_lessons_reports_cost_and_notifies_when_done(tmp_path):
+    from poc.kaggle_worker import memory
+    from poc.kaggle_worker.journal import Journal, read_jsonl
+
+    repo, head = make_repo(tmp_path)
+    store, fake = make_store(tmp_path), FakeDocker()
+    sent = []
+    backend = SandboxActivityBackend(store, SETTINGS, state_dir=tmp_path / "state", models=MODELS, aliases=ALIASES,
+                                     runner=fake, heartbeat_seconds=0.01,
+                                     notifier=lambda title, message, **kw: sent.append((title, message, kw)))
+    memory.remember(backend.state_dir, repo, "old-task", "Đừng đổi chữ ký hàm public;\n giữ docstring tiếng Việt.")
+    # The gateway's journal of this task's model calls (and of a best-of-N helper on another worker).
+    gateway = Journal(backend.state_dir / "journal")
+    for tag, run_s in (("task-cost", 120.0), ("task-cost-b2", 30.0), ("other", 999.0)):
+        gateway.write("gateway", {"tag": tag, "run_s": run_s, "prompt_tokens": 1000, "completion_tokens": 50})
+    task = make_task(store, repo, head, "task-cost")
+
+    async def scenario():
+        work = await backend.prepare_workspace(task, "k1")
+        route = await backend.reserve_route(task, "k2")
+        session = await backend.prepare_opencode_session(task, route, work, None, "k3")
+        return await backend.run_opencode(task, route, work, "", session, "k4", lambda beat: None)
+
+    result = asyncio.run(scenario())
+    prompt = fake.agent_calls()[0][-1]
+    assert "Lưu ý từ người dùng ở các task trước trên repo này" in prompt
+    assert "Đừng đổi chữ ký hàm public; giữ docstring tiếng Việt." in prompt
+    saved = json.loads((backend.task_dir("task-cost") / "result.json").read_text())
+    assert (saved["gpu_seconds"], saved["model_requests"], saved["prompt_tokens"]) == (150.0, 2, 2000)
+    assert saved["agent_steps"] == 0 and saved["tool_calls"] == 0 and saved["patch_added"] >= 1   # fake agent: no tools
+    assert "Cost: 2 model calls, 2.5 GPU minutes" in result.summary
+    (run,) = read_jsonl(backend.state_dir / "journal" / "tasks.jsonl")
+    assert run["wall_seconds"] >= 0 and run["gpu_seconds"] == 150.0
+    (title, message, kw), = sent
+    assert title == "Kite: task xong, test qua" and "task-cost" in message and "2.5 phút GPU" in message
+    assert "average" not in message and kw["tags"] == ("white_check_mark",)       # no code, no goal text

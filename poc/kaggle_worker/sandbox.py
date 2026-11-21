@@ -176,6 +176,11 @@ class SandboxRun:
     fast_attempts: int = 0        # fast-path candidates tried (best-of-N)
     repro: str = "off"            # the fast path's reproduction test: off | none | broken | not_reproduced
     #                               | reproduced
+    agent_steps: int = 0          # model turns of the OpenCode agent (all rounds)
+    tool_calls: int = 0           # tools it called
+    repeat_reads: int = 0         # reads of something it had already read (same file, same range)
+    patch_added: int = 0          # lines of the final patch
+    patch_removed: int = 0
 
     @property
     def verified(self) -> bool:
@@ -289,7 +294,8 @@ TASK_GUIDES = {
     "coding": [
         "1. Đọc các file liên quan và test hiện có trước khi sửa.",
         "2. Lập kế hoạch ngắn: cần đổi file nào, vì sao.",
-        "3. Sửa đúng phạm vi yêu cầu. Không sửa, xóa hay bỏ qua test để cho qua, trừ khi yêu cầu nói vậy.",
+        "3. Sửa đúng phạm vi yêu cầu, diff nhỏ nhất có thể: không đổi tên, không định dạng lại, không refactor "
+        "phần không liên quan. Không sửa, xóa hay bỏ qua test để cho qua, trừ khi yêu cầu nói vậy.",
         "4. Chạy lệnh kiểm tra; nếu lỗi thì đọc lỗi, tìm nguyên nhân gốc, sửa và chạy lại cho tới khi qua. "
         "Thử một cách hai lần mà kết quả không đổi thì đổi hướng, đừng lặp lại y nguyên.",
         "5. Trước khi kết thúc: xóa file thử bạn tạo (reproduce_*.py, debug_*.py...) và print gỡ lỗi bạn thêm. "
@@ -649,7 +655,7 @@ def fast_prompt(goal: str, context: str, test_command: str, check: str = "", fee
         "Quy tắc:",
         "- SEARCH chép đúng từng ký tự từ phần code bên dưới; giữ khối ngắn, chỉ quanh chỗ cần đổi.",
         "- Tạo file mới: để SEARCH trống.",
-        "- Sửa đủ mọi chỗ yêu cầu cần (kể cả nơi gọi tới), không đổi thứ không liên quan.",
+        "- Sửa đủ mọi chỗ yêu cầu cần (kể cả nơi gọi tới), không đổi thứ không liên quan; diff càng nhỏ càng tốt.",
         "- Không sửa hay xóa test có sẵn; được thêm file test mới.",
         f"- Nếu phần code bên dưới chưa đủ để sửa chắc chắn đúng, chỉ trả lời một dòng: {FAST_DECLINE}: <lý do>.",
         "- Chỉ cần các khối sửa, kèm tối đa hai câu tóm tắt.",
@@ -1225,6 +1231,37 @@ class StuckWatch:
         return self.feed("> end")
 
 
+TOOL_LINE = re.compile(r"^(→|←|\$|✱|⚙|%|◇)\s+(\S+)\s*(.*)$")
+
+
+def tool_stats(text: str) -> dict:
+    """What an ``opencode run`` did, from its output: model turns (``> agent · model`` headers), tool
+    calls (``→ Read x``, ``← Edit x``, ``$ cmd``, ``✱ Grep ...``) and reads of something already read
+    (same path, same range): each one is a model turn spent on nothing new."""
+    steps = calls = 0
+    reads: dict[str, int] = {}
+    for line in clean_output(text).splitlines():
+        if line.startswith("> "):
+            steps += 1
+            continue
+        match = TOOL_LINE.match(line.strip())
+        if match is None:
+            continue
+        calls += 1
+        if match.group(1) == "→" and match.group(2).lower() == "read":
+            reads[match.group(3).strip()] = reads.get(match.group(3).strip(), 0) + 1
+    again = {path: n - 1 for path, n in reads.items() if n > 1}
+    return {"agent_steps": steps, "tool_calls": calls, "repeat_reads": sum(again.values()),
+            "most_reread": sorted(again, key=again.get, reverse=True)[:3]}
+
+
+def patch_size(patch: str) -> tuple[int, int]:
+    """Lines added and removed by a unified diff."""
+    lines = patch.splitlines()
+    return (sum(1 for line in lines if line.startswith("+") and not line.startswith("+++")),
+            sum(1 for line in lines if line.startswith("-") and not line.startswith("---")))
+
+
 def edited_tests(workspace: Path, base: str) -> list[str]:
     """Test files that existed at ``base`` and the agent changed or deleted (adding tests is fine)."""
     rows = _git(Path(workspace), "diff", "--name-status", base, check=False).splitlines()
@@ -1580,7 +1617,8 @@ def agent_prompt(goal: str, test_command: str, *, task_type: str = "coding", con
             lines.append(f"Sau khi test qua, Kite còn kiểm tra bằng `{check_hint(check)}`; chạy lệnh này trước khi kết thúc.")
     lines.append("Không commit, không push: Kite sẽ tự lấy thay đổi để người dùng duyệt.")
     if context:
-        lines += ["", "Ngữ cảnh repo (Kite chuẩn bị sẵn; vẫn đọc lại file trước khi sửa):", context]
+        lines += ["", "Ngữ cảnh repo (Kite chuẩn bị sẵn; đọc file trước khi sửa nó, nhưng mỗi file chỉ đọc một lần, "
+                  "đọc lại chỉ khi file đã đổi; file lớn thì grep hoặc đọc đúng đoạn cần):", context]
     return "\n".join(lines)
 
 
@@ -1927,6 +1965,13 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                           context=repo_context(workspace, goal, graph=graph) if with_context else "", quick=template,
                           check=run.check_command)
     agent_log, test_log = [], []
+
+    def count_tools(output: str) -> None:
+        stats = tool_stats(output)
+        run.agent_steps += stats["agent_steps"]
+        run.tool_calls += stats["tool_calls"]
+        run.repeat_reads += stats["repeat_reads"]
+
     attempt, test_output = 0, ""
 
     def run_tests(after: str, last_output: str = "") -> tuple[int, str, str]:
@@ -2040,6 +2085,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
         run.agent_output_tail = _tail(output)
         agent_log.append(f"===== {kind} exit={run.agent_exit_code} =====\n{output}")
+        count_tools(output)
         if not run.test_command:
             break
         run.test_exit_code, test_output, ran = run_tests(kind, test_output)
@@ -2099,6 +2145,8 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                                  check=run.check_command, scratch=scratch_files(workspace, run.patch_base))])
         run.agent_seconds = round(run.agent_seconds + time.monotonic() - started, 1)
         agent_log.append(f"===== review ({run.review_mode}) exit={review_code} =====\n{output}")
+        if run.review_mode == "agent":
+            count_tools(output)
         if snapshot_tree(workspace) == before:
             run.review = "unchanged"
         else:
@@ -2125,6 +2173,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         log(f"[{task_id}] lưu ý: có file trông như file thử: {', '.join(run.scratch_files)}")
     run.changed_files = collect_patch(workspace, run.patch_base, patch_path)
     run.patch_path = str(patch_path)
+    run.patch_added, run.patch_removed = patch_size(patch_path.read_text(encoding="utf-8"))
     return _write_result(root, run)
 
 

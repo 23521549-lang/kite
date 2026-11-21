@@ -217,6 +217,12 @@ kite chat setup --force && kite chat reload
 
 Every task, sandbox run and bench run keeps a clone of the repository, its installed libraries and the code map next to its results and logs. `kite cleanup` lists those big folders for runs unchanged for `--days` (default 7) and removes them with `--yes`; `result.json`, `result.patch`, the logs, `trace.jsonl` and bench `results.json`/`README.md` stay. A task cleaned up this way can no longer be continued with `send_instruction`. `--deps-cache` also removes cached libraries that no kept task links to (they are installed again when needed). Do not use `docker system prune`: it also removes the sandbox network while no container uses it.
 
+### Notifications, repository memory, cost per task
+
+- `kite notify setup` picks a random ntfy topic (the only key to it), keeps it in a 0600 secret file and turns on one push message per finished or failed task: task id, outcome, minutes, GPU minutes; never code or the goal. Subscribe to the printed topic in the ntfy app, restart `kite-workflow-worker`, then `kite notify test`. `--off` turns it off.
+- A `bad` note on a task (chat `note_task`, or `kite journal note TASK --bad "why"`) becomes a line in `<state>/memory/<repo>.md`; later tasks on the same repository get the newest lines in their goal. `kite memory show <repo>` prints them; edit or delete lines in that file freely.
+- Each task's `result.json`, summary and journal line carry its cost: model calls, GPU seconds on the workers (Kaggle's quota), tokens, the agent's turns, tool calls and re-reads of something it had already read, and the patch size. `kite bench` reports them per task (patch size next to the real fix's) and `kite bench history` per run.
+
 ## Sandboxed runs
 
 `kite sandbox run` executes one task end to end without Temporal, in three throw-away containers that share a per-task clone of the repository's committed state:

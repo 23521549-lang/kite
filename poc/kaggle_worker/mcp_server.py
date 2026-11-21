@@ -261,9 +261,13 @@ class KiteOps:
             raise KiteToolError("verdict phải là 'good' (dùng được) hoặc 'bad' (sai, không dùng được)")
         if not task_id.strip() or len(task_id) > 200:
             raise KiteToolError("task_id không hợp lệ")
+        from .memory import remember_note
+
         record = {"task_id": task_id.strip(), "verdict": verdict, "text": reason.strip()[:2000], "source": "chat"}
         self.journal.write("notes", record)
-        return {"saved": True, **record}
+        # A bad verdict with a reason becomes a lesson for later tasks on the same repository.
+        remembered = remember_note(self.state_dir, record["task_id"], verdict, record["text"])
+        return {"saved": True, **record, "remembered_for_repo": bool(remembered)}
 
     async def task_status(self, task_id: str) -> dict:
         from .temporal_workflow import CodingTaskWorkflow
@@ -571,7 +575,7 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 - Khi task xong, gọi `task_result` và tóm tắt ngắn: đã đổi file nào, đổi gì, test do Kite tự chạy **PASSED** hay **FAILED**, rồi hỏi người dùng có muốn áp patch không.
 - Việc nhỏ cần xem hoặc chạy thử (đọc file, tìm code, chạy test, xem `git log`): dùng `run_command` trên repo, vài giây là có kết quả, không cần GPU. Xem nhanh trạng thái repo: `repo_status`.
 - Muốn sửa thêm trên task CHƯA xong: `send_instruction`. Task đã xong: tạo task mới.
-- Người dùng nhận xét kết quả một task (đúng, sai, dùng được, phải sửa lại…): gọi `note_task` với `verdict` `good` hoặc `bad`, `reason` là lời người dùng, rồi xác nhận ngắn là đã ghi. Không hỏi lại.
+- Người dùng nhận xét kết quả một task (đúng, sai, dùng được, phải sửa lại…): gọi `note_task` với `verdict` `good` hoặc `bad`, `reason` là lời người dùng, rồi xác nhận ngắn là đã ghi. Không hỏi lại. Kết quả có `remembered_for_repo: true` nghĩa là Kite sẽ nhắc lưu ý đó cho các task sau trên cùng repo: nói thêm một câu như vậy.
 - Kết quả `start_task` có `kite_yml_suggestion` nghĩa là repo chưa có `.kite.yml` nên Kite có thể cài thư viện hoặc chạy test chưa đúng. Báo `task_id` như thường, rồi đưa khối YAML đề xuất và nói người dùng kiểm tra rồi tự commit file `.kite.yml` vào gốc repo. Bạn không tự tạo file đó.
 - Hỏi về GPU/worker: `worker_status`. Worker có `launch` thì Kite tự bật notebook Kaggle khi có việc: `launch.state` là `launching`/`starting` nghĩa là đang bật (thường 5–10 phút), báo người dùng chờ; `launch.kaggle` là `queued` nghĩa là Kaggle đang xếp hàng GPU (Kite không đẩy nhanh được): báo số phút trong `launch.kaggle_seconds` và gợi ý chạy tay notebook nếu gấp; `error` thì báo đúng `launch.detail`. Không có worker nào `alive` và cũng không có `launch`: nhắc người dùng bật notebook Kaggle (mục Worker mode). Task vẫn được giữ và sẽ chạy khi worker kết nối.
 
@@ -595,6 +599,11 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 """
 
 
+NOTIFY_NOTE = """
+## Thông báo khi task xong
+
+Kite (không phải bạn) gửi một thông báo ntfy về điện thoại người dùng khi mỗi task xong hoặc dừng vì lỗi. Sau khi giao task, bạn có thể nói "Kite sẽ gửi thông báo về điện thoại khi task xong". Bạn vẫn không tự nhắn được: đừng hứa chính bạn sẽ báo.
+"""
 REASONER_AGENT = "suy-luan"
 REASONER_PROMPT = """Bạn là trợ lý suy luận trong chat của Kite, chạy bằng model MODEL. Luôn trả lời bằng tiếng Việt; giữ nguyên tên file, hàm, lệnh và code.
 
@@ -626,6 +635,8 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
     instructions = (LEAD_INSTRUCTIONS
                     .replace("ROOTS", ", ".join(f"`{root}`" for root in allowed_roots))
                     .replace("MODELS", ", ".join(f"`{m}`" for m in models)))
+    if config.notify.ntfy:
+        instructions += NOTIFY_NOTE
     thinker = next((m for m in config.routing.chat_only if m in models), None)
     if thinker is not None:
         # A chat-only model (a reasoning model that is no agent, e.g. R1-Distill) gets its own primary

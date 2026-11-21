@@ -1068,6 +1068,18 @@ def make_repo_fixture(task: RepoTask, source: Path, root: Path) -> Path:
     return repo
 
 
+def reference_lines(task: RepoTask, source: Path) -> int:
+    """Lines the real fix changed outside the hidden tests (added + removed): how big a patch needs to be."""
+    numstat = subprocess.run(["git", "-C", str(source), "diff", "--numstat", task.base, task.fix],
+                             capture_output=True, text=True).stdout
+    total = 0
+    for row in numstat.splitlines():
+        added, removed, path = (row.split("\t") + ["", "", ""])[:3]
+        if path not in task.hidden and added.isdigit() and removed.isdigit():
+            total += int(added) + int(removed)
+    return total
+
+
 def hidden_files(task, source: Path | None = None) -> dict[str, str]:
     """Hidden test files, as repository path -> content (written after the agent and Kite's test run)."""
     if isinstance(task, PolyglotTask):
@@ -1148,7 +1160,16 @@ def score_code(task, run: dict) -> dict:
             "check_runs": run.get("check_runs"), "check_seconds": run.get("check_seconds"),
             "scratch_files": run.get("scratch_files"), "fast_path": run.get("fast_path"),
             "fast_seconds": run.get("fast_seconds"), "review_mode": run.get("review_mode"),
-            "repro": run.get("repro"), "fast_attempts": run.get("fast_attempts")}
+            "repro": run.get("repro"), "fast_attempts": run.get("fast_attempts"),
+            # Cost and economy (lessons from Claude Code / Muse Code): turns, tool calls, re-reads,
+            # patch size against the real fix, GPU time on the workers and tokens.
+            "agent_steps": run.get("agent_steps"), "tool_calls": run.get("tool_calls"),
+            "repeat_reads": run.get("repeat_reads"),
+            "patch_lines": (run.get("patch_added") or 0) + (run.get("patch_removed") or 0)
+            if run.get("patch_added") is not None else None,
+            "reference_lines": run.get("reference_lines"),
+            "gpu_seconds": run.get("gpu_seconds"), "model_requests": run.get("model_requests"),
+            "prompt_tokens": run.get("prompt_tokens"), "completion_tokens": run.get("completion_tokens")}
 
 
 # --------------------------------------------------------------------------------------- driver
@@ -1221,6 +1242,11 @@ def summarize(entry: dict) -> dict:
         "code_hidden_failed": sum(item.get("hidden_passed") is False for item in code),
         "code_seconds": round(sum(item.get("agent_seconds") or 0 for item in code) / len(code), 1) if code else None,
         "code_wall_median": _median([item["wall_seconds"] for item in code if item.get("wall_seconds")]),
+        "code_gpu_minutes_median": _median([round(item["gpu_seconds"] / 60, 1) for item in code
+                                            if item.get("gpu_seconds")]),
+        "code_tool_calls": sum(item.get("tool_calls") or 0 for item in code),
+        "code_repeat_reads": sum(item.get("repeat_reads") or 0 for item in code),
+        "code_tokens": sum((item.get("prompt_tokens") or 0) + (item.get("completion_tokens") or 0) for item in code),
         "polyglot_total": len(polyglot := [item for item in code if item.get("polyglot")]),
         "polyglot_pass_1": sum(bool(item.get("pass_1")) for item in polyglot),
         "polyglot_pass_2": sum(bool(item.get("passed")) for item in polyglot),
@@ -1292,6 +1318,22 @@ def render_report(results: dict) -> str:
                          f"| {item.get('fix_rounds_used', 0)} | {item.get('review')}"
                          f"{' (1 lần gọi)' if item.get('review_mode') == 'one_call' else ''} "
                          f"| {item.get('stuck_stops') or 0} | {', '.join(item.get('scratch_files') or []) or '-'} |")
+    costed = [(model, item) for model, item in timed
+              if any(item.get(k) is not None for k in ("gpu_seconds", "tool_calls", "patch_lines"))]
+    if costed:
+        lines += ["", "## Chi phí từng task code", "",
+                  "Phút GPU: thời gian worker bỏ ra cho các lần gọi model của task (quota Kaggle tính theo giờ GPU). "
+                  "Đọc lại: lần agent đọc lại đúng thứ đã đọc. Dòng patch so với bản sửa thật (nếu có).", "",
+                  "| Model | Task | Phút GPU | Lần gọi model | Token (vào + sinh) | Lượt agent | Gọi tool (đọc lại) "
+                  "| Dòng patch (bản thật) |", "|---|---|---|---|---|---|---|---|"]
+        for model, item in costed:
+            gpu = round(item["gpu_seconds"] / 60, 1) if item.get("gpu_seconds") is not None else "-"
+            tokens = (f"{item.get('prompt_tokens') or 0} + {item.get('completion_tokens') or 0}"
+                      if item.get("model_requests") else "-")
+            reference = f" ({item['reference_lines']})" if item.get("reference_lines") is not None else ""
+            lines.append(f"| `{model}` | {item['id']} | {gpu} | {item.get('model_requests') or '-'} | {tokens} "
+                         f"| {item.get('agent_steps') or 0} | {item.get('tool_calls') or 0} "
+                         f"({item.get('repeat_reads') or 0}) | {item.get('patch_lines', '-')}{reference} |")
     lines += ["", "## Kịch bản sai", ""]
     for model, entry in results["models"].items():
         for item in entry.get("lead") or []:
@@ -1351,20 +1393,28 @@ def history(root: Path) -> tuple[str, list[dict]]:
                 "hidden_failed": s["code_hidden_failed"],
                 "polyglot": (f"{s['polyglot_pass_1']}/{s['polyglot_total']} → {s['polyglot_pass_2']}/"
                              f"{s['polyglot_total']}" if s["polyglot_total"] else ""),
-                "gen_tps": s["gen_tps"]})
+                "gen_tps": s["gen_tps"], "gpu_minutes_median": s["code_gpu_minutes_median"],
+                "tool_calls": s["code_tool_calls"] if code else None,
+                "repeat_reads": s["code_repeat_reads"] if code else None,
+                "patch_lines": sum(item.get("patch_lines") or 0 for item in code) if code else None})
     runs.sort(key=lambda r: (r["started"] or "", r["folder"]))
     lines = ["# Kite bench: các lần đo", "",
              "Mỗi dòng là một model trong một lần đo (`kite bench run`), cũ trước. Số liệu lấy từ `results.json` "
              "của từng thư mục.", "",
-             "| Lần đo | Bắt đầu | Model | Code đạt | Task trượt | s/task (trung vị) | s tổng | Đường nhanh qua "
-             "| Tái hiện ✓ | Rà soát 1 lần gọi | Trượt test ẩn | Agent trưởng | Polyglot pass@1 → @2 | Sinh tok/s |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| Lần đo | Bắt đầu | Model | Code đạt | Task trượt | s/task (trung vị) | s tổng | Phút GPU/task (trung vị) "
+             "| Đường nhanh qua | Tái hiện ✓ | Rà soát 1 lần gọi | Trượt test ẩn | Gọi tool (đọc lại) | Dòng patch "
+             "| Agent trưởng | Polyglot pass@1 → @2 | Sinh tok/s |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in runs:
+        calls = f"{r['tool_calls']} ({r['repeat_reads']})" if r["tool_calls"] else "-"
         lines.append(f"| {r['run']} | {r['started']} | `{r['model']}` | {r['code'] or '-'} | {r['failed'] or '-'} "
                      f"| {r['wall_median'] if r['wall_median'] is not None else '-'} "
                      f"| {r['wall_total'] if r['wall_total'] is not None else '-'} "
+                     f"| {r['gpu_minutes_median'] if r['gpu_minutes_median'] is not None else '-'} "
                      f"| {r['fast_passed'] if r['tasks'] else '-'} | {r['reproduced'] if r['tasks'] else '-'} "
                      f"| {r['one_call_review'] if r['tasks'] else '-'} | {r['hidden_failed'] if r['tasks'] else '-'} "
+                     f"| {calls} "
+                     f"| {r['patch_lines'] if r['patch_lines'] else '-'} "
                      f"| {r['lead'] or '-'} | {r['polyglot'] or '-'} | {r['gen_tps'] or '-'} |")
     harnesses = {}
     for r in runs:

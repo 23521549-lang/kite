@@ -20,9 +20,9 @@ import uuid
 
 from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers, load_config,
                      model_contexts, model_policy_from_config, redact_config, refresh_configured_providers,
-                     sandbox_settings_from_config, sync_config_to_store, validate_config)
+                     resolve_secret, sandbox_settings_from_config, sync_config_to_store, validate_config)
 from .integration import StaleWorkerResult, build_review_bundle
-from .journal import Journal, show_task, summarize
+from .journal import Journal, show_task, summarize, task_usage
 from .protocol import ScheduledTask, WorkerResult
 from .sandbox import SandboxError
 from .scheduler import WorkerScheduler
@@ -88,6 +88,18 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--deps-cache", action="store_true",
                          help="also remove cached libraries no kept task uses (they are reinstalled when needed)")
     cleanup.add_argument("--yes", action="store_true", help="remove (default: only list what would go)")
+    notify_parser = commands.add_parser("notify", help="push notifications (ntfy) when a task finishes")
+    notify_commands = notify_parser.add_subparsers(dest="notify_command", required=True)
+    notify_setup = notify_commands.add_parser(
+        "setup", help="pick a random ntfy topic, keep it in a 0600 secret file and turn notifications on")
+    notify_setup.add_argument("--server", default="https://ntfy.sh", help="ntfy server (default https://ntfy.sh)")
+    notify_setup.add_argument("--topic", default=None, help="topic name (default: a random one; it is the only key)")
+    notify_setup.add_argument("--off", action="store_true", help="turn notifications off")
+    notify_commands.add_parser("test", help="send a test notification")
+    memory_parser = commands.add_parser("memory", help="lessons Kite keeps per repository (from your bad notes)")
+    memory_commands = memory_parser.add_subparsers(dest="memory_command", required=True)
+    memory_show = memory_commands.add_parser("show", help="the lessons for one repository and their file")
+    memory_show.add_argument("repo", help="path of the repository")
     model = commands.add_parser("model", help="models the workers serve")
     model_commands = model.add_subparsers(dest="model_command", required=True)
     model_add = model_commands.add_parser(
@@ -480,9 +492,12 @@ def _journal_command(args: argparse.Namespace) -> int:
 
         _emit(show_task(journal, args.task_id, state_dir / "tasks" / task_slug(args.task_id) / "trace.jsonl"))
     else:
+        from .memory import remember_note
+
         record = {"task_id": args.task_id, "verdict": "good" if args.good else "bad", "text": args.text}
         journal.write("notes", record)
-        _emit({"saved": record, "file": str(journal.path("notes"))})
+        _emit({"saved": record, "file": str(journal.path("notes")),
+               "remembered_in": remember_note(state_dir, args.task_id, record["verdict"], args.text)})
     return 0
 
 
@@ -608,6 +623,67 @@ async def _ensure_temporal_namespace(client, *, retention_days: int = 7, settle_
     return True
 
 
+def _notifier(config):
+    """The configured push notifier (notify.ntfy), or one that does nothing."""
+    from .notify import Notifier
+
+    if not config.notify.ntfy:
+        return Notifier(None)
+    try:
+        return Notifier(resolve_secret(config.notify.ntfy))
+    except (ConfigError, OSError) as exc:
+        print(f"kite notify: {exc}; notifications are off", file=sys.stderr)
+        return Notifier(None)
+
+
+def _notify_command(args: argparse.Namespace) -> int:
+    import yaml
+
+    from . import notify
+
+    if args.notify_command == "test":
+        config = _load_operator_config(args)
+        if not config.notify.ntfy:
+            raise ConfigError("notifications are not set up: kite notify setup")
+        url = resolve_secret(config.notify.ntfy)
+        notify.send(url, "Kite: thử thông báo", "Nếu bạn đọc được dòng này, Kite sẽ báo khi mỗi task xong.",
+                    tags=("bell",))
+        _emit({"sent": True, "topic": notify.split_url(url)[1]})
+        return 0
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    secret = args.config.parent / "secrets" / "ntfy_url"
+    if args.off:
+        raw.pop("notify", None)
+        backup = _save_config(args.config, raw)
+        _emit({"notify": "off", "backup": str(backup), "next": "sudo systemctl restart kite-workflow-worker"})
+        return 0
+    url = f"{args.server.rstrip('/')}/{args.topic or notify.new_topic()}"
+    notify.split_url(url)                          # validate before writing anything
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(secret.parent, 0o700)
+    fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(url + "\n")
+    raw["notify"] = {"ntfy": f"file:{secret}"}
+    backup = _save_config(args.config, raw)
+    server, topic = notify.split_url(url)
+    _emit({"notify": "ntfy", "server": server, "topic": topic, "secret_file": str(secret), "backup": str(backup),
+           "next": [f"App ntfy trên điện thoại: Subscribe to topic -> {topic}"
+                    + ("" if server == notify.DEFAULT_SERVER else f" (server {server})"),
+                    "sudo systemctl restart kite-workflow-worker", "kite notify test"]})
+    return 0
+
+
+def _memory_command(args: argparse.Namespace) -> int:
+    from . import memory
+
+    path = memory.memory_path(args.config.parent, args.repo)
+    _emit({"repo": str(Path(args.repo).expanduser().resolve()), "file": str(path),
+           "lessons": memory.lessons(args.config.parent, args.repo, limit=1000, chars=10**9),
+           "used_in_tasks": memory.lessons(args.config.parent, args.repo)})
+    return 0
+
+
 def _run_workflow_worker(args: argparse.Namespace, config) -> int:
     """Serve the Temporal task queue with the sandbox backend (see deploy/kite-workflow-worker.service)."""
     from .backend import SandboxActivityBackend
@@ -621,7 +697,8 @@ def _run_workflow_worker(args: argparse.Namespace, config) -> int:
     journal = TemporalActivityJournal(state_dir / "activities.sqlite3")
     backend = SandboxActivityBackend(
         store, settings, state_dir=state_dir, models=models,
-        aliases={name: spec["model"] for name, spec in config.gateway.aliases.items()})
+        aliases={name: spec["model"] for name, spec in config.gateway.aliases.items()},
+        notifier=_notifier(config))
     activities = TemporalKiteActivities(backend, journal)
     methods = [activities.validate_task, activities.prepare_workspace, activities.reserve_route,
                activities.prepare_opencode_session, activities.run_opencode,
@@ -795,6 +872,10 @@ def _bench_command(args: argparse.Namespace) -> int:
                                deps_cache=args.config.parent / "deps-cache" if settings.deps_cache else None)
             result = run.to_dict()
             result["wall_seconds"] = round(time.monotonic() - started, 1)
+            # Model time and tokens of this run, from the gateway's journal on this machine.
+            result.update(task_usage(Journal(args.config.parent / "journal"), task_id))
+            if isinstance(task, bench.RepoTask):
+                result["reference_lines"] = bench.reference_lines(task, source)
             # Hidden tests: written only now, run like Kite's own tests (no network, same deps). The
             # polyglot exercises are scored like Aider: their tests run whatever state Kite ended in.
             polyglot_task = isinstance(task, bench.PolyglotTask)
@@ -922,6 +1003,10 @@ def _operator_command(args: argparse.Namespace) -> int:
         return 0
     if args.command == "cleanup":
         return _cleanup(args)
+    if args.command == "notify":
+        return _notify_command(args)
+    if args.command == "memory":
+        return _memory_command(args)
     if args.command == "model":
         return _model_add(args)
     if args.command == "doctor":
@@ -1138,7 +1223,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
-                        "mcp", "chat", "bench", "journal", "cleanup", "model"}:
+                        "mcp", "chat", "bench", "journal", "cleanup", "model", "notify", "memory"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

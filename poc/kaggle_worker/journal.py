@@ -238,6 +238,19 @@ def summarize(journal: Journal, *, since: float | None = None) -> dict:
     }
 
 
+def task_usage(journal: Journal, tag: str) -> dict:
+    """What one task cost in model time: its requests (tag ``tag``, and ``tag-bN`` of the best-of-N
+    helpers on other workers), GPU seconds (time a worker spent on them) and tokens. Kaggle's quota is
+    counted in GPU hours, so this is what decides how many tasks a week the workers can take."""
+    requests = [r for r in journal.read("gateway")
+                if r.get("tag") == tag or str(r.get("tag") or "").startswith(f"{tag}-b")]
+    return {"model_requests": len(requests),
+            "gpu_seconds": round(sum(r.get("run_s") or 0 for r in requests), 1),
+            "prompt_tokens": sum(r.get("prompt_tokens") or 0 for r in requests),
+            "completion_tokens": sum(r.get("completion_tokens") or 0 for r in requests),
+            "cached_tokens": sum(r.get("cached_tokens") or 0 for r in requests)}
+
+
 def show_task(journal: Journal, task_id: str, trace_path: Path | None) -> dict:
     """Everything recorded about one task: runs, step trace, model requests, lead-agent actions, notes."""
     requests = [r for r in journal.read("gateway") if r.get("tag") == task_id]

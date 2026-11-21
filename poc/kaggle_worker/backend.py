@@ -32,7 +32,8 @@ from typing import Any, Callable, Mapping
 from temporalio.exceptions import ApplicationError
 
 from . import sandbox as sbx
-from .journal import Journal, append_jsonl, clean_tag, short
+from .journal import Journal, append_jsonl, clean_tag, read_jsonl, short, task_usage
+from . import memory
 from .integration import ReviewBundle, build_review_bundle
 from .protocol import WorkerResult
 from .store import StoreError
@@ -143,7 +144,8 @@ class SandboxActivityBackend:
                  aliases: Mapping[str, str] | None = None, lease_seconds: int = 600,
                  max_observation_age_seconds: int = 300, runner=sbx.default_runner,
                  clock: Callable[[], float] = time.time,
-                 heartbeat_seconds: float = HEARTBEAT_SECONDS) -> None:
+                 heartbeat_seconds: float = HEARTBEAT_SECONDS,
+                 notifier: Callable[..., None] | None = None) -> None:
         self.store = store
         self.settings = settings
         self.state_dir = Path(state_dir)
@@ -155,6 +157,7 @@ class SandboxActivityBackend:
         self.clock = clock
         self.heartbeat_seconds = heartbeat_seconds
         self.journal = Journal(self.state_dir / "journal", clock=clock)
+        self.notifier = notifier                  # notify.Notifier: a push message when a task finishes
 
     # ------------------------------------------------------------------ helpers
     def task_dir(self, task_id: str) -> Path:
@@ -163,6 +166,13 @@ class SandboxActivityBackend:
     def _trace(self, task_id: str, event: str, **fields) -> None:
         """One line in the task's own trace.jsonl (every step, as it happens)."""
         append_jsonl(self.task_dir(task_id) / "trace.jsonl", {"event": event, **fields}, clock=self.clock)
+
+    def _notify(self, run: dict) -> None:
+        if self.notifier:
+            from .notify import task_message
+
+            title, message, tags, priority = task_message(run)
+            self.notifier(title, message, tags=tags, priority=priority)
 
     def _small_model(self, model: str) -> str | None:
         return next((alias for alias, base in self.aliases.items() if base == model), None)
@@ -313,21 +323,28 @@ class SandboxActivityBackend:
         goal = task.goal.strip()
         if instruction.strip():
             goal += f"\n\nChỉ dẫn bổ sung của người dùng (ưu tiên làm theo): {instruction.strip()}"
+        # What the person said went wrong in earlier tasks on this repository (memory.py).
+        lessons = memory.lessons_note(self.state_dir, task.repo_path)
+        goal += lessons
 
         graph = await asyncio.to_thread(sbx.code_graph, self.settings, work, root / "graph")
         context = await asyncio.to_thread(sbx.repo_context, work, goal, graph=graph)
         self._trace(task.task_id, "run_start", model=route.model_id, worker=route.worker_id, lease=route.lease_id,
                     task_type=task.task_type, instruction=short(instruction, 1000), context_chars=len(context),
-                    code_map=len(graph.symbols) if graph is not None else None)
+                    code_map=len(graph.symbols) if graph is not None else None,
+                    lessons=lessons.count("\n- ") or None)
         try:
             return await self._run_agent(task, route, work, root, slug, deps, patch_base, config_file, goal,
                                          instruction, context, session_id, heartbeat, graph)
         except BaseException as exc:
             # A crash (or cancel) mid-run still leaves a line saying how far it got.
             self._trace(task.task_id, "run_error", error=short(f"{type(exc).__name__}: {exc}", 500))
-            self.journal.write("tasks", {"task_id": task.task_id, "task_type": task.task_type,
-                                         "model": route.model_id, "worker": route.worker_id, "status": "error",
-                                         "error": short(f"{type(exc).__name__}: {exc}", 500)})
+            failed = {"task_id": task.task_id, "task_type": task.task_type, "repo": task.repo_path,
+                      "model": route.model_id, "worker": route.worker_id, "status": "error",
+                      "error": short(f"{type(exc).__name__}: {exc}", 500)}
+            self.journal.write("tasks", failed)
+            if not isinstance(exc, asyncio.CancelledError):
+                self._notify(failed)
             raise
 
     async def _run_agent(self, task: CodingTaskInput, route: RouteLease, work: Path, root: Path, slug: str,
@@ -383,6 +400,12 @@ class SandboxActivityBackend:
                 stream.write(f"\n===== check after {after} exit={code} =====\n{output}")
             return code, output, command
         stuck_stops = 0
+        tools = {"agent_steps": 0, "tool_calls": 0, "repeat_reads": 0}
+
+        def count_tools(text: str) -> None:
+            stats = sbx.tool_stats(text)
+            for key in tools:
+                tools[key] += stats[key]
         status, code, output = "not_started", None, ""
         fast_status, fast_seconds, ask, repro, fast_attempts = "off", 0.0, None, "off", 0
         if self.settings.fast_path and task.task_type == "coding" and test_command:
@@ -464,6 +487,7 @@ class SandboxActivityBackend:
                 stream.write(output)
             status = sbx.AGENT_STATUS.get(code, "failed")
             stuck_stops += status == "stuck"
+            count_tools(output)
             if not test_command:
                 break
             test_code, test_output, ran = await run_tests(kind, test_output)
@@ -521,6 +545,8 @@ class SandboxActivityBackend:
                            scratch=await asyncio.to_thread(sbx.scratch_files, work, patch_base))],
                     self.settings.agent_timeout_seconds, heartbeat, "REVIEWING", task.task_id, sbx.StuckWatch())
             seconds = round(seconds + step_seconds, 1)
+            if review_mode == "agent":
+                count_tools(review_output)
             with (root / "agent.log").open("a", encoding="utf-8") as stream:
                 stream.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} review ({review_mode}) "
                              f"model={route.model_id} exit={review_code} =====\n")
@@ -564,6 +590,14 @@ class SandboxActivityBackend:
             lines.insert(0, f"Kite fast path: tried ({fast_status}, {fast_seconds}s), then the agent took over.")
         if stuck_stops:
             lines.append(f"Kite stopped the agent {stuck_stops} time(s) for repeating the same steps.")
+        added, removed = sbx.patch_size(patch)
+        # What it cost: model time on the workers (the Kaggle quota) and tokens, from the gateway journal.
+        usage = task_usage(self.journal, clean_tag(task.task_id) or slug)
+        lines.append(f"Cost: {usage['model_requests']} model calls, {round(usage['gpu_seconds'] / 60, 1)} GPU "
+                     f"minutes, {usage['prompt_tokens']} prompt + {usage['completion_tokens']} generated tokens"
+                     + (f"; agent: {tools['tool_calls']} tool calls, {tools['repeat_reads']} re-reads"
+                        if tools["tool_calls"] else "")
+                     + f"; patch +{added}/-{removed} lines.")
         if tests_edited:
             lines.append(f"NOTE: existing tests were changed: {', '.join(tests_edited)} - check that this was "
                          "intended and not just to make tests pass.")
@@ -595,11 +629,9 @@ class SandboxActivityBackend:
             "review": review, "stuck_stops": stuck_stops, "tests_edited": tests_edited,
             "check_command": check_ran, "check_exit_code": check_code, "scratch_files": scratch,
             "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode, "repro": repro,
-            "fast_attempts": fast_attempts,
+            "fast_attempts": fast_attempts, "patch_added": added, "patch_removed": removed, **tools, **usage,
             "verified": verified,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
-        added = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
-        removed = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
         run = {"task_id": task.task_id, "task_type": task.task_type, "repo": task.repo_path,
                "model": route.model_id, "worker": route.worker_id, "goal": short(task.goal, 500),
                "instruction": short(instruction, 500), "status": "finished", "agent_status": status,
@@ -609,9 +641,13 @@ class SandboxActivityBackend:
                "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode,
                "repro": repro, "fast_attempts": fast_attempts, "verified": verified,
                "changed_files": changed, "lines_added": added, "lines_removed": removed,
-               "context_chars": len(context)}
+               "context_chars": len(context), **tools, **usage}
+        trace = read_jsonl(root / "trace.jsonl")          # the whole task, setup included
+        if trace and isinstance(trace[0].get("ts"), (int, float)):
+            run["wall_seconds"] = round(self.clock() - trace[0]["ts"], 1)
         self._trace(task.task_id, "run_end", **{k: v for k, v in run.items() if k not in ("task_id", "goal")})
         self.journal.write("tasks", run)
+        self._notify(run)
         return CodingRunResult(task.task_id, task.repo_head, session_id, patch, summary,
                                tuple(changed), int(seconds))
 

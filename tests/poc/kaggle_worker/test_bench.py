@@ -429,9 +429,40 @@ def test_history_puts_every_run_in_one_table_oldest_first(tmp_path, capsys):
     assert rows[1]["code"] == "1/2" and rows[1]["failed"] == "R2" and rows[1]["wall_total"] == 1300.0
     assert (rows[1]["fast_passed"], rows[1]["reproduced"], rows[1]["one_call_review"], rows[1]["hidden_failed"]) \
         == (1, 1, 1, 1)
-    assert "| v5 | 2026-11-21 09:00 | `qwen3.6` | 1/2 | R2 | 650.0 | 1300.0 | 1 | 1 | 1 | 1 | - | - | - |" in text
+    assert "| v5 | 2026-11-21 09:00 | `qwen3.6` | 1/2 | R2 | 650.0 | 1300.0 | - | 1 | 1 | 1 | 1 | - | - | - | - | - |" in text
     assert "- **v5**: task R1,R2; harness bật" in text
 
     from poc.kaggle_worker import cli
     assert cli.main(["--config", str(tmp_path / "config.yaml"), "bench", "history", "--root", str(tmp_path)]) == 0
     assert "| v5 |" in capsys.readouterr().out
+
+
+def test_cost_columns_show_gpu_time_tool_calls_and_patch_size_against_the_real_fix(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    g = ["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*g, "init", "-q"], check=True)
+    (src / "app.py").write_text("def f():\n    return 1\n")
+    (src / "tests").mkdir()
+    (src / "tests" / "test_app.py").write_text("def test_f():\n    pass\n")
+    subprocess.run([*g, "add", "-A"], check=True)
+    subprocess.run([*g, "commit", "-qm", "base"], check=True)
+    base = subprocess.run([*g, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (src / "app.py").write_text("def f():\n    return 2\n")
+    (src / "tests" / "test_app.py").write_text("def test_f():\n    assert True\n")
+    subprocess.run([*g, "commit", "-qam", "fix"], check=True)
+    fix = subprocess.run([*g, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    task = bench.RepoTask("R0", base, fix, ("tests/test_app.py",), "f() phải trả 2")
+    assert bench.reference_lines(task, src) == 2                         # the hidden test does not count
+
+    run = {"verified": True, "changed_files": ["app.py"], "hidden_exit_code": 0, "wall_seconds": 300.0,
+           "agent_steps": 9, "tool_calls": 12, "repeat_reads": 3, "patch_added": 4, "patch_removed": 1,
+           "reference_lines": 2, "gpu_seconds": 150.0, "model_requests": 11, "prompt_tokens": 90000,
+           "completion_tokens": 3000}
+    outcome = bench.score_code(task, run)
+    assert (outcome["patch_lines"], outcome["gpu_seconds"], outcome["repeat_reads"]) == (5, 150.0, 3)
+    results = {"started": "x", "models": {"qwen3.6": {"code": [outcome]}}}
+    report = bench.render_report(results)
+    assert "## Chi phí từng task code" in report and "| `qwen3.6` | R0 | 2.5 | 11 | 90000 + 3000 | 9 | 12 (3) | 5 (2) |" in report
+    summary = bench.summarize(results["models"]["qwen3.6"])
+    assert summary["code_gpu_minutes_median"] == 2.5 and summary["code_tokens"] == 93000
