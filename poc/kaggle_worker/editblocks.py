@@ -47,11 +47,14 @@ def _file_name(line: str) -> str:
     return text.strip().strip("`*'\":").strip()
 
 
-def parse(text: str) -> list[EditBlock]:
-    """Every SEARCH/REPLACE block in a model answer (thinking text and prose around them ignored)."""
+def parse(text: str, default_path: str = "") -> list[EditBlock]:
+    """Every SEARCH/REPLACE block in a model answer (thinking text and prose around them ignored).
+
+    ``default_path``: the file a block with no file name line before it belongs to, when the
+    caller asked for exactly one file (the reproduction test)."""
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
     lines = text.splitlines()
-    blocks, i, last_path = [], 0, ""
+    blocks, i, last_path = [], 0, default_path
     while i < len(lines):
         if not HEAD.match(lines[i]):
             i += 1

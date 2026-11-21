@@ -40,7 +40,8 @@ class FakeDocker:
                  agent_timeout: bool = False, test_returncodes: list[int] | None = None,
                  review: str = "none", quick_returncodes: list[int] | None = None,
                  check_returncodes: list[int] | None = None, repro_returncodes: list[int] | None = None,
-                 quick_fail: str = "FAILED test_calc.py::test_empty - ZeroDivisionError\n1 failed\n") -> None:
+                 quick_fail: str = "FAILED test_calc.py::test_empty - ZeroDivisionError\n1 failed\n",
+                 repro_fail: str = "FAILED test_kite_repro.py::test_empty_list - ZeroDivisionError\n") -> None:
         self.calls: list[list[str]] = []
         self.test_returncode = test_returncode
         self.test_returncodes = list(test_returncodes or [])     # one per test run, then test_returncode
@@ -51,6 +52,7 @@ class FakeDocker:
         self.check_returncodes = list(check_returncodes or [])
         self.repro_returncodes = list(repro_returncodes or [])
         self.quick_fail = quick_fail
+        self.repro_fail = repro_fail
 
     def kind(self, cmd: list[str]) -> str:
         return value_after(cmd, "--name").split("-")[1]          # kite-<kind>-<task>
@@ -86,7 +88,7 @@ class FakeDocker:
             return subprocess.CompletedProcess(cmd, code, output, "")
         if kind == "repro":                     # the fast path's reproduction test, on the code before the fix
             code = self.repro_returncodes.pop(0) if self.repro_returncodes else 1
-            output = "1 passed\n" if code == 0 else "FAILED test_kite_repro.py::test_empty_list - ZeroDivisionError\n"
+            output = "1 passed\n" if code == 0 else self.repro_fail
             return subprocess.CompletedProcess(cmd, code, output, "")
         if kind == "test":
             code = self.test_returncodes.pop(0) if self.test_returncodes else self.test_returncode
@@ -874,6 +876,47 @@ def test_without_a_reproduction_the_fast_fix_gets_the_agent_review(tmp_path):
     assert [fake.kind(c) for c in fake.calls] == ["test", "review"]
 
 
+def test_a_reproduction_test_broken_by_its_setup_is_no_evidence_and_never_shown_to_the_agent(tmp_path):
+    # Bench v4, gemma R1: the test reached real DynamoDB and failed with NoCredentialsError.
+    broken = ("E   botocore.exceptions.NoCredentialsError: Unable to locate credentials\n"
+              "FAILED test_kite_repro.py::test_empty_list_gives_zero - botocore...\n1 failed\n")
+    fake = FakeDocker(repro_fail=broken)
+    _, run = run_task(tmp_path, fake, "b1", asker=answers(REPRO, FIX))
+    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "broken", "agent") and run.verified
+    # Not written back with the fix: only the fix is checked, then the agent reviews.
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "test", "review"]
+    assert "test_kite_repro.py" not in run.changed_files
+    # The fix fails the tests: the agent gets the fix and the failure, not the broken test.
+    (tmp_path / "b").mkdir()
+    fake = FakeDocker(repro_fail=broken, test_returncodes=[1, 0])
+    _, run = run_task(tmp_path / "b", fake, "b2", asker=answers(REPRO, FIX))
+    agent = fake.call("agent")[-1]
+    assert run.fast_path == "tests_failed" and run.repro == "broken"
+    assert "test_empty_list_gives_zero" not in agent and "Test tái hiện Kite đã viết" not in agent
+
+
+def test_repro_outcome_tells_a_reproduction_from_a_broken_test():
+    assert sbx.repro_outcome(0, "1 passed") == "not_reproduced"
+    assert sbx.repro_outcome(5, "no tests ran") == "none"
+    assert sbx.repro_outcome(1, "E   assert 1 == 0\n1 failed") == "reproduced"
+    assert sbx.repro_outcome(1, "E   KeyError: 'name'\n1 failed") == "reproduced"          # the bug itself
+    # A function the goal asks to add does not exist yet: failing on the import is the reproduction.
+    assert sbx.repro_outcome(2, "E   ImportError: cannot import name 'paginate'\n1 error") == "reproduced"
+    for output in ("botocore.exceptions.NoCredentialsError: Unable to locate credentials",
+                   "urllib3.exceptions.NewConnectionError: Failed to establish a new connection",
+                   "E       fixture 'dynamo_table' not found", "ERROR at setup of test_x",
+                   "E     SyntaxError: invalid syntax"):
+        assert sbx.repro_outcome(1, output) == "broken", output
+
+
+def test_a_reproduction_block_without_its_file_name_still_lands_where_it_was_asked(tmp_path):
+    # Bench v4, qwen R2: the answer started at "<<<<<<< SEARCH", without the file name line.
+    fake = FakeDocker()
+    _, run = run_task(tmp_path, fake, "n1", asker=answers(REPRO.split("\n", 1)[1], FIX, "ỔN"))
+    assert run.repro == "reproduced" and run.review_mode == "one_call"
+    assert fake.call("repro")[-1] == "python -m pytest -q test_kite_repro.py"
+
+
 def test_a_fix_that_disagrees_with_the_reproduction_test_goes_to_the_agent(tmp_path):
     fake = FakeDocker(quick_returncodes=[1, 0],
                       quick_fail="FAILED test_kite_repro.py::test_empty_list_gives_zero - assert 1 == 0\n1 failed\n")
@@ -979,7 +1022,24 @@ def test_gateway_asker_sends_one_tagged_request(monkeypatch):
     ask = real(replace(SETTINGS, host_gateway_url="http://127.0.0.1:8787/v1"), "qwen3.6", tag="t-1", pin="kaggle-han")
     assert ask("hi") == FIX and seen["url"] == "http://127.0.0.1:8787/v1/chat/completions"
     assert seen["headers"]["X-kite-task"] == "t-1" and seen["headers"]["X-kite-worker"] == "kaggle-han"
-    assert seen["body"]["model"] == "qwen3.6" and seen["body"]["max_tokens"] == sbx.FAST_MAX_TOKENS
+    assert seen["body"]["model"] == "qwen3.6" and seen["body"]["max_tokens"] == sbx.FAST_MAX_TOKENS == 16384
+
+    # All the tokens went to thinking (bench v4: 3 of 17 requests): say so instead of an empty answer.
+    def thought_only(request, timeout):
+        return Response(_json.dumps({"choices": [{"message": {"content": "", "reasoning_content": "x" * 99},
+                                                  "finish_reason": "length"}]}).encode())
+
+    monkeypatch.setattr(sbx.urllib.request, "urlopen", thought_only)
+    with pytest.raises(sbx.SandboxError, match="thinking and gave no answer"):
+        ask("hi")
+
+    # Cut after the blocks: what arrived is still used (complete blocks apply, a cut one is rejected).
+    def cut(request, timeout):
+        return Response(_json.dumps({"choices": [{"message": {"content": FIX + "\nGiải thích"},
+                                                  "finish_reason": "length"}]}).encode())
+
+    monkeypatch.setattr(sbx.urllib.request, "urlopen", cut)
+    assert ask("hi").startswith(FIX)
 
 
 def test_changed_existing_tests_are_flagged_for_the_review(tmp_path):

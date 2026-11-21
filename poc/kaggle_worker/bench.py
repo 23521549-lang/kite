@@ -1118,7 +1118,8 @@ def render_report(results: dict) -> str:
             setup = "dùng lại" if item.get("setup_cached") else item.get("setup_seconds")
             check = {None: "-", 0: "✓"}.get(item.get("check_exit_code"), f"✗ {item.get('check_exit_code')}")
             fast = item.get("fast_path") or "off"
-            repro = {"reproduced": "tái hiện ✓", "not_reproduced": "không tái hiện", "none": "không có test"}.get(
+            repro = {"reproduced": "tái hiện ✓", "not_reproduced": "không tái hiện", "none": "không có test",
+                     "broken": "test hỏng"}.get(
                 item.get("repro") or "", "")
             fast = "-" if fast in ("off", "skipped") else \
                 f"{fast} ({item.get('fast_seconds')}{', ' + repro if repro else ''})"

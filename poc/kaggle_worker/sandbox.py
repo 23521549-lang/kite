@@ -167,7 +167,8 @@ class SandboxRun:
     fast_path: str = "off"
     fast_seconds: float = 0.0
     review_mode: str = ""         # agent | one_call
-    repro: str = "off"            # the fast path's reproduction test: off | none | not_reproduced | reproduced
+    repro: str = "off"            # the fast path's reproduction test: off | none | broken | not_reproduced
+    #                               | reproduced
 
     @property
     def verified(self) -> bool:
@@ -468,7 +469,9 @@ def restore_tree(workspace: Path, tree: str) -> None:
 FAST_CONTEXT_CHARS = 40000     # code shown to the fast path (about 11K tokens)
 FAST_FILE_CHARS = 16000        # a goal file this small is shown whole
 FAST_TEST_CHARS = 6000         # one related test file, for reference
-FAST_MAX_TOKENS = 8192         # thinking models spend part of it before the edit blocks
+# Thinking models spend most of it before the edit blocks: in bench v4, 8192 ran out in 8 of 17 one-call
+# requests (7k-8k tokens of thinking), leaving no answer or a cut block. 16384 leaves room for the answer.
+FAST_MAX_TOKENS = 16384
 FAST_DECLINE = "CẦN_AGENT"
 
 
@@ -664,8 +667,11 @@ def gateway_asker(settings: SandboxSettings, model: str, *, tag: str, pin: str |
                 data = json.loads(response.read())
         except Exception as exc:
             raise SandboxError(f"gateway: {exc}") from exc
-        message = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
-        return message.get("content") or ""
+        choice = (data.get("choices") or [{}])[0] or {}
+        content = (choice.get("message") or {}).get("content") or ""
+        if choice.get("finish_reason") == "length" and not content.strip():
+            raise SandboxError(f"the model used all {FAST_MAX_TOKENS} tokens thinking and gave no answer")
+        return content
     return ask
 
 
@@ -776,7 +782,9 @@ def repro_prompt(goal: str, context: str, path: str, command: str) -> str:
         "Bước 1 của Kite: TRƯỚC khi sửa, viết test kiểm tra đúng hành vi mà yêu cầu trên đòi hỏi.",
         "- Test phải THẤT BẠI với code hiện tại (bên dưới) và QUA khi code đã được sửa đúng yêu cầu.",
         "- Bao các quy tắc và trường hợp biên yêu cầu nêu; mỗi test kiểm một ý, tên test nói rõ ý đó.",
-        "- Dựng dữ liệu và fixture giống file test liên quan bên dưới; không dùng mạng.",
+        "- Dựng dữ liệu và fixture giống file test liên quan bên dưới. Test chạy trong sandbox KHÔNG có mạng và "
+        "KHÔNG có credential cloud (AWS...): mọi truy cập database/cloud phải qua fixture hoặc mock có sẵn "
+        "của repo (xem conftest), nếu không test sẽ lỗi vì môi trường chứ không phải vì lỗi cần sửa.",
         "- Không sửa code, không sửa test có sẵn.",
         "Trả lời bằng đúng một khối tạo file mới, theo mẫu:", "",
         path, "<<<<<<< SEARCH", "=======", "<toàn bộ nội dung file test>", ">>>>>>> REPLACE", "",
@@ -785,11 +793,31 @@ def repro_prompt(goal: str, context: str, path: str, command: str) -> str:
     ])
 
 
+# A reproduction test that fails because of its own setup or the sandbox (no network, no cloud
+# credentials, a fixture that does not exist, a syntax error) proves nothing about the bug. Bench v4,
+# gemma R1: the test wrote to real DynamoDB, failed with NoCredentialsError, counted as "reproduced",
+# and the agent was then shown it as the reproduction. Such a test is "broken": no evidence, not shown.
+# Import errors are not on the list: a test of a function the goal asks to add fails that way on purpose.
+REPRO_BROKEN = re.compile(
+    r"NoCredentialsError|NoRegionError|EndpointConnectionError|NewConnectionError|ConnectionRefusedError|"
+    r"Temporary failure in name resolution|socket\.gaierror|fixture '[^']+' not found|ERROR at setup of|"
+    r"SyntaxError|IndentationError")
+
+
+def repro_outcome(code: int, output: str) -> str:
+    """What running the reproduction test on the unchanged code shows."""
+    if code == 0:
+        return "not_reproduced"         # it passes already: it does not test what the goal changes
+    if code == 5:
+        return "none"                   # pytest collected no test
+    return "broken" if REPRO_BROKEN.search(output or "") else "reproduced"
+
+
 @dataclass
 class FastResult:
     status: str                 # off | skipped | declined | not_applied | error | tests_failed | check_failed
     #                             | repro_failed | passed
-    repro: str = "off"          # off | none | not_reproduced | reproduced
+    repro: str = "off"          # off | none | broken | not_reproduced | reproduced
     reason: str = ""
     answer: str = ""
     repro_answer: str = ""
@@ -830,7 +858,9 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
             examples = test_examples(workspace, repro_file, goal)
             reply = result.repro_answer = ask(repro_prompt(goal, context + ("\n\n" + examples if examples else ""),
                                                            repro_file, command))
-            blocks = [b for b in editblocks.parse(reply) if not b.search.strip() and codemap.is_test_path(b.path)]
+            # A block with no file name line belongs to the file we asked for (bench v4, qwen R2).
+            blocks = [b for b in editblocks.parse(reply, default_path=repro_file)
+                      if not b.search.strip() and codemap.is_test_path(b.path)]
         except Exception as exc:                       # no test is no evidence, not a failure
             blocks, result.log = [], [f"không viết được test tái hiện: {str(exc)[:200]}"]
         if blocks and not (workspace / blocks[0].path).exists():
@@ -842,7 +872,7 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
         if blocks and (workspace / repro_file).is_file():
             repro_text = (workspace / repro_file).read_text(encoding="utf-8")
             code, repro_output = run_one("repro", quick_test_command(template, [repro_file]))
-            result.repro = "not_reproduced" if code == 0 else "none" if code == 5 else "reproduced"
+            result.repro = repro_outcome(code, repro_output)
             (workspace / repro_file).unlink()
         else:
             result.repro = "none"

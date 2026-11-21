@@ -455,6 +455,8 @@ class SandboxActivityBackend:
             evidence = {"reproduced": "a reproduction test written from the goal failed before the fix and passes "
                                       "now (it is part of the patch)",
                         "not_reproduced": "its reproduction test also passed before the fix, so the agent reviewed it",
+                        "broken": "its reproduction test failed for setup reasons (sandbox, fixtures), not the bug, "
+                                  "so the agent reviewed it",
                         }.get(repro, "no reproduction test, so the agent reviewed it")
             lines.insert(0, f"Kite fast path: the fix came from one model call ({fast_seconds}s in all) and passed "
                             f"Kite's tests; {evidence}; no agent session was needed to write it.")
