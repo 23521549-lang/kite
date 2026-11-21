@@ -522,3 +522,25 @@ def test_assemble_stream_rebuilds_tool_calls_split_over_chunks():
     assert answer["choices"][0]["finish_reason"] == "tool_calls" and message["content"] is None
     assert [(c["id"], c["function"]["name"], c["function"]["arguments"]) for c in message["tool_calls"]] == [
         ("c1", "read", "{\"path\": \"a.py\"}"), ("call_1", "grep", "{}")]
+
+
+def test_model_add_puts_a_chat_only_model_on_the_named_workers(tmp_path, capsys):
+    from poc.kaggle_worker.config import load_config
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_base_config(tmp_path)))
+    args = ["--config", str(config_path), "model", "add", "r1-distill", "--provider", "kaggle-han",
+            "--context", "32768", "--chat-only"]
+    assert cli.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["added_to"] == ["kaggle-han"] and list(tmp_path.glob("config.json.bak-*"))
+    assert cli.main(args) == 0 and json.loads(capsys.readouterr().out)["added_to"] == []      # idempotent
+    raw = json.loads(config_path.read_text())
+    assert raw["providers"][0]["models"] == ["devstral", "r1-distill"]
+    assert raw["gateway"]["model_context"] == {"r1-distill": 32768} and raw["routing"]["chat_only"] == ["r1-distill"]
+    config = load_config(config_path)
+    assert config.routing.chat_only == ("r1-distill",)
+    assert cli.main(["--config", str(config_path), "model", "add", "x", "--provider", "kaggle-zz"]) == 1
+    assert cli.main(["--config", str(config_path), "model", "add", "x", "--provider", "kaggle-han",
+                     "--context", "100"]) == 1                              # validated before writing
+    assert "x" not in json.loads(config_path.read_text())["providers"][0]["models"]

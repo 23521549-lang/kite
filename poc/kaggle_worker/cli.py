@@ -82,6 +82,23 @@ def _parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="check that Kite works on this machine: services, gateway, "
                                                 "workers, Temporal, Docker, ports, secrets, disk")
     doctor.add_argument("--json", action="store_true", help="machine-readable output")
+    cleanup = commands.add_parser("cleanup", help="free disk: remove the clones, libraries and code maps of tasks "
+                                                  "and bench runs unchanged for --days (results and logs stay)")
+    cleanup.add_argument("--days", type=float, default=7, help="only folders unchanged this long (default 7)")
+    cleanup.add_argument("--deps-cache", action="store_true",
+                         help="also remove cached libraries no kept task uses (they are reinstalled when needed)")
+    cleanup.add_argument("--yes", action="store_true", help="remove (default: only list what would go)")
+    model = commands.add_parser("model", help="models the workers serve")
+    model_commands = model.add_subparsers(dest="model_command", required=True)
+    model_add = model_commands.add_parser(
+        "add", help="let pull workers serve one more model (edits the config, keeps a backup); the model must "
+                    "be in the notebook ROSTER and its dataset attached on Kaggle")
+    model_add.add_argument("model_id", help="the notebook ROSTER name, e.g. r1-distill")
+    model_add.add_argument("--provider", action="append", required=True,
+                           help="pull worker that serves it (repeat for more; each needs the dataset attached)")
+    model_add.add_argument("--context", type=int, help="context window in tokens (the ROSTER ctx), e.g. 32768")
+    model_add.add_argument("--chat-only", action="store_true",
+                           help="only for chatting (routing.chat_only): Kite never gives it a sandbox task")
     setup = commands.add_parser("setup", help="prepare local secret reference files without printing values")
     setup.add_argument("--secret-name", help="optional secret to capture without echo, e.g. KAGGLE_TOKEN")
     provider = commands.add_parser("provider", help="validate and manage configured providers")
@@ -272,6 +289,74 @@ def _worker_add(args: argparse.Namespace) -> int:
                     "kite provider sync",
                     "sudo systemctl restart kite-gateway kite-workflow-worker",
                     "Kaggle account mới: chia sẻ 7 dataset, Secrets KITE_WORKER_TOKEN = token vừa in, chạy ô Worker"]})
+    return 0
+
+
+def _save_config(path: Path, raw: dict) -> Path:
+    """Validate, keep a timestamped backup, write; returns the backup path."""
+    import yaml
+
+    validate_config(raw)
+    backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(path, backup)
+    text = (json.dumps(raw, ensure_ascii=False, indent=2) + "\n" if path.suffix == ".json"
+            else yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    path.write_text(text, encoding="utf-8")
+    return backup
+
+
+def _model_add(args: argparse.Namespace) -> int:
+    """Add a model to pull workers' ``models`` (and its context window, and chat_only if asked)."""
+    import yaml
+
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    providers = raw.get("providers") or []
+    changed = []
+    for wanted in dict.fromkeys(args.provider):
+        provider = next((p for p in providers if wanted in (p.get("id"), p.get("worker_id"))), None)
+        if provider is None or provider.get("adapter") != "pull":
+            raise ConfigError(f"no pull worker {wanted} in the config")
+        models = list(provider.get("models") or [])
+        if args.model_id != provider.get("model") and args.model_id not in models:
+            provider["models"] = models + [args.model_id]
+            changed.append(provider.get("id"))
+    gateway = raw.setdefault("gateway", {})
+    if args.context is not None:
+        gateway.setdefault("model_context", {})[args.model_id] = args.context
+    if args.chat_only:
+        routing = raw.setdefault("routing", {})
+        routing["chat_only"] = list(dict.fromkeys([*(routing.get("chat_only") or []), args.model_id]))
+    backup = _save_config(args.config, raw)
+    _emit({"model": args.model_id, "added_to": changed, "context": args.context, "chat_only": args.chat_only,
+           "backup": str(backup),
+           "next": ["kite provider sync", "sudo systemctl restart kite-gateway kite-workflow-worker",
+                    "kite chat setup --force && kite chat reload",
+                    f"Kaggle: gắn dataset của {args.model_id} (Add Input) vào notebook của "
+                    + ", ".join(args.provider)]})
+    return 0
+
+
+def _cleanup(args: argparse.Namespace) -> int:
+    from . import cleanup
+
+    state = args.config.parent
+    items = cleanup.plan(state, days=args.days, deps_cache=args.deps_cache)
+    by_kind: dict[str, list] = {}
+    for item in items:
+        by_kind.setdefault(item.kind, []).append(item)
+    total = sum(item.size for item in items)
+    print(f"{state}: {len(items)} thư mục không đổi từ {args.days:g} ngày trở lên, tổng {cleanup.human(total)}"
+          + ("" if args.yes else " (chưa xoá: thêm --yes để xoá)"))
+    for kind, group in by_kind.items():
+        print(f"  {kind}: {len(group)} thư mục, {cleanup.human(sum(i.size for i in group))}")
+    for item in items[:10]:
+        print(f"    {cleanup.human(item.size):>10}  {item.path}  ({item.age_days:.0f} ngày)")
+    if args.yes and items:
+        freed, errors = cleanup.remove(items)
+        print(f"Đã xoá {cleanup.human(freed)}." + (f" Lỗi {len(errors)}:" if errors else ""))
+        for error in errors[:10]:
+            print("  " + error)
+        return 1 if errors else 0
     return 0
 
 
@@ -835,6 +920,10 @@ def _operator_command(args: argparse.Namespace) -> int:
         else:
             _emit({"secrets_directory": str(secrets_dir.resolve()), "created": True})
         return 0
+    if args.command == "cleanup":
+        return _cleanup(args)
+    if args.command == "model":
+        return _model_add(args)
     if args.command == "doctor":
         from .doctor import render, run_checks, summary
 
@@ -1049,7 +1138,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
-                        "mcp", "chat", "bench", "journal"}:
+                        "mcp", "chat", "bench", "journal", "cleanup", "model"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

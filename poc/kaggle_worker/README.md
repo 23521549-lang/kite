@@ -201,6 +201,22 @@ The Kaggle CLI (`.[kaggle]` extra) gets `KAGGLE_API_TOKEN` as the path of the se
 
 Streaming: when a client asks for `stream: true` (OpenCode always does), the worker reads the answer from llama-server as it is generated and posts its chunks to `POST /worker/jobs/<id>/chunks` about twice a second; the gateway passes them on as SSE, so the chat shows the model's thinking and answer as they come instead of all at once at the end. If the person closes the chat, the gateway refuses the next batch and the worker stops generating. A streamed answer is never retried on another worker (the client already has part of it): a worker that dies mid-answer ends the request with an error. A notebook without streaming (imported before this change) still works: its whole answer is replayed as before. Re-import `kaggle_model_worker.ipynb` to get streaming.
 
+### Adding a model, chat-only models
+
+A model the workers should serve must be in the notebook's `ROSTER`, with its dataset attached to each worker's notebook. Then:
+
+```sh
+kite model add r1-distill --provider kaggle-han --context 32768 --chat-only   # edits the config, keeps a backup
+kite provider sync && sudo systemctl restart kite-gateway kite-workflow-worker
+kite chat setup --force && kite chat reload
+```
+
+`--chat-only` puts it in `routing.chat_only`: Kite never gives it a sandbox task (a task naming it is refused), and the chat gets a second primary agent, `suy-luan`, that runs on it with no tools at all; Tab switches between it and the lead agent. This is for a reasoning model that is no agent, such as DeepSeek-R1-Distill-Qwen-32B (`r1-distill` in the roster, dataset `kite-gguf-r1-distill` from `unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF`, `Q4_K_M`): good at thinking a question through, not at calling tools.
+
+### Disk
+
+Every task, sandbox run and bench run keeps a clone of the repository, its installed libraries and the code map next to its results and logs. `kite cleanup` lists those big folders for runs unchanged for `--days` (default 7) and removes them with `--yes`; `result.json`, `result.patch`, the logs, `trace.jsonl` and bench `results.json`/`README.md` stay. A task cleaned up this way can no longer be continued with `send_instruction`. `--deps-cache` also removes cached libraries that no kept task links to (they are installed again when needed). Do not use `docker system prune`: it also removes the sandbox network while no container uses it.
+
 ## Sandboxed runs
 
 `kite sandbox run` executes one task end to end without Temporal, in three throw-away containers that share a per-task clone of the repository's committed state:

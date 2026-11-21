@@ -595,6 +595,19 @@ Trong OpenCode, các tool của Kite có tên với tiền tố `kite_`: `kite_s
 """
 
 
+REASONER_AGENT = "suy-luan"
+REASONER_PROMPT = """Bạn là trợ lý suy luận trong chat của Kite, chạy bằng model MODEL. Luôn trả lời bằng tiếng Việt; giữ nguyên tên file, hàm, lệnh và code.
+
+Bạn KHÔNG có tool nào: không đọc được file hay repo, không chạy được lệnh, không giao việc cho Kite. Các hướng dẫn về tool `kite_*` trong AGENTS.md là của agent trưởng, không phải của bạn: bỏ qua chúng.
+
+Việc của bạn: những câu hỏi cần suy nghĩ kỹ dựa trên nội dung người dùng dán vào chat: thuật toán, toán, thiết kế, so sánh phương án, phân tích lỗi từ đoạn code hoặc log. Nói rõ chỗ nào bạn chắc, chỗ nào là giả định. Khi cần xem repo, sửa code hay chạy test, nói người dùng bấm Tab để chuyển về agent trưởng của Kite và nhờ ở đó; đừng giả vờ đã đọc hay đã chạy gì."""
+REASONER_NOTE = """
+## Agent suy luận
+
+Chat này có thêm agent `suy-luan` (model `MODEL`, không có tool), người dùng bấm Tab để chuyển sang. Khi người dùng hỏi một câu chỉ cần suy nghĩ sâu (thuật toán, toán, phân tích đoạn code họ dán vào) mà không cần xem repo hay sửa code, bạn có thể trả lời luôn hoặc gợi ý họ bấm Tab sang `suy-luan`. `MODEL` không làm task: đừng gọi `start_task` với model này.
+"""
+
+
 def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], allowed_roots) -> dict[str, str]:
     """opencode.json + AGENTS.md for the chat folder of the lead agent."""
     from .gateway import opencode_provider_config
@@ -613,6 +626,18 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
     instructions = (LEAD_INSTRUCTIONS
                     .replace("ROOTS", ", ".join(f"`{root}`" for root in allowed_roots))
                     .replace("MODELS", ", ".join(f"`{m}`" for m in models)))
+    thinker = next((m for m in config.routing.chat_only if m in models), None)
+    if thinker is not None:
+        # A chat-only model (a reasoning model that is no agent, e.g. R1-Distill) gets its own primary
+        # agent with no tools at all: the person switches to it with Tab for questions that need deep
+        # thinking, and back to the lead agent for anything that touches a repository.
+        opencode["agent"] = {REASONER_AGENT: {
+            "description": f"Hỏi đáp cần suy nghĩ sâu bằng {thinker}: không có tool, không giao việc cho Kite",
+            "mode": "primary", "model": f"kite/{thinker}", "temperature": 0.6,
+            "prompt": REASONER_PROMPT.replace("MODEL", thinker),
+            "tools": {"*": False},
+            "permission": {"edit": "deny", "bash": "deny", "webfetch": "deny"}}}
+        instructions += REASONER_NOTE.replace("MODEL", thinker)
     return {"opencode.json": json.dumps(opencode, indent=2, ensure_ascii=False) + "\n",
             "AGENTS.md": instructions}
 

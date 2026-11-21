@@ -256,7 +256,8 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
             continue
         status_ = FAIL if free < 1 else WARN if free < 5 else OK
         add(label, status_, f"{path}: còn {free:.1f} GiB",
-            "" if status_ == OK else "docker system prune; xóa ~/bench-repo-* cũ, /tmp/kite-*")
+            # Not `docker system prune`: it also deletes the sandbox network while no container uses it.
+            "" if status_ == OK else "kite cleanup (xem trước, rồi --yes); docker image prune; docker builder prune")
 
     # ---- tools
     executable = config.opencode_executable

@@ -516,3 +516,23 @@ def test_a_repo_without_kite_yml_gets_a_proposal_and_never_a_file(tmp_path):
     assert suggest_repo_config(["calc.py", "tests/test_calc.py"]) == ""
     assert "pip install -q -e '.[test]'" in suggest_repo_config(
         ["pyproject.toml", "pkg/core.py", "tests/test_core.py"], "[project.optional-dependencies]\ntest = [\"pytest\"]\n")
+
+
+def test_a_chat_only_model_gets_its_own_tool_less_agent_in_the_chat(tmp_path):
+    plain = json.loads(chat_files(make_config(tmp_path), lead_model="qwen3.6-fast", kite_command=["kite"],
+                                  allowed_roots=[tmp_path])["opencode.json"])
+    assert "agent" not in plain                                   # no chat-only model: nothing changes
+    raw = _raw_config(tmp_path)
+    raw["providers"][0]["models"].append("r1-distill")
+    raw["routing"] = {"chat_only": ["r1-distill"]}
+    config = validate_config(raw)
+    files = chat_files(config, lead_model="qwen3.6-fast", kite_command=["kite"], allowed_roots=[tmp_path])
+    opencode = json.loads(files["opencode.json"])
+    agent = opencode["agent"]["suy-luan"]
+    assert agent["model"] == "kite/r1-distill" and agent["mode"] == "primary" and agent["tools"] == {"*": False}
+    assert agent["permission"] == {"edit": "deny", "bash": "deny", "webfetch": "deny"}
+    assert "KHÔNG có tool" in agent["prompt"] and "r1-distill" in agent["prompt"] and "Tab" in agent["prompt"]
+    assert opencode["model"] == "kite/qwen3.6-fast"                      # the lead agent stays the default
+    assert "## Agent suy luận" in files["AGENTS.md"] and "đừng gọi `start_task` với model này" in files["AGENTS.md"]
+    ops = KiteOps(config, db_path=tmp_path / "s.sqlite3", state_dir=tmp_path, allowed_roots=[tmp_path])
+    assert "r1-distill" not in ops.base_models()                         # tasks can never name it
