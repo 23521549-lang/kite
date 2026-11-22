@@ -35,6 +35,120 @@ TASK = "chat-20261118-011626-bfdb"
 
 
 # --------------------------------------------------------------------------------------- gateway
+# --------------------------------------------------------------------------------------- one run at a time
+LOCK_NAME = "bench.lock"
+
+
+class BenchBusy(RuntimeError):
+    pass
+
+
+def _pid_alive(pid: Any) -> bool:
+    import os
+
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def running_bench(state_dir: Path) -> dict | None:
+    """The measurement run that holds the lock and is still alive, or None."""
+    try:
+        held = json.loads((Path(state_dir) / LOCK_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return held if isinstance(held, dict) and _pid_alive(held.get("pid")) else None
+
+
+def acquire_lock(state_dir: Path, *, label: str, out: Path) -> Path:
+    """Refuse a second measurement run while one is going: two runs share the worker's GPU and write
+    the same folder (bench v6: two runs started 18 s apart, every time and the results.json mixed)."""
+    import os
+
+    path = Path(state_dir) / LOCK_NAME
+    record = json.dumps({"pid": os.getpid(), "label": label, "out": str(out),
+                         "started": time.strftime("%Y-%m-%d %H:%M")})
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            held = running_bench(state_dir)
+            if held is not None:
+                raise BenchBusy(f"đang có một lần đo chạy: {held.get('label') or held.get('out')} "
+                                f"(pid {held.get('pid')}, từ {held.get('started')}); chờ nó xong, hoặc dừng: "
+                                f"kill {held.get('pid')}") from None
+            path.unlink(missing_ok=True)          # left by a run that died
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(record)
+        return path
+    raise BenchBusy(f"không tạo được {path}")
+
+
+def release_lock(path: Path) -> None:
+    import os
+
+    try:
+        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            path.unlink()
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+# Gateway errors that come from the machines, not from the model's work: an attempt that failed with
+# one of these is run again instead of being scored (bench v6 polyglot: P-wordy lost both tries while
+# the Kaggle session was ending and the next one queued for 1 h 40 min).
+INFRA_ERRORS = ("no worker took the request in time", "worker stopped responding",
+                "worker stopped in the middle of the answer", "context size has been exceeded",
+                "exceeds the available context size")
+
+
+def infra_errors(records: list[dict]) -> list[str]:
+    """The infrastructure errors among one attempt's gateway records."""
+    found = []
+    for record in records:
+        if record.get("outcome") == "ok":
+            continue
+        error = str(record.get("error") or "")
+        low = error.lower()
+        waited = record.get("run_s") is None and (record.get("queue_s") or 0) > 300
+        if any(phrase in low for phrase in INFRA_ERRORS) or (low.startswith("client disconnected") and waited):
+            found.append(error[:160])
+    return found
+
+
+def wait_for_worker(status_url: str, model: str, *, log: Callable[[str], None] = print,
+                    timeout: float = 4 * 3600, poll: float = 60,
+                    fetch: Callable[[str], dict] | None = None, sleep: Callable[[float], None] = time.sleep) -> bool:
+    """Block until a connected, ready worker serves ``model`` (the gateway's /status), or timeout."""
+    def get(url: str) -> dict:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            return json.loads(response.read())
+
+    fetch = fetch or get
+    deadline = time.monotonic() + timeout
+    said = False
+    while True:
+        try:
+            workers = fetch(status_url).get("workers") or []
+        except Exception:
+            workers = []
+        if any(w.get("alive") and not w.get("draining") and model in (w.get("models") or []) for w in workers):
+            return True
+        if time.monotonic() > deadline:
+            return False
+        if not said:
+            log(f"chưa có worker cho {model}: chờ worker kết nối lại rồi chạy tiếp")
+            said = True
+        sleep(poll)
+
+
 def gateway_post(url: str, *, timeout: float = 2400, worker: str | None = None) -> Post:
     """POST to the gateway; ``worker`` pins every request to one worker (X-Kite-Worker)."""
     headers = {"Content-Type": "application/json", **({"X-Kite-Worker": worker} if worker else {})}

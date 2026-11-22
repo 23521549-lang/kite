@@ -25,7 +25,7 @@ import time
 from typing import Any, Callable, Iterable
 
 TAG = re.compile(r"[A-Za-z0-9._:-]{1,120}")
-FILES = ("gateway", "tasks", "actions", "notes")
+FILES = ("gateway", "tasks", "actions", "notes", "launches")
 
 
 def clean_tag(value: str | None) -> str | None:
@@ -181,6 +181,7 @@ def _source(tag: str | None) -> str:
 
 def summarize(journal: Journal, *, since: float | None = None) -> dict:
     """Success rates, time and tokens per model and task type, failure reasons, gateway health."""
+    launches = journal.read("launches", since)
     runs = journal.read("tasks", since)
     actions = journal.read("actions", since)
     requests = journal.read("gateway", since)
@@ -218,6 +219,7 @@ def summarize(journal: Journal, *, since: float | None = None) -> dict:
                 {"task_id": r.get("task_id"), "model": r.get("model"), "reason": task_reason(r), "at": r.get("at")}
                 for r in runs if task_reason(r) not in ("verified", "done")][-10:],
         },
+        "autostart": launch_summary(launches),
         "lead_agent": {"tool_calls": dict(Counter(a.get("tool") for a in actions)),
                        "tool_errors": dict(tool_errors)},
         "gateway": {
@@ -235,6 +237,26 @@ def summarize(journal: Journal, *, since: float | None = None) -> dict:
                 "truncated": sum(r.get("finish_reason") == "length" for r in items),
             } for model, items in sorted(by_model.items())},
         },
+    }
+
+
+def launch_summary(records: list[dict]) -> dict:
+    """Kite starting Kaggle notebooks: how often, how long Kaggle queued them, how many connected."""
+    def minutes(values) -> dict:
+        values = sorted(v / 60 for v in values if isinstance(v, (int, float)))
+        if not values:
+            return {}
+        return {"median_min": round(values[len(values) // 2], 1), "max_min": round(values[-1], 1)}
+
+    events = Counter(r.get("event") for r in records)
+    return {
+        "pushes": events.get("push", 0), "connected": events.get("alive", 0), "failed": events.get("failed", 0),
+        "cancelled": events.get("cancelled", 0),
+        # pushed -> Kaggle running (its queue); pushed -> worker connected (queue + model load)
+        "kaggle_queue": minutes(r.get("queued_s") for r in records if r.get("event") == "running"),
+        "to_connect": minutes(r.get("since_push_s") for r in records if r.get("event") == "alive"),
+        "recent_failures": [{"at": r.get("at"), "worker": r.get("worker"), "error": r.get("error")}
+                            for r in records if r.get("event") == "failed"][-5:],
     }
 
 

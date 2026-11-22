@@ -630,11 +630,15 @@ def test_a_busy_worker_only_takes_more_requests_for_the_model_it_has_loaded():
         other = await gateway.submit({"model": "devstral", "messages": []})
         assert (await gateway.next_job("w1", 0)).job_id == first.job_id
         assert await gateway.next_job("w1", 0) is None          # devstral would swap the model under it
-        same = await gateway.submit({"model": "qwen3.6", "messages": []})
+        task = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="task-2")
+        assert await gateway.next_job("w1", 0) is None          # one task at a time: the other slot is for chat
+        same = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="chat")
         assert (await gateway.next_job("w1", 0)).job_id == same.job_id
         assert await gateway.next_job("w1", 0) is None          # both slots taken
         gateway.complete("w1", first.job_id, {"status": "ok", "response": COMPLETION})
         gateway.complete("w1", same.job_id, {"status": "ok", "response": COMPLETION})
+        assert (await gateway.next_job("w1", 0)).job_id == task.job_id    # the waiting task, model loaded
+        gateway.complete("w1", task.job_id, {"status": "ok", "response": COMPLETION})
         assert (await gateway.next_job("w1", 0)).job_id == other.job_id   # idle: now it may switch
         return gateway.status()["workers"][0]
 
@@ -671,3 +675,94 @@ def test_cancelling_a_task_drops_its_queued_and_running_requests_and_stops_the_w
     alive, refused, cancelled, gone, answers, left = asyncio.run(scenario())
     assert alive == 200 and refused == 400 and cancelled == {"tag": "t9", "dropped": 2}
     assert gone == 409 and all(code >= 500 for code in answers) and left == ["t10"]
+
+
+def test_a_request_that_ran_out_of_the_shared_kv_cache_runs_again_alone():
+    # Bench v6: two long requests on one --kv-unified cache failed with "Context size has been exceeded".
+    async def scenario():
+        gateway = make_gateway()
+        await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6", "slots": 2})
+        task = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="task-1")
+        chat = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="chat")
+        assert (await gateway.next_job("w1", 0)).job_id == chat.job_id       # chat first
+        assert (await gateway.next_job("w1", 0)).job_id == task.job_id
+        gateway.complete("w1", task.job_id, {"status": "error", "error": "RuntimeError: llama-server: "
+                                             "{'code': 500, 'message': 'Context size has been exceeded.'}"})
+        assert not task.future.done() and task.exclusive                      # queued again, to run alone
+        other = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="chat")
+        assert await gateway.next_job("w1", 0) is None                       # not next to the chat still running
+        gateway.complete("w1", chat.job_id, {"status": "ok", "response": COMPLETION})
+        assert (await gateway.next_job("w1", 0)).job_id == task.job_id
+        assert await gateway.next_job("w1", 0) is None                       # nothing next to it, not even chat
+        gateway.complete("w1", task.job_id, {"status": "error", "error": "Context size has been exceeded"})
+        with pytest.raises(GatewayError):                                    # alone and still too big: fails
+            task.future.result()
+        assert (await gateway.next_job("w1", 0)).job_id == other.job_id
+
+    asyncio.run(scenario())
+
+
+def test_a_second_kaggle_session_of_the_same_worker_is_told_to_stop():
+    # A run Kite pushed may start after you ran the notebook by hand: one worker, two sessions.
+    async def scenario():
+        now = [1000.0]
+        gateway = make_gateway(clock=lambda: now[0], heartbeat_timeout_seconds=90)
+        auth = {"Authorization": f"Bearer {TOKEN_A}"}
+        beat = {"ready": True, "loaded_model": "qwen3.6"}
+        async with TestClient(TestServer(create_app(gateway))) as client:
+            first = await client.post("/worker/heartbeat", json=beat, headers={**auth, "X-Kite-Session": "one"})
+            assert (await first.json())["stop"] is False
+            second = await client.post("/worker/heartbeat", json={**beat, "draining": True},
+                                       headers={**auth, "X-Kite-Session": "two"})
+            assert (await second.json())["stop"] is True and (await second.json())["duplicate"] is True
+            assert gateway.present("w1")                    # the second one's beat changed nothing
+            jobs = await client.get("/worker/jobs?wait=0", headers={**auth, "X-Kite-Session": "two"})
+            assert jobs.status == 409
+            now[0] += 200                                   # the first session is gone (Kaggle's 12 h)
+            third = await client.post("/worker/heartbeat", json=beat, headers={**auth, "X-Kite-Session": "two"})
+            assert (await third.json())["stop"] is False and gateway.workers["w1"].session == "two"
+
+    asyncio.run(scenario())
+
+
+def test_a_chat_with_no_worker_gets_a_status_note_at_once_and_starts_one():
+    async def scenario():
+        woken = []
+        gateway = make_gateway(on_demand=woken.append,
+                               wait_note=lambda model: f"{model}: Kaggle đang xếp hàng; bấm Save Version")
+        journal = []
+        gateway.journal = journal.append
+        async with TestClient(TestServer(create_app(gateway))) as client:
+            plain = await client.post("/v1/chat/completions", headers={"X-Kite-Task": "chat"},
+                                      json={"model": "qwen3.6-fast", "messages": [{"role": "user", "content": "hi"}]})
+            body = await plain.json()
+            assert body["choices"][0]["message"]["content"] == "qwen3.6: Kaggle đang xếp hàng; bấm Save Version"
+            streamed = await client.post("/v1/chat/completions", headers={"X-Kite-Task": "chat"},
+                                         json={"model": "qwen3.6", "stream": True, "messages": []})
+            text = await streamed.text()
+            assert "Save Version" in text and text.rstrip().endswith("data: [DONE]")
+            assert gateway.status()["queued_jobs"] == 0           # nothing left waiting in the queue
+            await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+            assert gateway.no_worker_note("qwen3.6") is None      # a worker is there: chat goes to it
+        assert woken == ["qwen3.6", "qwen3.6"]
+        assert [r["outcome"] for r in journal] == ["no_worker", "no_worker"]
+
+    asyncio.run(scenario())
+
+
+def test_a_queued_request_keeps_waiting_past_the_timeout_while_a_worker_is_starting():
+    async def scenario():
+        now = [1000.0]
+        starting = [True]
+        gateway = make_gateway(clock=lambda: now[0], job_timeout_seconds=1800,
+                               starting=lambda model: starting[0], max_wait_seconds=4 * 3600)
+        job = await gateway.submit({"model": "qwen3.6", "messages": []}, tag="bench-p-wordy")
+        now[0] += 3600
+        gateway.reap()
+        assert not job.future.done()                          # Kaggle still queueing the notebook
+        starting[0] = False
+        gateway.reap()
+        with pytest.raises(GatewayError, match="no worker took the request in time"):
+            job.future.result()
+
+    asyncio.run(scenario())

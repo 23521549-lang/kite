@@ -941,18 +941,19 @@ def test_the_one_call_review_can_correct_a_fast_fix_but_never_break_it(tmp_path)
     assert run.review_mode == "agent" and [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "review"]
 
 
-def test_without_a_reproduction_the_fast_fix_gets_the_agent_review(tmp_path):
-    # The test passes on the old code too: it proves nothing, so a reading-only review is not enough.
+def test_a_fast_fix_that_passed_gets_the_one_call_review_even_without_a_reproduction(tmp_path):
+    # Bench v6 polyglot: after a passed fast fix the agent review ran 9-29 minutes and was thrown away
+    # 5 times out of 7 (it broke the solution). The one-call review reads the fix instead.
     fake = FakeDocker(repro_returncodes=[0])
-    _, run = run_task(tmp_path, fake, "p1", asker=answers(REPRO, FIX))
-    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "not_reproduced", "agent") and run.verified
-    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "review"]
+    _, run = run_task(tmp_path, fake, "p1", asker=answers(REPRO, FIX, "ỔN"))
+    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "not_reproduced", "one_call") and run.verified
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test"]
     # No test written at all (the model answered something else): the same.
     (tmp_path / "b").mkdir()
     fake = FakeDocker()
-    _, run = run_task(tmp_path / "b", fake, "p2", asker=answers("Không viết được.", FIX))
-    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "none", "agent")
-    assert [fake.kind(c) for c in fake.calls] == ["test", "review"]
+    _, run = run_task(tmp_path / "b", fake, "p2", asker=answers("Không viết được.", FIX, "ỔN"))
+    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "none", "one_call")
+    assert [fake.kind(c) for c in fake.calls] == ["test"]
 
 
 def test_a_reproduction_test_broken_by_its_setup_is_no_evidence_and_never_shown_to_the_agent(tmp_path):
@@ -960,10 +961,10 @@ def test_a_reproduction_test_broken_by_its_setup_is_no_evidence_and_never_shown_
     broken = ("E   botocore.exceptions.NoCredentialsError: Unable to locate credentials\n"
               "FAILED test_kite_repro.py::test_empty_list_gives_zero - botocore...\n1 failed\n")
     fake = FakeDocker(repro_fail=broken)
-    _, run = run_task(tmp_path, fake, "b1", asker=answers(REPRO, FIX))
-    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "broken", "agent") and run.verified
-    # Not written back with the fix: only the fix is checked, then the agent reviews.
-    assert [fake.kind(c) for c in fake.calls] == ["repro", "test", "review"]
+    _, run = run_task(tmp_path, fake, "b1", asker=answers(REPRO, FIX, "ỔN"))
+    assert (run.fast_path, run.repro, run.review_mode) == ("passed", "broken", "one_call") and run.verified
+    # Not written back with the fix: only the fix is checked, then the one-call review reads it.
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "test"]
     assert "test_kite_repro.py" not in run.changed_files
     # The fix fails the tests: the agent gets the fix and the failure, not the broken test.
     (tmp_path / "b").mkdir()
@@ -1140,8 +1141,8 @@ def test_a_second_candidate_told_why_the_first_failed_can_still_spare_the_agent(
     prompts = []
     _, run = run_task(tmp_path, fake, "f3", asker=lambda prompt: prompts.append(prompt) or FIX)
     assert run.fast_path == "passed" and run.fast_attempts == 2 and run.verified
-    assert [fake.kind(c) for c in fake.calls] == ["test", "test", "review"]     # no repro test: agent review
-    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-1]
+    assert [fake.kind(c) for c in fake.calls] == ["test", "test"]     # passed: the one-call review, no agent
+    assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-2] and "RÀ SOÁT cuối" in prompts[-1]
 
 
 def test_a_retry_after_a_failed_reproduction_never_shows_the_test(tmp_path):
@@ -1340,3 +1341,29 @@ def test_adding_tests_to_an_existing_test_file_is_allowed_but_changing_or_skippi
             "(items):\n    items.clear()\n>>>>>>> REPLACE\n")
     assert "conftest.py" in sbx.fast_apply(repo, hook).reason
     assert sbx.fast_apply(repo, skipping).status == "not_applied"
+
+
+def test_an_answer_that_stops_before_replace_or_names_no_file_still_applies(tmp_path):
+    # Bench v6 polyglot: "an edit block is not closed or has no file name" lost a fast try on
+    # phone-number, zebra-puzzle, beer-song and book-store.
+    from poc.kaggle_worker import editblocks as eb
+
+    (tmp_path / "phone_number.py").write_text("class PhoneNumber:\n    pass\n")
+    unclosed = ("phone_number.py\n```python\n<<<<<<< SEARCH\nclass PhoneNumber:\n    pass\n=======\n"
+                "class PhoneNumber:\n    def __init__(self, number):\n        self.number = number\n```\n")
+    blocks = eb.parse(unclosed)
+    assert blocks[0].replace == "class PhoneNumber:\n    def __init__(self, number):\n        self.number = number"
+    nameless = "<<<<<<< SEARCH\nclass PhoneNumber:\n    pass\n=======\nclass PhoneNumber:\n    x = 1\n>>>>>>> REPLACE\n"
+    with pytest.raises(eb.EditError, match="no file name"):
+        eb.parse(nameless)
+    assert eb.parse(nameless, default_path="phone_number.py")[0].path == "phone_number.py"
+    # Still refused: a block cut before its ======= line, or one that runs into the next block.
+    with pytest.raises(eb.EditError, match="no ======= line"):
+        eb.parse("a.py\n<<<<<<< SEARCH\nx = 1\n")
+    with pytest.raises(eb.EditError, match="not closed"):
+        eb.parse("a.py\n<<<<<<< SEARCH\nx\n=======\ny\na.py\n<<<<<<< SEARCH\nz\n=======\nw\n>>>>>>> REPLACE\n")
+    # The fast path gives a nameless block the one code file the model was shown.
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    attempt = sbx.fast_apply(tmp_path, nameless, 10, shown=["phone_number.py", "phone_number_test.py"])
+    assert attempt.status == "applied" and "x = 1" in (tmp_path / "phone_number.py").read_text()

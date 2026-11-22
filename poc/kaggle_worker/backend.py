@@ -610,13 +610,13 @@ class SandboxActivityBackend:
         review, review_mode = "skipped", ""
         if sbx.wants_review(self.settings, task.task_type, test_command, status, test_code) and check_code in (None, 0):
             before = await asyncio.to_thread(sbx.snapshot_tree, work)
-            # A fast fix with a real reproduction, or a small agent patch whose tests pass, gets the one-call
-            # review; a second agent session (5-10 minutes) is kept for big agent changes.
+            # A fast fix that passed, or a small agent patch whose tests pass, gets the one-call review; a
+            # second agent session (5-30 minutes, thrown away 5 times out of 7 after a passed fast fix on the
+            # polyglot exercises) is kept for big agent changes.
             small = (fast_status != "passed" and status == "ok" and test_code == 0
                      and sum(sbx.patch_size(sbx._git(work, "diff", patch_base, before, check=False)))
                      <= sbx.SMALL_REVIEW_LINES)
-            if (fast_status == "passed" and repro == "reproduced" or small) and self.settings.fast_review \
-                    and ask is not None:
+            if (fast_status == "passed" or small) and self.settings.fast_review and ask is not None:
                 review_mode = "one_call"
                 self._trace(task.task_id, "review_start", mode=review_mode)
                 started = time.monotonic()

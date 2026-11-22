@@ -466,3 +466,44 @@ def test_cost_columns_show_gpu_time_tool_calls_and_patch_size_against_the_real_f
     assert "## Chi phí từng task code" in report and "| `qwen3.6` | R0 | 2.5 | 11 | 90000 + 3000 | 9 | 12 (3) | 5 (2) |" in report
     summary = bench.summarize(results["models"]["qwen3.6"])
     assert summary["code_gpu_minutes_median"] == 2.5 and summary["code_tokens"] == 93000
+
+
+def test_a_second_measurement_run_is_refused_while_one_is_going(tmp_path):
+    # Bench v6: two runs started 18 s apart, shared the GPU and wrote the same folder.
+    import os
+
+    lock = bench.acquire_lock(tmp_path, label="v6", out=tmp_path / "v6")
+    with pytest.raises(bench.BenchBusy, match="v6"):
+        bench.acquire_lock(tmp_path, label="v6-again", out=tmp_path / "v6")
+    assert bench.running_bench(tmp_path)["pid"] == os.getpid()
+    bench.release_lock(lock)
+    assert bench.running_bench(tmp_path) is None
+    # A lock left by a run that died does not block the next one.
+    (tmp_path / bench.LOCK_NAME).write_text(json.dumps({"pid": 999999999, "label": "old"}))
+    bench.release_lock(bench.acquire_lock(tmp_path, label="v7", out=tmp_path / "v7"))
+
+
+def test_attempts_lost_to_the_machines_are_told_apart_from_the_models_failures():
+    records = [
+        {"outcome": "ok"},
+        {"outcome": "error", "error": "no worker took the request in time", "run_s": None, "queue_s": 6382.9},
+        {"outcome": "error", "error": "client disconnected", "run_s": None, "queue_s": 3602.5},   # gave up waiting
+        {"outcome": "error", "error": "client disconnected", "run_s": 45.2, "queue_s": 0.0},     # aborted a running one
+        {"outcome": "error", "error": "RuntimeError: llama-server: {'message': 'Context size has been exceeded'}",
+         "run_s": 130.0, "queue_s": 0.0},
+        {"outcome": "error", "error": "task cancelled", "run_s": 12.8, "queue_s": 0.0},
+    ]
+    found = bench.infra_errors(records)
+    assert len(found) == 3 and found[0].startswith("no worker") and "Context size" in found[2]
+
+
+def test_waiting_for_a_worker_polls_the_gateway_until_one_serves_the_model():
+    answers = iter([{"workers": []},
+                    {"workers": [{"alive": True, "draining": True, "models": ["qwen3.6"]}]},
+                    {"workers": [{"alive": True, "draining": False, "models": ["qwen3.6"]}]}])
+    said, slept = [], []
+    assert bench.wait_for_worker("http://x/status", "qwen3.6", log=said.append, fetch=lambda url: next(answers),
+                                 sleep=slept.append, poll=60)
+    assert len(slept) == 2 and len(said) == 1
+    assert not bench.wait_for_worker("http://x/status", "qwen3.6", log=said.append, timeout=0,
+                                     fetch=lambda url: {"workers": []}, sleep=slept.append)

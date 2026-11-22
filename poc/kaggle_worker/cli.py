@@ -174,9 +174,10 @@ def _parser() -> argparse.ArgumentParser:
                            help="<kaggle user>/<notebook slug> from the notebook URL kaggle.com/code/...")
     autostart.add_argument("--idle-minutes", type=int, default=30,
                            help="a notebook Kite started ends after this long without a job (default 30)")
-    autostart.add_argument("--token", choices=["kaggle-secret", "per-launch"], default="kaggle-secret",
-                           help="worker token: the notebook's Kaggle Secret (default) or a short-lived "
-                                "token Kite writes into the notebook it pushes")
+    autostart.add_argument("--token", choices=["per-launch", "kaggle-secret"], default="per-launch",
+                           help="worker token: a short-lived token Kite writes into the notebook it pushes "
+                                "(default), or the notebook's Kaggle Secret (Kaggle does not give Secrets "
+                                "to a run pushed through its API)")
     autostart.add_argument("--model", default=None, help="model to load first when nothing asks for one")
     autostart.add_argument("--off", action="store_true", help="remove autostart from this worker")
     start = worker_commands.add_parser("start", help="start the worker's Kaggle notebook now (autostart)")
@@ -556,9 +557,11 @@ def _worker_status_text(report: dict) -> str:
             line = f"  tự bật: {launch.get('state')}"
             if launch.get("seconds") is not None and launch.get("state") != "idle":
                 line += f" ({minutes(launch.get('seconds'))})"
-            if launch.get("kaggle"):
+            if launch.get("kaggle") and launch.get("state") != "alive":   # stale once the worker is up
                 line += f", Kaggle: {launch['kaggle']}" + (f" ({minutes(launch['kaggle_seconds'])})"
                                                           if launch.get("kaggle_seconds") is not None else "")
+            if launch.get("failures"):
+                line += f", lỗi liền {launch['failures']} lần"
             lines.append(line)
             if launch.get("detail"):
                 lines.append(f"  {launch['detail']}")
@@ -657,9 +660,13 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
     if any(p.launch is not None for p in config.providers if p.adapter == "pull" and p.enabled):
         from .launcher import KaggleLauncher
 
-        launcher = KaggleLauncher(config, gateway, state_dir=args.config.parent)
+        launcher = KaggleLauncher(
+            config, gateway, state_dir=args.config.parent, notify=_notifier(config),
+            journal=lambda record: Journal(args.config.parent / "journal").write("launches", record))
         launcher.load_tokens()
         gateway.on_demand = launcher.on_demand
+        gateway.starting = launcher.starting
+        gateway.wait_note = launcher.wait_note
         watcher = asyncio.get_running_loop().create_task(launcher.watch())   # noqa: F841 (kept alive)
     runner = web.AppRunner(create_app(gateway, launcher=launcher))
     await runner.setup()
@@ -965,7 +972,29 @@ def _bench_command(args: argparse.Namespace) -> int:
             if args.no_fast_path:
                 settings = dataclasses.replace(settings, fast_path=False)
 
+        status_url = f"http://{config.gateway.host}:{config.gateway.port}/status"
+        bench_journal = Journal(args.config.parent / "journal")
+
         def kite_run(task, model, repo, goal, task_id, out_dir):
+            """One attempt; run again once if it failed because of the machines (no worker, a worker that
+            stopped, a KV cache shared with another request), after waiting for a worker."""
+            run, result = kite_run_once(task, model, repo, goal, task_id, out_dir)
+            if result.get("hidden_exit_code") == 0:
+                return run, result
+            errors = bench.infra_errors([r for r in bench_journal.read("gateway")
+                                         if r.get("tag") == task_id or str(r.get("tag") or "").startswith(f"{task_id}-b")])
+            if not errors:
+                return run, result
+            log(f"[{task_id}] lỗi hạ tầng, không tính lần này: {errors[0]}")
+            base = config.gateway.aliases.get(model, {}).get("model", model)
+            if not bench.wait_for_worker(status_url, base, log=log):
+                result["infra_errors"] = errors[:3]
+                return run, result
+            run, again = kite_run_once(task, model, repo, goal, f"{task_id}-r", out_dir)
+            again["infra_rerun"] = {"errors": errors[:3], "lost_seconds": result.get("wall_seconds")}
+            return run, again
+
+        def kite_run_once(task, model, repo, goal, task_id, out_dir):
             started = time.monotonic()
             run = sbx.run_task(settings, repo=repo, goal=goal, model=model, models=served,
                                state_dir=out_dir / "runs", task_id=task_id, with_context=not args.no_harness,
@@ -1025,11 +1054,18 @@ def _bench_command(args: argparse.Namespace) -> int:
         (f"bật ({harness_settings.fix_rounds} vòng sửa, rà soát {'bật' if harness_settings.self_review else 'tắt'}, "
          f"có ngữ cảnh repo, bản đồ code graphify {'bật' if map_on else 'tắt'}, đường nhanh "
          f"{'bật' if harness_settings.fast_path and not args.no_fast_path else 'tắt'})")
+    try:
+        lock = bench.acquire_lock(args.config.parent, label=args.label or out.name, out=out)
+    except bench.BenchBusy as exc:
+        raise ConfigError(str(exc)) from exc
     log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code"
         f" | harness {harness}")
-    results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
-                              run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log,
-                              meta={"harness": harness, **({"label": args.label} if args.label else {})})
+    try:
+        results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
+                                  run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log,
+                                  meta={"harness": harness, **({"label": args.label} if args.label else {})})
+    finally:
+        bench.release_lock(lock)
     _emit({"out": str(out), "report": str(out / "README.md"),
            "summary": {m: bench.summarize(entry) for m, entry in results["models"].items()}})
     return 0

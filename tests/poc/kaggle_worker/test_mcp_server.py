@@ -345,6 +345,13 @@ def test_context_window_per_model_reaches_opencode(tmp_path):
     sandbox = agent_config(sandbox_settings_from_config(config), model="qwen3.6", models=["qwen3.6", "devstral"])
     limits = {m: spec["limit"]["context"] for m, spec in sandbox["provider"]["kite"]["models"].items()}
     assert limits == {"qwen3.6": 65536, "devstral": 32768}
+    # A 128K window shared by the chat and one task (--parallel 2 --kv-unified): 48K chat, 80K agent.
+    raw["gateway"]["model_context"] = {"qwen3.6": 131072}
+    config = validate_config(raw)
+    files = chat_files(config, lead_model="qwen3.6", kite_command=["kite"], allowed_roots=[Path("/home/u")])
+    assert json.loads(files["opencode.json"])["provider"]["kite"]["models"]["qwen3.6"]["limit"]["context"] == 49152
+    sandbox = agent_config(sandbox_settings_from_config(config), model="qwen3.6", models=["qwen3.6"])
+    assert sandbox["provider"]["kite"]["models"]["qwen3.6"]["limit"]["context"] == 81920
     for bad in ({"qwen3.6": 1024}, {"qwen3.6": 10 ** 6}, {"qwen3.6": "64k"}, {"bad name!": 65536}):
         raw["gateway"]["model_context"] = bad
         with pytest.raises(ConfigError):

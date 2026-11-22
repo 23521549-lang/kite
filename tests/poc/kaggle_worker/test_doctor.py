@@ -152,3 +152,45 @@ def test_cli_doctor_exit_code_and_json(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("poc.kaggle_worker.doctor.default_probes", lambda: fake_down)
     assert cli.main(["--config", str(path), "doctor"]) == 1
     assert "✗ gateway" in capsys.readouterr().out
+
+
+def test_someone_elses_notebook_that_is_off_is_not_a_warning(tmp_path):
+    # Full-test day, A1: doctor warned "kaggle-an chưa kết nối" (another person's notebook) every time.
+    raw, path = config_for(tmp_path)
+    second = json.loads(json.dumps(raw["providers"][0]))
+    second.update(id="kaggle-an", owner="an")
+    token = tmp_path / "secrets" / "worker_token_kaggle-an"
+    token.write_text("u" * 40 + "\n")
+    token.chmod(0o600)
+    second["secrets"] = {"worker_token": f"file:{token}"}
+    raw["providers"].append(second)
+    status = {"workers": [{"worker_id": "kaggle-han", "alive": True, "loaded_model": "qwen3.6", "busy": False},
+                          {"worker_id": "kaggle-an", "alive": False}], "queued_jobs": 0}
+    fake, _ = probes(gateway=status)
+    named = by_name(run_checks(validate_config(raw), path, fake))
+    assert named["worker kaggle-an"].status == "skip" and "chưa kết nối" in named["worker kaggle-an"].detail
+    alone = {"workers": [{"worker_id": "kaggle-han", "alive": False}, {"worker_id": "kaggle-an", "alive": False}]}
+    fake, _ = probes(gateway=alone)
+    named = by_name(run_checks(validate_config(raw), path, fake))
+    assert named["worker kaggle-an"].status == "warn"           # nothing can serve: then it matters
+
+
+def test_autostart_checks_the_token_mode_and_reads_the_gpu_quota(tmp_path):
+    raw, path = config_for(tmp_path, launch=True)
+    raw["providers"][0]["launch"]["token"] = "kaggle-secret"
+    status = {"workers": [{"worker_id": "kaggle-han", "alive": False, "launch": {"state": "idle"}}]}
+    fake, calls = probes(gateway=status)
+    plain_run = fake.run
+
+    def run(command, timeout):
+        if command[0] == "env" and command[-2:] == ["quota", "-v"]:
+            assert any(part.startswith("KAGGLE_API_TOKEN=") and part.endswith("kaggle_api_token_kaggle-han")
+                       for part in command)
+            return 0, "resource,used,remaining,total,refreshAt\nGPU,27.50h,2.50h,30.00h,2026-11-28T00:00:00+00:00\n"
+        return plain_run(command, timeout)
+
+    fake.run = run
+    named = by_name(run_checks(validate_config(raw), path, fake))
+    assert named["tự bật kaggle-han"].status == "warn" and "--token per-launch" in named["tự bật kaggle-han"].fix
+    quota = named["quota GPU kaggle-han"]
+    assert quota.status == "warn" and quota.detail == "còn 2.50h / 30.00h, làm mới 2026-11-28T00:00"

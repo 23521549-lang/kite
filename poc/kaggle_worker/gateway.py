@@ -67,6 +67,9 @@ class WorkerState:
     current_jobs: set[str] = field(default_factory=set)
     slots: int = 1
     version: str | None = None      # WORKER_VERSION of the notebook code the worker runs
+    # The Kaggle session serving this worker ID (X-Kite-Session). A second session of the same
+    # worker (a run Kite pushed that started after one opened by hand) is told to stop at once.
+    session: str | None = None
 
 
 @dataclass
@@ -85,6 +88,15 @@ class Job:
     stream: bool = False            # the client asked for stream: true
     chunks: asyncio.Queue | None = None   # streamed chunks for the client; None marks the end
     sent: int = 0                   # chunks accepted from the worker (the next index expected)
+    exclusive: bool = False         # ran out of KV cache next to another request: run it alone
+
+    @property
+    def is_chat(self) -> bool:
+        return self.tag == "chat"
+
+
+# Phrases llama-server uses when the (shared, --kv-unified) KV cache has no room left.
+CONTEXT_FULL = ("context size has been exceeded", "exceeds the available context size")
 
 
 StatusHook = Callable[[WorkerState, bool], Awaitable[None] | None]
@@ -111,6 +123,9 @@ class ModelGateway:
         journal: Callable[[dict], None] | None = None,
         affinity_seconds: float = 20.0,
         on_demand: Callable[[str], None] | None = None,
+        starting: Callable[[str], bool] | None = None,
+        wait_note: Callable[[str], str] | None = None,
+        max_wait_seconds: float = 4 * 3600.0,
     ) -> None:
         if not workers:
             raise ValueError("at least one worker must be configured")
@@ -143,6 +158,14 @@ class ModelGateway:
         self.affinity: dict[str, str] = {}
         # Called with a base model when a request arrives and no live worker serves it (autostart).
         self.on_demand = on_demand
+        # True while a worker for this base model is being started (autostart): a queued request
+        # then keeps waiting past job_timeout_seconds, up to max_wait_seconds (bench v6 polyglot: a
+        # Kaggle session ended and the next one waited in Kaggle's queue for 1 h 40 min).
+        self.starting = starting
+        self.max_wait_seconds = max_wait_seconds
+        # Text for the person chatting when no worker can answer yet (what is being started, how to
+        # start it by hand). None: a built-in sentence.
+        self.wait_note = wait_note
         self.started_at = clock()
         self.jobs: dict[str, Job] = {}
         self._queue: list[str] = []
@@ -180,6 +203,59 @@ class ModelGateway:
             raise ValueError(f"unknown worker {worker_id}")
         self.stop_requested.add(worker_id)
         self._notify()
+
+    def claim_session(self, worker_id: str, session: str | None) -> bool:
+        """True if ``session`` is (or now becomes) the Kaggle session that serves ``worker_id``.
+
+        The first session to call in holds the worker while it keeps heartbeating; another session
+        with the same token (Kite's pushed run that Kaggle started after you ran the notebook by hand)
+        is refused and told to stop. A silent or draining holder hands over to the next one.
+        """
+        worker = self.workers[worker_id]
+        session = (session or "")[:64]
+        if worker.session is None or worker.session == session:
+            worker.session = session
+            return True
+        holder_live = (bool(worker.last_seen) and self.clock() - worker.last_seen <= self.heartbeat_timeout_seconds
+                       and not worker.draining)
+        if holder_live:
+            return False
+        worker.session = session
+        return True
+
+    def no_worker_note(self, requested: Any) -> str | None:
+        """For a chat request: None if a connected worker can take it (it may be loading a model);
+        otherwise start one (autostart) and return what to tell the person now."""
+        if not isinstance(requested, str) or not requested.strip():
+            return None
+        model, _params = self.resolve_model(requested)
+        if not any(model in w.model_ids for w in self.workers.values()) or self.serving(model):
+            return None
+        if self.on_demand is not None:
+            try:
+                self.on_demand(model)
+            except Exception as exc:          # starting a worker must never fail the request
+                print(f"kite gateway: autostart error: {exc}", file=sys.stderr)
+        if self.wait_note is not None:
+            try:
+                note = self.wait_note(model)
+                if note:
+                    return note
+            except Exception as exc:
+                print(f"kite gateway: wait note error: {exc}", file=sys.stderr)
+        return (f"Chưa có worker nào đang chạy model {requested}, nên chưa trả lời được. Mở notebook "
+                "Kaggle của worker và bấm Save Version (hoặc Run All); khi worker kết nối, nhắn lại câu vừa rồi.")
+
+    def journal_note(self, tag: str | None, requested: str) -> None:
+        """One gateway line for a chat request answered with a status note (no worker)."""
+        if self.journal is None:
+            return
+        try:
+            self.journal({"job_id": "-", "tag": tag, "requested": requested, "model": self.resolve_model(requested)[0],
+                          "worker": None, "pinned": None, "attempts": 0, "outcome": "no_worker",
+                          "error": "no worker: the chat got a status note", "queue_s": 0.0, "run_s": None})
+        except Exception as exc:
+            print(f"kite gateway: journal error: {exc}", file=sys.stderr)
 
     def present(self, worker_id: str) -> bool:
         """Connected and staying: heartbeating (also while it loads a model, when it is not ready),
@@ -319,12 +395,28 @@ class ModelGateway:
                     return False        # leave it a moment for the worker that has this conversation cached
             return True
 
+        running = [self.jobs[j] for j in worker.current_jobs if j in self.jobs]
+        task_running = any(not job.is_chat for job in running)
+        alone = any(job.exclusive for job in running)
+        # A request waiting to run alone: let this worker empty out instead of starting more next to it.
+        alone_waiting = any(self.jobs[j].exclusive and self.jobs[j].model in worker.model_ids for j in self._queue)
+
+        def fits(job: Job) -> bool:
+            """A busy worker's other slot: same model (no swap), never next to a request that must run
+            alone, and at most one task or bench request at a time. Its second slot is for the person
+            chatting: two long agent conversations on one shared 128K KV cache ran out of room (bench
+            v6: 23 'Context size has been exceeded' in half an hour, two bench runs at once)."""
+            if not busy:
+                return True
+            if alone or alone_waiting or job.exclusive or job.model != worker.loaded_model:
+                return False
+            return job.is_chat or not task_running
+
         candidates = [self.jobs[j] for j in self._queue
-                      if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j])
-                      # A worker already running a job only takes more for the loaded model (no swap).
-                      and (not busy or self.jobs[j].model == worker.loaded_model)]
-        # The person chatting is waiting; a task's request can wait one turn. Stable sort keeps age order.
-        candidates.sort(key=lambda job: job.tag != "chat")
+                      if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j]) and fits(self.jobs[j])]
+        # The person chatting is waiting; a task's request can wait one turn. A request that already
+        # failed for lack of room next to another one goes before both. Stable sort keeps age order.
+        candidates.sort(key=lambda job: (not job.exclusive, not job.is_chat))
         if not candidates:
             return None
         loaded = [j for j in candidates if j.model == worker.loaded_model]
@@ -402,9 +494,18 @@ class ModelGateway:
             return True
         if payload.get("status") == "ok" and isinstance(payload.get("response"), dict):
             self._finish(job, result=payload["response"])
-        else:
-            error = payload.get("error")
-            self._finish(job, error=str(error)[:2000] if error else "worker reported an error")
+            return True
+        error = str(payload.get("error") or "worker reported an error")[:2000]
+        worker = self.workers[worker_id]
+        if (not job.sent and not job.exclusive and len(worker.current_jobs) > 1
+                and any(phrase in error.lower() for phrase in CONTEXT_FULL)):
+            # It shared the KV cache with another request and ran out of room: run it again, alone.
+            worker.current_jobs.discard(job.job_id)
+            job.exclusive, job.worker_id, job.assigned_at = True, None, None
+            self._queue.insert(0, job.job_id)
+            self._notify()
+            return True
+        self._finish(job, error=error)
         return True
 
     def reap(self) -> None:
@@ -412,7 +513,9 @@ class ModelGateway:
         now = self.clock()
         for job in list(self.jobs.values()):
             if job.worker_id is None:
-                if now - job.created_at > self.job_timeout_seconds:
+                waited = now - job.created_at
+                if waited > self.job_timeout_seconds and not (
+                        waited < self.max_wait_seconds and self._worker_coming(job.model)):
                     self._finish(job, error="no worker took the request in time")
                 continue
             worker = self.workers[job.worker_id]
@@ -430,6 +533,18 @@ class ModelGateway:
                 job.assigned_at = None
                 self._queue.insert(0, job.job_id)
                 self._notify()
+
+    def _worker_coming(self, model: str) -> bool:
+        """A worker for ``model`` is connected (busy, or loading a model) or being started: a queued
+        request is worth keeping."""
+        if self.serving(model):
+            return True
+        if self.starting is None:
+            return False
+        try:
+            return bool(self.starting(model))
+        except Exception:
+            return False
 
     def status(self) -> dict[str, Any]:
         now = self.clock()
@@ -479,6 +594,13 @@ def completion_to_sse(response: Mapping[str, Any]) -> list[bytes]:
         + [b"data: [DONE]\n\n"]
 
 
+def note_completion(model: str, text: str) -> dict[str, Any]:
+    """A chat completion the gateway writes itself (no model ran): a status line for the person."""
+    return {"id": "chatcmpl-kite-note", "object": "chat.completion", "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
+
+
 def sse_chunk(chunk: Mapping[str, Any], model: str) -> bytes:
     """One streamed chunk from llama-server, as SSE, named with the model the client asked for."""
     return f"data: {json.dumps({**chunk, 'model': model}, ensure_ascii=False)}\n\n".encode()
@@ -506,8 +628,25 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
             return _error(400, "body must be JSON")
         if not isinstance(body, dict):
             return _error(400, "body must be a JSON object")
+        tag = clean_tag(request.headers.get("X-Kite-Task"))
+        if tag == "chat":
+            # No worker can answer yet (Kaggle may keep a pushed run queued for hours): say so now,
+            # with how to start one by hand, instead of leaving the chat silent.
+            note = gateway.no_worker_note(body.get("model"))
+            if note:
+                gateway.journal_note(tag, str(body.get("model")))
+                reply = note_completion(str(body.get("model")), note)
+                if not body.get("stream"):
+                    return web.json_response(reply)
+                stream = web.StreamResponse(headers={"Content-Type": "text/event-stream",
+                                                     "Cache-Control": "no-cache"})
+                await stream.prepare(request)
+                for chunk in completion_to_sse(reply):
+                    await stream.write(chunk)
+                await stream.write_eof()
+                return stream
         try:
-            job = await gateway.submit(body, tag=clean_tag(request.headers.get("X-Kite-Task")),
+            job = await gateway.submit(body, tag=tag,
                                        pin=clean_tag(request.headers.get("X-Kite-Worker")),
                                        stream=bool(body.get("stream")))
         except GatewayError as exc:
@@ -565,6 +704,10 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
         payload = await request.json()
         if not isinstance(payload, dict):
             return _error(400, "heartbeat must be a JSON object")
+        if not gateway.claim_session(worker_id, request.headers.get("X-Kite-Session")):
+            # Another Kaggle session already serves this worker: this one ends (no jobs for it).
+            return web.json_response({"worker_id": worker_id, "models": [], "stop": True,
+                                      "duplicate": True})
         worker = await gateway.heartbeat(worker_id, payload)
         return web.json_response({"worker_id": worker_id, "models": list(worker.model_ids),
                                   "stop": worker_id in gateway.stop_requested})
@@ -575,6 +718,8 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
             wait = max(0.0, min(float(request.query.get("wait", "50")), 55.0))
         except ValueError:
             return _error(400, "wait must be a number of seconds")
+        if not gateway.claim_session(worker_id, request.headers.get("X-Kite-Session")):
+            return _error(409, "another session of this worker is connected; this one should stop")
         job = await gateway.next_job(worker_id, wait)
         if job is None:
             return web.Response(status=204)

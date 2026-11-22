@@ -44,6 +44,34 @@ NOTEBOOK = Path(__file__).with_name("kaggle_model_worker.ipynb")
 LAUNCH_LINE = re.compile(r"^KITE_LAUNCH = \{\}.*$", re.M)
 RUNNING = {"queued", "running", "new_script"}
 LAUNCH_WINDOW_SECONDS = 6 * 3600       # a pushed run starts well within this; later starts are manual runs
+# Kaggle can keep a run pushed through its API queued for hours while "Save Version" pressed on
+# kaggle.com starts at once (22 Nov: version 11 pushed by Kite queued 200+ min, version 12 saved by
+# hand at the same moment ran at once). After this long in the queue, tell the person to press it.
+QUEUE_NOTIFY_SECONDS = 180.0
+MAX_FAILURES = 2                       # runs that stopped before connecting: then wait for `--force`
+
+
+def kaggle_url(kernel: str) -> str:
+    """Where to open the notebook to press Save Version (the editor)."""
+    return f"https://www.kaggle.com/code/{kernel}/edit"
+
+
+_ERROR_LINE = re.compile(r"^\s*([A-Za-z_][\w.]*(?:Error|Exception|Exit)|Error)\b\s*:")
+
+
+def log_error_line(log: str) -> str:
+    """The line that says why a Kaggle run stopped, from ``kaggle kernels logs`` output (a JSON list
+    of {stream_name, time, data} or plain text): the last ``SomethingError: ...`` line."""
+    text = log
+    try:
+        entries = json.loads(log)
+        if isinstance(entries, list):
+            text = "".join(str(e.get("data", "")) for e in entries if isinstance(e, dict))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    hits = [line for line in lines if _ERROR_LINE.match(line)]
+    return (hits[-1] if hits else "")[:300]
 
 # (command, env, timeout) -> (exit code, combined output)
 Runner = Callable[[list[str], dict[str, str], float], tuple[int, str]]
@@ -103,6 +131,10 @@ class LaunchState:
     reason: str = ""
     kaggle: str | None = None      # last status Kaggle reported for the run: queued | running | error | ...
     kaggle_since: float = 0.0      # when Kaggle first reported that status
+    failures: int = 0              # runs in a row that stopped before the worker connected
+    pushed_at: float = 0.0         # this start: when the notebook was pushed (0: a run already there)
+    running_at: float = 0.0        # this start: when Kaggle first said the run is running
+    notified: bool = False         # this start: the person was told to press Save Version
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def report(self, now: float) -> dict[str, Any]:
@@ -110,11 +142,26 @@ class LaunchState:
                 "detail": self.detail, "kernel": self.spec.kernel, "version": self.version,
                 "kaggle": self.kaggle,
                 "kaggle_seconds": round(now - self.kaggle_since) if self.kaggle and self.kaggle_since else None,
-                "reason": self.reason, "idle_minutes": self.spec.idle_minutes, "token": self.spec.token}
+                "reason": self.reason, "idle_minutes": self.spec.idle_minutes, "token": self.spec.token,
+                "failures": self.failures, "url": kaggle_url(self.spec.kernel)}
 
     def saw(self, status: str | None, now: float) -> None:
         if status != self.kaggle:
             self.kaggle, self.kaggle_since = status, now
+
+
+def kaggle_env(provider: Any, config_dir: str) -> dict[str, str]:
+    """Environment for the Kaggle CLI with this provider's credentials (never ~/.kaggle)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KAGGLE_")}
+    env["KAGGLE_CONFIG_DIR"] = config_dir
+    reference = provider.secrets.get("kaggle_api_token")
+    if reference:
+        # The Kaggle CLI accepts a path to a file that holds the token: point it at the secret file.
+        env["KAGGLE_API_TOKEN"] = reference[5:] if reference.startswith("file:") else resolve_secret(reference)
+    else:
+        env["KAGGLE_USERNAME"] = (provider.launch.kaggle_username or "") if provider.launch else ""
+        env["KAGGLE_KEY"] = resolve_secret(provider.secrets["kaggle_key"])
+    return env
 
 
 class KaggleLauncher:
@@ -123,8 +170,11 @@ class KaggleLauncher:
     def __init__(self, config: KiteConfig, gateway: Any, *, state_dir: Path, runner: Runner = default_runner,
                  clock: Callable[[], float] = time.time, notebook: Path = NOTEBOOK,
                  command: str | None = None, startup_seconds: float = 1500.0, retry_seconds: float = 600.0,
-                 grace_seconds: float | None = None, sleep: Callable[[float], Any] = asyncio.sleep) -> None:
+                 grace_seconds: float | None = None, sleep: Callable[[float], Any] = asyncio.sleep,
+                 notify: Callable[..., None] | None = None, journal: Callable[[dict], None] | None = None) -> None:
         self.config = config
+        self.notify = notify            # ntfy: (title, message, tags=, priority=); never carries code or goals
+        self.journal = journal          # one line per push / run start / connect / failure ("launches")
         self.gateway = gateway
         self.state_dir = Path(state_dir)
         self.runner = runner
@@ -179,17 +229,7 @@ class KaggleLauncher:
 
     # ------------------------------------------------------------------ Kaggle CLI
     def _env(self, worker_id: str, config_dir: str) -> dict[str, str]:
-        provider = self.providers[worker_id]
-        env = {k: v for k, v in os.environ.items() if not k.startswith("KAGGLE_")}
-        env["KAGGLE_CONFIG_DIR"] = config_dir          # never read or write ~/.kaggle
-        reference = provider.secrets.get("kaggle_api_token")
-        if reference:
-            # The Kaggle CLI accepts a path to a file that holds the token: point it at the secret file.
-            env["KAGGLE_API_TOKEN"] = reference[5:] if reference.startswith("file:") else resolve_secret(reference)
-        else:
-            env["KAGGLE_USERNAME"] = provider.launch.kaggle_username or ""
-            env["KAGGLE_KEY"] = resolve_secret(provider.secrets["kaggle_key"])
-        return env
+        return kaggle_env(self.providers[worker_id], config_dir)
 
     def _kaggle(self, worker_id: str, args: list[str], timeout: float = 120) -> tuple[int, str]:
         with tempfile.TemporaryDirectory(prefix="kite-kaggle-") as config_dir:
@@ -199,6 +239,54 @@ class KaggleLauncher:
         code, output = self._kaggle(worker_id, ["kernels", "status", self.states[worker_id].spec.kernel], 60)
         status = parse_status(output) if code == 0 else None
         return status, (parse_failure(output) if status else output.strip()[-300:])
+
+    def kernel_error(self, worker_id: str) -> str:
+        """Why the latest run stopped, from its log (``kaggle kernels logs``; older CLIs: empty)."""
+        code, output = self._kaggle(worker_id, ["kernels", "logs", self.states[worker_id].spec.kernel], 120)
+        return log_error_line(output) if code == 0 else ""
+
+    # ------------------------------------------------------------------ telling the person
+    def _record(self, state: LaunchState, event: str, **fields: Any) -> None:
+        if self.journal is None:
+            return
+        try:
+            self.journal({"event": event, "worker": state.worker_id, "kernel": state.spec.kernel,
+                          "version": state.version, "reason": state.reason, **fields})
+        except Exception as exc:
+            print(f"kite gateway: launch journal error: {exc}", file=sys.stderr)
+
+    def _tell(self, title: str, message: str, *, priority: int = 4) -> None:
+        if not self.notify:
+            return
+        try:
+            self.notify(title, message, tags=("rocket",), priority=priority)
+        except Exception as exc:
+            print(f"kite gateway: notify error: {exc}", file=sys.stderr)
+
+    def starting(self, model: str) -> bool:
+        """Gateway hook: a worker that serves ``model`` is being started (keep its requests queued)."""
+        return any(state.state in ("launching", "starting")
+                   for wid, state in self.states.items() if model in self.gateway.workers[wid].model_ids)
+
+    def wait_note(self, model: str) -> str:
+        """What the person chatting is told while no worker can answer (gateway hook)."""
+        states = [s for wid, s in self.states.items() if model in self.gateway.workers[wid].model_ids]
+        if not states:
+            return ""
+        state = states[0]
+        self._refresh(state)
+        now = self.clock()
+        doing = {
+            "launching": "Kite đang đẩy notebook lên Kaggle",
+            "starting": (f"Kaggle đang xếp hàng notebook {round((now - state.kaggle_since) / 60)} phút"
+                         if state.kaggle in ("queued", "new_script") and state.kaggle_since
+                         else "notebook đang chạy trên Kaggle (đang nạp model)" if state.kaggle == "running"
+                         else "Kite đang bật notebook"),
+            "error": f"lần bật trước bị lỗi: {state.detail}"[:300],
+        }.get(state.state, "Kite đang bật notebook")
+        return (f"Worker {state.worker_id} chưa chạy nên chưa trả lời được ({doing}). Muốn nhanh: mở "
+                f"{kaggle_url(state.spec.kernel)} rồi bấm Save Version (Save & Run All); Kaggle thường cấp "
+                "GPU ngay cho cách này. Worker kết nối khoảng 2–3 phút sau khi notebook chạy; khi đó nhắn lại.")
 
     def _push(self, worker_id: str, model: str | None, reason: str) -> tuple[bool, str, str | None]:
         """Pull the notebook's metadata, push this repo's notebook with KITE_LAUNCH, run it."""
@@ -249,7 +337,14 @@ class KaggleLauncher:
     def _refresh(self, state: LaunchState) -> None:
         if self.gateway.present(state.worker_id):
             if state.state != "alive":
-                state.state, state.since, state.detail = "alive", self.clock(), ""
+                now = self.clock()
+                if state.state in ("launching", "starting"):
+                    self._record(state, "alive",
+                                 since_push_s=round(now - state.pushed_at) if state.pushed_at else None,
+                                 queued_s=round((state.running_at or now) - state.pushed_at)
+                                 if state.pushed_at else None)
+                state.state, state.since, state.detail = "alive", now, ""
+                state.failures, state.notified = 0, False
         elif state.state == "alive":
             state.state, state.since, state.detail = "idle", self.clock(), "worker đã ngắt kết nối"
 
@@ -289,6 +384,8 @@ class KaggleLauncher:
                 return {"worker": wid, **state.report(self.clock())}
         for wid in candidates:
             state = self.states[wid]
+            if state.failures >= MAX_FAILURES and not force:
+                continue        # it failed MAX_FAILURES times in a row: pushing again would fail the same way
             if (state.state == "error" and not force
                     and self.clock() - state.since < self.retry_seconds):
                 continue
@@ -315,10 +412,14 @@ class KaggleLauncher:
                     if ok:
                         state.state, state.version = "starting", version
                         state.saw("queued", self.clock())
+                        state.pushed_at, state.running_at, state.notified = self.clock(), 0.0, False
                         state.detail = (f"đã đẩy notebook version {version}; chờ Kaggle cấp GPU rồi "
                                         "worker kết nối sau ~5–10 phút")
+                        self._record(state, "push")
                     else:
                         state.state, state.detail = "error", error
+                        state.failures += 1
+                        self._record(state, "failed", error=error[:300])
             except Exception as exc:
                 state.state, state.detail = "error", f"{type(exc).__name__}: {exc}"[:300]
             state.since = self.clock()
@@ -340,19 +441,42 @@ class KaggleLauncher:
                 continue
             state.saw(status, now)
             minutes = (now - state.kaggle_since) / 60
+            url = kaggle_url(state.spec.kernel)
             if status == "queued" or status == "new_script":
                 state.detail = (f"Kaggle đang xếp hàng GPU cho version {state.version or '?'} ({minutes:.0f} phút); "
-                                "Kite không đẩy nhanh được, chạy tay (Run All) nếu cần gấp")
+                                f"muốn nhanh: mở {url} và bấm Save Version")
+                if now - state.kaggle_since >= QUEUE_NOTIFY_SECONDS and not state.notified:
+                    state.notified = True
+                    self._tell("Kite cần GPU: bấm Save Version",
+                               f"{state.worker_id}: Kaggle đang xếp hàng notebook {minutes:.0f} phút. "
+                               f"Mở {url} và bấm Save Version để chạy ngay.")
             elif status == "running":
+                if not state.running_at:
+                    state.running_at = now
+                    self._record(state, "running",
+                                 queued_s=round(now - state.pushed_at) if state.pushed_at else None)
                 state.detail = (f"notebook đang chạy {minutes:.0f} phút, worker chưa kết nối"
                                 + (" (quá lâu: xem log version trên Kaggle)" if now - state.kaggle_since
                                    > self.startup_seconds else " (đang nạp model)"))
+            elif status.startswith("cancel"):
+                # Cancelled on kaggle.com (or replaced by a version saved there): not a failure.
+                state.state, state.since = "idle", now
+                state.detail = "bản trên Kaggle đã bị hủy; Kite đẩy lại khi có việc"
+                self._record(state, "cancelled")
             else:
+                why = await asyncio.to_thread(self.kernel_error, state.worker_id)
                 state.state, state.since = "error", now
+                state.failures += 1
                 state.detail = (f"notebook dừng ({status}) trước khi worker kết nối"
-                                + (f": {detail}" if detail else "")
-                                + ("; nếu log báo lỗi Secret, đặt launch.token: per-launch"
-                                   if state.spec.token == "kaggle-secret" and status == "error" else ""))
+                                + (f": {why}" if why else f": {detail}" if detail else "")
+                                + ("; nếu lỗi Secret, đặt launch.token: per-launch"
+                                   if state.spec.token == "kaggle-secret" and status == "error" else "")
+                                + (f"; đã lỗi {state.failures} lần liền: Kite ngừng tự bật, sửa xong chạy "
+                                   f"kite worker start {state.worker_id} --force" if state.failures >= MAX_FAILURES
+                                   else ""))
+                self._record(state, "failed", status=status, error=(why or detail)[:300])
+                self._tell("Kite: notebook worker bị lỗi",
+                           f"{state.worker_id}: {(why or status)[:200]}. Mở {url} để xem log.")
                 print(f"kite gateway: autostart {state.worker_id}: {state.detail}", file=sys.stderr)
 
     async def watch(self, every: float = 60.0) -> None:

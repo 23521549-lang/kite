@@ -258,12 +258,15 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
     which task each request belongs to. ``worker_pin`` (``X-Kite-Worker``) makes the gateway send
     the requests to the worker the task's route reserved.
     """
+    from .config import split_context
     from .gateway import opencode_provider_config
 
     base_url = settings.gateway_url.rstrip("/")
     if base_url.endswith("/v1"):
         base_url = base_url[:-3]
-    config = opencode_provider_config(base_url, list(models), context=dict(settings.model_context))
+    # The agent's share of the window: the person chatting may use the worker's other slot.
+    config = opencode_provider_config(base_url, list(models),
+                                      context={m: split_context(c)[0] for m, c in settings.model_context.items()})
     config["model"] = f"kite/{model}"
     headers = {}
     if task_tag:
@@ -796,8 +799,12 @@ def fast_apply(workspace: Path, answer: str, context_chars: int = 0, shown: Sequ
         return FastAttempt("declined", answer, declined.group(1).strip()[:300], context_chars=context_chars)
     before = snapshot_tree(workspace)
     fixed: list[str] = []
+    # A block with no file name goes to the one code file the model was shown (a polyglot exercise:
+    # the solution file), as a block for "the file above" would.
+    code_shown = [f for f in shown if not codemap.is_test_path(f)]
     try:
-        files = editblocks.apply(workspace, editblocks.parse(answer), search_tiers(workspace, shown), fixed)
+        files = editblocks.apply(workspace, editblocks.parse(answer, default_path=code_shown[0] if len(code_shown) == 1
+                                                             else ""), search_tiers(workspace, shown), fixed)
         existing_tests = edited_tests(workspace, before, files)
         if existing_tests:
             raise editblocks.EditError(f"sửa test có sẵn ({', '.join(existing_tests)})")
@@ -2296,8 +2303,10 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         # does the same for real tasks): a second agent session costs 5-10 minutes.
         small = (run.fast_path != "passed" and run.agent_status == "ok" and run.test_exit_code == 0
                  and sum(patch_size(_git(workspace, "diff", run.patch_base, before, check=False))) <= SMALL_REVIEW_LINES)
-        if (run.fast_path == "passed" and run.repro == "reproduced" or small) and settings.fast_review \
-                and ask is not None:
+        # A fast fix that passed gets the one-call review even without a reproduction: on the 34 polyglot
+        # exercises (bench v6) the agent review after a passed fast fix ran 9-29 minutes and was thrown
+        # away 5 times out of 7 (it broke the solution), about 1.9 hours of 10.8.
+        if (run.fast_path == "passed" or small) and settings.fast_review and ask is not None:
             # A one-call fix gets a one-call review: approve, or corrections kept only if tests still pass.
             run.review_mode = "one_call"
             log(f"[{task_id}] vòng rà soát (một lần gọi): {model} đọc lại bản sửa theo yêu cầu và chỗ gọi...")

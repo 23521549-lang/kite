@@ -85,12 +85,22 @@ def parse(text: str, default_path: str = "") -> list[EditBlock]:
         while j < len(lines) and not DIVIDER.match(lines[j]):
             search.append(lines[j])
             j += 1
+        if j >= len(lines):
+            raise EditError("an edit block has no ======= line")
         j += 1
-        while j < len(lines) and not TAIL.match(lines[j]):
+        while j < len(lines) and not TAIL.match(lines[j]) and not HEAD.match(lines[j]):
             replace.append(lines[j])
             j += 1
-        if j >= len(lines) or not path:
-            raise EditError("an edit block is not closed or has no file name")
+        if j < len(lines) and HEAD.match(lines[j]):
+            raise EditError("an edit block is not closed (a new one starts before >>>>>>> REPLACE)")
+        if j >= len(lines):
+            # The answer ended before >>>>>>> REPLACE (bench v6: phone-number, zebra-puzzle, beer-song,
+            # book-store lost a fast try to this): the rest of the answer is the replacement, without
+            # the code fence that closed it.
+            while replace and (not replace[-1].strip() or FENCE.match(replace[-1])):
+                replace.pop()
+        if not path:
+            raise EditError("an edit block has no file name (write the file path on the line above <<<<<<< SEARCH)")
         blocks.append(EditBlock(path, "\n".join(search), "\n".join(replace)))
         last_path, i = path, j + 1
     return blocks

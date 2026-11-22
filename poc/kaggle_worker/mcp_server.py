@@ -25,7 +25,7 @@ import urllib.request
 import uuid
 from typing import Any, Awaitable, Callable
 
-from .config import KiteConfig, gateway_models, model_contexts, model_policy_from_config
+from .config import KiteConfig, gateway_models, model_contexts, model_policy_from_config, split_context
 from .journal import Journal, read_jsonl, short
 from .protocol import ScheduledTask
 from .store import SQLiteSchedulerStore, StoreError
@@ -797,7 +797,9 @@ class KiteOps:
                      "detail": c.detail, "fix": c.fix} for c in checks if c.status in (FAIL, WARN)]
         overall = summary(checks)
         return {"status": overall["status"], "fail": overall["fail"], "warn": overall["warn"], "problems": problems,
-                "ok": [c.name for c in checks if c.status == OK]}
+                "ok": [c.name for c in checks if c.status == OK],
+                # Worth saying even when fine; "not connected" of someone else's notebook is not a problem.
+                "gpu_quota": {c.name.removeprefix("quota GPU "): c.detail for c in checks if c.name.startswith("quota GPU")}}
 
     async def cleanup(self, confirm: bool = False, days: float = 7) -> dict:
         """Free disk: the clones, libraries and code maps of tasks and bench runs unchanged for ``days``
@@ -878,6 +880,12 @@ class KiteOps:
                 args += [flag, str(path)]
         if polyglot_count:
             args += ["--polyglot-count", str(int(polyglot_count))]
+        from . import bench
+
+        running = bench.running_bench(self.state_dir)
+        if running is not None:
+            raise KiteToolError(f"đang có một lần đo chạy ({running.get('label')}, từ {running.get('started')}): "
+                                "chờ nó xong rồi đo tiếp")
         if not confirm:
             return {"confirm_needed": True, "command": "kite " + " ".join(args), "out": str(out),
                     "will": "đo chạy nền, dùng GPU Kaggle (R1-R4 khoảng 1 giờ); trong lúc đo đừng cập nhật Kite"}
@@ -1085,8 +1093,8 @@ Trong OpenCode, tool của Kite có tiền tố `kite_`: `start_task`, `task_sta
 
 ## Hệ thống
 
-- Trục trặc (task không chạy, worker không sống, chat chậm bất thường) hoặc người dùng hỏi Kite có ổn không: `doctor`. Vấn đề nào có `fix`: giải thích ngắn, hỏi người dùng, đồng ý thì làm bằng tool tương ứng với `confirm=true`: ổ đĩa đầy → `cleanup`; notebook cũ hoặc worker lỗi → `worker_restart`; có bản Kite mới → `update_kite`. Không gọi với `confirm=true` khi người dùng chưa đồng ý.
-- GPU/worker: `worker_status`. Worker có `launch` thì Kite tự bật notebook khi có việc: `launching`/`starting` là đang bật (5–10 phút); `launch.kaggle` là `queued` là Kaggle đang xếp hàng GPU; `error` thì báo đúng `launch.detail`. Không worker nào sống và không có `launch`: nhắc người dùng bật notebook Kaggle. Task vẫn được giữ và chạy khi worker kết nối.
+- Trục trặc (task không chạy, worker không sống, chat chậm bất thường) hoặc người dùng hỏi Kite có ổn không: `doctor`. Chỉ báo các mục trong `problems` và quota GPU (`gpu_quota`); mục không nằm trong `problems` (kể cả notebook của người khác đang tắt) không phải lỗi, đừng nhắc. Vấn đề nào có `fix`: giải thích ngắn, hỏi người dùng, đồng ý thì làm bằng tool tương ứng với `confirm=true`: ổ đĩa đầy → `cleanup`; notebook cũ hoặc worker lỗi → `worker_restart`; có bản Kite mới → `update_kite`. Không gọi với `confirm=true` khi người dùng chưa đồng ý. Đừng đề xuất lệnh bật notebook của worker không có `launch`: đó là notebook của người khác.
+- GPU/worker: `worker_status`. Worker có `launch` thì Kite tự bật notebook khi có việc: `launching`/`starting` là đang bật; `launch.kaggle` là `queued` là Kaggle đang xếp hàng (có khi hàng giờ): bảo người dùng mở `launch.url` và bấm Save Version, Kaggle thường chạy ngay cách này; `error` thì báo đúng `launch.detail`. Không worker nào sống và không có `launch`: nhắc người dùng bật notebook Kaggle. Task vẫn được giữ và chạy khi worker kết nối.
 - Đo đạc: `bench_start` (hỏi trước, chạy nền, dùng GPU) và `bench_history`.
 
 ## Quy tắc an toàn
@@ -1131,7 +1139,8 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
 
     models = gateway_models(config)
     opencode = opencode_provider_config(f"http://{config.gateway.host}:{config.gateway.port}", models,
-                                        context=model_contexts(config, models))
+                                        context={name: split_context(tokens)[1] for name, tokens
+                                                 in model_contexts(config, models).items()})
     opencode["model"] = f"kite/{lead_model}"
     opencode["small_model"] = f"kite/{lead_model}"
     opencode["mcp"] = {"kite": {"type": "local", "command": list(kite_command), "enabled": True}}

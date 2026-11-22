@@ -51,9 +51,10 @@ def raw_config(tmp_path: Path, *, launch: dict | None = None, second: bool = Fal
 class FakeKaggle:
     """Answers the Kaggle CLI calls the launcher makes and records them."""
 
-    def __init__(self, status: str = "COMPLETE", push_ok: bool = True):
+    def __init__(self, status: str = "COMPLETE", push_ok: bool = True, log: str = ""):
         self.status = status
         self.push_ok = push_ok
+        self.log = log
         self.calls: list[list[str]] = []
         self.envs: list[dict] = []
         self.pushed: dict | None = None
@@ -65,6 +66,8 @@ class FakeKaggle:
         self.envs.append(env)
         if args[:2] == ["kernels", "status"]:
             return 0, f'{args[2]} has status "KernelWorkerStatus.{self.status}"\n'
+        if args[:2] == ["kernels", "logs"]:
+            return 0, self.log
         if args[:2] == ["kernels", "pull"]:
             folder = Path(args[args.index("-p") + 1])
             (folder / "kite-worker.ipynb").write_text("{}")
@@ -138,7 +141,8 @@ def test_a_request_with_no_connected_worker_pushes_the_notebook_with_the_request
     assert "enable_tpu" not in fake.metadata
     values = launch_values(fake.pushed)
     assert values["model"] == "qwen3.6" and values["idle_minutes"] == 30 and values["worker_id"] == "kaggle-han"
-    assert values["gateway_url"] == "https://1-2-3-4.sslip.io:8443" and "token" not in values
+    # Per-launch token by default: Kaggle gives no Secrets to a run pushed through its API.
+    assert values["gateway_url"] == "https://1-2-3-4.sslip.io:8443" and len(values["token"]) >= 32
     assert values["expires"] == 11_000 + 6 * 3600
     state = launcher.status()["kaggle-han"]
     assert state["state"] == "starting" and state["version"] == "12" and state["reason"] == "request"
@@ -192,8 +196,13 @@ def test_a_failed_push_is_reported_and_not_retried_at_once(tmp_path):
 
 def test_while_starting_kite_follows_the_kaggle_run_and_reports_a_stop_at_once(tmp_path):
     async def scenario():
-        fake = FakeKaggle()
-        _config, gateway, launcher, _fake, clock = make(tmp_path, fake=fake)
+        fake = FakeKaggle(log=json.dumps([
+            {"stream_name": "stdout", "time": 90.2, "data": "Kite tự bật notebook: bỏ qua task mẫu.\n"},
+            {"stream_name": "stderr", "time": 93.1, "data": "HTTPError: HTTP Error 400: Bad Request\n"},
+            {"stream_name": "stderr", "time": 93.1, "data": "RuntimeError: Không đọc được Secret KITE_WORKER_TOKEN.\n"},
+            {"stream_name": "stderr", "time": 96.2, "data": "[NbConvertApp] Converting notebook\n"}]))
+        _config, gateway, launcher, _fake, clock = make(
+            tmp_path, fake=fake, launch={"kernel": "hanle/kite-worker", "token": "kaggle-secret"})
         await launcher.wake(model="qwen3.6")
         seen = []
         fake.status = "QUEUED"
@@ -214,22 +223,29 @@ def test_while_starting_kite_follows_the_kaggle_run_and_reports_a_stop_at_once(t
 
     queued, running, stopped = asyncio.run(scenario())
     assert queued["state"] == "starting" and queued["kaggle"] == "queued" and queued["kaggle_seconds"] == 15 * 60
-    assert "xếp hàng GPU cho version 12 (15 phút)" in queued["detail"] and "Run All" in queued["detail"]
+    assert "xếp hàng GPU cho version 12 (15 phút)" in queued["detail"] and "Save Version" in queued["detail"]
+    assert "https://www.kaggle.com/code/hanle/kite-worker/edit" in queued["detail"]
     assert running["kaggle"] == "running" and running["kaggle_seconds"] == 0 and "đang nạp model" in running["detail"]
     assert stopped["state"] == "error" and stopped["kaggle"] == "error" and "per-launch" in stopped["detail"]
+    # The line of the Kaggle log that says why it stopped (version 8, 22 Nov).
+    assert "RuntimeError: Không đọc được Secret KITE_WORKER_TOKEN." in stopped["detail"] and stopped["failures"] == 1
 
 
-def test_a_run_cancelled_on_kaggle_is_reported_without_the_secret_hint(tmp_path):
+def test_a_run_cancelled_on_kaggle_is_not_a_failure(tmp_path):
     async def scenario():
         fake = FakeKaggle()
         _config, _gateway, launcher, _fake, _clock = make(tmp_path, fake=fake)
         await launcher.wake(model="qwen3.6")
         fake.status = "CANCEL_ACKNOWLEDGED"
         await launcher.check_starting()
-        return launcher.status()["kaggle-han"]
+        state = launcher.status()["kaggle-han"]
+        fake.status = "COMPLETE"
+        again = await launcher.wake(model="qwen3.6")          # pushes again when work arrives
+        return state, again
 
-    state = asyncio.run(scenario())
-    assert state["state"] == "error" and "cancel_acknowledged" in state["detail"] and "per-launch" not in state["detail"]
+    state, again = asyncio.run(scenario())
+    assert state["state"] == "idle" and "hủy" in state["detail"] and state["failures"] == 0
+    assert again["state"] == "starting"
 
 
 def test_worker_status_reads_like_a_sentence(tmp_path, capsys, monkeypatch):
@@ -442,7 +458,7 @@ def test_worker_autostart_command_stores_the_token_and_edits_the_config(tmp_path
     token = tmp_path / "secrets" / "kaggle_api_token_kaggle-han"
     assert token.read_text() == "KGAT_new\n" and token.stat().st_mode & 0o777 == 0o600
     saved = json.loads(path.read_text())["providers"][0]
-    assert saved["launch"] == {"kernel": "hanle/kite-worker", "idle_minutes": 45, "token": "kaggle-secret"}
+    assert saved["launch"] == {"kernel": "hanle/kite-worker", "idle_minutes": 45, "token": "per-launch"}
     assert saved["secrets"]["kaggle_api_token"] == f"file:{token.resolve()}"
     assert "KGAT_new" not in json.dumps(report) and report["next"][1] == "kite worker start kaggle-han"
     assert cli.main(["--config", str(path), "worker", "autostart", "kaggle-han", "--kernel", "x/y", "--off"]) == 0
@@ -459,3 +475,89 @@ def test_chat_setup_tells_the_mcp_server_which_model_to_start(tmp_path, capsys):
     capsys.readouterr()
     command = json.loads((chat / "opencode.json").read_text())["mcp"]["kite"]["command"]
     assert command[command.index("--lead-model") + 1] == "qwen3.6"
+
+
+def test_a_long_kaggle_queue_tells_the_person_to_press_save_version_once(tmp_path):
+    # 22 Nov: Kite's push sat 200+ min in Kaggle's queue; "Save Version" pressed on kaggle.com ran at once.
+    told, journal = [], []
+
+    async def scenario():
+        fake = FakeKaggle()
+        _config, gateway, launcher, _fake, clock = make(
+            tmp_path, fake=fake, notify=lambda title, message, **kw: told.append((title, message)),
+            journal=journal.append)
+        await launcher.wake(model="qwen3.6", reason="chat")
+        fake.status = "QUEUED"
+        clock["now"] += 60
+        await launcher.check_starting()
+        assert told == []                                   # a minute: it may still start by itself
+        clock["now"] += 150
+        await launcher.check_starting()
+        clock["now"] += 300
+        await launcher.check_starting()
+        fake.status = "RUNNING"
+        clock["now"] += 60
+        await launcher.check_starting()
+        clock["now"] += 120
+        await gateway.heartbeat("kaggle-han", {"ready": True, "loaded_model": "qwen3.6"})
+        return launcher.status()["kaggle-han"], launcher.wait_note("qwen3.6")
+
+    state, note = asyncio.run(scenario())
+    assert len(told) == 1 and "Save Version" in told[0][1]
+    assert "https://www.kaggle.com/code/hanle/kite-worker/edit" in told[0][1]
+    assert state["state"] == "alive" and state["failures"] == 0
+    events = [(r["event"], r.get("queued_s"), r.get("since_push_s")) for r in journal]
+    assert events == [("push", None, None), ("running", 570, None), ("alive", 570, 690)]
+
+
+def test_after_two_failed_runs_kite_stops_pushing_until_forced(tmp_path):
+    told = []
+
+    async def scenario():
+        fake = FakeKaggle(log="RuntimeError: llama-server thoát sớm\n")
+        _config, _gateway, launcher, _fake, clock = make(
+            tmp_path, fake=fake, notify=lambda title, message, **kw: told.append(message))
+        for _ in range(2):
+            fake.status = "COMPLETE"
+            await launcher.wake(model="qwen3.6")
+            fake.status = "ERROR"
+            await launcher.check_starting()
+            clock["now"] += 601                             # past the retry wait
+        pushes = sum(c[:2] == ["kernels", "push"] for c in fake.calls)
+        blocked = await launcher.wake(model="qwen3.6")
+        fake.status = "COMPLETE"
+        forced = await launcher.wake(model="qwen3.6", force=True)
+        return pushes, blocked, forced, sum(c[:2] == ["kernels", "push"] for c in fake.calls)
+
+    pushes, blocked, forced, after = asyncio.run(scenario())
+    assert pushes == 2 and blocked["state"] == "error" and blocked["failures"] == 2
+    assert "kite worker start kaggle-han --force" in blocked["detail"] and "llama-server thoát sớm" in blocked["detail"]
+    assert forced["state"] == "starting" and after == 3
+    assert len(told) == 2 and all("llama-server thoát sớm" in m for m in told)
+
+
+def test_the_chat_note_says_what_is_happening_and_how_to_start_it_by_hand(tmp_path):
+    async def scenario():
+        fake = FakeKaggle()
+        _config, gateway, launcher, _fake, clock = make(tmp_path, fake=fake)
+        gateway.wait_note = launcher.wait_note
+        gateway.starting = launcher.starting
+        await launcher.wake(model="qwen3.6")
+        fake.status = "QUEUED"
+        clock["now"] += 12 * 60
+        await launcher.check_starting()
+        return gateway.no_worker_note("qwen3.6-fast" if "qwen3.6-fast" in gateway.aliases else "qwen3.6"), \
+            gateway._worker_coming("qwen3.6")
+
+    note, coming = asyncio.run(scenario())
+    assert "Kaggle đang xếp hàng notebook 12 phút" in note
+    assert "https://www.kaggle.com/code/hanle/kite-worker/edit" in note and "Save Version" in note
+    assert coming                                               # queued requests keep waiting meanwhile
+
+
+def test_log_error_line_finds_why_a_run_stopped():
+    from poc.kaggle_worker.launcher import log_error_line
+
+    plain = "Traceback (most recent call last):\n  File x\nPermissionError: gateway rejected the worker token\n"
+    assert log_error_line(plain) == "PermissionError: gateway rejected the worker token"
+    assert log_error_line("[NbConvertApp] Writing 83093 bytes\n") == ""

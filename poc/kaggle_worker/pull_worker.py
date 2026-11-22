@@ -22,13 +22,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any, Callable
 
 # Version of the worker code in the Kaggle notebook: a hash of all its code cells (this line written
 # as ``WORKER_VERSION = ""``). The worker reports it in its heartbeat, so EC2 can tell when a notebook
 # started by hand runs older code than the repository (``kite doctor``, ``kite worker status``).
 # tests/poc/kaggle_worker/test_launcher.py checks it and prints the right value when a cell changes.
-WORKER_VERSION = "024cf8ecfa01"
+WORKER_VERSION = "35e5dd0e37ee"
 
 
 class PullWorker:
@@ -74,6 +75,10 @@ class PullWorker:
         self._busy = threading.Condition()
         self._running = 0
         self._threads: list[threading.Thread] = []
+        # Names this Kaggle session to the gateway: if another session of the same worker is already
+        # connected (a run Kite pushed that Kaggle started after you ran the notebook by hand), the
+        # gateway tells this one to stop instead of letting two sessions take jobs.
+        self.session = uuid.uuid4().hex[:16]
 
     @property
     def slots(self) -> int:
@@ -86,7 +91,7 @@ class PullWorker:
     def _call(self, method: str, url: str, body: Any = None, *, timeout: float = 70,
               auth: bool = True) -> tuple[int, Any]:
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "X-Kite-Session": self.session}
         if auth:
             headers["Authorization"] = f"Bearer {self.token}"
         request = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -117,7 +122,8 @@ class PullWorker:
             raise RuntimeError(f"heartbeat failed: HTTP {status} {body}")
         if isinstance(body, dict) and body.get("stop") and not self._stop.is_set():
             # `kite worker stop` on EC2: finish the current job, then end the session.
-            self.log("Gateway yêu cầu dừng worker (kite worker stop).")
+            self.log("Một phiên Kaggle khác của worker này đang chạy: phiên này dừng."
+                     if body.get("duplicate") else "Gateway yêu cầu dừng worker (kite worker stop).")
             self.draining = True
             self._stop.set()
 
@@ -300,6 +306,10 @@ class PullWorker:
                     continue
                 if status == 401:
                     raise PermissionError("gateway rejected the worker token")
+                if status == 409:
+                    self.log("Một phiên Kaggle khác của worker này đang chạy: phiên này dừng.")
+                    self.draining = True
+                    break
                 if status != 200 or not isinstance(body, dict):
                     self.log(f"GET /worker/jobs trả HTTP {status}: {body}")
                     self._stop.wait(5)

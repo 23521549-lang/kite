@@ -109,6 +109,26 @@ def listeners(output: str) -> list[tuple[str, int]]:
     return found
 
 
+def gpu_quota(p: Probes, command: str, token_file: str) -> tuple[str, str, str]:
+    """(status, detail, fix) from ``kaggle quota -v``: GPU hours left this week (Kaggle CLI 2.x)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="kite-kaggle-") as config_dir:
+        code, output = p.run(["env", f"KAGGLE_CONFIG_DIR={config_dir}", f"KAGGLE_API_TOKEN={token_file}",
+                              command, "quota", "-v"], 60)
+    row = next((line.split(",") for line in output.splitlines() if line.startswith("GPU,")), None)
+    if code != 0 or not row or len(row) < 4:
+        return SKIP, "không đọc được (kaggle CLI cũ chưa có lệnh quota?)", ""
+    remaining, total = row[2].strip(), row[3].strip()
+    refresh = f", làm mới {row[4].strip()[:16]}" if len(row) > 4 and row[4].strip() else ""
+    try:
+        low = float(remaining.rstrip("h")) < 3
+    except ValueError:
+        low = False
+    return (WARN if low else OK), f"còn {remaining} / {total}{refresh}", (
+        "gần hết: bộ đo dài (polyglot ~7–11 giờ) để tuần sau" if low else "")
+
+
 def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = None) -> list[Check]:
     p = probes or default_probes()
     checks: list[Check] = []
@@ -179,6 +199,10 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
                 add(name, OK, f"đang bật trên Kaggle ({launch.get('state')}, {launch.get('seconds')} giây)")
             elif launch:
                 add(name, OK, "chưa chạy; Kite tự bật khi có việc")
+            elif alive or autostart:
+                # Someone else's notebook (one Kaggle account per person) that is simply off: not a
+                # problem while another worker is up or can be started (A1 of the full-test day).
+                add(name, SKIP, "chưa kết nối (không có tự bật; bình thường khi chủ notebook chưa bật)")
             else:
                 add(name, WARN, "chưa kết nối", "mở notebook Kaggle và chạy tới ô Worker mode "
                     f"(hoặc cấu hình tự bật: kite worker autostart {worker.get('worker_id')} --kernel <user>/<slug>)")
@@ -190,6 +214,17 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
         add("kaggle CLI", OK if found else FAIL, command if found else "chưa cài (cần cho tự bật worker)",
             "" if found else '"$(command -v uv || echo ~/.local/bin/uv)" pip install --python .venv/bin/python '
                              '-e ".[codemap,kaggle]"')
+        for provider in pulls:
+            if provider.launch is None:
+                continue
+            wid = provider.effective_worker_id
+            if provider.launch.token == "kaggle-secret":
+                add(f"tự bật {wid}", WARN, "notebook đọc Kaggle Secret, mà Kaggle không gắn Secrets cho bản Kite "
+                    "đẩy qua API (lỗi HTTP 400): bản tự bật sẽ dừng ở ô worker",
+                    f"kite worker autostart {wid} --kernel {provider.launch.kernel} --token per-launch")
+            reference = provider.secrets.get("kaggle_api_token", "")
+            if found and reference.startswith("file:"):
+                add(f"quota GPU {wid}", *gpu_quota(p, command, reference[5:]))
 
     # ---- Temporal
     host, port = _host_port(config.temporal_endpoint, 7233)

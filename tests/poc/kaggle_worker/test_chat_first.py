@@ -190,6 +190,12 @@ def test_machine_tools_ask_first_and_run_detached(tmp_path):
     assert plan["confirm_needed"] and "--label v6" in plan["command"] and "--worker kaggle-han" in plan["command"]
     asyncio.run(ops.bench_start(confirm=True, label="v6", repo_source=str(repo)))
     assert spawned[-1][spawned[-1].index("--out") + 1] == str(ops.state_dir / "bench" / "v6")
+    from poc.kaggle_worker import bench
+
+    lock = bench.acquire_lock(ops.state_dir, label="v6", out=ops.state_dir / "bench" / "v6")
+    with pytest.raises(KiteToolError, match="đang có một lần đo chạy"):      # one run at a time
+        asyncio.run(ops.bench_start(confirm=True, label="v7", repo_source=str(repo)))
+    bench.release_lock(lock)
     listed = asyncio.run(ops.cleanup())
     assert listed["removed"] is False and listed["folders"] == 0
     # An update while a task holds a worker would cut it off.

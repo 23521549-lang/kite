@@ -58,7 +58,9 @@ class ProviderConfig:
 class LaunchConfig:
     kernel: str                         # "<kaggle user>/<notebook slug>" of the owner's worker notebook
     idle_minutes: int = 30              # a notebook Kite started ends after this long without a job
-    token: str = "kaggle-secret"        # or "per-launch": a short-lived token written into the pushed notebook
+    # "per-launch": a short-lived token written into the pushed notebook. "kaggle-secret": the notebook's
+    # Kaggle Secret, which Kaggle does not give a run pushed through its API (HTTP 400, version 8 log).
+    token: str = "per-launch"
     accelerator: str = "NvidiaTeslaT4"  # Kaggle CLI name of "GPU T4 x2"
     max_hours: float = 11.5             # Kaggle ends sessions at 12 h
     model: str | None = None            # model to load first when no request names one
@@ -82,7 +84,7 @@ def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tupl
     idle = launch.get("idle_minutes", 30)
     if not isinstance(idle, int) or isinstance(idle, bool) or not 5 <= idle <= 720:
         raise ConfigError(f"{label}.idle_minutes must be between 5 and 720")
-    token = launch.get("token", "kaggle-secret")
+    token = launch.get("token", "per-launch")
     if token not in LAUNCH_TOKEN_MODES:
         raise ConfigError(f"{label}.token must be one of {', '.join(LAUNCH_TOKEN_MODES)}")
     accelerator = launch.get("accelerator", "NvidiaTeslaT4")
@@ -131,6 +133,20 @@ class GatewayConfig:
 
 
 DEFAULT_CONTEXT = 32768
+
+
+def split_context(total: int) -> tuple[int, int]:
+    """(agent, chat) context budgets for one model window shared by two requests at once.
+
+    A worker serves the person chatting next to one task (llama-server --parallel 2 --kv-unified:
+    both use the same KV cache of ``total`` tokens). OpenCode compacts each conversation before its
+    own limit, so the two limits together must fit the window: the chat keeps 48K, the task's agent
+    the rest (bench v6: two agents at once filled 128K and failed 23 requests). Only the large
+    windows that the notebook shares between two requests are split; smaller ones stay whole.
+    """
+    if total < 98304:
+        return total, total
+    return total - 49152, 49152
 
 
 @dataclass(frozen=True)
