@@ -173,7 +173,7 @@ class SandboxConfig:
     quick_tests: bool = True
     fast_path: bool = True
     fast_review: bool = True
-    fast_retries: int = 1             # more one-call fixes after a failed one, told why it failed (0-3)
+    fast_retries: int = 0             # more one-call fixes after a failed one, told why it failed (0-3)
     fast_parallel: bool = True        # also ask an idle worker that has the model loaded (best-of-N)
 
 
@@ -518,7 +518,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
         quick_tests=_flag(sb.get("quick_tests", True), "sandbox.quick_tests"),
         fast_path=_flag(sb.get("fast_path", True), "sandbox.fast_path"),
         fast_review=_flag(sb.get("fast_review", True), "sandbox.fast_review"),
-        fast_retries=_fast_retries(sb.get("fast_retries", 1)),
+        fast_retries=_fast_retries(sb.get("fast_retries", 0)),
         fast_parallel=_flag(sb.get("fast_parallel", True), "sandbox.fast_parallel"),
     )
 

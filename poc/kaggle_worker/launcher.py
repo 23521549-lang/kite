@@ -135,6 +135,11 @@ class LaunchState:
     pushed_at: float = 0.0         # this start: when the notebook was pushed (0: a run already there)
     running_at: float = 0.0        # this start: when Kaggle first said the run is running
     notified: bool = False         # this start: the person was told to press Save Version
+    # The worker was seen gone after the gateway's first heartbeat window: when it connects again
+    # without a run Kite pushed, someone started it (Save Version on kaggle.com). A worker that only
+    # reconnects after a gateway restart is not counted (22 Nov: version 14, saved by hand after Kite's
+    # version 13 was cancelled, left "connected: 0" in the journal).
+    absent_seen: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def report(self, now: float) -> dict[str, Any]:
@@ -343,9 +348,14 @@ class KaggleLauncher:
                                  since_push_s=round(now - state.pushed_at) if state.pushed_at else None,
                                  queued_s=round((state.running_at or now) - state.pushed_at)
                                  if state.pushed_at else None)
+                elif state.absent_seen:
+                    self._record(state, "alive", by_hand=True)
                 state.state, state.since, state.detail = "alive", now, ""
-                state.failures, state.notified = 0, False
-        elif state.state == "alive":
+                state.failures, state.notified, state.absent_seen = 0, False, False
+            return
+        if self.clock() - self.gateway.started_at >= self.grace_seconds:
+            state.absent_seen = True
+        if state.state == "alive":
             state.state, state.since, state.detail = "idle", self.clock(), "worker đã ngắt kết nối"
 
     def status(self) -> dict[str, dict[str, Any]]:

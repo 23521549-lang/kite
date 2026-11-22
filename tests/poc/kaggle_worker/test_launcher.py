@@ -292,6 +292,53 @@ def test_per_launch_token_is_accepted_until_the_run_ends_and_survives_a_gateway_
     assert values["idle_minutes"] == 20
 
 
+def test_a_run_saved_by_hand_after_kites_was_cancelled_is_journalled(tmp_path):
+    # 22 Nov: version 13 (Kite's push) queued, was cancelled; version 14, saved by hand, connected and
+    # the journal said "connected: 0".
+    journal = []
+
+    async def scenario():
+        fake = FakeKaggle()
+        _config, gateway, launcher, _fake, clock = make(tmp_path, fake=fake, journal=journal.append)
+        await launcher.wake(model="qwen3.6")
+        fake.status = "CANCEL_ACKNOWLEDGED"
+        clock["now"] += 60
+        await launcher.check_starting()
+        fake.status = "RUNNING"
+        clock["now"] += 300
+        await gateway.heartbeat("kaggle-han", {"ready": True, "loaded_model": "qwen3.6"})
+        return launcher.status()["kaggle-han"]
+
+    state = asyncio.run(scenario())
+    assert state["state"] == "alive"
+    assert [(r["event"], r.get("by_hand")) for r in journal] == [
+        ("push", None), ("cancelled", None), ("alive", True)]
+    from poc.kaggle_worker.journal import launch_summary
+
+    summary = launch_summary(journal)
+    assert (summary["pushes"], summary["connected"], summary["connected_by_hand"]) == (1, 0, 1)
+
+
+def test_a_worker_that_reconnects_after_a_gateway_restart_is_not_a_run_by_hand(tmp_path):
+    journal = []
+
+    async def scenario():
+        config = validate_config(raw_config(tmp_path, launch={"kernel": "hanle/kite-worker"}))
+        clock = {"now": 5000.0}
+        gateway = ModelGateway([WorkerAuth("kaggle-han", TOKEN_A, ("qwen3.6", "gemma4-26b"))],
+                               clock=lambda: clock["now"])
+        launcher = KaggleLauncher(config, gateway, state_dir=tmp_path, runner=FakeKaggle(),
+                                  clock=lambda: clock["now"], journal=journal.append)
+        clock["now"] += 5
+        launcher.status()                                   # asked before the old worker came back
+        clock["now"] += 5
+        await gateway.heartbeat("kaggle-han", {"ready": True})
+        return launcher.status()["kaggle-han"]
+
+    state = asyncio.run(scenario())
+    assert state["state"] == "alive" and journal == []
+
+
 def test_restart_grace_waits_for_running_workers_to_reconnect(tmp_path):
     slept = []
 

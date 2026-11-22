@@ -104,9 +104,9 @@ class FakeDocker:
         return next(c for c in self.calls if c[:2] != ["docker", "kill"] and self.kind(c) == kind)
 
 
-def run_task(tmp_path: Path, fake: FakeDocker, task_id: str, **kwargs):
+def run_task(tmp_path: Path, fake: FakeDocker, task_id: str, settings=SETTINGS, **kwargs):
     repo = make_repo(tmp_path)
-    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average", model="qwen3.6",
+    run = sbx.run_task(settings, repo=repo, goal="Sửa average", model="qwen3.6",
                        models=["qwen3.6", "qwen3.6-fast"], small_model="qwen3.6-fast",
                        state_dir=tmp_path / "state", task_id=task_id, runner=fake,
                        log=lambda _m: None, **kwargs)
@@ -337,9 +337,9 @@ def test_sandbox_config_validation_and_settings():
         gateway_host="172.19.0.1", memory="1g", setup_command="pip install -r requirements.txt")))
     assert settings.gateway_url == "http://172.19.0.1:8787/v1" and settings.memory == "1g"
     assert settings.setup_command == "pip install -r requirements.txt" and settings.setup_network == "bridge"
-    assert (settings.fast_retries, settings.fast_parallel) == (1, True)
-    tuned = sandbox_settings_from_config(validate_config(_config(fast_retries=0, fast_parallel=False)))
-    assert (tuned.fast_retries, tuned.fast_parallel) == (0, False)
+    assert (settings.fast_retries, settings.fast_parallel) == (0, True)
+    tuned = sandbox_settings_from_config(validate_config(_config(fast_retries=1, fast_parallel=False)))
+    assert (tuned.fast_retries, tuned.fast_parallel) == (1, False)
     for bad in ({"gateway_host": "127.0.0.1"}, {"gateway_host": "8.8.8.8"}, {"network": "host"},
                 {"memory": "lots"}, {"docker_command": []}, {"setup_network": "host"},
                 {"setup_command": 3}, {"self_review": "yes"}, {"deps_cache": "on"}, {"quick_tests": 1},
@@ -1083,7 +1083,11 @@ def test_a_fix_is_not_disputed_when_it_breaks_a_case_or_fails_without_the_reprod
             ("same", before, 0, "repro_failed"),             # nothing it was meant to fix got better
             ("other", one + "FAILED test_calc.py::test_x - e\n", 0, "repro_failed"),   # another test fails too
             ("suite", one, 1, "repro_failed"),               # the repository's tests fail without the repro
-            ("split", one, 0, "repro_disputed")):
+            ("split", one, 0, "repro_disputed"),
+            # The whole reproduction passes, an existing test fails by name: kept for the agent (v6b R1).
+            ("old", "FAILED test_calc.py::test_old_behaviour - assert 0 == 1\n", 0, "old_tests_failed"),
+            # A test file that does not even import: the code is broken, nothing to keep.
+            ("broken", "ERROR test_calc.py - ImportError\n", 0, "tests_failed")):
         workspace = tmp_path / name
         subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
         runs = []
@@ -1101,7 +1105,37 @@ def test_a_fix_is_not_disputed_when_it_breaks_a_case_or_fails_without_the_reprod
                                run_one=lambda kind, command: (1, before), retries=0)
         assert result.status == status, name
         kept = (workspace / "test_kite_repro.py").exists(), "if xs else 0" in (workspace / "calc.py").read_text()
-        assert kept == ((True, True) if status == "repro_disputed" else (False, False)), name
+        assert kept == ((True, True) if status in ("repro_disputed", "old_tests_failed") else (False, False)), name
+        if status == "old_tests_failed":
+            assert "test_calc.py::test_old_behaviour" in result.note and "sửa test đó theo hành vi mới" in result.note
+
+
+def test_a_fix_that_passes_the_reproduction_but_breaks_an_old_test_stays_for_the_agent(tmp_path):
+    # Bench v6b, R1 (an unknown id answers 404 now): the fix passed the reproduction, the old test that
+    # asserted the old answer failed, and two candidates plus 280 s test runs went to waste before the
+    # agent wrote the fix again from scratch. Now the fix and the test stay; the agent settles the old test.
+    fake = FakeDocker(test_returncodes=[1, 0])
+    logs: list[str] = []
+    repo = make_repo(tmp_path)
+    (repo / "test_calc.py").write_text("from calc import average\n\n\ndef test_empty():\n    assert average([]) == -1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "old behaviour")
+    ask = answers(REPRO, FIX, "ỔN")
+    run = sbx.run_task(SETTINGS, repo=repo, goal="Sửa average trong calc.py cho list rỗng", model="qwen3.6",
+                       models=["qwen3.6"], state_dir=tmp_path / "state", task_id="o1", runner=fake,
+                       log=logs.append, asker=ask)
+    assert [fake.kind(c) for c in fake.calls] == ["repro", "quick", "test", "agent", "quick", "test"]
+    assert run.fast_path == "old_tests_failed" and run.fast_attempts == 1 and run.verified
+    agent = fake.call("agent")[-1]
+    assert "GIỮ nó trong /work" in agent and "test CÓ SẴN của repo lỗi: test_calc.py::test_empty" in agent
+    assert "sửa CODE cho test đó qua lại" in agent and "if xs else 0" in agent
+    # The agent starts from the fix with the reproduction test still in the clone.
+    assert "test_kite_repro.py" in run.changed_files
+    assert [c for c in fake.calls if fake.kind(c) == "quick"][1][-1].startswith(
+        "python -m pytest -q test_calc.py::test_empty")
+    assert any("old_tests_failed (bản 1)" in line and "agent xem các test có sẵn đang lỗi" in line
+               for line in logs)
+    assert "Đây là bước RÀ SOÁT cuối" in ask.prompts[-1] and len(ask.prompts) == 3
 
 
 def test_the_reproduction_test_goes_next_to_the_tests_of_the_named_code(tmp_path):
@@ -1119,9 +1153,12 @@ def test_the_reproduction_test_goes_next_to_the_tests_of_the_named_code(tmp_path
 
 def test_a_fast_fix_that_fails_the_tests_is_dropped_and_the_agent_is_told(tmp_path):
     # Both candidates fail the tests (the second was told why the first failed): the agent takes over.
+    from dataclasses import replace
+
     fake = FakeDocker(test_returncodes=[1, 1, 0])
     prompts = []
-    _, run = run_task(tmp_path, fake, "f2", asker=lambda prompt: prompts.append(prompt) or FIX)
+    _, run = run_task(tmp_path, fake, "f2", replace(SETTINGS, fast_retries=1),
+                      asker=lambda prompt: prompts.append(prompt) or FIX)
     assert [fake.kind(c) for c in fake.calls][:4] == ["test", "test", "agent", "test"]
     assert run.fast_path == "tests_failed" and run.fast_attempts == 2 and run.verified and run.fix_rounds_used == 0
     assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-2] and "ZeroDivisionError" in prompts[-2]
@@ -1137,9 +1174,12 @@ def test_a_fast_fix_that_fails_the_tests_is_dropped_and_the_agent_is_told(tmp_pa
 
 
 def test_a_second_candidate_told_why_the_first_failed_can_still_spare_the_agent(tmp_path):
+    from dataclasses import replace
+
     fake = FakeDocker(test_returncodes=[1, 0])
     prompts = []
-    _, run = run_task(tmp_path, fake, "f3", asker=lambda prompt: prompts.append(prompt) or FIX)
+    _, run = run_task(tmp_path, fake, "f3", replace(SETTINGS, fast_retries=1),
+                      asker=lambda prompt: prompts.append(prompt) or FIX)
     assert run.fast_path == "passed" and run.fast_attempts == 2 and run.verified
     assert [fake.kind(c) for c in fake.calls] == ["test", "test"]     # passed: the one-call review, no agent
     assert "LẦN THỬ TRƯỚC CỦA KITE CHƯA ĐẠT" in prompts[-2] and "RÀ SOÁT cuối" in prompts[-1]
@@ -1148,8 +1188,10 @@ def test_a_second_candidate_told_why_the_first_failed_can_still_spare_the_agent(
 def test_a_retry_after_a_failed_reproduction_never_shows_the_test(tmp_path):
     fake = FakeDocker(quick_returncodes=[1, 1, 0],
                       quick_fail="FAILED test_kite_repro.py::test_empty_list_gives_zero - assert 1 == 0\n1 failed\n")
+    from dataclasses import replace
+
     ask = answers(REPRO, FIX, FIX)
-    _, run = run_task(tmp_path, fake, "f4", asker=ask)
+    _, run = run_task(tmp_path, fake, "f4", replace(SETTINGS, fast_retries=1), asker=ask)
     assert run.fast_path == "repro_failed" and run.fast_attempts == 2
     retry = ask.prompts[2]
     assert "kiểm tra độc lập Kite viết từ yêu cầu vẫn lỗi" in retry and "if xs else 0" in retry   # the tried diff

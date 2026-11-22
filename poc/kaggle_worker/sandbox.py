@@ -124,8 +124,11 @@ class SandboxSettings:
     fast_review: bool = True
     # Best-of-N on the fast path (Harness²-style: several cheap candidates, Kite's tests choose). After a
     # candidate fails, ask again this many times, told why the last one failed (never the reproduction
-    # test itself: the fix stays independent of it).
-    fast_retries: int = 1
+    # test itself: the fix stays independent of it). Off by default: in bench v6, v6b and v6-poly34
+    # (42 tasks) 12 second candidates were asked; 1 passed and held (P-book-store), 1 passed Kite's tests
+    # and failed the exercise's (P-connect), 10 failed again. Each cost a model call and a test run
+    # (R1: 280 s of tests per run), and the agent took the task after them anyway.
+    fast_retries: int = 0
     # With another worker idle on the same model, ask it for a second candidate at the same time.
     fast_parallel: bool = True
     # Context window per served model (aliases included), told to OpenCode; missing models: 32768.
@@ -170,7 +173,7 @@ class SandboxRun:
     check_output_tail: str = ""
     scratch_files: list[str] = field(default_factory=list)  # new files that look like experiments
     # off | skipped | passed | declined | not_applied | tests_failed | check_failed | repro_failed
-    # | repro_disputed (the fix stays in the clone for the agent) | error
+    # | repro_disputed | old_tests_failed (these two: the fix stays in the clone for the agent) | error
     fast_path: str = "off"
     fast_seconds: float = 0.0
     review_mode: str = ""         # agent | one_call
@@ -768,7 +771,8 @@ class FastAttempt:
     files: list[str] = field(default_factory=list)
     context_chars: int = 0
     fixed: list[str] = field(default_factory=list)   # what Kite set right in the blocks (editblocks notes)
-    kept: str = ""              # tree with this candidate and the reproduction test (repro_disputed)
+    kept: str = ""              # tree with this candidate and the reproduction test (repro_disputed,
+    #                             old_tests_failed)
 
 
 def fast_attempt(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: Callable[[str], str],
@@ -819,6 +823,18 @@ def fast_apply(workspace: Path, answer: str, context_chars: int = 0, shown: Sequ
 FAST_REASONS = {"tests_failed": "test của Kite lỗi", "check_failed": "bước kiểm tra lỗi",
                 "not_applied": "không áp được vào code", "repro_failed": "test tái hiện lỗi trên bản sửa"}
 FAILING_NODE = re.compile(r"^(?:FAILED|ERROR) ([\w./-]+\.py)(?:::(\S+))?", re.M)
+
+
+def old_failures(output: str, repro_file: str) -> list[str] | None:
+    """The repository's existing tests that fail while the reproduction test ``repro_file`` passes, as
+    ``file::name``; None when a reproduction case fails too, when a whole file fails (collection: the
+    code is broken, not the behaviour), or when no failing test is named (a crash or a timeout)."""
+    failing = []
+    for file, name in FAILING_NODE.findall(clean_output(output)):
+        if file == repro_file or repro_file.endswith("/" + file) or not name:
+            return None
+        failing.append(f"{file}::{name}")
+    return sorted(set(failing)) or None
 
 
 def failing_tests(output: str, path: str) -> set[str] | None:
@@ -932,7 +948,7 @@ def repro_outcome(code: int, output: str) -> str:
 @dataclass
 class FastResult:
     status: str                 # off | skipped | declined | not_applied | error | tests_failed | check_failed
-    #                             | repro_failed | repro_disputed | passed
+    #                             | repro_failed | repro_disputed | old_tests_failed | passed
     repro: str = "off"          # off | none | broken | not_reproduced | reproduced
     attempts: int = 0           # candidates tried (best-of-N)
     reason: str = ""
@@ -950,6 +966,7 @@ class FastResult:
 
 FAST_STATUS_VI = {"passed": "qua hết test", "tests_failed": "trượt test", "repro_failed": "trượt test tái hiện",
                   "repro_disputed": "qua test của repo, lệch một phần test tái hiện",
+                  "old_tests_failed": "qua test tái hiện, làm lỗi test có sẵn",
                   "check_failed": "trượt bước kiểm tra", "not_applied": "không áp được vào code",
                   "declined": "model nói không sửa được", "skipped": "bỏ qua", "error": "lỗi khi gọi model"}
 
@@ -982,6 +999,14 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
     test, with no retry (a retry told "an independent check still fails" bends a right fix toward a
     wrong test),
     and the agent settles the remaining cases: fix the code, or fix the case that contradicts the goal.
+
+    "old_tests_failed": the candidate turns the whole reproduction green and only existing tests of
+    the repository fail, each one by name. A goal that changes a behaviour (an unknown id now answers
+    404) breaks the tests that asserted the old one, and the fast path may not edit existing tests:
+    bench v6b R1 lost 942 s on two such candidates and the agent then wrote the fix again from scratch,
+    plus the change to the old test that the real fix made too. The candidate is kept with the test and
+    the agent decides for each failing test: the goal changes what it asserts (update it, say so), or
+    the candidate broke something else (fix the code).
     ``progress`` gets one line per finished step (for ``task_status`` while the task runs).
     """
     def note(line: str) -> None:
@@ -1056,6 +1081,10 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
         if code == 0 and check_code in (None, 0):
             return "passed", output, check_code, check_output
         split = disputed(fast, label, output) if code != 0 else None
+        if split is None and code != 0 and result.repro == "reproduced" and old_failures(output, repro_file):
+            fast.kept = snapshot_tree(workspace)          # the candidate and the reproduction test
+            restore_tree(workspace, fast.before)
+            return "old_tests_failed", output, None, ""
         restore_tree(workspace, fast.before)              # also drops the reproduction test
         if split is not None:
             return "repro_disputed", output, split[0], split[1]
@@ -1081,10 +1110,12 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
     else:
         replies = [None]                                   # asked below, through fast_attempt
     last = best = None             # (status, attempt, test output, check code, check output)
-    rank = {"repro_disputed": 4, "tests_failed": 3, "repro_failed": 3, "check_failed": 3, "not_applied": 2}
+    rank = {"repro_disputed": 5, "old_tests_failed": 4, "tests_failed": 3, "repro_failed": 3, "check_failed": 3,
+            "not_applied": 2}
+    kept_for_agent = ("repro_disputed", "old_tests_failed")
     pending = len(replies) + max(0, retries)
     for n in range(1, pending + 1):
-        if n > len(replies) and best and best[0] == "repro_disputed":
+        if n > len(replies) and best and best[0] in kept_for_agent:
             break                         # no blind retry against a test that may be wrong: the agent decides
         if n <= len(replies) and replies[n - 1] is not None:
             reply = replies[n - 1]
@@ -1128,6 +1159,12 @@ def fast_path(workspace: Path, goal: str, graph: codemap.CodeGraph | None, ask: 
         result.check_code, result.check_output = check_code, check_output
         still = failing_tests(output, repro_file) or set()
         result.note = disputed_note(repro_file, fast.diff, output, sorted(originally - still), sorted(still))
+        return result
+    if status == "old_tests_failed":
+        restore_tree(workspace, fast.kept)
+        result.answer, result.files, result.reason = fast.answer, fast.files, fast.reason
+        result.failing_output, result.test_output = output, output
+        result.note = old_tests_note(repro_file, fast.diff, output, old_failures(output, repro_file) or [])
         return result
     if status in ("tests_failed", "repro_failed", "check_failed"):
         if status != "check_failed":
@@ -1279,6 +1316,27 @@ def disputed_note(repro_file: str, diff: str, output: str, fixed: list[str], fai
              "Các file trong bản sửa đã khác phần code in ở trên: đọc lại trước khi sửa tiếp.",
              "Bản sửa đang giữ:", "```diff", diff.strip()[:3000], "```",
              "Kết quả test tái hiện trên bản sửa:", "```", failure_digest(output, 2000).strip(), "```"]
+    return "\n".join(lines)
+
+
+def old_tests_note(repro_file: str, diff: str, output: str, failing: list[str]) -> str:
+    """What the agent hears when a fast fix passes the whole reproduction and breaks existing tests:
+    the fix and the reproduction test stay in /work; each failing test asserts either the behaviour the
+    goal changes or something the fix broke."""
+    lines = ["", f"Kite đã thử một bản sửa nhanh (một lần gọi model) và GIỮ nó trong /work: test tái hiện Kite "
+             f"viết từ yêu cầu, `{repro_file}` (cũng đang ở /work, từng lỗi trên code cũ), nay qua hết; nhưng "
+             f"{len(failing)} test CÓ SẴN của repo lỗi: {', '.join(failing[:12])}"
+             + (f" và {len(failing) - 12} test nữa" if len(failing) > 12 else "") + ".",
+             "Đọc lại yêu cầu rồi, với từng test có sẵn đang lỗi:",
+             "- nếu yêu cầu ĐỔI đúng hành vi mà test đó khẳng định (ví dụ yêu cầu bảo trả 404 mà test cũ chờ 200): "
+             "sửa test đó theo hành vi mới, chỉ sửa chỗ khẳng định hành vi cũ, và nói rõ trong câu trả lời test "
+             "nào đã sửa, vì sao;",
+             "- nếu yêu cầu không nói đổi hành vi đó: bản sửa đã làm hỏng thứ khác; sửa CODE cho test đó qua lại, "
+             "không sửa test.",
+             "Không xóa test, không thêm skip hay xfail. Các file trong bản sửa đã khác phần code in ở trên: đọc lại "
+             "trước khi sửa tiếp.",
+             "Bản sửa đang giữ:", "```diff", diff.strip()[:3000], "```",
+             "Kết quả test trên bản sửa:", "```", failure_digest(output, 2000).strip(), "```"]
     return "\n".join(lines)
 
 
@@ -2242,6 +2300,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                 f"{f' ({fast.reason})' if fast.reason else ''} sau {run.fast_seconds}s"
                 + ("; bỏ qua agent, sang rà soát" if run.fast_path == "passed" else
                    "; giữ bản sửa, agent xem các ca test tái hiện còn lỗi" if run.fast_path == "repro_disputed"
+                   else "; giữ bản sửa, agent xem các test có sẵn đang lỗi" if run.fast_path == "old_tests_failed"
                    else "; chuyển sang agent"))
 
     while run.fast_path != "passed":

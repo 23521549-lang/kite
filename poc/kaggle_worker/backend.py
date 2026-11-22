@@ -73,6 +73,8 @@ FAST_OUTCOMES = {"passed": "bản sửa qua hết test", "tests_failed": "bản 
                  "repro_failed": "bản sửa trượt test tái hiện, chuyển cho agent",
                  "repro_disputed": "bản sửa qua test của repo nhưng lệch một phần test tái hiện, giữ lại để agent "
                                    "xem ca nào sai",
+                 "old_tests_failed": "bản sửa qua test tái hiện nhưng làm lỗi test có sẵn, giữ lại để agent xem test "
+                                     "cũ khẳng định hành vi mà yêu cầu đổi hay bản sửa làm hỏng",
                  "check_failed": "bản sửa trượt bước kiểm tra, chuyển cho agent",
                  "not_applied": "bản sửa không áp được, chuyển cho agent",
                  "declined": "model nói không sửa được trong một lần, chuyển cho agent",

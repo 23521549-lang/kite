@@ -250,7 +250,11 @@ def launch_summary(records: list[dict]) -> dict:
 
     events = Counter(r.get("event") for r in records)
     return {
-        "pushes": events.get("push", 0), "connected": events.get("alive", 0), "failed": events.get("failed", 0),
+        "pushes": events.get("push", 0),
+        "connected": sum(r.get("event") == "alive" and not r.get("by_hand") for r in records),
+        # runs Kite did not push (Save Version pressed on kaggle.com) that connected
+        "connected_by_hand": sum(r.get("event") == "alive" and bool(r.get("by_hand")) for r in records),
+        "failed": events.get("failed", 0),
         "cancelled": events.get("cancelled", 0),
         # pushed -> Kaggle running (its queue); pushed -> worker connected (queue + model load)
         "kaggle_queue": minutes(r.get("queued_s") for r in records if r.get("event") == "running"),
