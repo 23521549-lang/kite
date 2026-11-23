@@ -90,7 +90,7 @@ def test_chat_round_trip_applies_alias_and_forces_non_streaming():
             assert answer.status == 200
             assert (await answer.json())["choices"][0]["message"]["content"] == "xin chào"
             models = await (await client.get("/v1/models")).json()
-            assert {m["id"] for m in models["data"]} == {"qwen3.6", "devstral", "qwen3.6-fast"}
+            assert {m["id"] for m in models["data"]} == {"qwen3.6", "devstral", "qwen3.6-fast", "kite-auto"}
     asyncio.run(scenario())
 
 

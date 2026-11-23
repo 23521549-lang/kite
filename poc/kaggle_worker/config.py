@@ -15,8 +15,8 @@ class ConfigError(ValueError):
 
 
 # "pull" = a worker that long-polls the Kite gateway (for example a Kaggle notebook).
-ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
-_BUILTIN_ADAPTERS = {"opencode", "harness2", "kaggle", "pull"}
+ADAPTERS = {"opencode", "harness2", "kaggle", "pull", "relay"}
+_BUILTIN_ADAPTERS = {"opencode", "harness2", "kaggle", "pull", "relay"}
 _ID = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 _CAPABILITY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -43,6 +43,8 @@ class ProviderConfig:
     models: tuple[str, ...] = ()
     # Autostart (pull workers on Kaggle): Kite runs the owner's notebook when work arrives. See launcher.py.
     launch: "LaunchConfig | None" = None
+    # Adapter "relay": Kite calls the provider itself (paid API, a server by URL). See relay.py.
+    relay: "RelayConfig | None" = None
 
     @property
     def model_ids(self) -> tuple[str, ...]:
@@ -52,6 +54,68 @@ class ProviderConfig:
     @property
     def effective_worker_id(self) -> str:
         return self.worker_id or self.id
+
+
+@dataclass(frozen=True)
+class RelayConfig:
+    kind: str                            # openai (any OpenAI-compatible API) | anthropic
+    base_url: str
+    upstream: tuple[tuple[str, str], ...] = ()     # (Kite model name, the provider's model name)
+    price_in: float = 0.0                # USD per million prompt tokens (0: free, e.g. your own server)
+    price_out: float = 0.0               # USD per million completion tokens
+    daily_cap: float | None = None       # USD; at the cap the worker stops taking jobs until 00:00 UTC
+    monthly_cap: float | None = None     # USD; until the 1st (UTC)
+    timeout: float = 600.0
+
+
+_PRIVATE_HOST = re.compile(r"^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|"
+                           r"172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|host\.docker\.internal)$")
+
+
+def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]) -> RelayConfig:
+    from urllib.parse import urlparse
+
+    r = _mapping(raw, where)
+    unknown = set(r) - {"kind", "base_url", "upstream", "price", "caps", "timeout_seconds"}
+    if unknown:
+        raise ConfigError(f"{where} has unsupported fields: {', '.join(sorted(unknown))}")
+    kind = r.get("kind")
+    if kind not in ("openai", "anthropic"):
+        raise ConfigError(f"{where}.kind must be openai or anthropic")
+    base_url = r.get("base_url") or ("https://api.anthropic.com" if kind == "anthropic" else None)
+    url = urlparse(base_url) if isinstance(base_url, str) else None
+    if url is None or url.scheme not in ("https", "http") or not url.hostname:
+        raise ConfigError(f"{where}.base_url must be an http(s) URL")
+    if url.scheme == "http" and not _PRIVATE_HOST.match(url.hostname):
+        raise ConfigError(f"{where}.base_url must use https outside this machine and private networks "
+                          "(the API key would travel in clear text)")
+    if kind == "anthropic" and not secrets.get("api_key"):
+        raise ConfigError(f"{where}: Anthropic needs secrets.api_key")
+    upstream = _mapping(r.get("upstream", {}), f"{where}.upstream")
+    for name, target in upstream.items():
+        if name not in models:
+            raise ConfigError(f"{where}.upstream names {name}, which is not one of this provider's models")
+        if not isinstance(target, str) or not target.strip() or len(target) > 200:
+            raise ConfigError(f"{where}.upstream.{name} must be the provider's model name")
+    price = _mapping(r.get("price", {}), f"{where}.price")
+    caps = _mapping(r.get("caps", {}), f"{where}.caps")
+    numbers = {}
+    for key, value in (("price_in", price.get("input", 0)), ("price_out", price.get("output", 0)),
+                       ("daily_cap", caps.get("daily_usd")), ("monthly_cap", caps.get("monthly_usd")),
+                       ("timeout", r.get("timeout_seconds", 600))):
+        if value is None:
+            numbers[key] = None
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ConfigError(f"{where}: {key} must be a non-negative number")
+        numbers[key] = float(value)
+    if set(price) - {"input", "output"} or set(caps) - {"daily_usd", "monthly_usd"}:
+        raise ConfigError(f"{where}: price takes input/output, caps take daily_usd/monthly_usd")
+    if not numbers["timeout"] or numbers["timeout"] > 3600:
+        raise ConfigError(f"{where}.timeout_seconds must be between 1 and 3600")
+    return RelayConfig(kind, base_url.rstrip("/"), tuple((k, v.strip()) for k, v in upstream.items()),
+                       numbers["price_in"], numbers["price_out"], numbers["daily_cap"], numbers["monthly_cap"],
+                       numbers["timeout"])
 
 
 @dataclass(frozen=True)
@@ -282,7 +346,7 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
     for i, item in enumerate(providers_raw):
         p = _mapping(item, f"providers[{i}]")
         unknown_keys = set(p) - {"id", "adapter", "enabled", "model", "capabilities", "quota", "secrets",
-                                 "owner", "worker_id", "roles", "models", "launch"}
+                                 "owner", "worker_id", "roles", "models", "launch", "relay"}
         if unknown_keys:
             raise ConfigError(f"providers[{i}] has unsupported fields")
         pid, adapter, model = p.get("id"), p.get("adapter"), p.get("model")
@@ -333,9 +397,16 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
                 raise ConfigError(f"providers[{i}].launch is only for adapter 'pull'")
             all_models = (model, *[m for m in extra_models if m != model])
             launch = _validate_launch(p["launch"], f"providers[{i}].launch", secrets, all_models)
+        relay = None
+        if adapter == "relay":
+            relay = _validate_relay(p.get("relay"), f"providers[{i}].relay", secrets,
+                                    (model, *[m for m in extra_models if m != model]))
+        elif p.get("relay") is not None:
+            raise ConfigError(f"providers[{i}].relay is only for adapter 'relay'")
         providers.append(ProviderConfig(
             pid, adapter, enabled, model, tuple(caps), seconds, concurrency, dict(secrets),
             owner=owner, worker_id=worker_id, roles=tuple(roles), models=tuple(extra_models), launch=launch,
+            relay=relay,
         ))
     worker_ids = [p.effective_worker_id for p in providers]
     if len(set(worker_ids)) != len(worker_ids):
@@ -560,20 +631,24 @@ def resolve_secret(reference: str) -> str:
 
 
 def gateway_workers(config: KiteConfig) -> list:
-    """WorkerAuth entries for every enabled provider that uses adapter ``pull``."""
+    """WorkerAuth entries for every enabled provider that uses adapter ``pull`` or ``relay``. A relay
+    worker runs inside the gateway and never authenticates over HTTP: its token is a random one."""
     from .gateway import WorkerAuth
+    from .relay import internal_token
 
     return [
-        WorkerAuth(p.effective_worker_id, resolve_secret(p.secrets["worker_token"]), p.model_ids)
-        for p in config.providers if p.adapter == "pull" and p.enabled
+        WorkerAuth(p.effective_worker_id,
+                   resolve_secret(p.secrets["worker_token"]) if p.adapter == "pull" else internal_token(),
+                   p.model_ids)
+        for p in config.providers if p.adapter in ("pull", "relay") and p.enabled
     ]
 
 
 def gateway_models(config: KiteConfig) -> list[str]:
-    """Model names the gateway serves: base models of enabled pull workers, then usable aliases."""
+    """Model names the gateway serves: base models of enabled pull and relay workers, then usable aliases."""
     base: list[str] = []
     for p in config.providers:
-        if p.adapter == "pull" and p.enabled:
+        if p.adapter in ("pull", "relay") and p.enabled:
             base.extend(m for m in p.model_ids if m not in base)
     return base + [name for name, spec in config.gateway.aliases.items() if spec["model"] in base]
 

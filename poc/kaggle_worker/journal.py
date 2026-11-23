@@ -25,7 +25,7 @@ import time
 from typing import Any, Callable, Iterable
 
 TAG = re.compile(r"[A-Za-z0-9._:-]{1,120}")
-FILES = ("gateway", "tasks", "actions", "notes", "launches")
+FILES = ("gateway", "tasks", "actions", "notes", "launches", "spend")
 
 
 def clean_tag(value: str | None) -> str | None:
@@ -186,6 +186,7 @@ def summarize(journal: Journal, *, since: float | None = None) -> dict:
     actions = journal.read("actions", since)
     requests = journal.read("gateway", since)
     notes = journal.read("notes", since)
+    spend = journal.read("spend", since)
 
     def group(key: str) -> dict:
         out = {}
@@ -220,6 +221,7 @@ def summarize(journal: Journal, *, since: float | None = None) -> dict:
                 for r in runs if task_reason(r) not in ("verified", "done")][-10:],
         },
         "autostart": launch_summary(launches),
+        "spend": spend_summary(spend),
         "lead_agent": {"tool_calls": dict(Counter(a.get("tool") for a in actions)),
                        "tool_errors": dict(tool_errors)},
         "gateway": {
@@ -238,6 +240,19 @@ def summarize(journal: Journal, *, since: float | None = None) -> dict:
             } for model, items in sorted(by_model.items())},
         },
     }
+
+
+def spend_summary(records: list[dict]) -> dict:
+    """What the paid workers (relay.py) cost: USD, requests and tokens per worker."""
+    out: dict[str, dict] = {}
+    for record in records:
+        worker = str(record.get("worker"))
+        entry = out.setdefault(worker, {"usd": 0.0, "requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        entry["usd"] = round(entry["usd"] + float(record.get("usd") or 0), 6)
+        entry["requests"] += 1
+        entry["prompt_tokens"] += int(record.get("prompt_tokens") or 0)
+        entry["completion_tokens"] += int(record.get("completion_tokens") or 0)
+    return out
 
 
 def launch_summary(records: list[dict]) -> dict:

@@ -99,6 +99,12 @@ class Job:
 CONTEXT_FULL = ("context size has been exceeded", "exceeds the available context size")
 
 
+# A request for this model goes to whichever worker is free, whatever model it runs (the owner's
+# choice on 23 Nov: "whichever worker is idle"); the worker that takes it answers with its own model,
+# and the rest of that task or conversation stays on it.
+ANY_MODEL = "kite-auto"
+
+
 def starts_a_worker(tag: str | None) -> bool:
     """Requests that may start a Kaggle notebook (autostart) when no worker serves them: the person's
     chat in OpenCode (tag ``chat``) and the tasks it started (``chat-...``, best-of-N helpers too).
@@ -176,6 +182,10 @@ class ModelGateway:
         # start it by hand). None: a built-in sentence.
         self.wait_note = wait_note
         self.started_at = clock()
+        # Workers that cost money per token or per hour (relay workers with a price). While a free
+        # worker that can take a job is up, a paid one leaves the job alone for free_first_seconds.
+        self.paid: set[str] = set()
+        self.free_first_seconds = 5.0
         self.jobs: dict[str, Job] = {}
         self._queue: list[str] = []
         self._changed = asyncio.Event()
@@ -238,6 +248,10 @@ class ModelGateway:
         if not isinstance(requested, str) or not requested.strip():
             return None
         model, _params = self.resolve_model(requested)
+        if model == ANY_MODEL:
+            return None if self.serving(model) else (
+                "Chưa có worker nào đang bật nên chưa trả lời được. Bật một worker (Kaggle hoặc API) "
+                "rồi nhắn lại.")
         if not any(model in w.model_ids for w in self.workers.values()) or self.serving(model):
             return None
         if self.on_demand is not None:
@@ -275,11 +289,16 @@ class ModelGateway:
 
     def serving(self, model: str) -> bool:
         """A connected worker that may serve ``model`` exists (it may still be loading a model)."""
-        return any(model in w.model_ids and self.present(w.worker_id) for w in self.workers.values())
+        return any((model == ANY_MODEL or model in w.model_ids) and self.present(w.worker_id)
+                   for w in self.workers.values())
+
+    @staticmethod
+    def _serves(worker: WorkerState, model: str) -> bool:
+        return model == ANY_MODEL or model in worker.model_ids
 
     def served_models(self) -> list[str]:
         base = sorted({m for w in self.workers.values() for m in w.model_ids})
-        return base + sorted(a for a, alias in self.aliases.items() if alias.base_model in base)
+        return base + sorted(a for a, alias in self.aliases.items() if alias.base_model in base) + [ANY_MODEL]
 
     def resolve_model(self, requested: str) -> tuple[str, dict[str, Any]]:
         alias = self.aliases.get(requested)
@@ -301,7 +320,7 @@ class ModelGateway:
         if not isinstance(requested, str) or not requested.strip():
             raise GatewayError("request must name a model")
         model, params = self.resolve_model(requested)
-        if not any(model in w.model_ids for w in self.workers.values()):
+        if model != ANY_MODEL and not any(model in w.model_ids for w in self.workers.values()):
             raise GatewayError(f"no configured worker serves model {requested}")
         forwarded = {**body, **params, "model": model, "stream": False}
         forwarded.pop("stream_options", None)
@@ -312,7 +331,7 @@ class ModelGateway:
         self.jobs[job.job_id] = job
         self._queue.append(job.job_id)
         self._notify()
-        if self.on_demand is not None and not self.serving(model) and starts_a_worker(tag):
+        if self.on_demand is not None and model != ANY_MODEL and not self.serving(model) and starts_a_worker(tag):
             try:
                 self.on_demand(model)
             except Exception as exc:          # starting a worker must never fail the request
@@ -397,6 +416,21 @@ class ModelGateway:
                 return (holder is None or holder.draining or not self._alive(holder, now)
                         or holder.worker_id in self.stop_requested)
             owner = self.affinity.get(job.tag) if job.pinned is None and job.tag else None
+            if owner and owner != worker.worker_id and job.tag != "chat":
+                holder = self.workers.get(owner)
+                if (holder is not None and not holder.draining and self._alive(holder, now)
+                        and holder.worker_id not in self.stop_requested and self._serves(holder, job.model)):
+                    # A task keeps the worker that took its first request: each worker may run another
+                    # model, and switching in the middle changes the answers. It moves only when that
+                    # worker is gone, stopped, or out of quota (not ready).
+                    return False
+            if worker.worker_id in self.paid and owner != worker.worker_id \
+                    and now - job.created_at < self.free_first_seconds and any(
+                    other.worker_id not in self.paid and other.worker_id != worker.worker_id
+                    and self._alive(other, now) and not other.draining and other.worker_id not in self.stop_requested
+                    and self._serves(other, job.model) and len(other.current_jobs) < other.slots
+                    for other in self.workers.values()):
+                return False            # a free worker can take it: do not spend money on it
             if owner and owner != worker.worker_id and now - job.created_at < self.affinity_seconds:
                 holder = self.workers.get(owner)
                 if (holder is not None and not holder.draining and self._alive(holder, now)
@@ -408,7 +442,7 @@ class ModelGateway:
         task_running = any(not job.is_chat for job in running)
         alone = any(job.exclusive for job in running)
         # A request waiting to run alone: let this worker empty out instead of starting more next to it.
-        alone_waiting = any(self.jobs[j].exclusive and self.jobs[j].model in worker.model_ids for j in self._queue)
+        alone_waiting = any(self.jobs[j].exclusive and self._serves(worker, self.jobs[j].model) for j in self._queue)
 
         def fits(job: Job) -> bool:
             """A busy worker's other slot: same model (no swap), never next to a request that must run
@@ -417,18 +451,19 @@ class ModelGateway:
             v6: 23 'Context size has been exceeded' in half an hour, two bench runs at once)."""
             if not busy:
                 return True
-            if alone or alone_waiting or job.exclusive or job.model != worker.loaded_model:
+            if alone or alone_waiting or job.exclusive or (job.model != worker.loaded_model
+                                                            and job.model != ANY_MODEL):
                 return False
             return job.is_chat or not task_running
 
         candidates = [self.jobs[j] for j in self._queue
-                      if self.jobs[j].model in worker.model_ids and allowed(self.jobs[j]) and fits(self.jobs[j])]
+                      if self._serves(worker, self.jobs[j].model) and allowed(self.jobs[j]) and fits(self.jobs[j])]
         # The person chatting is waiting; a task's request can wait one turn. A request that already
         # failed for lack of room next to another one goes before both. Stable sort keeps age order.
         candidates.sort(key=lambda job: (not job.exclusive, not job.is_chat))
         if not candidates:
             return None
-        loaded = [j for j in candidates if j.model == worker.loaded_model]
+        loaded = [j for j in candidates if j.model in (worker.loaded_model, ANY_MODEL)]
         if loaded:
             return loaded[0]
         # Do not make a worker switch models while another live worker already has that model loaded
@@ -456,6 +491,10 @@ class ModelGateway:
                 job = self._pick_job(worker, busy=bool(worker.current_jobs))
                 if job is not None:
                     self._queue.remove(job.job_id)
+                    if job.model == ANY_MODEL:      # this worker answers with its own model
+                        job.model = (worker.loaded_model if worker.loaded_model in worker.model_ids
+                                     else worker.model_ids[0])
+                        job.body["model"] = job.model
                     job.worker_id = worker_id
                     job.assigned_at = self.clock()
                     if job.tag:

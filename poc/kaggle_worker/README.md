@@ -205,6 +205,22 @@ One task at a time per worker: the second request slot (`--parallel 2 --kv-unifi
 
 Streaming: when a client asks for `stream: true` (OpenCode always does), the worker reads the answer from llama-server as it is generated and posts its chunks to `POST /worker/jobs/<id>/chunks` about twice a second; the gateway passes them on as SSE, so the chat shows the model's thinking and answer as they come instead of all at once at the end. If the person closes the chat, the gateway refuses the next batch and the worker stops generating. A streamed answer is never retried on another worker (the client already has part of it): a worker that dies mid-answer ends the request with an error. A notebook without streaming (imported before this change) still works: its whole answer is replayed as before. Re-import `kaggle_model_worker.ipynb` to get streaming.
 
+### API workers (Kite calls the provider)
+
+A worker can also be an API Kite calls itself (`adapter: relay`, see `relay.py`): any OpenAI-compatible `/chat/completions` (OpenAI, OpenRouter, Groq, DeepSeek, Gemini's compatible endpoint, vLLM, Ollama, llama-server) or Anthropic's Messages API. It takes jobs from the same queue as the Kaggle workers, so routing, the journal and per-task stickiness work the same.
+
+```sh
+kite worker add-api openrouter --kind openai --base-url https://openrouter.ai/api/v1 \
+  --model gpt=openai/gpt-5-mini --price-in 0.25 --price-out 2 --daily-cap 1 --monthly-cap 10
+# asks for the API key without echo, stores it in secrets/api_key_openrouter (0600)
+sudo systemctl restart kite-gateway
+kite worker spend
+```
+
+`--model NAME=PROVIDER_MODEL` gives the name Kite uses and the provider's own name. Prices are USD per million tokens; every answer's token usage is priced into the journal (`spend`) and shown by `kite worker spend`, `kite journal summary` and `kite doctor`. At its daily or monthly cap (UTC) a worker stops taking jobs, the others take them, and ntfy tells you once. Arguments only llama-server knows (`top_k`, `min_p`, `chat_template_kwargs`...) are not sent to an OpenAI-style API. A key is required for Anthropic and for any API outside this machine; plain `http` is accepted only for this machine and private networks.
+
+Routing between workers: a free worker gets a request first (a paid one waits 5 s for it); a task keeps the worker that took its first request until that worker is gone, stopped or at its cap; the model name `kite-auto` goes to any free worker, which answers with its own model.
+
 ### Adding a model, chat-only models
 
 A model the workers should serve must be in the notebook's `ROSTER`, with its dataset attached to each worker's notebook. Then:

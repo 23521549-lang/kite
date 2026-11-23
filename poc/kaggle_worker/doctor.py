@@ -136,9 +136,26 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
     state_dir = Path(config_path).parent
     pulls = [pr for pr in config.providers if pr.adapter == "pull" and pr.enabled]
     autostart = [pr.effective_worker_id for pr in pulls if pr.launch is not None]
+    relays = [pr for pr in config.providers if pr.adapter == "relay" and pr.enabled and pr.relay is not None]
 
     add("cấu hình", OK, f"{config_path}: {len(pulls)} worker ({', '.join(pr.effective_worker_id for pr in pulls) or 'không có'})"
-        + (f"; tự bật: {', '.join(autostart)}" if autostart else ""))
+        + (f"; tự bật: {', '.join(autostart)}" if autostart else "")
+        + (f"; worker API: {', '.join(pr.effective_worker_id for pr in relays)}" if relays else ""))
+    if relays:
+        from .journal import Journal
+        from .relay import SpendLedger
+
+        ledger = SpendLedger(Journal(state_dir / "journal").read("spend"))
+        for provider in relays:
+            r = provider.relay
+            day, month = ledger.spent(provider.effective_worker_id)
+            caps = [(day, r.daily_cap, "hôm nay"), (month, r.monthly_cap, "tháng này")]
+            near = [f"{spent:.2f}/{cap:.2f} USD {when}" for spent, cap, when in caps if cap and spent >= 0.8 * cap]
+            detail = f"{r.kind} {r.base_url}; đã chi {day:.2f} USD hôm nay, {month:.2f} USD tháng này" + (
+                f" (hạn mức {r.daily_cap or '-'}/ngày, {r.monthly_cap or '-'}/tháng)" if r.daily_cap or r.monthly_cap
+                else ("" if not (r.price_in or r.price_out) else "; chưa đặt hạn mức chi"))
+            add(f"worker API {provider.effective_worker_id}", WARN if near else OK, detail,
+                f"gần hoặc chạm hạn mức ({', '.join(near)}): nâng caps trong config hoặc chờ làm mới" if near else "")
 
     # ---- secrets: present, private
     for provider in config.providers:
@@ -166,7 +183,7 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
     # ---- gateway and workers
     gateway_url = f"http://{config.gateway.host}:{config.gateway.port}"
     status: dict | None = None
-    if pulls:
+    if pulls or relays:
         try:
             status = p.http_json(gateway_url + "/status", 5)
         except Exception as exc:

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 
 from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers, load_config,
                      model_contexts, model_policy_from_config, redact_config, refresh_configured_providers,
@@ -193,6 +194,23 @@ def _parser() -> argparse.ArgumentParser:
     restart.add_argument("worker_id")
     restart.add_argument("--model", default=None, help="model to load first")
     restart.add_argument("--wait-minutes", type=float, default=20, help="how long to wait for the session to end")
+    add_api = worker_commands.add_parser(
+        "add-api", help="add a worker Kite calls itself: an OpenAI-compatible API (OpenAI, OpenRouter, Groq, "
+                        "DeepSeek, Gemini, vLLM, Ollama...) or Anthropic; asks for the API key without echo")
+    add_api.add_argument("worker_id", help="new worker id, e.g. openrouter (lowercase, digits, '-')")
+    add_api.add_argument("--kind", choices=["openai", "anthropic"], required=True)
+    add_api.add_argument("--base-url", default=None,
+                         help="the API's base URL, e.g. https://openrouter.ai/api/v1 (Anthropic: its default)")
+    add_api.add_argument("--model", action="append", required=True, metavar="NAME[=PROVIDER_MODEL]",
+                         help="a model this worker serves, under the name Kite uses; '=...' gives the provider's "
+                              "own name (repeat for more models)")
+    add_api.add_argument("--price-in", type=float, default=0.0, help="USD per million prompt tokens (0: free)")
+    add_api.add_argument("--price-out", type=float, default=0.0, help="USD per million completion tokens")
+    add_api.add_argument("--daily-cap", type=float, default=None, help="USD per day; then the worker stops")
+    add_api.add_argument("--monthly-cap", type=float, default=None, help="USD per month; then the worker stops")
+    add_api.add_argument("--concurrency", type=int, default=2, help="requests at once (default 2)")
+    add_api.add_argument("--no-key", action="store_true", help="the API needs no key (a server on this machine)")
+    worker_commands.add_parser("spend", help="what each API worker cost today and this month, against its caps")
     worker_status = worker_commands.add_parser("status", help="connected workers and autostart state "
                                                               "(from the gateway)")
     worker_status.add_argument("--json", action="store_true", help="the gateway's full report")
@@ -320,6 +338,76 @@ def _worker_add(args: argparse.Namespace) -> int:
                     "kite provider sync",
                     "sudo systemctl restart kite-gateway kite-workflow-worker",
                     "Kaggle account mới: chia sẻ 7 dataset, Secrets KITE_WORKER_TOKEN = token vừa in, chạy ô Worker"]})
+    return 0
+
+
+def _worker_add_api(args: argparse.Namespace) -> int:
+    """Add a relay provider (relay.py) and keep its API key in a 0600 file; backup + validate."""
+    import yaml
+
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    providers = raw.get("providers") or []
+    if any(args.worker_id in (p.get("id"), p.get("worker_id")) for p in providers):
+        raise ConfigError(f"worker {args.worker_id} already exists")
+    names, upstream = [], {}
+    for item in args.model:
+        name, _, target = item.partition("=")
+        names.append(name.strip())
+        if target.strip():
+            upstream[name.strip()] = target.strip()
+    relay: dict = {"kind": args.kind, "price": {"input": args.price_in, "output": args.price_out}}
+    if args.base_url:
+        relay["base_url"] = args.base_url
+    if upstream:
+        relay["upstream"] = upstream
+    caps = {k: v for k, v in (("daily_usd", args.daily_cap), ("monthly_usd", args.monthly_cap)) if v is not None}
+    if caps:
+        relay["caps"] = caps
+    provider = {"id": args.worker_id, "adapter": "relay", "enabled": True, "owner": "self", "model": names[0],
+                "models": names[1:], "capabilities": ["coding"],
+                "quota": {"gpu_seconds": 0, "concurrency": args.concurrency}, "secrets": {}, "relay": relay}
+    key_path = args.config.parent / "secrets" / f"api_key_{args.worker_id}"
+    report: dict[str, object] = {"added": args.worker_id, "kind": args.kind, "models": names}
+    if not args.no_key:
+        provider["secrets"]["api_key"] = f"file:{key_path}"
+    raw["providers"] = [*providers, provider]
+    validate_config(raw)                      # before asking for the key: a typo costs nothing
+    if not args.no_key:
+        if key_path.exists():
+            report["key"] = f"dùng lại {key_path}"
+        else:
+            value = getpass.getpass(f"API key cho {args.worker_id} (không hiện ra màn hình): ").strip()
+            if not value:
+                raise ConfigError("key is empty")
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            os.chmod(key_path.parent, 0o700)
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(value + "\n")
+            report["key"] = f"đã lưu {key_path} (0600)"
+    report["backup"] = str(_save_config(args.config, raw))
+    if (args.price_in or args.price_out) and not caps:
+        report["warning"] = "worker trả tiền chưa có hạn mức chi: thêm --daily-cap / --monthly-cap khi tạo lại"
+    report["next"] = ["sudo systemctl restart kite-gateway", "kite worker status", "kite worker spend"]
+    _emit(report)
+    return 0
+
+
+def _worker_spend(args: argparse.Namespace) -> int:
+    from .relay import SpendLedger
+
+    config = _load_operator_config(args)
+    ledger = SpendLedger(Journal(args.config.parent / "journal").read("spend"))
+    rows = []
+    for p in config.providers:
+        if p.adapter != "relay" or p.relay is None:
+            continue
+        day, month = ledger.spent(p.effective_worker_id)
+        rows.append({"worker": p.effective_worker_id, "enabled": p.enabled, "kind": p.relay.kind,
+                     "today_usd": round(day, 4), "daily_cap": p.relay.daily_cap,
+                     "month_usd": round(month, 4), "monthly_cap": p.relay.monthly_cap,
+                     "price_per_mtok": {"input": p.relay.price_in, "output": p.relay.price_out}})
+    _emit({"workers": rows, "note": "giờ UTC; số tiền tính từ token mỗi câu trả lời nhân giá bạn nhập"})
     return 0
 
 
@@ -616,7 +704,7 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
 
     workers = gateway_workers(config)
     if not workers:
-        raise ConfigError("no enabled provider uses adapter 'pull'")
+        raise ConfigError("no enabled provider uses adapter 'pull' or 'relay'")
     store = SQLiteSchedulerStore(_db_path(args), model_policy=model_policy_from_config(config))
     temporal: dict[str, object] = {"client": None}
 
@@ -668,6 +756,16 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
         gateway.starting = launcher.starting
         gateway.wait_note = launcher.wait_note
         watcher = asyncio.get_running_loop().create_task(launcher.watch())   # noqa: F841 (kept alive)
+    # Workers Kite calls itself (relay.py): paid APIs, servers by URL. They take jobs from the same queue.
+    from .relay import RelayWorker, SpendLedger, relay_specs
+
+    specs = relay_specs(config)
+    gateway.paid = {spec.worker_id for spec in specs if spec.paid}
+    journal = Journal(args.config.parent / "journal")
+    ledger = SpendLedger(journal.read("spend"))
+    relay_tasks = [asyncio.get_running_loop().create_task(  # noqa: F841 (kept alive)
+        RelayWorker(spec, gateway, ledger, notify=_notifier(config), journal=journal.write).run())
+        for spec in specs]
     runner = web.AppRunner(create_app(gateway, launcher=launcher))
     await runner.setup()
     hosts = [config.gateway.host]
@@ -685,6 +783,7 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
     _emit({"listening": [f"http://{h}:{config.gateway.port}" for h in hosts],
            "public_url": config.gateway.public_url,
            "workers": [w.worker_id for w in workers], "models": gateway.served_models(),
+           "api_workers": [spec.worker_id for spec in specs],
            "autostart": sorted(launcher.states) if launcher else []})
     sys.stdout.flush()
     try:
@@ -1259,6 +1358,10 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _worker_add(args)
     if args.command == "worker" and args.worker_command == "autostart":
         return _worker_autostart(args)
+    if args.command == "worker" and args.worker_command == "add-api":
+        return _worker_add_api(args)
+    if args.command == "worker" and args.worker_command == "spend":
+        return _worker_spend(args)
     if args.command == "worker" and args.worker_command == "restart":
         return _worker_restart(args)
     if args.command == "worker" and args.worker_command in ("start", "stop", "status"):
