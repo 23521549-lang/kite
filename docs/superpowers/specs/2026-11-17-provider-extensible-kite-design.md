@@ -1,6 +1,6 @@
 # Provider-Extensible Kite Coding System — Design Spec
 
-**Status:** Approved architecture  
+**Status:** Approved architecture; partly updated by `2026-11-23-kite-web-provider-design.md` (web, providers, paid providers with owner caps, automated deployment)  
 **Date:** 2026-11-17
 
 ## 1. Goal
