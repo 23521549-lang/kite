@@ -1,5 +1,8 @@
 # Local Temporal and PostgreSQL services
 
+This is the Temporal stack of the development machine (bootstrap.sh, systemd services). A machine of its
+own runs all of Kite from images with Docker Compose and updates itself: see [stack/README.md](stack/README.md).
+
 This Compose stack follows Temporal's PostgreSQL deployment example and pins the service images. The server and UI bind to loopback only; PostgreSQL is available only on the internal Compose network. PostgreSQL data is stored at `KITE_DATA_DIR/postgres` (default `/var/lib/kite/postgres`).
 
 From the repository root:

@@ -1,0 +1,10 @@
+[Unit]
+Description=Kite: pull the stable image, run it, put the previous one back if it is not healthy
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kite-stack update --timer
+TimeoutStartSec=45min

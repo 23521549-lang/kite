@@ -290,8 +290,23 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
         add("temporal", FAIL, f"không kết nối được {host}:{port}",
             "sudo docker ps --filter name=temporal; xem lại docker compose của Temporal")
 
+    # ---- the Compose deployment: kite-stack on the host updates the images (deploy/stack)
+    from . import stack
+
+    if stack.in_compose():
+        state = stack.status()
+        current, last = state.get("current") or {}, state.get("last") or {}
+        if state.get("error"):
+            add("cập nhật (kite-stack)", WARN, state["error"], "sudo kite-stack status")
+        elif last.get("result") in ("rolled_back", "failed"):
+            add("cập nhật (kite-stack)", WARN, f"lần cập nhật cuối: {last.get('result')}: {last.get('message', '')}"[:300],
+                "sudo kite-stack logs; sudo kite-stack update")
+        else:
+            add("cập nhật (kite-stack)", OK, f"đang chạy {current.get('revision') or stack.version() or '?'}"
+                + (f", tự cập nhật {'bật' if state.get('auto') else 'tắt'}" if "auto" in state else ""))
+
     # ---- systemd services
-    if p.which("systemctl"):
+    if p.which("systemctl") and not stack.in_compose():
         for unit in ("kite-gateway", "kite-workflow-worker"):
             code, output = p.run(["systemctl", "is-active", unit], 10)
             state = output.strip().splitlines()[-1] if output.strip() else "unknown"
@@ -321,7 +336,11 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
                     add(f"cổng {wanted} ({label})", OK, f"chỉ nội bộ ({where})")
 
     # ---- sandbox: Docker, image, network
-    if config.sandbox is not None:
+    if config.sandbox is not None and stack.in_compose() and not Path("/var/run/docker.sock").exists():
+        # In the Compose deployment only the workflow worker's container reaches Docker.
+        add("docker", SKIP, "chỉ container worker dùng Docker",
+            "sudo kite-stack compose exec worker kite sandbox doctor")
+    elif config.sandbox is not None:
         docker = list(config.sandbox.docker_command)
         code, output = p.run([*docker, "version", "--format", "{{.Server.Version}}"], 20)
         if code != 0:

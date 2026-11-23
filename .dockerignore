@@ -1,0 +1,18 @@
+# Only what the Kite image needs (see Dockerfile).
+.git
+.github
+.venv
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+.pytest_cache
+.kite
+**/.env
+**/secrets
+docs
+tests
+infra
+web/node_modules
+web/dist
+web/.dist-new
+web/.dist-old

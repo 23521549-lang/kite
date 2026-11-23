@@ -1,0 +1,9 @@
+[Unit]
+Description=Kite: carry out the requests the web and the chat left
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kite-stack requests
+TimeoutStartSec=45min

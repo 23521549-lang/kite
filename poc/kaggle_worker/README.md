@@ -275,6 +275,18 @@ The front end (`web/`: React, TypeScript, Vite, Mantine, Zustand; versions pinne
 
 The API covers every tab: `/api/overview`; `/api/workers` (list, add, edit, delete, `start`, `stop`, `auto` = start it for the chat, `auto-click`, `browser`) and `/api/provider-types`, `/api/providers/test`; `/api/tasks` (start, apply, commit, cancel, pause, resume, instruct, note, patch); `/api/repos` (repositories, memory, `.kite.yml`); `/api/journal/{summary,events,daily}`, `/api/spend`; `/api/bench/{history,run}`; `/api/settings`, `/api/system/{doctor,update,cleanup,restart}`; `/api/chat/info` and `/api/opencode/*` (Chat); WebSockets `/api/ws` (gateway status, journal events, what each running task is doing) and `/api/browser/ws` (Kite's browser for kaggle.com). Workers stay in `config.yaml` with their keys in 0600 files, so `kite worker ...` and the web always agree; a change applies after `POST /api/system/restart` (refused while a task runs, unless forced). The web's own tables (account, sessions, audit, repositories) are SQLite in the state folder, or Postgres with `--web-db postgresql+psycopg://...`.
 
+### A machine of its own (Docker Compose)
+
+Besides this development setup (Git checkout, systemd, `kite update`), Kite installs on any Ubuntu machine
+with one command and runs from images there: CI publishes `ghcr.io/<owner>/kite` and `kite-sandbox` for
+every green commit of main and moves their `stable` tag; kite-stack on the machine pulls `stable`, starts it,
+checks every service and puts the previous release back when one is not healthy. The web's Settings tab
+shows the running release and has an update button there. `kite stack export` on this machine and
+`sudo kite-stack import` on the new one move the config, secrets, journal, memory, task records, library
+cache, chat folder, repositories and the web account. Terraform for AWS (`infra/aws`) makes the machine
+from a GitHub Actions workflow with no AWS key in GitHub. Details: `deploy/stack/README.md`,
+`infra/aws/README.md`.
+
 ### Adding a model, chat-only models
 
 A model the workers should serve must be in the notebook's `ROSTER`, with its dataset attached to each worker's notebook. Then:

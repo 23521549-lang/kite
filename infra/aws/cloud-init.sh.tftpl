@@ -1,0 +1,30 @@
+#!/bin/bash
+# First boot of Kite's machine (Terraform user data): mount the data volume at /var/lib/kite, wait for the
+# Elastic IP, install Kite. Its output: /var/log/kite-install.log
+set -euo pipefail
+exec > >(tee -a /var/log/kite-install.log) 2>&1
+echo "== $(date -Is) first boot"
+
+dev="/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${replace(volume_id, "-", "")}"
+for _ in $(seq 1 120); do [ -e "$dev" ] && break; sleep 5; done
+[ -e "$dev" ] || { echo "the data volume ${volume_id} did not attach"; exit 1; }
+if ! blkid "$dev" >/dev/null 2>&1; then
+  echo "== new data volume: formatting"
+  mkfs.ext4 -q -L kite-data "$dev"
+fi
+uuid="$(blkid -s UUID -o value "$dev")"
+mkdir -p /var/lib/kite
+grep -q "$uuid" /etc/fstab || echo "UUID=$uuid /var/lib/kite ext4 defaults,nofail 0 2" >> /etc/fstab
+mountpoint -q /var/lib/kite || mount /var/lib/kite
+
+# The certificate is asked for the Elastic IP's name: wait until the address is this machine's.
+token="$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')"
+for _ in $(seq 1 60); do
+  ip="$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/public-ipv4 || true)"
+  [ "$ip" = "${address}" ] && break
+  sleep 5
+done
+
+curl -fsSL "${installer_url}" -o /root/kite-install.sh
+bash /root/kite-install.sh --access "${access}" --domain "${domain}" --image "${image}"
+echo "== $(date -Is) done: ssh in and run sudo kite-stack admin"

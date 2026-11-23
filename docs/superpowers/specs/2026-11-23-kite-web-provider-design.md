@@ -189,6 +189,17 @@ Task, journal, memory và bench giữ chỗ lưu hiện tại trước, sau đó
 4. **CD:** dịch vụ trên máy kiểm tra nhãn `stable`, kéo image mới, `compose up`, kiểm tra sức khỏe, lỗi thì quay về bản trước. Có nút cập nhật trong tab Cài đặt.
 5. **Chuyển máy:** đưa config, secret, journal, memory, cache thư viện từ máy cũ sang. Máy mới chạy ổn thì mới đổi; máy cũ tiếp tục làm máy phát triển.
 
+**Đã chốt khi làm P6 (24/11):**
+- **Một image Kite** cho mọi dịch vụ (gateway, worker Temporal, web kèm trang, server OpenCode của chat) thay cho ba image: các dịch vụ dùng chung code và thư mục state, gateway cũng chạy Chromium. Thêm image `kite-sandbox` cho task. Cả hai dựng trên Ubuntu 24.04; OpenCode 2.4.0 lấy từ npm (`@opencode/cli-linux-x64`), kiểm SHA-512. OpenCode 2 chạy được hoàn toàn không mạng với cache rỗng (đã thử), nên CI dựng được image sandbox.
+- Dịch vụ Kite trong compose dùng **mạng và process của host**, chạy uid 1000, thấy `/var/lib/kite` ở đúng đường dẫn như host: gateway và web vẫn chỉ nghe loopback như máy phát triển, sandbox nhận đường dẫn host khi mount, khóa của lần đo thấy được từ mọi dịch vụ. Chỉ container worker có Docker socket. Chỉ Caddy ra Internet.
+- **kite-stack** (Python thuần, chạy bằng root qua systemd) thay cho dịch vụ CD trong container: lấy file compose từ chính image mới (file compose và image luôn đi cùng nhau), ghim image theo digest, chạy, kiểm tra sức khỏe từng dịch vụ, lỗi thì quay về bản trước và không tự thử lại digest đó. Không cập nhật khi đang có task, lần đo hoặc chat đang trả lời. Web và chat không có quyền Docker: chúng để file yêu cầu trong `stack/requests` và đọc `stack/status.json`.
+- Mạng sandbox có subnet cố định (`172.30.230.0/24`), kite-stack tạo trước khi gateway chạy; địa chỉ của host trên mạng này được ghi vào config.
+- Máy mới chạy được khi **chưa có worker và chưa có tài khoản**: gateway vẫn chạy, trang đăng nhập bảo chạy `sudo kite-stack admin`.
+- Web dùng **Postgres** (database và role `kite_web` riêng, cùng server với Temporal); máy phát triển vẫn dùng SQLite. Chuyển máy chép bảng của web sang Postgres; phiên đăng nhập không chép.
+- **Chuyển máy**: `kite stack export` gom config, secret, journal, memory, bản ghi task, cache thư viện, thư mục chat, phiên chat của OpenCode và các repo trong tab Repo (có thể có commit chỉ nằm trên máy cũ vì Kite không push). `sudo kite-stack import` đặt vào máy mới, đổi đường dẫn của máy cũ, địa chỉ public và địa chỉ mạng sandbox.
+- **Terraform AWS**: EC2 Ubuntu 24.04, ổ dữ liệu riêng có `prevent_destroy`, Elastic IP, security group (443, 80 cho chứng chỉ, SSH theo IP chủ), không IAM role cho máy. GitHub Actions đăng nhập AWS bằng OIDC qua role chỉ nhận môi trường `aws` của repo (cả hai dạng `sub`, có và không có id). Chỉ chạy bằng tay (plan rồi apply).
+- CI chỉ gắn `stable` khi test, build trang và kiểm file triển khai đều xanh trên `main`. Lỗi Terraform không chặn image.
+
 ## 7. Thứ tự làm
 | Đợt | Nội dung | Cần GPU? |
 |---|---|---|

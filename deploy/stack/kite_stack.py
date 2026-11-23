@@ -1,0 +1,779 @@
+#!/usr/bin/env python3
+"""kite-stack: install, update and run Kite's Docker Compose deployment on this machine (as root).
+
+    curl -fsSL https://raw.githubusercontent.com/<owner>/kite/main/deploy/stack/install.sh | sudo bash
+    sudo kite-stack admin                 # the owner account (password + 2FA app)
+    sudo kite-stack status | update | logs [service] | restart [service...] | kite <args>
+    sudo kite-stack import kite-export.tgz            # move a machine (kite stack export on the old one)
+
+Releases. CI pushes ghcr.io/<owner>/kite and kite-sandbox for every green commit of main and moves their
+``stable`` tag. ``update`` (a systemd timer, every 10 minutes) pulls ``stable``; when its digest is new it
+copies the compose files out of the new image into ``releases/<id>`` (so compose files and image always go
+together), pins both images by digest there (images.env), points ``current`` at it and starts it. If a
+Kite service is not healthy within the deadline, ``current`` goes back to the previous release, which
+starts again; that digest is not tried again automatically. Nothing is updated while a task, a bench run
+or a chat answer is in progress (``kite busy``), unless asked with --force.
+
+The web and the chat cannot run Docker: they leave request files in ``requests/`` (a systemd path unit
+starts ``kite-stack requests``) and read ``status.json``. stack.env (0600) keeps the secrets of the
+machine (Postgres passwords) and its settings (address, access mode, auto update).
+
+Standard library only (Python 3.10+ for Ubuntu 22.04): this runs on the host, outside the image.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import grp
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from typing import Any, Callable
+
+DATA = Path("/var/lib/kite")             # fixed: the task sandboxes get host paths for their mounts
+LIB = Path("/usr/local/lib/kite-stack")
+BIN = Path("/usr/local/bin/kite-stack")
+UNIT_DIR = Path("/etc/systemd/system")
+UNITS = ("kite-stack-update.service", "kite-stack-update.timer",
+         "kite-stack-requests.service", "kite-stack-requests.path")
+DEFAULT_IMAGE = "ghcr.io/23521549-lang/kite"
+KITE_SERVICES = ("gateway", "worker", "web", "opencode")
+INFRA_SERVICES = ("postgres", "temporal", "caddy")
+ONE_SHOT = ("temporal-setup", "web-db")
+UID = 1000
+LOCAL_RELEASE = "kite-release"           # local tags that keep the images of kept releases
+SANDBOX_TAG = "kite-sandbox:latest"      # the name Kite's config uses for the task sandbox
+SANDBOX_NETWORK = "kite-sandbox-net"     # internal: the task agents reach only the gateway on it
+SANDBOX_SUBNET, SANDBOX_GATEWAY = "172.30.230.0/24", "172.30.230.1"
+SETTINGS = ("KITE_ACCESS", "KITE_DOMAIN", "KITE_HTTPS_PORT", "KITE_IMAGE_REPO", "KITE_SANDBOX_REPO",
+            "KITE_CHANNEL", "KITE_AUTO_UPDATE", "TZ")
+
+Runner = Callable[..., subprocess.CompletedProcess]
+
+
+class StackError(RuntimeError):
+    pass
+
+
+def default_runner(cmd: list[str], *, timeout: float | None = None, capture: bool = True,
+                   tty: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
+    if tty:
+        return subprocess.run(cmd, timeout=timeout, env=env)
+    return subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout, env=env)
+
+
+def read_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def write_env(path: Path, values: dict[str, str], header: str, mode: int = 0o600) -> None:
+    lines = [f"# {line}" for line in header.splitlines()] + [f"{k}={v}" for k, v in values.items()]
+    atomic_write(path, "\n".join(lines) + "\n", mode)
+
+
+def atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(text)
+    os.chmod(temp, mode)
+    os.replace(temp, path)
+
+
+def short(digest: str) -> str:
+    return digest.split(":", 1)[-1][:12]
+
+
+class Stack:
+    def __init__(self, data: Path = DATA, *, run: Runner = default_runner, clock: Callable[[], float] = time.time,
+                 sleep: Callable[[float], None] = time.sleep, out: Callable[[str], None] = print,
+                 health_timeout: float = 300.0) -> None:
+        self.data, self.run_cmd, self.clock, self.sleep, self.out = Path(data), run, clock, sleep, out
+        self.health_timeout = health_timeout
+        self.dir = self.data / "stack"
+        self.env_file = self.dir / "stack.env"
+        self.releases = self.dir / "releases"
+        self.current_link = self.dir / "current"
+        self.previous_link = self.dir / "previous"
+        self.status_file = self.dir / "status.json"
+        self.requests_dir = self.dir / "requests"
+
+    # ------------------------------------------------------------------ small helpers
+    def run(self, cmd: list[str], *, timeout: float | None = 600, check: bool = False, **kw) -> subprocess.CompletedProcess:
+        done = self.run_cmd(cmd, timeout=timeout, **kw)
+        if check and done.returncode != 0:
+            detail = ((done.stderr or "") + (done.stdout or "")).strip()[-800:] if kw.get("capture", True) else ""
+            raise StackError(f"{' '.join(cmd[:4])}... lỗi ({done.returncode}): {detail}")
+        return done
+
+    def env(self) -> dict[str, str]:
+        return read_env(self.env_file)
+
+    def release(self, link: Path | None = None) -> Path | None:
+        link = link or self.current_link
+        return link.resolve() if link.is_symlink() and link.resolve().is_dir() else None
+
+    def release_info(self, release: Path | None) -> dict:
+        if release is None:
+            return {}
+        try:
+            return json.loads((release / "release.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def compose(self, *args: str, release: Path | None = None) -> list[str]:
+        release = release or self.release()
+        if release is None:
+            raise StackError("chưa có bản nào được cài (sudo kite-stack install)")
+        files = ["-f", str(release / "deploy" / "stack" / "compose.yaml")]
+        for extra in filter(None, os.environ.get("KITE_STACK_OVERRIDE", "").split(":")):
+            files += ["-f", extra]                     # tests and local experiments only
+        return ["docker", "compose", "-p", "kite", "--project-directory", str(release / "deploy" / "stack"),
+                "--env-file", str(self.env_file), "--env-file", str(release / "images.env"), *files, *args]
+
+    # ------------------------------------------------------------------ status for the web
+    def status(self) -> dict:
+        try:
+            data = json.loads(self.status_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def set_status(self, **fields: Any) -> dict:
+        data = self.status()
+        data.update(fields)
+        data["updated"] = self.clock()
+        data["auto"] = self.env().get("KITE_AUTO_UPDATE", "1") == "1"
+        current = self.release_info(self.release())
+        if current:
+            data["current"] = {"digest": current.get("kite_digest"), "revision": current.get("revision"),
+                               "created": current.get("created"), "id": current.get("id"),
+                               "since": current.get("activated")}
+        atomic_write(self.status_file, json.dumps(data, indent=2), 0o644)
+        return data
+
+    def finish(self, action: str, result: str, message: str = "", **extra: Any) -> dict:
+        self.out(f"{action}: {result}" + (f" — {message}" if message else ""))
+        return self.set_status(state="idle", last={"action": action, "result": result, "message": message[:1500],
+                                                   "at": self.clock(), **extra})
+
+    @contextlib.contextmanager
+    def lock(self, wait: float = 0.0):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with open(self.dir / ".lock", "w") as handle:
+            deadline = self.clock() + wait
+            while True:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if self.clock() >= deadline:
+                        raise StackError("kite-stack khác đang chạy (cập nhật hoặc khởi động lại)") from None
+                    self.sleep(5)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    # ------------------------------------------------------------------ images and releases
+    def image_refs(self) -> tuple[str, str]:
+        env = self.env()
+        repo = env.get("KITE_IMAGE_REPO") or DEFAULT_IMAGE
+        sandbox = env.get("KITE_SANDBOX_REPO") or f"{repo}-sandbox"
+        channel = env.get("KITE_CHANNEL") or "stable"
+        return f"{repo}:{channel}", f"{sandbox}:{channel}"
+
+    def inspect(self, ref: str) -> dict:
+        done = self.run(["docker", "image", "inspect", ref], timeout=60, check=True)
+        data = json.loads(done.stdout)
+        return data[0] if isinstance(data, list) and data else {}
+
+    def digest_of(self, ref: str) -> str:
+        """The registry digest of a pulled image (repo@sha256:...) for the repository in ``ref``."""
+        repo = ref.rsplit("@", 1)[0]
+        repo = repo.rsplit(":", 1)[0] if ":" in repo.rsplit("/", 1)[-1] else repo
+        for item in self.inspect(ref).get("RepoDigests") or []:
+            if item.startswith(repo + "@"):
+                return item.split("@", 1)[1]
+        raise StackError(f"{ref} không có digest của {repo} (image dựng tại chỗ?)")
+
+    def pull(self) -> dict:
+        kite_ref, sandbox_ref = self.image_refs()
+        for ref in (kite_ref, sandbox_ref):
+            self.run(["docker", "pull", "-q", ref], timeout=1800, check=True)
+        info = self.inspect(kite_ref)
+        labels = (info.get("Config") or {}).get("Labels") or {}
+        return {"kite_ref": kite_ref, "kite_digest": self.digest_of(kite_ref),
+                "sandbox_ref": sandbox_ref, "sandbox_digest": self.digest_of(sandbox_ref),
+                "revision": (labels.get("org.opencontainers.image.revision") or "")[:12],
+                "created": labels.get("org.opencontainers.image.created") or info.get("Created", "")}
+
+    def prepare(self, new: dict) -> Path:
+        """releases/<id>: the deploy/ folder of the new image, images.env with both images pinned."""
+        kite_repo = new["kite_ref"].rsplit(":", 1)[0]
+        sandbox_repo = new["sandbox_ref"].rsplit(":", 1)[0]
+        pinned = f"{kite_repo}@{new['kite_digest']}"
+        release_id = short(new["kite_digest"])
+        target = self.releases / release_id
+        if target.exists():
+            shutil.rmtree(target)
+        staging = self.releases / f".{release_id}.new"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        name = f"kite-stack-extract-{release_id}"
+        self.run(["docker", "rm", "-f", name], timeout=60)
+        self.run(["docker", "create", "--name", name, pinned], timeout=120, check=True)
+        try:
+            self.run(["docker", "cp", f"{name}:/opt/kite/deploy", str(staging / "deploy")], timeout=300, check=True)
+        finally:
+            self.run(["docker", "rm", "-f", name], timeout=60)
+        write_env(staging / "images.env",
+                  {"KITE_IMAGE": pinned, "KITE_SANDBOX_IMAGE": f"{sandbox_repo}@{new['sandbox_digest']}"},
+                  "Images of this release, pinned by digest (kite-stack).", 0o644)
+        record = {**new, "id": release_id, "prepared": self.clock()}
+        atomic_write(staging / "release.json", json.dumps(record, indent=2), 0o644)
+        staging.rename(target)
+        for repo, digest, name in ((kite_repo, new["kite_digest"], "kite"),
+                                   (sandbox_repo, new["sandbox_digest"], "sandbox")):
+            self.run(["docker", "tag", f"{repo}@{digest}", f"{LOCAL_RELEASE}/{name}:{release_id}"], timeout=60)
+        return target
+
+    def activate(self, release: Path, *, previous: Path | None = None) -> None:
+        """Point ``current`` at a release (``previous`` at the one it replaces) and tag its sandbox image
+        with the name Kite's config uses."""
+        info = self.release_info(release)
+        sandbox = read_env(release / "images.env").get("KITE_SANDBOX_IMAGE")
+        if sandbox:
+            self.run(["docker", "tag", sandbox, SANDBOX_TAG], timeout=60, check=True)
+        old = self.release()
+        keep = previous if previous is not None else (old if old and old != release else None)
+        for link, target in ((self.previous_link, keep), (self.current_link, release)):
+            if target is None:
+                continue
+            temp = link.with_name(link.name + ".new")
+            if temp.is_symlink() or temp.exists():
+                temp.unlink()
+            temp.symlink_to(target)
+            os.replace(temp, link)
+        info["activated"] = self.clock()
+        atomic_write(release / "release.json", json.dumps(info, indent=2), 0o644)
+
+    def prune(self) -> list[str]:
+        keep = {p for p in (self.release(), self.release(self.previous_link)) if p is not None}
+        removed = []
+        for release in sorted(self.releases.glob("*")) if self.releases.is_dir() else []:
+            if release in keep or release.name.startswith("."):
+                continue
+            for name in ("kite", "sandbox"):
+                self.run(["docker", "rmi", f"{LOCAL_RELEASE}/{name}:{release.name}"], timeout=120)
+            shutil.rmtree(release, ignore_errors=True)
+            removed.append(release.name)
+        self.run(["docker", "image", "prune", "-f"], timeout=600)
+        return removed
+
+    # ------------------------------------------------------------------ health
+    def services_state(self) -> dict[str, dict]:
+        done = self.run(self.compose("ps", "-a", "--format", "json"), timeout=60)
+        states: dict[str, dict] = {}
+        text = (done.stdout or "").strip()
+        rows: list = []
+        if text.startswith("["):
+            with contextlib.suppress(ValueError):
+                rows = json.loads(text)
+        else:
+            for line in text.splitlines():
+                with contextlib.suppress(ValueError):
+                    rows.append(json.loads(line))
+        for row in rows:
+            states[row.get("Service", "")] = {"state": row.get("State", ""), "health": row.get("Health", ""),
+                                              "exit": row.get("ExitCode", 0)}
+        return states
+
+    def wait_healthy(self, timeout: float | None = None, services: tuple[str, ...] | None = None) -> tuple[bool, str]:
+        """Every Kite service running and healthy, Postgres, Temporal and Caddy running, the one-shot
+        setups finished well. Fails early when a service keeps failing."""
+        wanted = services or (*KITE_SERVICES, *INFRA_SERVICES)
+        deadline = self.clock() + (timeout or self.health_timeout)
+        strikes: dict[str, int] = {}
+        problems: list[str] = []
+        while True:
+            states = self.services_state()
+            problems = []
+            for name in ONE_SHOT if services is None else ():
+                st = states.get(name)
+                if st and st["state"] == "exited" and int(st.get("exit") or 0) != 0:
+                    problems.append(f"{name}: lỗi (exit {st['exit']})")
+                    strikes[name] = 99
+            for name in wanted:
+                st = states.get(name)
+                if st is None:
+                    problems.append(f"{name}: chưa có container")
+                elif st["state"] != "running":
+                    problems.append(f"{name}: {st['state']}")
+                    if st["state"] in ("exited", "dead", "restarting"):
+                        strikes[name] = strikes.get(name, 0) + 1
+                elif st["health"] not in ("", "healthy"):
+                    problems.append(f"{name}: {st['health']}")
+                    if st["health"] == "unhealthy":
+                        strikes[name] = strikes.get(name, 0) + 1
+                else:
+                    strikes.pop(name, None)
+            if not problems:
+                return True, "mọi dịch vụ khỏe"
+            if any(v >= 4 for v in strikes.values()) or self.clock() >= deadline:
+                break
+            self.sleep(5)
+        bad = [p.split(":", 1)[0] for p in problems]
+        logs = ""
+        kite_bad = [s for s in bad if s in (*KITE_SERVICES, *INFRA_SERVICES, *ONE_SHOT)]
+        if kite_bad:
+            done = self.run(self.compose("logs", "--no-color", "--tail", "25", *kite_bad[:3]), timeout=60)
+            logs = (done.stdout or "")[-1500:]
+        return False, "; ".join(problems) + (f"\n{logs}" if logs else "")
+
+    def sandbox_network(self) -> str:
+        """The tasks' internal network, made before the gateway starts (it also listens on the host's
+        address there). An existing one is kept: its address goes into Kite's config."""
+        fmt = "{{.Internal}} {{(index .IPAM.Config 0).Gateway}}"
+        done = self.run(["docker", "network", "inspect", "-f", fmt, SANDBOX_NETWORK], timeout=60)
+        if done.returncode != 0:
+            self.run(["docker", "network", "create", "--internal", "--subnet", SANDBOX_SUBNET,
+                      "--gateway", SANDBOX_GATEWAY, SANDBOX_NETWORK], timeout=60, check=True)
+            return SANDBOX_GATEWAY
+        internal, _, gateway = done.stdout.strip().partition(" ")
+        if internal != "true":
+            raise StackError(f"mạng {SANDBOX_NETWORK} có sẵn nhưng không --internal: xóa nó rồi chạy lại")
+        return gateway or SANDBOX_GATEWAY
+
+    def up(self, release: Path | None = None) -> tuple[bool, str]:
+        self.sandbox_network()
+        done = self.run(self.compose("up", "-d", "--remove-orphans", release=release), timeout=1800)
+        if done.returncode != 0:
+            return False, "docker compose up lỗi: " + ((done.stderr or "") + (done.stdout or "")).strip()[-1200:]
+        return self.wait_healthy()
+
+    # ------------------------------------------------------------------ busy?
+    def busy(self) -> dict:
+        """Running tasks, a bench run, a chat answering: asked inside the running gateway (else a new
+        container of the current release)."""
+        for cmd in (self.compose("exec", "-T", "gateway", "kite", "busy"),
+                    self.compose("run", "--rm", "--no-deps", "-T", "gateway", "kite", "busy")):
+            done = self.run(cmd, timeout=180)
+            if done.returncode == 0:
+                with contextlib.suppress(ValueError):
+                    return json.loads(done.stdout)
+        return {"busy": False, "unknown": True}
+
+    # ------------------------------------------------------------------ update
+    def update(self, *, force: bool = False, timer: bool = False, check_only: bool = False) -> dict:
+        try:
+            with self.lock(wait=0 if timer else 900):
+                return self._update(force=force, timer=timer, check_only=check_only)
+        except StackError as exc:
+            if timer and "đang chạy" in str(exc):
+                return {"skipped": str(exc)}
+            raise
+
+    def _update(self, *, force: bool, timer: bool, check_only: bool) -> dict:
+        env = self.env()
+        if timer and env.get("KITE_AUTO_UPDATE", "1") != "1":
+            return self.set_status(state="idle")
+        self.set_status(state="checking")
+        try:
+            new = self.pull()
+        except (StackError, subprocess.SubprocessError) as exc:
+            return self.finish("update", "failed", f"không tải được image: {exc}")
+        self.set_status(available={"digest": new["kite_digest"], "revision": new["revision"],
+                                   "created": new["created"], "checked": self.clock()})
+        current = self.release_info(self.release())
+        if current.get("kite_digest") == new["kite_digest"] and current.get("sandbox_digest") == new["sandbox_digest"]:
+            return self.finish("update", "up_to_date", f"đang chạy {new['revision'] or short(new['kite_digest'])}")
+        if check_only:
+            return self.finish("check", "available", f"có bản mới {new['revision'] or short(new['kite_digest'])}")
+        bad = self.status().get("bad_digests") or []
+        if new["kite_digest"] in bad and not force:
+            return self.finish("update", "failed", f"bản {new['revision']} đã lỗi lúc thử trước; chờ bản sau "
+                                                   "(hoặc kite-stack update --force)")
+        if not force and current:
+            busy = self.busy()
+            if busy.get("busy"):
+                what = ", ".join(filter(None, [
+                    f"task {', '.join(busy.get('tasks') or [])}" if busy.get("tasks") else "",
+                    f"lần đo {busy['bench'].get('label')}" if busy.get("bench") else "",
+                    "chat đang trả lời" if busy.get("chat") else ""]))
+                return self.finish("update", "busy", f"hoãn vì đang chạy: {what}; thử lại lần sau")
+        old = self.release()
+        release = self.prepare(new)
+        self.set_status(state="updating")
+        self.activate(release)
+        ok, detail = self.up()
+        if ok:
+            self.adopt(release)
+            removed = self.prune()
+            return self.finish("update", "updated", f"đã chạy {new['revision'] or release.name}", removed=removed)
+        bad = (self.status().get("bad_digests") or [])[-9:] + [new["kite_digest"]]
+        self.set_status(state="rolling_back", bad_digests=bad)
+        if old is None:
+            return self.finish("update", "failed", f"bản mới không khỏe: {detail}")
+        self.activate(old, previous=release)
+        ok_back, back = self.up()
+        message = f"bản {new['revision'] or release.name} không khỏe: {detail}"
+        if not ok_back:
+            message += f"\nbản cũ cũng chưa khỏe: {back}"
+        return self.finish("update", "rolled_back", message)
+
+    def adopt(self, release: Path) -> None:
+        """Use this release's kite-stack (and systemd units) from now on: only once it ran healthy."""
+        source = release / "deploy" / "stack"
+        LIB.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "kite_stack.py", LIB / "kite_stack.py.new")
+        os.replace(LIB / "kite_stack.py.new", LIB / "kite_stack.py")
+        os.chmod(LIB / "kite_stack.py", 0o755)
+        if not BIN.exists():
+            BIN.symlink_to(LIB / "kite_stack.py")
+        changed = False
+        for unit in UNITS:
+            new = (source / "systemd" / unit).read_text(encoding="utf-8")
+            path = UNIT_DIR / unit
+            if not path.exists() or path.read_text(encoding="utf-8") != new:
+                atomic_write(path, new, 0o644)
+                changed = True
+        if changed and shutil.which("systemctl"):
+            self.run(["systemctl", "daemon-reload"], timeout=60)
+
+    # ------------------------------------------------------------------ requests from the web and the chat
+    def requests(self) -> list[dict]:
+        done = []
+        for path in sorted(self.requests_dir.glob("*.json")) if self.requests_dir.is_dir() else []:
+            try:
+                request = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                request = {}
+            path.unlink(missing_ok=True)
+            action = request.get("action")
+            try:
+                if action == "update":
+                    result = self.update(force=bool(request.get("force")))
+                elif action == "check":
+                    result = self.update(check_only=True)
+                elif action == "restart":
+                    result = self.restart(list(request.get("services") or []))
+                else:
+                    result = {"ignored": f"việc lạ: {action!r}"}
+            except (StackError, subprocess.SubprocessError, OSError) as exc:
+                result = self.finish(str(action), "failed", str(exc))
+            done.append({"request": path.name, "action": action, "result": (result.get("last") or result)})
+        return done
+
+    def restart(self, services: list[str]) -> dict:
+        names = [s for s in services if s in KITE_SERVICES]
+        if not names or len(names) != len(services):
+            raise StackError(f"chỉ khởi động lại được: {', '.join(KITE_SERVICES)}")
+        if "gateway" in names and "opencode" not in names:
+            names.append("opencode")          # the chat reads the workers again (new or changed ones)
+        with self.lock(wait=600):
+            self.set_status(state="restarting")
+            done = self.run(self.compose("restart", *names), timeout=600)
+            if done.returncode != 0:
+                return self.finish("restart", "failed", (done.stderr or done.stdout or "").strip()[-800:])
+            ok, detail = self.wait_healthy(services=tuple(names))
+            return self.finish("restart", "restarted" if ok else "failed",
+                               ", ".join(names) + ("" if ok else f": {detail}"))
+
+    # ------------------------------------------------------------------ install
+    def install(self, *, access: str, domain: str | None, https_port: int, image: str, sandbox: str | None,
+                channel: str, auto_update: bool | None, timezone: str | None,
+                ghcr_token_file: Path | None) -> dict:
+        if os.geteuid() != 0:
+            raise StackError("chạy bằng root: sudo kite-stack install ...")
+        if not self.data.is_dir():
+            raise StackError(f"{self.data} chưa có: tạo (hoặc gắn ổ dữ liệu vào đó) rồi chạy lại")
+        if not os.path.ismount(self.data):
+            self.out(f"lưu ý: {self.data} không phải ổ riêng; dữ liệu nằm trên ổ hệ thống")
+        for folder, owner, mode in ((self.data / "kite", UID, 0o755), (self.data / "home", UID, 0o755),
+                                    (self.data / "postgres", None, 0o700), (self.data / "caddy", None, 0o755),
+                                    (self.dir, 0, 0o755), (self.releases, 0, 0o755), (self.requests_dir, UID, 0o700)):
+            folder.mkdir(parents=True, exist_ok=True)
+            if owner is not None:
+                os.chown(folder, owner, owner)
+            if owner is not None or not any(folder.iterdir()):
+                os.chmod(folder, mode)
+        env = self.env()
+        public_ip = None
+        if not domain and not env.get("KITE_DOMAIN"):
+            public_ip = self.public_ip()
+            domain = f"{public_ip.replace('.', '-')}.sslip.io"
+        values = {
+            "KITE_ACCESS": access or env.get("KITE_ACCESS", "public"),
+            "KITE_DOMAIN": domain or env["KITE_DOMAIN"],
+            "KITE_HTTPS_PORT": str(https_port or env.get("KITE_HTTPS_PORT", "443")),
+            "KITE_IMAGE_REPO": image or env.get("KITE_IMAGE_REPO", DEFAULT_IMAGE),
+            "KITE_SANDBOX_REPO": sandbox or env.get("KITE_SANDBOX_REPO") or f"{image or DEFAULT_IMAGE}-sandbox",
+            "KITE_CHANNEL": channel or env.get("KITE_CHANNEL", "stable"),
+            "KITE_AUTO_UPDATE": {True: "1", False: "0"}.get(auto_update, env.get("KITE_AUTO_UPDATE", "1")),
+            "TZ": timezone or env.get("TZ") or self.host_timezone(),
+            "DOCKER_GID": str(grp.getgrnam("docker").gr_gid),
+            "TEMPORAL_POSTGRES_PASSWORD": env.get("TEMPORAL_POSTGRES_PASSWORD") or secrets.token_urlsafe(32),
+            "KITE_WEB_DB_PASSWORD": env.get("KITE_WEB_DB_PASSWORD") or secrets.token_urlsafe(32),
+        }
+        if values["KITE_ACCESS"] not in ("public", "private"):
+            raise StackError("--access là public hoặc private")
+        write_env(self.env_file, values, "Kite on this machine (kite-stack). Secrets: keep this file 0600, root only.")
+        if ghcr_token_file:
+            user = values["KITE_IMAGE_REPO"].split("/")[1]
+            token = Path(ghcr_token_file).read_text(encoding="utf-8").strip()
+            done = subprocess.run(["docker", "login", "ghcr.io", "-u", user, "--password-stdin"], input=token,
+                                  text=True, capture_output=True, timeout=60)
+            if done.returncode != 0:
+                raise StackError("docker login ghcr.io lỗi: " + done.stderr.strip()[-300:])
+        with self.lock(wait=900):
+            if self.release() is None:
+                self.set_status(state="updating")
+                new = self.pull()
+                release = self.prepare(new)
+                self.activate(release)
+            release = self.release()
+            url = self.public_url()
+            init = self.run(self.compose("run", "--rm", "--no-deps", "-T", "gateway", "kite", "stack", "init",
+                                         "--public-url", url, "--sandbox-gateway", self.sandbox_network()),
+                            timeout=600)
+            if init.returncode != 0:
+                raise StackError("kite stack init lỗi: " + (init.stderr or init.stdout).strip()[-800:])
+            ok, detail = self.up()
+            self.adopt(release)
+            for unit in ("kite-stack-update.timer", "kite-stack-requests.path"):
+                self.run(["systemctl", "enable", "--now", unit], timeout=60)
+            result = self.finish("install", "updated" if ok else "failed", detail if not ok else f"Kite chạy ở {url}")
+        return {"url": url, "healthy": ok, "detail": detail, "access": values["KITE_ACCESS"],
+                "next": ["sudo kite-stack admin   # tạo tài khoản chủ (mật khẩu + app 2FA)",
+                         f"mở {url}" if values["KITE_ACCESS"] == "public"
+                         else "ssh -L 8790:127.0.0.1:8790 <máy> rồi mở http://127.0.0.1:8790"],
+                "status": result.get("last")}
+
+    def public_url(self) -> str:
+        env = self.env()
+        port = int(env.get("KITE_HTTPS_PORT", "443"))
+        return f"https://{env['KITE_DOMAIN']}" + ("" if port == 443 else f":{port}")
+
+    def public_ip(self) -> str:
+        """This machine's public IPv4: AWS's metadata service, else an echo service."""
+        try:
+            token_req = urllib.request.Request("http://169.254.169.254/latest/api/token", method="PUT",
+                                               headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+            token = urllib.request.urlopen(token_req, timeout=2).read().decode()
+            ip_req = urllib.request.Request("http://169.254.169.254/latest/meta-data/public-ipv4",
+                                            headers={"X-aws-ec2-metadata-token": token})
+            ip = urllib.request.urlopen(ip_req, timeout=2).read().decode().strip()
+            if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
+                return ip
+        except OSError:
+            pass
+        for url in ("https://checkip.amazonaws.com", "https://api.ipify.org"):
+            with contextlib.suppress(OSError):
+                ip = urllib.request.urlopen(url, timeout=10).read().decode().strip()
+                if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
+                    return ip
+        raise StackError("không tìm được IP public: chạy lại với --domain <tên miền>")
+
+    @staticmethod
+    def host_timezone() -> str:
+        with contextlib.suppress(OSError):
+            name = Path("/etc/timezone").read_text(encoding="utf-8").strip()
+            if name:
+                return name
+        with contextlib.suppress(OSError):
+            target = os.readlink("/etc/localtime")
+            if "zoneinfo/" in target:
+                return target.split("zoneinfo/", 1)[1]
+        return "UTC"
+
+    def configure(self, **settings: str | None) -> dict:
+        """Change the address, the access mode or the auto update; Caddy and the config follow."""
+        env = self.env()
+        if not env:
+            raise StackError("chưa cài: sudo kite-stack install")
+        for key, value in settings.items():
+            if value is not None:
+                env[key] = value
+        if env.get("KITE_ACCESS") not in ("public", "private"):
+            raise StackError("access là public hoặc private")
+        write_env(self.env_file, env, "Kite on this machine (kite-stack). Secrets: keep this file 0600, root only.")
+        with self.lock(wait=600):
+            url = self.public_url()
+            self.run(self.compose("exec", "-T", "gateway", "kite", "stack", "init", "--public-url", url), timeout=300)
+            ok, detail = self.up()
+            self.finish("configure", "updated" if ok else "failed", detail)
+        return {"url": url, "access": env["KITE_ACCESS"], "auto_update": env.get("KITE_AUTO_UPDATE") == "1",
+                "healthy": ok, "detail": detail,
+                "note": "đổi địa chỉ thì notebook Kaggle cần stub mới: kite-stack kite worker stub <worker>"}
+
+    # ------------------------------------------------------------------ moving a machine
+    def import_state(self, archive: Path, *, force: bool) -> dict:
+        archive = Path(archive).resolve()
+        if not archive.is_file():
+            raise StackError(f"không có file {archive}")
+        staged = self.dir / "import.tgz"
+        with self.lock(wait=600):
+            shutil.copy2(archive, staged)
+            os.chown(staged, UID, UID)
+            os.chmod(staged, 0o600)
+            try:
+                self.run(self.compose("stop", *KITE_SERVICES), timeout=300)
+                args = ["run", "--rm", "--no-deps", "-T", "-e", f"KITE_PUBLIC_URL={self.public_url()}", "web",
+                        "kite", "stack", "import", "/var/lib/kite/stack/import.tgz",
+                        "--sandbox-gateway", self.sandbox_network(), *(["--force"] if force else [])]
+                done = self.run(self.compose(*args), timeout=3600)
+            finally:
+                staged.unlink(missing_ok=True)
+            if done.returncode != 0:
+                self.up()
+                raise StackError("import lỗi: " + ((done.stderr or "") + (done.stdout or "")).strip()[-1200:])
+            ok, detail = self.up()
+            self.finish("import", "updated" if ok else "failed", detail)
+        report = {}
+        with contextlib.suppress(ValueError):
+            report = json.loads(done.stdout[done.stdout.find("{"):])
+        return {"imported": report, "healthy": ok, "detail": detail,
+                "next": ["mở trang web, đăng nhập bằng tài khoản của máy cũ",
+                         "notebook Kaggle trỏ về địa chỉ mới: kite-stack kite worker restart <worker> "
+                         "(hoặc dán lại: kite-stack kite worker stub <worker>)"]}
+
+
+# ---------------------------------------------------------------------- command line
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    passthrough: list[str] = []
+    if argv and argv[0] in ("kite", "compose"):      # everything after them goes on as it is (-h, --json...)
+        argv, passthrough = argv[:1], argv[1:]
+    parser = argparse.ArgumentParser(prog="kite-stack", description=__doc__.split("\n\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    install = commands.add_parser("install", help="install (or repair) Kite on this machine")
+    install.add_argument("--access", choices=["public", "private"], default=None,
+                         help="public: web page and /worker/* over HTTPS; private: only /worker/*, the web page "
+                              "through ssh -L or tailscale (default: public)")
+    install.add_argument("--domain", default=None, help="DNS name of this machine (default: <ip>.sslip.io)")
+    install.add_argument("--https-port", type=int, default=None, help="default 443")
+    install.add_argument("--image", default=None, help=f"Kite image repository (default {DEFAULT_IMAGE})")
+    install.add_argument("--sandbox-image", default=None, help="sandbox image repository (default <image>-sandbox)")
+    install.add_argument("--channel", default=None, help="tag to follow (default stable)")
+    install.add_argument("--no-auto-update", action="store_true", help="update only when asked")
+    install.add_argument("--timezone", default=None)
+    install.add_argument("--ghcr-token-file", type=Path, default=None,
+                         help="only for private images: a file with a GitHub token (read:packages)")
+    update = commands.add_parser("update", help="pull the stable image and run it if it is new")
+    update.add_argument("--force", action="store_true", help="also while something runs, or a digest that failed")
+    update.add_argument("--timer", action="store_true", help=argparse.SUPPRESS)
+    update.add_argument("--check", action="store_true", help="only look for a new image")
+    commands.add_parser("requests", help="carry out the web's and the chat's requests (systemd path unit)")
+    commands.add_parser("status", help="running release, newest one, last update, containers")
+    restart = commands.add_parser("restart", help="restart Kite services")
+    restart.add_argument("services", nargs="*", default=list(KITE_SERVICES))
+    logs = commands.add_parser("logs", help="logs of the services")
+    logs.add_argument("services", nargs="*")
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.add_argument("-n", "--tail", default="200")
+    commands.add_parser("up", help="start every service of the current release")
+    commands.add_parser("down", help="stop every service (data stays)")
+    admin = commands.add_parser("admin", help="create the owner account, or --reset its password and 2FA")
+    admin.add_argument("--username", default=None)
+    admin.add_argument("--reset", action="store_true")
+    commands.add_parser("kite", help="run a kite command in the gateway's container: kite-stack kite doctor")
+    commands.add_parser("compose", help="docker compose with this machine's files: kite-stack compose ps")
+    configure = commands.add_parser("configure", help="change the address, the access mode, the auto update")
+    configure.add_argument("--access", choices=["public", "private"], default=None)
+    configure.add_argument("--domain", default=None)
+    configure.add_argument("--https-port", type=int, default=None)
+    configure.add_argument("--auto-update", choices=["on", "off"], default=None)
+    imp = commands.add_parser("import", help="move a machine: an export made with `kite stack export`")
+    imp.add_argument("archive", type=Path)
+    imp.add_argument("--force", action="store_true", help="replace the tasks this machine already has")
+    args = parser.parse_args(argv)
+
+    stack = Stack()
+    tty = sys.stdin.isatty() and sys.stdout.isatty()
+    try:
+        if args.command == "install":
+            report = stack.install(access=args.access or "", domain=args.domain, https_port=args.https_port or 0,
+                                   image=args.image or "", sandbox=args.sandbox_image, channel=args.channel or "",
+                                   auto_update=False if args.no_auto_update else None, timezone=args.timezone,
+                                   ghcr_token_file=args.ghcr_token_file)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0 if report["healthy"] else 1
+        if args.command == "update":
+            report = stack.update(force=args.force, timer=args.timer, check_only=args.check)
+            print(json.dumps(report.get("last", report), indent=2, ensure_ascii=False))
+            return 0 if (report.get("last") or {}).get("result") not in ("failed", "rolled_back") else 1
+        if args.command == "requests":
+            print(json.dumps(stack.requests(), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "status":
+            print(json.dumps(stack.status(), indent=2, ensure_ascii=False))
+            if stack.release():
+                stack.run(stack.compose("ps"), timeout=60, capture=False)
+            return 0
+        if args.command == "restart":
+            report = stack.restart(args.services)
+            print(json.dumps(report.get("last", report), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "logs":
+            cmd = stack.compose("logs", "--no-color", "--tail", args.tail, *(["-f"] if args.follow else []),
+                                *args.services)
+            return stack.run(cmd, timeout=None, capture=False).returncode
+        if args.command == "up":
+            with stack.lock(wait=600):
+                ok, detail = stack.up()
+            print(detail)
+            return 0 if ok else 1
+        if args.command == "down":
+            with stack.lock(wait=600):
+                return stack.run(stack.compose("down"), timeout=600, capture=False).returncode
+        if args.command == "admin":
+            cmd = stack.compose("run", "--rm", "--no-deps", *([] if tty else ["-T"]), "web", "kite", "web", "admin",
+                                *(["--username", args.username] if args.username else []),
+                                *(["--reset"] if args.reset else []))
+            return stack.run(cmd, timeout=None, tty=True).returncode
+        if args.command == "kite":
+            running = stack.services_state().get("gateway", {}).get("state") == "running"
+            base = ("exec",) if running else ("run", "--rm", "--no-deps")
+            cmd = stack.compose(*base, *([] if tty else ["-T"]), "gateway", "kite", *passthrough)
+            return stack.run(cmd, timeout=None, tty=True).returncode
+        if args.command == "compose":
+            return stack.run(stack.compose(*passthrough), timeout=None, tty=True).returncode
+        if args.command == "configure":
+            report = stack.configure(KITE_ACCESS=args.access, KITE_DOMAIN=args.domain,
+                                     KITE_HTTPS_PORT=str(args.https_port) if args.https_port else None,
+                                     KITE_AUTO_UPDATE={"on": "1", "off": "0"}.get(args.auto_update or ""))
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0 if report["healthy"] else 1
+        if args.command == "import":
+            report = stack.import_state(args.archive, force=args.force)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            return 0 if report["healthy"] else 1
+    except (StackError, subprocess.SubprocessError, OSError) as exc:
+        print(f"kite-stack: {exc}", file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

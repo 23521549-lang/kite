@@ -1,0 +1,16 @@
+# Kite's HTTPS front, --access private: only /worker/* (the Kaggle notebooks must reach it). The web page
+# stays on the machine (127.0.0.1:8790): open it through `ssh -L 8790:127.0.0.1:8790` or `tailscale serve`.
+{$KITE_DOMAIN}:{$KITE_HTTPS_PORT} {
+	@worker path /worker/*
+	handle @worker {
+		reverse_proxy 127.0.0.1:8787 {
+			flush_interval -1
+			transport http {
+				read_timeout 120s
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

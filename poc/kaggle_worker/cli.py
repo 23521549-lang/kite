@@ -42,7 +42,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kite", description="Kite provider-neutral coding control plane")
     parser.add_argument("--db", type=Path, default=None,
                         help="SQLite state file (default: scheduler.sqlite3 beside --config)")
-    parser.add_argument("--config", type=Path, default=Path(".kite/config.yaml"), help="Kite YAML/JSON configuration")
+    parser.add_argument("--config", type=Path, default=Path(os.environ.get("KITE_CONFIG") or ".kite/config.yaml"),
+                        help="Kite YAML/JSON configuration (default: $KITE_CONFIG, else .kite/config.yaml)")
     commands = parser.add_subparsers(dest="command", required=True)
     task = commands.add_parser("task", help="manage queued tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
@@ -108,6 +109,38 @@ def _parser() -> argparse.ArgumentParser:
                                                 "services (the old commit comes back if the tests fail)")
     update.add_argument("--yes", action="store_true", help="do it (default: only show what is new)")
     update.add_argument("--no-restart", action="store_true", help="pull and test, but restart nothing")
+    commands.add_parser("busy", help="what an update or a restart would cut off: running tasks and a bench run "
+                                     "(JSON; kite-stack asks before it updates)")
+    stack = commands.add_parser("stack", help="Kite in the Docker Compose deployment (deploy/stack): run inside the "
+                                              "Kite image, or on the old machine to move it")
+    stack_commands = stack.add_subparsers(dest="stack_command", required=True)
+    stack_init = stack_commands.add_parser("init", help="write the config of a new machine (never overwrites one)")
+    stack_init.add_argument("--public-url", default=None, help="https:// address Kaggle notebooks reach /worker/* at")
+    stack_init.add_argument("--sandbox-gateway", default=None,
+                            help="the host's address on the sandbox network (kite-stack creates the network)")
+    stack_health = stack_commands.add_parser("health", help="health check of one service (the containers' HEALTHCHECK)")
+    stack_health.add_argument("service", choices=["gateway", "worker", "web", "opencode"])
+    stack_commands.add_parser("opencode", help="start of the chat's container: rewrite the chat's files, then run "
+                                               "opencode serve --service")
+    stack_commands.add_parser("status", help="the running release, the newest one, the last update (kite-stack)")
+    stack_request = stack_commands.add_parser("request", help="ask kite-stack on the host to update, check or restart")
+    stack_request.add_argument("action", choices=["update", "check", "restart"])
+    stack_request.add_argument("services", nargs="*", help="for restart: gateway, worker, web, opencode")
+    stack_request.add_argument("--force", action="store_true", help="update even while a task or a bench runs")
+    stack_export = stack_commands.add_parser(
+        "export", help="on the old machine: one file with the config, secrets, journal, memory, task records, the "
+                       "library cache, the chat folder and the repositories Kite works on (for kite-stack import)")
+    stack_export.add_argument("--out", type=Path, default=Path.home() / "kite-export.tgz")
+    stack_export.add_argument("--repo", action="append", type=Path, default=[],
+                              help="repository to take along (default: the ones in the web's Repo tab)")
+    stack_export.add_argument("--no-cache", action="store_true", help="leave the library cache (deps-cache) behind")
+    stack_export.add_argument("--no-chat-history", action="store_true", help="leave OpenCode's chat sessions behind")
+    stack_import = stack_commands.add_parser("import", help="on the new machine (kite-stack import runs this): put an "
+                                                            "export in place")
+    stack_import.add_argument("archive", type=Path)
+    stack_import.add_argument("--public-url", default=os.environ.get("KITE_PUBLIC_URL") or None)
+    stack_import.add_argument("--sandbox-gateway", default=None, help="this machine's address on the sandbox network")
+    stack_import.add_argument("--force", action="store_true", help="overwrite the tasks this machine already has")
     model = commands.add_parser("model", help="models the workers serve")
     model_commands = model.add_subparsers(dest="model_command", required=True)
     model_add = model_commands.add_parser(
@@ -329,12 +362,14 @@ def _parser() -> argparse.ArgumentParser:
                       "and 2FA (for a lost phone; it signs every browser out)")
     web_admin.add_argument("--username", default=None, help="account name (default: the existing one, else 'admin')")
     web_admin.add_argument("--reset", action="store_true", help="new password and 2FA for the existing account")
-    web_admin.add_argument("--web-db", default=None, help="database URL (default: SQLite in the state folder)")
+    web_admin.add_argument("--web-db", default=os.environ.get("KITE_WEB_DB") or None,
+                           help="database URL (default: $KITE_WEB_DB, else SQLite in the state folder)")
     web_serve = web_commands.add_parser("serve", help="run the web back end on loopback (Caddy publishes it over HTTPS)")
     web_serve.add_argument("--host", default="127.0.0.1")
     web_serve.add_argument("--port", type=int, default=8790)
-    web_serve.add_argument("--web-db", default=None, help="database URL (default: SQLite in the state folder; Postgres: "
-                                                      "postgresql+psycopg://user:pass@host/db)")
+    web_serve.add_argument("--web-db", default=os.environ.get("KITE_WEB_DB") or None,
+                           help="database URL (default: $KITE_WEB_DB, else SQLite in the state folder; Postgres: "
+                                "postgresql+psycopg://user:pass@host/db)")
     web_serve.add_argument("--allow-root", action="append", type=Path, default=[],
                            help="folders whose Git repositories tasks may use (default: the home folder)")
     web_serve.add_argument("--insecure-cookies", action="store_true",
@@ -784,8 +819,19 @@ def _chat_setup_again(config_path: Path) -> dict:
 
 
 def _update_command(args: argparse.Namespace) -> int:
-    from . import update
+    from . import stack, update
 
+    if stack.in_compose():
+        # The image cannot update itself: kite-stack on the host pulls the new image and checks it.
+        if not args.yes:
+            report = stack.update_plan()
+            report["next"] = "kite update --yes (kite-stack tải image mới, kiểm tra rồi chạy)" if report["behind"] \
+                else "Kite đã là bản mới nhất (kite-stack kiểm tra mỗi 10 phút)"
+        else:
+            report = stack.request("update")
+            report["next"] = "kite stack status (vài phút sau)"
+        _emit(report)
+        return 0
     if not args.yes:
         report = update.plan()
         if not report.get("error"):
@@ -937,7 +983,9 @@ def _web_serve(args: argparse.Namespace, store, sealer) -> int:
     from .web.app import GatewayDown, WebContext, create_app
 
     if not store.user_count():
-        raise ConfigError("chưa có tài khoản: chạy kite web admin trước")
+        # Serve anyway (a new Compose machine is healthy before its owner exists): signing in says what to do.
+        print("kite web: chưa có tài khoản; tạo bằng `kite web admin` (máy Compose: sudo kite-stack admin)",
+              file=sys.stderr, flush=True)
     config = _load_operator_config(args)
     config_path = args.config.resolve()
     chat_dir = Path.home() / "kite-chat"
@@ -963,6 +1011,11 @@ def _web_serve(args: argparse.Namespace, store, sealer) -> int:
         return data
 
     async def restart(services: list[str]) -> dict:
+        from . import stack
+
+        if stack.in_compose():          # kite-stack on the host restarts the containers
+            queued = stack.request("restart", services=services)
+            return {"ok": True, "services": services, "queued": True, "request": queued["request"], "error": None}
         done = await asyncio.to_thread(subprocess.run, ["sudo", "-n", "systemctl", "restart", *services],
                                        capture_output=True, text=True, timeout=120)
         return {"ok": done.returncode == 0, "services": services, "error": done.stderr.strip()[-300:] or None}
@@ -1039,7 +1092,9 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
 
     workers = gateway_workers(config)
     if not workers:
-        raise ConfigError("no enabled provider uses adapter 'pull' or 'relay'")
+        # A new machine has no worker yet: serve anyway, so the web can add one (then restart the gateway).
+        print("kite gateway: chưa có worker nào (pull hoặc relay); thêm trên web rồi khởi động lại gateway",
+              file=sys.stderr, flush=True)
     store = SQLiteSchedulerStore(_db_path(args), model_policy=model_policy_from_config(config))
     temporal: dict[str, object] = {"client": None}
 
@@ -1323,6 +1378,100 @@ def _kite_executable() -> list[str]:
     """How to run this Kite again (the chat's MCP server, detached jobs started from the chat)."""
     kite = Path(sys.argv[0]).resolve() if Path(sys.argv[0]).exists() else Path(shutil.which("kite") or "kite")
     return [str(kite)]
+
+
+def _busy_command(args: argparse.Namespace) -> int:
+    """Running tasks and a bench run: what kite-stack must not cut off with an update."""
+    from . import bench
+
+    tasks = []
+    if args.db.exists():
+        with SQLiteSchedulerStore(args.db) as store:
+            tasks = [str(t["task_id"]) for t in store.list_tasks() if t["state"] == "LEASED"]
+    running = bench.running_bench(args.config.parent)
+    chat = _chat_sessions_busy(Path.home())
+    _emit({"busy": bool(tasks or running or chat), "tasks": tasks, "chat": chat,
+           "bench": {"label": running.get("label"), "started": running.get("started")} if running else None})
+    return 0
+
+
+def _chat_sessions_busy(home: Path) -> int:
+    """Chat sessions answering right now (OpenCode's background server); 0 when it cannot be asked."""
+    import base64
+    import urllib.parse
+    import urllib.request
+
+    try:
+        from .web.app import _session_busy, find_opencode
+
+        url, password = find_opencode(home, "", None)
+        if not url:
+            return 0
+        query = urllib.parse.urlencode({"directory": str(home / "kite-chat"), "limit": "30"})
+        request = urllib.request.Request(f"{url}/api/session?{query}")
+        if password:
+            request.add_header("Authorization", "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode())
+        with urllib.request.urlopen(request, timeout=5) as response:
+            data = json.loads(response.read().decode())
+    except Exception:               # no server, no web extra, an old server: nothing to wait for
+        return 0
+    items = data.get("data") if isinstance(data, dict) else None
+    return sum(1 for item in items if _session_busy(item)) if isinstance(items, list) else 0
+
+
+def _stack_command(args: argparse.Namespace) -> int:
+    from . import stack
+
+    config_path = args.config.resolve()
+    if args.stack_command == "init":
+        _emit(stack.init_config(config_path, public=args.public_url, sandbox_gateway=args.sandbox_gateway))
+        return 0
+    if args.stack_command == "health":
+        ok, detail = stack.health(args.service, config_path)
+        print(detail)
+        return 0 if ok else 1
+    if args.stack_command == "status":
+        _emit({"version": stack.version(), **stack.status()})
+        return 0
+    if args.stack_command == "request":
+        fields = {"services": args.services} if args.action == "restart" else {"force": args.force}
+        _emit(stack.request(args.action, **fields))
+        return 0
+    if args.stack_command == "export":
+        report = stack.export_state(config_path.parent, args.out, repos=args.repo, with_cache=not args.no_cache,
+                                    chat_history=not args.no_chat_history)
+        report["next"] = (f"chép {args.out} sang máy mới (scp), rồi ở máy mới: sudo kite-stack import "
+                          f"~/{Path(args.out).name}")
+        _emit(report)
+        return 0
+    if args.stack_command == "import":
+        report = stack.import_state(args.archive, config_path.parent, home=Path.home(),
+                                    web_db=os.environ.get("KITE_WEB_DB") or None, public=args.public_url,
+                                    sandbox_gateway=args.sandbox_gateway, force=args.force)
+        _emit(report)
+        return 0
+    if args.stack_command == "opencode":
+        def refresh(path: Path) -> dict:
+            return _chat_setup_again(path)
+
+        def setup(path: Path) -> dict:
+            config = load_config(path)
+            if not gateway_models(config):
+                return {"chat": "chưa có worker nào phục vụ model: thêm worker trên web, chat sẽ được tạo khi "
+                                "khởi động lại"}
+            # --force: AGENTS.md is written from Kite's state (what the chat remembers lives there too).
+            done = subprocess.run([*_kite_executable(), "--config", str(path), "chat", "setup", "--no-reload",
+                                   "--force"], capture_output=True, text=True)
+            return {"chat": "đã tạo ~/kite-chat" if done.returncode == 0
+                    else "chat setup lỗi: " + (done.stderr or done.stdout).strip()[-300:]}
+
+        def serve() -> None:
+            sys.stdout.flush()
+            os.execvp("opencode", ["opencode", "serve", "--service"])
+
+        stack.opencode_entry(config_path, refresh, setup, serve)
+        return 0
+    return -1
 
 
 def _chat_command(args: argparse.Namespace) -> int:
@@ -1642,6 +1791,10 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _memory_command(args)
     if args.command == "update":
         return _update_command(args)
+    if args.command == "busy":
+        return _busy_command(args)
+    if args.command == "stack":
+        return _stack_command(args)
     if args.command == "model":
         return _model_add(args)
     if args.command == "doctor":
@@ -1876,8 +2029,8 @@ def _run(args: argparse.Namespace) -> int:
         _emit(asdict(bundle))
         return 0
 
-    if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
-                        "mcp", "chat", "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web"}:
+    if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox", "mcp", "chat",
+                        "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web", "busy", "stack"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

@@ -1,0 +1,22 @@
+# Kite's HTTPS front, --access public: the web page and /worker/* (Kaggle notebooks). The gateway's own API
+# (/v1/*, /kite/*) is never published. Caddy gets the certificate itself (Let's Encrypt).
+{$KITE_DOMAIN}:{$KITE_HTTPS_PORT} {
+	@worker path /worker/*
+	handle @worker {
+		reverse_proxy 127.0.0.1:8787 {
+			flush_interval -1
+			transport http {
+				read_timeout 120s
+			}
+		}
+	}
+	@gateway_private path /v1/* /kite/*
+	handle @gateway_private {
+		respond 404
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8790 {
+			flush_interval -1
+		}
+	}
+}

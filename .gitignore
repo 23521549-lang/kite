@@ -20,3 +20,11 @@ web/node_modules/
 web/dist/
 web/.dist-new/
 web/.dist-old/
+# Terraform (infra/aws): providers, local state of the bootstrap, plans
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+# a machine export (kite stack export) holds secrets
+kite-export.tgz

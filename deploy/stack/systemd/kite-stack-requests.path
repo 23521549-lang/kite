@@ -1,0 +1,9 @@
+[Unit]
+Description=Kite: requests from the web and the chat (update, restart)
+
+[Path]
+PathExistsGlob=/var/lib/kite/stack/requests/*.json
+Unit=kite-stack-requests.service
+
+[Install]
+WantedBy=paths.target

@@ -205,7 +205,8 @@ def test_every_api_route_needs_a_session(site):
     app, client = site["client"].app, site["client"]
     checked = 0
     for route in app.routes:
-        if isinstance(route, APIRoute) and route.path.startswith("/api/") and route.path != "/api/auth/login":
+        if isinstance(route, APIRoute) and route.path.startswith("/api/") and route.path not in ("/api/auth/login",
+                                                                                               "/api/health"):
             path = route.path.replace("{path:path}", "session").replace("{", "").replace("}", "")
             for method in route.methods:
                 response = client.request(method, path)
@@ -216,6 +217,18 @@ def test_every_api_route_needs_a_session(site):
                 with client.websocket_connect(route.path, headers={"origin": "https://testserver"}) as ws:
                     ws.receive_json()
     assert checked > 40
+    assert client.get("/api/health").json() == {"ok": True}       # the container's health check, nothing else
+
+
+def test_a_machine_without_an_account_serves_and_signing_in_says_how_to_make_one(site):
+    from sqlalchemy import delete
+
+    from poc.kaggle_worker.web.db import users
+
+    with site["store"].engine.begin() as conn:
+        conn.execute(delete(users))
+    response = login(site)
+    assert response.status_code == 409 and "kite-stack admin" in response.json()["error"]
 
 
 def test_signing_in_needs_password_and_code_and_sets_a_strict_cookie(site):

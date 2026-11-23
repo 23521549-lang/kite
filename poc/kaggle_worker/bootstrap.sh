@@ -44,8 +44,9 @@ fi
 # Install the basic tools first; the bootstrap command does not assume make,
 # git, Python, or Docker were preinstalled on a fresh Ubuntu image.
 "${SUDO[@]}" apt-get update
+# libatomic1: Chromium of Kite's browser (Playwright) needs it on Ubuntu 24.04.
 "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  ca-certificates curl gnupg git make python3-minimal
+  ca-certificates curl gnupg git make python3-minimal libatomic1
 
 # Configure Docker's official Ubuntu repository idempotently.
 "${SUDO[@]}" install -m 0755 -d /etc/apt/keyrings

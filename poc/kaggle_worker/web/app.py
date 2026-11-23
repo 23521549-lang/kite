@@ -14,6 +14,7 @@ import asyncio
 from dataclasses import dataclass
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import time
@@ -334,7 +335,7 @@ def create_app(ctx: WebContext) -> FastAPI:
     @app.middleware("http")
     async def require_session(request: Request, call_next):
         # Every API route needs a session, before its body is even read: a new route is closed by default.
-        if request.url.path.startswith("/api/") and request.url.path != "/api/auth/login":
+        if request.url.path.startswith("/api/") and request.url.path not in ("/api/auth/login", "/api/health"):
             if await asyncio.to_thread(session_of, request) is None:
                 return JSONResponse({"error": "cần đăng nhập"}, status_code=401,
                                     headers={"Cache-Control": "no-store"})
@@ -370,6 +371,9 @@ def create_app(ctx: WebContext) -> FastAPI:
             raise HTTPException(403, "yêu cầu từ trang khác")
         if ctx.store.failures_from(ip, IP_WINDOW) >= IP_LIMIT:
             raise HTTPException(429, "quá nhiều lần đăng nhập sai từ địa chỉ này; thử lại sau 15 phút")
+        if not ctx.store.user_count():
+            raise HTTPException(409, "máy này chưa có tài khoản: chạy `sudo kite-stack admin` (hoặc `kite web admin`) "
+                                     "trên máy")
         now = ctx.clock()
         user = ctx.store.user_by_name(body.username.strip())
         if user is not None and user.locked_until > now:
@@ -816,6 +820,11 @@ def create_app(ctx: WebContext) -> FastAPI:
         from .. import update
 
         version = await asyncio.to_thread(_git_head, update.REPO)
+        if not version.get("commit"):            # the Compose image has no .git: its revision is baked in
+            from .. import stack
+
+            version = {"commit": stack.version(), "subject": os.environ.get("KITE_VERSION_SUBJECT", ""),
+                       "date": os.environ.get("KITE_VERSION_DATE", "")}
         return {"ntfy": bool(config.notify.ntfy), "gateway": {"host": config.gateway.host, "port": config.gateway.port,
                                                              "public_url": config.gateway.public_url},
                 "version": version, "state_dir": str(ctx.state_dir),
@@ -834,6 +843,11 @@ def create_app(ctx: WebContext) -> FastAPI:
                                 "Gửi từ trang web của Kite.")
         audit(session, "ntfy_test")
         return {"sent": True}
+
+    @app.get("/api/health")
+    async def health():
+        # Unauthenticated on purpose: the container's health check and Caddy only learn that the web answers.
+        return {"ok": True}
 
     @app.get("/api/system/doctor")
     async def doctor(request: Request):

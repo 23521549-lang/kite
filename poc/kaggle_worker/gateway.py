@@ -142,8 +142,7 @@ class ModelGateway:
         wait_note: Callable[[str], str] | None = None,
         max_wait_seconds: float = 4 * 3600.0,
     ) -> None:
-        if not workers:
-            raise ValueError("at least one worker must be configured")
+        # No worker is allowed (a new machine): requests get "no worker serves this model" until one is added.
         ids = [w.worker_id for w in workers]
         if len(set(ids)) != len(ids):
             raise ValueError("worker IDs must be unique")

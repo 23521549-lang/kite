@@ -1,0 +1,179 @@
+# Kite on one machine with Docker Compose. kite-stack (kite_stack.py next to this file) installs it,
+# pins the images by digest in images.env and updates it: never run `docker compose` on this file by hand
+# without its env files (`sudo kite-stack compose ps` passes them).
+#
+# Kite's services run from one image, share the host's network and process space, run as uid 1000 and
+# see the state folder at the same path as the host (/var/lib/kite). So they behave exactly as on the
+# development machine: the gateway and the web listen on loopback only, the task sandboxes the worker
+# starts on the host's Docker get host paths for their mounts, and a bench run's lock is seen by every
+# service. Only Caddy faces the Internet: /worker/* for the Kaggle notebooks, and the web page unless the
+# machine was installed with --access private.
+name: kite
+
+x-kite: &kite
+  image: ${KITE_IMAGE:?set by kite-stack in images.env}
+  network_mode: host
+  pid: host
+  user: "1000:1000"
+  restart: unless-stopped
+  stop_grace_period: 30s
+  environment: &kite-env
+    HOME: /var/lib/kite/home
+    KITE_CONFIG: /var/lib/kite/kite/config.yaml
+    KITE_DEPLOY: compose
+    TZ: ${TZ:-UTC}
+  volumes:
+    - /var/lib/kite:/var/lib/kite
+  logging: &logging
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: "5"
+
+x-health: &health
+  interval: 15s
+  timeout: 10s
+  retries: 4
+  start_period: 90s
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
+      POSTGRES_DB: postgres
+    volumes:
+      - /var/lib/kite/postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${KITE_PG_PORT:-5432}:5432"     # loopback only: Kite's services use the host network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    logging: *logging
+
+  # Temporal's schema (idempotent: safe on every start).
+  temporal-setup:
+    image: temporalio/admin-tools:1.32.2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
+      DB_PORT: "5432"
+    volumes:
+      - ./temporal-setup.sh:/temporal-setup.sh:ro
+    entrypoint: ["/bin/sh", "/temporal-setup.sh"]
+    restart: "no"
+    logging: *logging
+
+  temporal:
+    image: temporalio/server:1.32.2
+    depends_on:
+      temporal-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
+      POSTGRES_SEEDS: postgres
+      SQL_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
+      BIND_ON_IP: 0.0.0.0
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    volumes:
+      - ../dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    ports:
+      - "127.0.0.1:7233:7233"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    logging: *logging
+
+  # The web's own database and role in the same Postgres (idempotent).
+  web-db:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: temporal
+      PGPASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
+      PGDATABASE: postgres
+      KITE_WEB_DB_PASSWORD: ${KITE_WEB_DB_PASSWORD:?set in stack.env}
+    volumes:
+      - ./web-db.sh:/web-db.sh:ro
+    entrypoint: ["/bin/sh", "/web-db.sh"]
+    restart: "no"
+    logging: *logging
+
+  gateway:
+    <<: *kite
+    command: ["kite", "gateway", "serve"]
+    shm_size: 1gb                  # Chromium (Kite's browser for kaggle.com) needs more than 64 MB
+    healthcheck:
+      <<: *health
+      test: ["CMD", "kite", "stack", "health", "gateway"]
+
+  worker:
+    <<: *kite
+    command: ["kite", "workflow", "worker"]
+    group_add:
+      - "${DOCKER_GID:?set in stack.env}"
+    volumes:
+      - /var/lib/kite:/var/lib/kite
+      - /var/run/docker.sock:/var/run/docker.sock   # each task's sandbox runs on the host's Docker
+    depends_on:
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      <<: *health
+      test: ["CMD", "kite", "stack", "health", "worker"]
+
+  web:
+    <<: *kite
+    command: ["kite", "web", "serve"]
+    environment:
+      <<: *kite-env
+      KITE_WEB_DB: "postgresql+psycopg://kite_web:${KITE_WEB_DB_PASSWORD:?set in stack.env}@127.0.0.1:${KITE_PG_PORT:-5432}/kite_web"
+    depends_on:
+      web-db:
+        condition: service_completed_successfully
+    healthcheck:
+      <<: *health
+      test: ["CMD", "kite", "stack", "health", "web"]
+
+  # The chat's OpenCode server (the lead agent): the web's Chat tab talks to it.
+  opencode:
+    <<: *kite
+    command: ["kite", "stack", "opencode"]
+    depends_on:
+      gateway:
+        condition: service_started
+    healthcheck:
+      <<: *health
+      test: ["CMD", "kite", "stack", "health", "opencode"]
+
+  caddy:
+    image: caddy:2
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      KITE_DOMAIN: ${KITE_DOMAIN:?set in stack.env}
+      KITE_HTTPS_PORT: ${KITE_HTTPS_PORT:-443}
+    volumes:
+      - ./Caddyfile.${KITE_ACCESS:-public}:/etc/caddy/Caddyfile:ro
+      - /var/lib/kite/caddy/data:/data
+      - /var/lib/kite/caddy/config:/config
+    logging: *logging

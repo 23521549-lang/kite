@@ -15,11 +15,11 @@ import {
   TextInput,
   Title,
 } from '@mantine/core'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { get, post, qs } from '../api'
 import { ConfirmButton, Empty, JsonView, KeyValue, Loading, Page } from '../components/common'
 import { loadMe, useKite } from '../store'
-import { ago, attempt, fmtTime, useLoad } from '../util'
+import { ago, attempt, fmtTime, notifyOk, useLoad } from '../util'
 
 export default function Settings() {
   const settings = useLoad(() => get<Record<string, any>>('/api/settings'), [])
@@ -42,7 +42,7 @@ export default function Settings() {
             ) : (
               <KeyValue
                 rows={[
-                  ['Phiên bản', `${s.version?.commit ?? '?'} · ${s.version?.subject ?? ''}`],
+                  ['Phiên bản', [s.version?.commit || '?', s.version?.subject].filter(Boolean).join(' · ')],
                   ['Ngày', fmtTime(s.version?.date)],
                   ['Gateway', `${s.gateway.host}:${s.gateway.port}`],
                   ['Địa chỉ cho worker', s.gateway.public_url ?? 'chưa đặt'],
@@ -250,6 +250,8 @@ function Update() {
       </Group>
       {!p ? (
         <Loading error={plan.error} />
+      ) : p.deploy === 'compose' ? (
+        <StackUpdate plan={p} reload={plan.reload} onResult={setResult} />
       ) : p.error ? (
         <Alert color="red">{p.error}</Alert>
       ) : p.behind ? (
@@ -278,7 +280,12 @@ function Update() {
           Đang là bản mới nhất ({p.head}).
         </Text>
       )}
-      {result ? (
+      {result?.queued ? (
+        <Alert color="blue" mt="sm">
+          Đã gửi yêu cầu. kite-stack trên máy tải image mới, kiểm tra rồi chạy (vài phút); image lỗi thì tự quay về
+          bản cũ. Xong thì tải lại trang.
+        </Alert>
+      ) : result ? (
         <Stack gap="xs" mt="sm">
           <Alert color={result.updated ? 'teal' : 'red'}>
             {result.updated ? `Đã cập nhật; test: ${result.tests}` : result.error ?? result.note}
@@ -289,6 +296,82 @@ function Update() {
         </Stack>
       ) : null}
     </Card>
+  )
+}
+
+const STACK_STATE: Record<string, string> = {
+  idle: 'chờ',
+  checking: 'đang kiểm tra bản mới',
+  updating: 'đang cập nhật',
+  rolling_back: 'đang quay về bản cũ',
+  restarting: 'đang khởi động lại',
+}
+const STACK_RESULT: Record<string, string> = {
+  updated: 'đã cập nhật',
+  up_to_date: 'đang là bản mới nhất',
+  busy: 'hoãn: có task hoặc lần đo đang chạy',
+  rolled_back: 'bản mới lỗi, đã quay về bản cũ',
+  failed: 'lỗi',
+  restarted: 'đã khởi động lại',
+}
+
+/** The Compose deployment: kite-stack on the host pulls the image, checks it and keeps the old one on failure. */
+function StackUpdate({
+  plan,
+  reload,
+  onResult,
+}: {
+  plan: Record<string, any>
+  reload: () => void
+  onResult: (r: Record<string, any>) => void
+}) {
+  const st = plan.stack ?? {}
+  const last = st.last ?? {}
+  const working = st.state && st.state !== 'idle' && st.state !== 'unknown'
+  useEffect(() => {
+    if (!working) return
+    const id = window.setInterval(reload, 5000)
+    return () => window.clearInterval(id)
+  }, [working, reload])
+  return (
+    <Stack gap="xs">
+      {plan.error ? <Alert color="yellow">{plan.error}</Alert> : null}
+      <Text size="sm">
+        Đang chạy <Code>{plan.head || '?'}</Code>
+        {st.current?.created ? ` (build ${fmtTime(st.current.created)})` : ''}
+        {plan.behind ? (
+          <>
+            {' '}
+            · có bản mới <Code>{plan.target}</Code>
+          </>
+        ) : null}
+      </Text>
+      <Text size="sm" c="dimmed">
+        Tự cập nhật: {st.auto === false ? 'tắt' : 'bật'} (kite-stack kiểm tra nhãn stable mỗi 10 phút)
+        {st.state ? ` · ${STACK_STATE[st.state] ?? st.state}` : ''}
+      </Text>
+      {last.result ? (
+        <Alert color={last.result === 'rolled_back' || last.result === 'failed' ? 'red' : 'gray'}>
+          Lần cuối ({fmtTime(last.at)}): {STACK_RESULT[last.result] ?? last.result}
+          {last.message ? ` — ${last.message}` : ''}
+        </Alert>
+      ) : null}
+      <Group>
+        <ConfirmButton
+          label="Cập nhật ngay"
+          title="Cập nhật Kite?"
+          message="kite-stack tải image mới nhất đã qua CI, chạy nó rồi kiểm tra từng dịch vụ. Dịch vụ nào không khỏe thì quay về image cũ. Không làm khi có task hoặc lần đo đang chạy."
+          confirmLabel="Cập nhật"
+          onConfirm={async () => {
+            const res = await attempt(() => post('/api/system/update'))
+            if (res) {
+              onResult(res)
+              reload()
+            }
+          }}
+        />
+      </Group>
+    </Stack>
   )
 }
 
@@ -360,7 +443,8 @@ function Cleanup() {
 
 function Restart() {
   const restart = async (services: string[], force = false) => {
-    await attempt(() => post('/api/system/restart', { services, force }), 'Đã khởi động lại')
+    const res = await attempt(() => post<Record<string, any>>('/api/system/restart', { services, force }))
+    if (res) notifyOk(res.queued ? 'Đã gửi yêu cầu khởi động lại' : 'Đã khởi động lại')
   }
   return (
     <Card withBorder>

@@ -1,0 +1,64 @@
+name: Infra
+
+# Kite's AWS machine (infra/aws), by hand only: plan, then apply. AWS is reached with GitHub's OIDC token
+# through the role made by infra/aws/bootstrap (no AWS key in GitHub). Repository variables:
+#   AWS_ROLE_ARN, AWS_REGION, TF_STATE_BUCKET   (outputs of infra/aws/bootstrap)
+#   KITE_SSH_CIDR                               (your IP for SSH, e.g. 203.0.113.7/32)
+#   KITE_SSH_PUBLIC_KEY                         (one line: ssh-ed25519 AAAA... you@laptop)
+#   KITE_ACCESS, KITE_DOMAIN                    (optional: private, your own domain)
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: plan shows the changes; apply makes them
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: infra-aws
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    environment: aws
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: infra/aws
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_ssh_cidr: ${{ vars.KITE_SSH_CIDR }}
+      TF_VAR_ssh_public_key: ${{ vars.KITE_SSH_PUBLIC_KEY }}
+      TF_VAR_access: ${{ vars.KITE_ACCESS || 'public' }}
+      TF_VAR_domain: ${{ vars.KITE_DOMAIN || '' }}
+      TF_VAR_image: ghcr.io/${{ github.repository_owner }}/kite
+      TF_VAR_installer_url: https://raw.githubusercontent.com/${{ github.repository }}/main/deploy/stack/install.sh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+      - name: Init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=kite/aws.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+      - name: Plan
+        run: terraform plan -input=false -out=kite.tfplan
+      - name: Apply
+        if: inputs.action == 'apply'
+        run: |
+          terraform apply -input=false kite.tfplan
+          terraform output

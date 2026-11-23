@@ -32,3 +32,112 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest tests/poc/kaggle_worker -q -p no:cacheprovider
+
+  # The web page type-checks and builds (Node.js from the same wheel as the ui extra and the image).
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Node.js
+        run: python -m pip install "nodejs-wheel>=24,<25"
+      - name: Type-check and build
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+  # The deployment files: Compose config, shell scripts, Terraform.
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compose file
+        run: |
+          printf 'KITE_IMAGE=kite:test\n' > /tmp/images.env
+          printf '%s\n' KITE_DOMAIN=example.invalid TEMPORAL_POSTGRES_PASSWORD=x KITE_WEB_DB_PASSWORD=y \
+            DOCKER_GID=999 KITE_ACCESS=public > /tmp/stack.env
+          docker compose -p kite --project-directory deploy/stack --env-file /tmp/stack.env \
+            --env-file /tmp/images.env -f deploy/stack/compose.yaml config --quiet
+      - name: Shell scripts
+        run: |
+          shellcheck -x deploy/stack/install.sh deploy/stack/temporal-setup.sh deploy/stack/web-db.sh \
+            deploy/sandbox/context.sh
+          python3 -m py_compile deploy/stack/kite_stack.py
+
+  # Terraform of the AWS machine (infra/aws): checked here, applied by the infra workflow by hand.
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - name: Format and validation
+        run: |
+          terraform fmt -check -recursive infra
+          for dir in infra/aws infra/aws/bootstrap; do
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+  # Images for the Compose deployment, only from main once every check above passed: sha-<commit>, and
+  # `stable`, the tag kite-stack on the machines follows.
+  images:
+    needs: [tests, web, deploy]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      KITE_IMAGE: ghcr.io/${{ github.repository_owner }}/kite
+      SANDBOX_IMAGE: ghcr.io/${{ github.repository_owner }}/kite-sandbox
+    steps:
+      - uses: actions/checkout@v7
+      - name: Commit
+        id: commit
+        run: |
+          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Kite image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.KITE_IMAGE }}:sha-${{ steps.commit.outputs.short }}
+            ${{ env.KITE_IMAGE }}:stable
+          build-args: |
+            KITE_VERSION=${{ github.sha }}
+            KITE_VERSION_DATE=${{ steps.commit.outputs.date }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.created=${{ steps.commit.outputs.date }}
+          cache-from: type=gha,scope=kite
+          cache-to: type=gha,scope=kite,mode=max
+      - name: Sandbox build context
+        run: bash deploy/sandbox/context.sh "${{ runner.temp }}/sandbox"
+      - name: Sandbox image
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ runner.temp }}/sandbox
+          push: true
+          tags: |
+            ${{ env.SANDBOX_IMAGE }}:sha-${{ steps.commit.outputs.short }}
+            ${{ env.SANDBOX_IMAGE }}:stable
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=sandbox
+          cache-to: type=gha,scope=sandbox,mode=max

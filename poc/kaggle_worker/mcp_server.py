@@ -847,10 +847,10 @@ class KiteOps:
     async def update_kite(self, confirm: bool = False) -> dict:
         """Update Kite on EC2 from GitHub: show what is new; with confirm=True pull, run the tests (the
         old commit comes back if they fail), restart the services and rewrite the chat's files."""
-        from . import update
+        from . import stack, update
 
         if not confirm:
-            report = await asyncio.to_thread(update.plan)
+            report = await asyncio.to_thread(stack.update_plan if stack.in_compose() else update.plan)
             if not report.get("error"):
                 report["confirm_needed"] = bool(report["behind"])
             return report
@@ -858,6 +858,11 @@ class KiteOps:
         if running:
             raise KiteToolError(f"đang có task chạy ({', '.join(running)}): cập nhật lúc này sẽ cắt ngang nó. "
                                 "Chờ task xong (wait_task) hoặc hủy rồi cập nhật.")
+        if stack.in_compose():
+            queued = stack.request("update")
+            return {"started": True, "queued": True, "request": queued["request"],
+                    "note": "kite-stack trên máy đang tải image mới, kiểm tra rồi chạy (vài phút; image lỗi thì tự "
+                            "quay về bản cũ). Chat sẽ khởi động lại khi xong: người dùng mở lại trang Chat."}
         log = self._spawn_detached(["update", "--yes"], "update")
         return {"started": True, "log": str(log),
                 "note": "Kite đang kéo code, chạy test (khoảng 1-2 phút) rồi khởi động lại; xong thì người dùng thoát "
