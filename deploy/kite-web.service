@@ -1,0 +1,22 @@
+# systemd unit for Kite's web back end (FastAPI on loopback; Caddy publishes it over HTTPS).
+# Install: kite web admin (once), then
+#   sudo cp deploy/kite-web.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now kite-web
+[Unit]
+Description=Kite web back end
+After=network-online.target kite-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kite
+ExecStart=/home/ubuntu/kite/.venv/bin/kite --config /var/lib/kite/kite/config.yaml web serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# No NoNewPrivileges: the web restarts Kite's services and updates Kite through sudo, like the chat does.
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

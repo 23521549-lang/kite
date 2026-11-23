@@ -163,6 +163,8 @@ Loại nào không nằm trong bảng thì thêm bằng **OpenAI-compatible**, n
 
 Task, journal, memory và bench giữ chỗ lưu hiện tại trước, sau đó mới chuyển dần vào Postgres nếu cần.
 
+**Đã chốt khi làm P3 (23/11):** worker và provider vẫn nằm trong `config.yaml`, key nằm trong file 0600, để lệnh `kite worker ...` và web luôn thấy cùng một danh sách; bảng `providers`, `workers`, `spend_ledger` chưa cần. Bảng của web (`users`, `sessions`, `login_attempts`, `audit_log`, `repos`, `settings`) dùng SQLite trong thư mục state khi chạy trên máy hiện tại, Postgres khi triển khai bằng compose (P6). Migration dùng bảng `schema_version` và các bước viết trong code thay cho Alembic, vì mới có một phiên bản schema.
+
 ## 6. Triển khai (làm sau cùng)
 1. **Hạ tầng (theo cloud):** Terraform cho AWS tạo EC2 t3.medium, EBS cho `/var/lib/kite`, security group (443, SSH theo IP chủ), Elastic IP, IAM tối thiểu. State lưu trong S3. GitHub Actions đăng nhập AWS bằng OIDC, không giữ AWS key dài hạn. Máy có sẵn ở nơi khác thì bỏ qua bước này.
 2. **Bộ cài (mọi máy Ubuntu):** chạy lại bao nhiêu lần cũng được. Cài Docker, tạo thư mục dữ liệu, sinh secret ngay trên máy, ghi cấu hình mặc định, chọn kiểu truy cập (sslip.io, tên miền, hoặc mạng riêng), dựng compose, cài dịch vụ tự cập nhật, tạo tài khoản admin. Máy mới thì cloud-init gọi bộ cài lúc khởi động lần đầu.

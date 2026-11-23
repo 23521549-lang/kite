@@ -1,0 +1,1133 @@
+"""The web back end: FastAPI routes for every tab, the events WebSocket, and two proxies (the OpenCode
+server for Chat, Kite's browser for the Worker tab).
+
+Security (spec 5.4): one account; argon2 password and TOTP, both needed; 5 wrong tries lock the account
+for 15 minutes and 20 from one address in 15 minutes block that address; the session cookie is
+``__Host-`` prefixed, HttpOnly, Secure, SameSite=Strict, 12 hours idle and 7 days at most; every write
+needs the session's CSRF token in ``X-CSRF-Token`` and a same-site Origin; WebSockets check Origin;
+answers carry a strict Content-Security-Policy; there is no /docs. Sensitive actions go to the audit log.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+import hmac
+import json
+from pathlib import Path
+import re
+import time
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from ..config import ConfigError, load_config
+from ..journal import FILES, Journal, read_jsonl, summarize
+from ..mcp_server import KiteToolError
+from . import security as sec
+from . import workers as wk
+from .db import Store, User
+
+IDLE_SECONDS = 12 * 3600
+ABSOLUTE_SECONDS = 7 * 86400
+LOCK_AFTER, LOCK_SECONDS = 5, 900
+IP_LIMIT, IP_WINDOW = 20, 900
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+CSP = ("default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+       "connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; "
+       "object-src 'none'")
+GatewayCall = Callable[[str, str, dict | None], Awaitable[dict]]
+
+
+class GatewayDown(RuntimeError):
+    pass
+
+
+@dataclass
+class Session:
+    sid: str
+    user: User
+    csrf: str
+    ip: str
+
+
+class WebContext:
+    """What the routes need: the config file, the web's store, Kite's operations, the gateway."""
+
+    def __init__(self, config_path: Path, store: Store, sealer: sec.Sealer, *,
+                 ops_factory: Callable[[Any], Any], gateway: GatewayCall, clock: Callable[[], float] = time.time,
+                 secure_cookies: bool = True, opencode_url: str = "http://127.0.0.1:4096",
+                 opencode_password: str | None = None, gateway_ws: str = "ws://127.0.0.1:8787",
+                 restart: Callable[[list[str]], Awaitable[dict]] | None = None, dist: Path | None = None,
+                 http_factory: Callable | None = None, ledger_factory: Callable[[], Any] | None = None,
+                 quota: Callable[[], Awaitable[dict]] | None = None, events_every: float = 2.0) -> None:
+        self.config_path = Path(config_path)
+        self.store, self.sealer, self.gateway = store, sealer, gateway
+        self.clock, self.secure_cookies = clock, secure_cookies
+        self.opencode_url, self.opencode_password = opencode_url.rstrip("/"), opencode_password
+        self.gateway_ws, self.restart, self.dist = gateway_ws.rstrip("/"), restart, dist
+        self.http_factory, self.quota, self.events_every = http_factory, quota, events_every
+        self._ops_factory, self._ledger_factory = ops_factory, ledger_factory
+        self._config, self._config_mtime, self._ops = None, None, None
+
+    @property
+    def state_dir(self) -> Path:
+        return self.config_path.parent
+
+    @property
+    def cookie(self) -> str:
+        return "__Host-kite" if self.secure_cookies else "kite_session"
+
+    def config(self):
+        mtime = self.config_path.stat().st_mtime_ns
+        if self._config is None or mtime != self._config_mtime:
+            self._config, self._config_mtime, self._ops = load_config(self.config_path), mtime, None
+        return self._config
+
+    def ops(self):
+        config = self.config()
+        if self._ops is None:
+            self._ops = self._ops_factory(config)
+        return self._ops
+
+    def ledger(self):
+        if self._ledger_factory is not None:
+            return self._ledger_factory()
+        from ..relay import SpendLedger
+
+        return SpendLedger(Journal(self.state_dir / "journal").read("spend"))
+
+    def journal(self) -> Journal:
+        return Journal(self.state_dir / "journal")
+
+
+# ---------------------------------------------------------------- request bodies
+class LoginIn(BaseModel):
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=200)
+    code: str = Field(max_length=12)
+
+
+class PasswordIn(BaseModel):
+    current: str = Field(max_length=200)
+    new: str = Field(max_length=200)
+    code: str = Field(max_length=12)
+
+
+class TotpBeginIn(BaseModel):
+    password: str = Field(max_length=200)
+    code: str = Field(max_length=12)
+
+
+class TotpConfirmIn(BaseModel):
+    code: str = Field(max_length=12)
+
+
+class TaskIn(BaseModel):
+    repo: str = Field(max_length=500)
+    goal: str = Field(max_length=20000)
+    task_type: str = "coding"
+    model: str | None = None
+    continue_from: str = ""
+    ignore_uncommitted: bool = False
+
+
+class TextIn(BaseModel):
+    text: str = Field(default="", max_length=20000)
+
+
+class NoteIn(BaseModel):
+    verdict: str
+    reason: str = Field(default="", max_length=2000)
+
+
+class CommitIn(BaseModel):
+    message: str = Field(max_length=2000)
+
+
+class RepoIn(BaseModel):
+    name: str = Field(max_length=100)
+    path: str = Field(max_length=500)
+    url: str = Field(default="", max_length=500)
+
+
+class MemoryIn(BaseModel):
+    text: str = Field(max_length=2000)
+    repo: str = ""
+
+
+class RepoConfigIn(BaseModel):
+    repo: str
+    config: str = Field(max_length=20000)
+
+
+class StartIn(BaseModel):
+    model: str | None = None
+    force: bool = False
+
+
+class SwitchIn(BaseModel):
+    on: bool
+
+
+class BenchIn(BaseModel):
+    label: str = ""
+    suites: str = "code"
+    models: str = ""
+    worker: str = ""
+
+
+class RestartIn(BaseModel):
+    services: list[str] = ["kite-gateway"]
+    force: bool = False
+
+
+class CleanupIn(BaseModel):
+    days: float = 7
+
+
+# ---------------------------------------------------------------- the app
+def client_ip(request) -> str:
+    """The caller's address; behind Caddy on this machine, the one Caddy saw (last X-Forwarded-For entry)."""
+    host = request.client.host if request.client else ""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded and host in ("127.0.0.1", "::1"):
+        return forwarded.split(",")[-1].strip()[:64]
+    return host[:64]
+
+
+def same_origin(request, origin: str | None) -> bool:
+    """A browser's Origin must be this site: its host and port are the ones the request came to."""
+    if not origin:
+        return False
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
+    return bool(parts.netloc) and parts.netloc.lower() == (request.headers.get("host") or "").lower()
+
+
+def create_app(ctx: WebContext) -> FastAPI:
+    app = FastAPI(title="Kite", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.middleware("http")
+    async def headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("Content-Security-Policy", CSP)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
+        if request.url.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
+    @app.exception_handler(ConfigError)
+    async def config_error(_request, exc):
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.exception_handler(GatewayDown)
+    async def gateway_down(_request, exc):
+        return JSONResponse({"error": f"không gọi được gateway: {exc}"}, status_code=502)
+
+    @app.exception_handler(KiteToolError)
+    async def tool_error(_request, exc):
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.exception_handler(ValueError)
+    async def value_error(_request, exc):
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(_request, exc):
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code, headers=getattr(exc, "headers", None))
+
+    # ------------------------------------------------------------------ sessions
+    def session_of(request) -> Session | None:
+        token = request.cookies.get(ctx.cookie)
+        if not token:
+            return None
+        sid = sec.digest(token)
+        row = ctx.store.session(sid)
+        now = ctx.clock()
+        if row is None:
+            return None
+        if now - row.last_seen > IDLE_SECONDS or now - row.created_at > ABSOLUTE_SECONDS:
+            ctx.store.drop_session(sid)
+            return None
+        user = ctx.store.user(row.user_id)
+        if user is None:
+            return None
+        if now - row.last_seen > 60:
+            ctx.store.touch_session(sid)
+        return Session(sid, user, row.csrf, client_ip(request))
+
+    @app.middleware("http")
+    async def require_session(request: Request, call_next):
+        # Every API route needs a session, before its body is even read: a new route is closed by default.
+        if request.url.path.startswith("/api/") and request.url.path != "/api/auth/login":
+            if await asyncio.to_thread(session_of, request) is None:
+                return JSONResponse({"error": "cần đăng nhập"}, status_code=401,
+                                    headers={"Cache-Control": "no-store"})
+        return await call_next(request)
+
+    def auth(request: Request) -> Session:
+        session = session_of(request)
+        if session is None:
+            raise HTTPException(401, "cần đăng nhập")
+        if request.method not in SAFE_METHODS:
+            origin = request.headers.get("origin")
+            if origin is not None and not same_origin(request, origin):
+                raise HTTPException(403, "yêu cầu từ trang khác")
+            if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), session.csrf):
+                raise HTTPException(403, "thiếu mã CSRF")
+        return session
+
+    def audit(session: Session | None, action: str, target: str = "", ok: bool = True,
+              detail: dict | None = None, *, ip: str = "", username: str = "") -> None:
+        ctx.store.audit(session.user.username if session else username, session.ip if session else ip, action,
+                        target, ok, detail)
+
+    def set_cookie(response: Response, token: str) -> None:
+        response.set_cookie(ctx.cookie, token, max_age=ABSOLUTE_SECONDS, httponly=True, secure=ctx.secure_cookies,
+                            samesite="strict", path="/")
+
+    # ------------------------------------------------------------------ auth
+    @app.post("/api/auth/login")
+    async def login(body: LoginIn, request: Request, response: Response):
+        ip = client_ip(request)
+        origin = request.headers.get("origin")
+        if origin is not None and not same_origin(request, origin):
+            raise HTTPException(403, "yêu cầu từ trang khác")
+        if ctx.store.failures_from(ip, IP_WINDOW) >= IP_LIMIT:
+            raise HTTPException(429, "quá nhiều lần đăng nhập sai từ địa chỉ này; thử lại sau 15 phút")
+        now = ctx.clock()
+        user = ctx.store.user_by_name(body.username.strip())
+        if user is not None and user.locked_until > now:
+            ctx.store.attempt(ip, body.username, False)
+            raise HTTPException(429, f"tài khoản tạm khóa {round((user.locked_until - now) / 60) or 1} phút "
+                                     "vì nhập sai nhiều lần")
+        password_ok = await asyncio.to_thread(sec.verify_password, user.password_hash if user else None, body.password)
+        counter = None
+        if user is not None and password_ok:
+            counter = sec.verify_totp(ctx.sealer.unseal(user.totp_secret), body.code, now=now,
+                                      last_counter=user.totp_last)
+        if user is None or not password_ok or counter is None:
+            ctx.store.attempt(ip, body.username, False)
+            if user is not None:
+                failed = user.failed + 1
+                ctx.store.update_user(user.id, failed=failed,
+                                      locked_until=now + LOCK_SECONDS if failed >= LOCK_AFTER else user.locked_until)
+            audit(None, "login", body.username[:64], False, ip=ip, username=body.username[:64])
+            raise HTTPException(401, "sai tên đăng nhập, mật khẩu hoặc mã 2FA")
+        ctx.store.update_user(user.id, failed=0, locked_until=0.0, totp_last=counter)
+        ctx.store.attempt(ip, user.username, True)
+        ctx.store.prune_sessions(idle=IDLE_SECONDS, absolute=ABSOLUTE_SECONDS)
+        token, csrf = sec.new_token(), sec.new_token()
+        ctx.store.add_session(sec.digest(token), user.id, csrf, ip, request.headers.get("user-agent", ""))
+        if await asyncio.to_thread(_needs_rehash, user.password_hash):
+            ctx.store.update_user(user.id, password_hash=await asyncio.to_thread(sec.hash_password, body.password))
+        set_cookie(response, token)
+        ctx.store.audit(user.username, ip, "login", user.username, True)
+        return {"username": user.username, "csrf": csrf}
+
+    @app.post("/api/auth/logout")
+    async def logout(request: Request, response: Response):
+        session = auth(request)
+        ctx.store.drop_session(session.sid)
+        response.delete_cookie(ctx.cookie, path="/", secure=ctx.secure_cookies, httponly=True, samesite="strict")
+        audit(session, "logout")
+        return {"ok": True}
+
+    @app.get("/api/auth/me")
+    async def me(request: Request):
+        session = auth(request)
+        return {"username": session.user.username, "csrf": session.csrf,
+                "sessions": ctx.store.list_sessions(session.user.id)}
+
+    @app.post("/api/auth/logout-others")
+    async def logout_others(request: Request):
+        session = auth(request)
+        dropped = ctx.store.drop_sessions(session.user.id, keep=session.sid)
+        audit(session, "logout_others", detail={"sessions": dropped})
+        return {"dropped": dropped}
+
+    def check_second_factor(session: Session, password: str, code: str) -> int:
+        user = ctx.store.user(session.user.id)
+        counter = sec.verify_totp(ctx.sealer.unseal(user.totp_secret), code, now=ctx.clock(),
+                                  last_counter=user.totp_last)
+        if not sec.verify_password(user.password_hash, password) or counter is None:
+            audit(session, "reauth", ok=False)
+            raise HTTPException(403, "mật khẩu hoặc mã 2FA không đúng")
+        return counter
+
+    @app.post("/api/auth/password")
+    async def change_password(body: PasswordIn, request: Request):
+        session = auth(request)
+        counter = await asyncio.to_thread(check_second_factor, session, body.current, body.code)
+        problem = sec.password_problem(body.new)
+        if problem:
+            raise HTTPException(400, problem)
+        hashed = await asyncio.to_thread(sec.hash_password, body.new)
+        ctx.store.update_user(session.user.id, password_hash=hashed, password_changed_at=ctx.clock(),
+                              totp_last=counter)
+        dropped = ctx.store.drop_sessions(session.user.id, keep=session.sid)
+        audit(session, "password_changed", detail={"other_sessions_closed": dropped})
+        return {"ok": True, "other_sessions_closed": dropped}
+
+    @app.post("/api/auth/totp/begin")
+    async def totp_begin(body: TotpBeginIn, request: Request):
+        session = auth(request)
+        counter = await asyncio.to_thread(check_second_factor, session, body.password, body.code)
+        secret = sec.new_totp_secret()
+        ctx.store.update_user(session.user.id, totp_pending=ctx.sealer.seal(secret), totp_last=counter)
+        audit(session, "totp_begin")
+        return {"secret": secret, "uri": sec.otpauth_uri(secret, session.user.username),
+                "next": "thêm mã này vào app xác thực rồi gửi mã 6 số đầu tiên tới /api/auth/totp/confirm"}
+
+    @app.post("/api/auth/totp/confirm")
+    async def totp_confirm(body: TotpConfirmIn, request: Request):
+        session = auth(request)
+        user = ctx.store.user(session.user.id)
+        if not user.totp_pending:
+            raise HTTPException(400, "chưa bắt đầu đổi 2FA")
+        secret = ctx.sealer.unseal(user.totp_pending)
+        counter = sec.verify_totp(secret, body.code, now=ctx.clock())
+        if counter is None:
+            raise HTTPException(400, "mã chưa đúng; kiểm tra giờ trên điện thoại")
+        ctx.store.update_user(user.id, totp_secret=user.totp_pending, totp_pending=None, totp_last=counter)
+        audit(session, "totp_changed")
+        return {"ok": True}
+
+    # ------------------------------------------------------------------ gateway helpers
+    async def gateway_status() -> dict | None:
+        try:
+            return await ctx.gateway("GET", "/status", None)
+        except GatewayDown:
+            return None
+
+    # ------------------------------------------------------------------ overview
+    @app.get("/api/overview")
+    async def overview(request: Request):
+        auth(request)
+        status = await gateway_status()
+        ledger = ctx.ledger()
+        config = ctx.config()
+        rows = wk.worker_rows(config, status, ledger, _auto_click(ctx))
+        tasks = await ctx.ops().list_tasks(limit=50)
+        counts: dict[str, int] = {}
+        for task in tasks:
+            counts[task["state"]] = counts.get(task["state"], 0) + 1
+        quota = None
+        if ctx.quota is not None:
+            try:
+                quota = await ctx.quota()
+            except Exception:
+                quota = None
+        return {"gateway_up": status is not None, "workers": rows,
+                "queued_jobs": (status or {}).get("queued_jobs", 0), "running_jobs": (status or {}).get("running_jobs", 0),
+                "spend": {"today_usd": round(sum(r["spend"]["today_usd"] for r in rows), 4),
+                          "month_usd": round(sum(r["spend"]["month_usd"] for r in rows), 4)},
+                "tasks": {"counts": counts, "recent": tasks[:10]}, "gpu_quota": quota}
+
+    # ------------------------------------------------------------------ providers and workers
+    @app.get("/api/provider-types")
+    async def provider_types(request: Request):
+        auth(request)
+        return {"types": wk.PROVIDER_TYPES}
+
+    @app.post("/api/providers/test")
+    async def provider_test(request: Request):
+        auth(request)
+        body = await _json(request)
+        return await wk.test_connection(body, session_factory=ctx.http_factory)
+
+    @app.get("/api/workers")
+    async def workers(request: Request):
+        auth(request)
+        status = await gateway_status()
+        return {"gateway_up": status is not None,
+                "workers": wk.worker_rows(ctx.config(), status, ctx.ledger(), _auto_click(ctx))}
+
+    @app.post("/api/workers")
+    async def add_worker(request: Request):
+        session = auth(request)
+        body = await _json(request)
+        try:
+            report = wk.add_worker(ctx.config_path, body)
+        except ConfigError as exc:
+            audit(session, "worker_add", str(body.get("id", "")), False, {"error": str(exc), "type": body.get("type")})
+            raise
+        audit(session, "worker_add", report["added"], True, {"type": report["type"]})
+        return report
+
+    @app.patch("/api/workers/{worker_id}")
+    async def edit_worker(worker_id: str, request: Request):
+        session = auth(request)
+        body = await _json(request)
+        report = wk.update_worker(ctx.config_path, worker_id, body)
+        audit(session, "worker_update", worker_id, True,
+              {"fields": [k for k in body if k not in wk.SECRET_FIELDS],
+               "keys_changed": [k for k in body if k in wk.SECRET_FIELDS]})
+        return report
+
+    @app.delete("/api/workers/{worker_id}")
+    async def delete_worker(worker_id: str, request: Request):
+        session = auth(request)
+        report = wk.remove_worker(ctx.config_path, worker_id)
+        audit(session, "worker_remove", worker_id)
+        return report
+
+    def worker_kind(worker_id: str) -> str:
+        provider = next((p for p in ctx.config().providers if p.effective_worker_id == worker_id), None)
+        if provider is None or provider.adapter not in ("pull", "relay"):
+            raise HTTPException(404, f"không có worker {worker_id}")
+        return wk.kind_of(provider)
+
+    @app.post("/api/workers/{worker_id}/start")
+    async def start_worker(worker_id: str, request: Request, body: StartIn | None = None):
+        session = auth(request)
+        kind, body = worker_kind(worker_id), body or StartIn()
+        if kind in ("openai", "anthropic"):
+            report = await ctx.gateway("POST", "/kite/switch", {"worker": worker_id, "on": True})
+        else:
+            report = await ctx.gateway("POST", "/kite/wake", {"worker": worker_id, "model": body.model,
+                                                              "reason": "web", "force": body.force})
+        audit(session, "worker_start", worker_id, True, {"kind": kind, "paid": kind != "kaggle"})
+        return report
+
+    @app.post("/api/workers/{worker_id}/stop")
+    async def stop_worker(worker_id: str, request: Request):
+        session = auth(request)
+        kind = worker_kind(worker_id)
+        if kind in ("openai", "anthropic"):
+            report = await ctx.gateway("POST", "/kite/switch", {"worker": worker_id, "on": False})
+        else:
+            report = await ctx.gateway("POST", "/kite/stop", {"worker": worker_id})
+        audit(session, "worker_stop", worker_id, True, {"kind": kind})
+        return report
+
+    @app.post("/api/workers/{worker_id}/auto")
+    async def auto_start(worker_id: str, body: SwitchIn, request: Request):
+        session = auth(request)
+        worker_kind(worker_id)
+        report = await ctx.gateway("POST", "/kite/switch", {"worker": worker_id, "auto": body.on})
+        audit(session, "worker_autostart", worker_id, True, {"on": body.on})
+        return report
+
+    @app.post("/api/workers/{worker_id}/auto-click")
+    async def auto_click(worker_id: str, body: SwitchIn, request: Request):
+        session = auth(request)
+        if worker_kind(worker_id) != "kaggle":
+            raise HTTPException(400, "chỉ worker Kaggle có công tắc Kite tự bấm")
+        from ..browser import set_auto_click
+
+        set_auto_click(ctx.state_dir, worker_id, body.on)
+        audit(session, "kaggle_auto_click", worker_id, True, {"on": body.on})
+        return {"worker": worker_id, "auto_click": body.on}
+
+    @app.post("/api/workers/{worker_id}/browser")
+    async def open_browser(worker_id: str, request: Request):
+        session = auth(request)
+        if worker_kind(worker_id) != "kaggle":
+            raise HTTPException(400, "trình duyệt Kite chỉ dành cho worker Kaggle")
+        report = await ctx.gateway("POST", "/kite/browser/open", {"worker": worker_id})
+        audit(session, "kaggle_browser_open", worker_id)
+        return report
+
+    @app.get("/api/spend")
+    async def spend(request: Request, days: int = 31):
+        auth(request)
+        since = ctx.clock() - max(1, min(days, 400)) * 86400
+        by_day: dict[str, dict[str, float]] = {}
+        for record in ctx.journal().read("spend", since):
+            day = str(record.get("at", ""))[:10]
+            worker = str(record.get("worker"))
+            by_day.setdefault(day, {})[worker] = round(by_day.get(day, {}).get(worker, 0.0)
+                                                       + float(record.get("usd") or 0), 6)
+        return {"days": [{"day": d, "workers": w, "usd": round(sum(w.values()), 6)} for d, w in sorted(by_day.items())]}
+
+    # ------------------------------------------------------------------ tasks
+    @app.get("/api/tasks")
+    async def tasks(request: Request, limit: int = 30):
+        auth(request)
+        return {"tasks": await ctx.ops().list_tasks(limit=max(1, min(limit, 50)))}
+
+    @app.get("/api/tasks/{task_id}")
+    async def task(task_id: str, request: Request):
+        auth(request)
+        ops = ctx.ops()
+        report: dict[str, Any] = {"log": await ops.task_log(task_id, limit=80)}
+        try:
+            report["status"] = await ops.task_status(task_id)
+        except Exception as exc:                  # Temporal down: the trace above still tells the story
+            report["status"] = {"error": str(exc)[:300]}
+        if report["status"].get("workflow") == "COMPLETED":
+            report["result"] = await ops.task_result(task_id)
+        from ..journal import show_task
+        from ..backend import task_slug
+
+        resolved = report["log"].get("task_id", task_id)
+        report["journal"] = show_task(ctx.journal(), resolved,
+                                      ctx.state_dir / "tasks" / task_slug(resolved) / "trace.jsonl")
+        return report
+
+    @app.get("/api/tasks/{task_id}/patch")
+    async def task_patch(task_id: str, request: Request):
+        auth(request)
+        from ..backend import task_slug
+
+        resolved = ctx.ops().resolve(task_id)
+        path = ctx.state_dir / "tasks" / task_slug(resolved) / "result.patch"
+        if not path.is_file():
+            raise HTTPException(404, "task chưa có patch")
+        return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace"))
+
+    @app.post("/api/tasks")
+    async def new_task(body: TaskIn, request: Request):
+        session = auth(request)
+        ops = ctx.ops()
+        report = await ops.logged("start_task", ops.start_task, body.repo, body.goal, body.task_type, body.model,
+                                  body.continue_from, body.ignore_uncommitted)
+        audit(session, "task_start", report.get("task_id", ""), True, {"repo": body.repo})
+        return report
+
+    async def task_action(request: Request, task_id: str, name: str, *args, audited: bool = False):
+        session = auth(request)
+        ops = ctx.ops()
+        try:
+            report = await ops.logged(name, getattr(ops, name), task_id, *args)
+        except Exception as exc:
+            if audited:
+                audit(session, name, task_id, False, {"error": str(exc)[:300]})
+            raise
+        if audited:
+            audit(session, name, report.get("task_id", task_id) if isinstance(report, dict) else task_id)
+        return report
+
+    @app.post("/api/tasks/{task_id}/apply")
+    async def task_apply(task_id: str, request: Request):
+        return await task_action(request, task_id, "apply_result", audited=True)
+
+    @app.post("/api/tasks/{task_id}/commit")
+    async def task_commit(task_id: str, body: CommitIn, request: Request):
+        return await task_action(request, task_id, "commit_result", body.message, audited=True)
+
+    @app.post("/api/tasks/{task_id}/cancel")
+    async def task_cancel(task_id: str, request: Request):
+        return await task_action(request, task_id, "cancel_task", audited=True)
+
+    @app.post("/api/tasks/{task_id}/pause")
+    async def task_pause(task_id: str, request: Request):
+        return await task_action(request, task_id, "pause_task")
+
+    @app.post("/api/tasks/{task_id}/resume")
+    async def task_resume(task_id: str, request: Request):
+        return await task_action(request, task_id, "resume_task")
+
+    @app.post("/api/tasks/{task_id}/instruct")
+    async def task_instruct(task_id: str, body: TextIn, request: Request):
+        return await task_action(request, task_id, "send_instruction", body.text)
+
+    @app.post("/api/tasks/{task_id}/note")
+    async def task_note(task_id: str, body: NoteIn, request: Request):
+        return await task_action(request, task_id, "note_task", body.verdict, body.reason)
+
+    # ------------------------------------------------------------------ repositories
+    @app.get("/api/repos")
+    async def repos(request: Request):
+        auth(request)
+        ops = ctx.ops()
+        return {"repos": ctx.store.repo_rows(), "allowed_roots": [str(r) for r in ops.allowed_roots],
+                "memory": await ops.memory_show("")}
+
+    @app.post("/api/repos")
+    async def add_repo(body: RepoIn, request: Request):
+        session = auth(request)
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", body.name):
+            raise HTTPException(400, "tên repo chỉ gồm chữ, số, '.', '_', '-'")
+        await ctx.ops().repo_status(body.path)          # inside the allowed folders, a Git repo with a commit
+        repo_id = ctx.store.add_repo(body.name, str(Path(body.path).expanduser().resolve()), body.url)
+        audit(session, "repo_add", body.name, True, {"path": body.path})
+        return {"id": repo_id}
+
+    @app.delete("/api/repos/{repo_id}")
+    async def remove_repo(repo_id: int, request: Request):
+        session = auth(request)
+        if not ctx.store.drop_repo(repo_id):
+            raise HTTPException(404, "không có repo này")
+        audit(session, "repo_remove", str(repo_id))
+        return {"ok": True}
+
+    @app.get("/api/repos/status")
+    async def repo_status(request: Request, repo: str):
+        auth(request)
+        return await ctx.ops().repo_status(repo)
+
+    @app.get("/api/repos/memory")
+    async def repo_memory(request: Request, repo: str = ""):
+        auth(request)
+        return await ctx.ops().memory_show(repo)
+
+    @app.post("/api/repos/memory")
+    async def repo_remember(body: MemoryIn, request: Request):
+        session = auth(request)
+        report = await ctx.ops().remember(body.text, body.repo)
+        audit(session, "memory_add", body.repo or "chat")
+        return report
+
+    @app.delete("/api/repos/memory/{number}")
+    async def repo_forget(number: int, request: Request, repo: str = ""):
+        session = auth(request)
+        report = await ctx.ops().memory_forget(number, repo)
+        audit(session, "memory_forget", repo or "chat", True, {"number": number})
+        return report
+
+    @app.get("/api/repos/config")
+    async def repo_config(request: Request, repo: str):
+        auth(request)
+        return await ctx.ops().repo_config(repo)
+
+    @app.put("/api/repos/config")
+    async def save_repo_config(body: RepoConfigIn, request: Request):
+        session = auth(request)
+        report = await ctx.ops().repo_config(body.repo, body.config)
+        audit(session, "repo_config", body.repo)
+        return report
+
+    # ------------------------------------------------------------------ journal
+    @app.get("/api/journal/summary")
+    async def journal_summary(request: Request, days: float = 7):
+        auth(request)
+        since = ctx.clock() - days * 86400 if days > 0 else None
+        return await asyncio.to_thread(summarize, ctx.journal(), since=since)
+
+    @app.get("/api/journal/events")
+    async def journal_events(request: Request, file: str = "gateway", limit: int = 100, before: float | None = None,
+                             tag: str | None = None):
+        auth(request)
+        if file not in FILES:
+            raise HTTPException(400, f"file phải là một trong: {', '.join(FILES)}")
+        records = ctx.journal().read(file)
+        if before is not None:
+            records = [r for r in records if (r.get("ts") or 0) < before]
+        if tag:
+            records = [r for r in records if tag in (r.get("tag"), r.get("task_id"), r.get("worker"))]
+        return {"file": file, "records": records[-max(1, min(limit, 500)):][::-1]}
+
+    @app.get("/api/journal/daily")
+    async def journal_daily(request: Request, days: int = 30):
+        auth(request)
+        since = ctx.clock() - max(1, min(days, 400)) * 86400
+        return {"days": await asyncio.to_thread(daily, ctx.journal(), since)}
+
+    # ------------------------------------------------------------------ bench
+    @app.get("/api/bench/history")
+    async def bench_history(request: Request):
+        auth(request)
+        from .. import bench
+
+        text, rows = await asyncio.to_thread(bench.history, [ctx.state_dir / "bench", Path.home()])
+        return {"runs": rows, "table": text}
+
+    @app.post("/api/bench/run")
+    async def bench_run(body: BenchIn, request: Request):
+        session = auth(request)
+        ops = ctx.ops()
+        report = await ops.logged("bench_start", ops.bench_start, True, body.label, body.suites, body.models,
+                                  "", "", 0, body.worker)
+        audit(session, "bench_start", body.label, True, {"suites": body.suites, "models": body.models})
+        return report
+
+    # ------------------------------------------------------------------ settings and system
+    @app.get("/api/settings")
+    async def settings(request: Request):
+        auth(request)
+        config = ctx.config()
+        from .. import update
+
+        version = await asyncio.to_thread(_git_head, update.REPO)
+        return {"ntfy": bool(config.notify.ntfy), "gateway": {"host": config.gateway.host, "port": config.gateway.port,
+                                                             "public_url": config.gateway.public_url},
+                "version": version, "state_dir": str(ctx.state_dir),
+                "chat_preferences": (await ctx.ops().memory_show(""))["chat"]}
+
+    @app.post("/api/settings/ntfy/test")
+    async def ntfy_test(request: Request):
+        session = auth(request)
+        config = ctx.config()
+        if not config.notify.ntfy:
+            raise HTTPException(400, "chưa cài ntfy: kite notify setup")
+        from .. import notify
+        from ..config import resolve_secret
+
+        await asyncio.to_thread(notify.send, resolve_secret(config.notify.ntfy), "Kite: thử thông báo",
+                                "Gửi từ trang web của Kite.")
+        audit(session, "ntfy_test")
+        return {"sent": True}
+
+    @app.get("/api/system/doctor")
+    async def doctor(request: Request):
+        auth(request)
+        return await ctx.ops().doctor()
+
+    @app.get("/api/system/update")
+    async def update_plan(request: Request):
+        auth(request)
+        return await ctx.ops().update_kite(False)
+
+    @app.post("/api/system/update")
+    async def update_run(request: Request):
+        session = auth(request)
+        ops = ctx.ops()
+        try:
+            report = await ops.logged("update_kite", ops.update_kite, True)
+        except Exception as exc:
+            audit(session, "update", ok=False, detail={"error": str(exc)[:300]})
+            raise
+        audit(session, "update", detail={"log": report.get("log")})
+        return report
+
+    @app.get("/api/system/cleanup")
+    async def cleanup_plan(request: Request, days: float = 7):
+        auth(request)
+        return await ctx.ops().cleanup(False, days)
+
+    @app.post("/api/system/cleanup")
+    async def cleanup_run(body: CleanupIn, request: Request):
+        session = auth(request)
+        report = await ctx.ops().cleanup(True, body.days)
+        audit(session, "cleanup", detail={"freed": report.get("freed"), "days": body.days})
+        return report
+
+    @app.post("/api/system/restart")
+    async def restart(body: RestartIn, request: Request):
+        session = auth(request)
+        allowed = {"kite-gateway", "kite-workflow-worker"}
+        services = [s for s in body.services if s in allowed]
+        if not services or len(services) != len(body.services):
+            raise HTTPException(400, f"chỉ khởi động lại được: {', '.join(sorted(allowed))}")
+        running = [t["task_id"] for t in await ctx.ops().list_tasks(limit=50) if t["state"] == "LEASED"]
+        if running and not body.force:
+            raise HTTPException(409, f"đang có task chạy ({', '.join(running)}); khởi động lại sẽ cắt ngang nó")
+        if ctx.restart is None:
+            raise HTTPException(501, "máy này không cho web khởi động lại dịch vụ")
+        report = await ctx.restart(services)
+        audit(session, "restart", ",".join(services), bool(report.get("ok")), report)
+        return report
+
+    @app.get("/api/audit")
+    async def audit_rows(request: Request, limit: int = 100, before: float | None = None):
+        auth(request)
+        return {"rows": ctx.store.audit_rows(limit, before)}
+
+    # ------------------------------------------------------------------ Chat: the OpenCode server
+    @app.api_route("/api/opencode/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def opencode(path: str, request: Request):
+        session = auth(request)
+        if not re.fullmatch(r"[A-Za-z0-9/_.:-]{0,300}", path) or ".." in path:
+            raise HTTPException(400, "đường dẫn không hợp lệ")
+        import aiohttp
+
+        url = f"{ctx.opencode_url}/{path}"
+        headers = {k: v for k, v in request.headers.items() if k.lower() in ("content-type", "accept", "last-event-id")}
+        if ctx.opencode_password:
+            import base64
+
+            basic = base64.b64encode(f"opencode:{ctx.opencode_password}".encode()).decode()
+            headers["Authorization"] = f"Basic {basic}"
+        body = await request.body() if request.method not in SAFE_METHODS else None
+        factory = ctx.http_factory or aiohttp.ClientSession
+        client = factory()
+        try:
+            upstream = await client.request(request.method, url, params=list(request.query_params.multi_items()),
+                                            data=body, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
+        except aiohttp.ClientError as exc:
+            await client.close()
+            raise HTTPException(502, f"không gọi được OpenCode server ({type(exc).__name__}); "
+                                     "kiểm tra dịch vụ kite-opencode") from exc
+        if request.method not in SAFE_METHODS and path.rstrip("/").split("/")[-1] in ("prompt_async", "message", "shell"):
+            audit(session, "chat_message", path[:200])
+
+        async def stream():
+            try:
+                async for chunk in upstream.content.iter_any():
+                    yield chunk
+            finally:
+                upstream.release()
+                await client.close()
+
+        kept = {k: v for k, v in upstream.headers.items() if k.lower() in ("content-type", "cache-control")}
+        return StreamingResponse(stream(), status_code=upstream.status, headers=kept)
+
+    # ------------------------------------------------------------------ WebSockets
+    def ws_session(websocket: WebSocket) -> Session | None:
+        if not same_origin(websocket, websocket.headers.get("origin")):
+            return None
+        return session_of(websocket)
+
+    @app.websocket("/api/ws")
+    async def events(websocket: WebSocket):
+        session = ws_session(websocket)
+        if session is None:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        tail = JournalTail(ctx.state_dir / "journal")
+        last_status, last_tasks = None, None
+        try:
+            while True:
+                status = await gateway_status()
+                if status != last_status:
+                    last_status = status
+                    await websocket.send_json({"t": "status", "gateway_up": status is not None, "status": status})
+                for name, record in tail.new_records():
+                    await websocket.send_json({"t": "event", "file": name, "record": record})
+                running = await asyncio.to_thread(task_activity, ctx, await ctx.ops().list_tasks(limit=20))
+                if running != last_tasks:
+                    last_tasks = running
+                    await websocket.send_json({"t": "tasks", "tasks": running})
+                try:
+                    await asyncio.wait_for(websocket.receive_text(), timeout=ctx.events_every)
+                except asyncio.TimeoutError:
+                    pass
+        except WebSocketDisconnect:
+            return
+
+    @app.websocket("/api/browser/ws")
+    async def browser_screen(websocket: WebSocket):
+        session = ws_session(websocket)
+        if session is None:
+            await websocket.close(code=4401)
+            return
+        import aiohttp
+
+        try:
+            token = (await ctx.gateway("GET", "/kite/browser/token", None))["token"]
+        except (GatewayDown, KeyError):
+            await websocket.close(code=4502)
+            return
+        await websocket.accept()
+        ctx.store.audit(session.user.username, session.ip, "kaggle_browser_view", "", True)
+        port = urlsplit(ctx.gateway_ws).port
+        factory = ctx.http_factory or aiohttp.ClientSession
+        async with factory() as client:
+            async with client.ws_connect(f"{ctx.gateway_ws}/kite/browser/ws?k={token}",
+                                         headers={"Origin": f"http://127.0.0.1:{port}"}, max_msg_size=8 << 20) as upstream:
+                async def down():
+                    async for message in upstream:
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            await websocket.send_text(message.data)
+                        else:
+                            break
+
+                async def up():
+                    while True:
+                        text = await websocket.receive_text()
+                        if len(text) <= 1 << 16:
+                            await upstream.send_str(text)
+
+                tasks = [asyncio.ensure_future(down()), asyncio.ensure_future(up())]
+                try:
+                    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for task in tasks:
+                        task.cancel()
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
+
+    # ------------------------------------------------------------------ the page
+    @app.get("/kite-mini.js")
+    async def mini_js():
+        return Response(MINI_JS, media_type="text/javascript")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def page(path: str):
+        if path.startswith("api/"):
+            raise HTTPException(404, "không có API này")
+        if ctx.dist is not None and (ctx.dist / "index.html").is_file():
+            target = (ctx.dist / path).resolve()
+            if path and target.is_file() and ctx.dist.resolve() in target.parents:
+                return FileResponse(target)
+            return FileResponse(ctx.dist / "index.html")
+        return HTMLResponse(MINI_PAGE)
+
+    return app
+
+
+# ---------------------------------------------------------------- helpers
+async def _json(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(400, "body phải là JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "body phải là một object JSON")
+    return body
+
+
+def _needs_rehash(hashed: str) -> bool:
+    try:
+        return sec._hasher().check_needs_rehash(hashed)
+    except Exception:
+        return False
+
+
+def _auto_click(ctx: WebContext) -> Callable[[str], bool]:
+    from ..browser import auto_click_on
+
+    return lambda worker: auto_click_on(ctx.state_dir, worker)
+
+
+def _git_head(repo: Path) -> dict:
+    import subprocess
+
+    done = subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(repo), "log", "-1", "--format=%h%x09%s%x09%cI"],
+                          capture_output=True, text=True)
+    commit, _, rest = done.stdout.strip().partition("\t")
+    subject, _, date = rest.partition("\t")
+    return {"commit": commit, "subject": subject[:200], "date": date}
+
+
+class JournalTail:
+    """New lines of the journal files since the last call (starting at their current end)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self.offsets = {name: self._size(name) for name in FILES}
+
+    def _size(self, name: str) -> int:
+        try:
+            return (self.root / f"{name}.jsonl").stat().st_size
+        except OSError:
+            return 0
+
+    def new_records(self) -> list[tuple[str, dict]]:
+        out = []
+        for name in FILES:
+            path = self.root / f"{name}.jsonl"
+            size = self._size(name)
+            if size < self.offsets[name]:
+                self.offsets[name] = 0                       # the file was replaced
+            if size == self.offsets[name]:
+                continue
+            with path.open("rb") as stream:
+                stream.seek(self.offsets[name])
+                chunk = stream.read(min(size - self.offsets[name], 1 << 20))
+            complete = chunk[:chunk.rfind(b"\n") + 1]
+            self.offsets[name] += len(complete)
+            for line in complete.splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    out.append((name, record))
+        return out[-200:]
+
+
+def task_activity(ctx: WebContext, tasks: list[dict]) -> list[dict]:
+    """What each queued or running task is doing now, from its trace (for the Overview's 3D office)."""
+    from ..backend import task_slug
+
+    out = []
+    for task in tasks:
+        if task.get("state") not in ("QUEUED", "LEASED"):
+            continue
+        entry = {"task_id": task["task_id"], "state": task["state"], "goal": task.get("goal", "")[:120],
+                 "step": None, "action": None, "phase": None, "since": None, "worker": None}
+        trace = read_jsonl(ctx.state_dir / "tasks" / task_slug(task["task_id"]) / "trace.jsonl")
+        for record in trace:
+            event = record.get("event")
+            if event == "step_start":
+                entry.update(step=record.get("step"), since=record.get("ts"), action=None)
+            elif event == "step":
+                entry.update(step=None, action=None)
+            elif event == "agent_action":
+                entry["action"] = record.get("action")
+            elif event in ("fast_start", "review_start"):
+                entry["phase"] = "fast_path" if event == "fast_start" else "review"
+            elif event in ("fast_path", "review_end"):
+                entry["phase"] = None
+            if record.get("worker"):
+                entry["worker"] = record.get("worker")
+        out.append(entry)
+    return out
+
+
+def daily(journal: Journal, since: float) -> list[dict]:
+    """Per day: model requests, errors, tokens, GPU seconds (gateway), tasks and their verdicts, spend."""
+    days: dict[str, dict[str, float]] = {}
+
+    def bucket(record: dict) -> dict[str, float]:
+        return days.setdefault(str(record.get("at", ""))[:10], {
+            "requests": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0, "gpu_seconds": 0.0,
+            "tasks": 0, "tasks_ok": 0, "usd": 0.0})
+
+    for record in journal.read("gateway", since):
+        entry = bucket(record)
+        entry["requests"] += 1
+        entry["errors"] += record.get("outcome") == "error"
+        entry["prompt_tokens"] += int(record.get("prompt_tokens") or 0)
+        entry["completion_tokens"] += int(record.get("completion_tokens") or 0)
+        entry["gpu_seconds"] += float(record.get("run_s") or 0)
+    for record in journal.read("tasks", since):
+        entry = bucket(record)
+        entry["tasks"] += 1
+        entry["tasks_ok"] += bool(record.get("verified") or record.get("outcome") in ("ok", "READY_FOR_REVIEW"))
+    for record in journal.read("spend", since):
+        bucket(record)["usd"] += float(record.get("usd") or 0)
+    return [{"day": day, **{k: round(v, 4) if isinstance(v, float) else v for k, v in values.items()}}
+            for day, values in sorted(days.items())]
+
+
+MINI_PAGE = """<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><title>Kite</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font:15px system-ui,sans-serif;background:#16181d;color:#e6e6e6;margin:0;padding:24px}
+main{max-width:860px;margin:auto}input,button{font:inherit;padding:8px 10px;border-radius:6px;border:1px solid #3d424d;
+background:#22252c;color:#e6e6e6;margin:4px 0;width:100%;box-sizing:border-box}button{cursor:pointer;background:#2f5fd0;border:0}
+pre{background:#20232a;padding:12px;border-radius:8px;overflow:auto;font-size:12px}#err{color:#f08a7a}
+form{max-width:340px}.muted{color:#9aa0aa}
+</style></head><body><main>
+<h1>Kite</h1>
+<p class="muted">Giao diện đầy đủ đến ở bước P4. Trang này để đăng nhập và xem trạng thái.</p>
+<form id="login"><input id="u" placeholder="Tên đăng nhập" autocomplete="username">
+<input id="p" type="password" placeholder="Mật khẩu" autocomplete="current-password">
+<input id="c" placeholder="Mã 2FA (6 số)" inputmode="numeric" autocomplete="one-time-code">
+<button>Đăng nhập</button><div id="err"></div></form>
+<div id="app" hidden><button id="out" style="width:auto">Đăng xuất</button><pre id="data"></pre></div>
+</main><script src="/kite-mini.js"></script></body></html>
+"""
+
+MINI_JS = """
+let csrf = '';
+const $ = id => document.getElementById(id);
+async function show() {
+  const me = await fetch('/api/auth/me');
+  if (!me.ok) { $('login').hidden = false; $('app').hidden = true; return; }
+  csrf = (await me.json()).csrf;
+  $('login').hidden = true; $('app').hidden = false;
+  const data = await fetch('/api/overview');
+  $('data').textContent = JSON.stringify(await data.json(), null, 2);
+}
+$('login').onsubmit = async e => {
+  e.preventDefault();
+  const r = await fetch('/api/auth/login', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({username: $('u').value, password: $('p').value, code: $('c').value})});
+  if (!r.ok) { $('err').textContent = (await r.json()).error || 'Không đăng nhập được'; return; }
+  $('p').value = ''; $('c').value = ''; $('err').textContent = ''; show();
+};
+$('out').onclick = async () => { await fetch('/api/auth/logout', {method: 'POST', headers: {'X-CSRF-Token': csrf}}); show(); };
+show(); setInterval(() => { if (!$('app').hidden) show(); }, 10000);
+"""

@@ -215,6 +215,7 @@ class KaggleLauncher:
                           and p.effective_worker_id in gateway.workers}
         self.states = {wid: LaunchState(wid, p.launch) for wid, p in self.providers.items()}
         self._pending: set[str] = set()
+        self.allow: Callable[[str], bool] = lambda worker: True   # starters.Switches.auto: "start it for me"
         self._tasks: set[asyncio.Task] = set()      # keep references: the loop only holds weak ones
 
     # ------------------------------------------------------------------ tokens
@@ -367,7 +368,8 @@ class KaggleLauncher:
             if worker not in self.states:
                 raise ValueError(f"worker {worker} has no launch config (providers[].launch)")
             return [worker]
-        return [wid for wid in self.states if model is None or model in self.gateway.workers[wid].model_ids]
+        return [wid for wid in self.states if (model is None or model in self.gateway.workers[wid].model_ids)
+                and self.allow(wid)]
 
     def _refresh(self, state: LaunchState) -> None:
         if self.gateway.present(state.worker_id):

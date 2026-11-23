@@ -690,11 +690,12 @@ def _hostname(value: str | None) -> str | None:
 
 def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
                launcher: Any = None, worker_code: Callable[[str, Mapping[str, str]], dict] | None = None,
-               browser: Any = None) -> web.Application:
+               browser: Any = None, switches: Any = None, relays: Mapping[str, Any] | None = None) -> web.Application:
     """``launcher`` (optional) starts workers on demand: ``wake(model=, worker=, reason=)``,
     ``status()``, and ``stop(worker)`` for workers it stops itself; see starters.py.
     ``worker_code`` answers ``GET /worker/code`` for the bootstrap notebook (stub.py).
-    ``browser`` is Kite's own browser for kaggle.com (browser.py), served on loopback only."""
+    ``browser`` is Kite's own browser for kaggle.com (browser.py), served on loopback only.
+    ``switches`` (starters.Switches) and ``relays`` (worker id -> RelayWorker) back ``/kite/switch``."""
     app = web.Application(client_max_size=max_body_bytes)
 
     async def models(_request: web.Request) -> web.Response:
@@ -827,6 +828,9 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
 
     async def status(_request: web.Request) -> web.Response:
         report = gateway.status()
+        if switches is not None:
+            for worker in report["workers"]:
+                worker["switch"] = {"on": switches.on(worker["worker_id"]), "auto": switches.auto(worker["worker_id"])}
         if launcher is not None:
             launches = launcher.status()
             for worker in report["workers"]:
@@ -908,7 +912,33 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
         return web.json_response({"worker": worker_id, "stop_requested": True,
                                   "note": "worker finishes its current job, then ends the session"})
 
+    async def switch(request: web.Request) -> web.Response:
+        local_only(request)
+        if switches is None:
+            return _error(404, "switches are not configured")
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _error(400, "body must be JSON")
+        worker_id = body.get("worker") if isinstance(body, dict) else None
+        if worker_id not in gateway.workers:
+            return _error(400, f"no worker {worker_id}")
+        values = {k: body[k] for k in ("on", "auto") if isinstance(body.get(k), bool)}
+        state = switches.set(worker_id, **values)
+        relay = (relays or {}).get(worker_id)
+        if relay is not None:
+            await relay.beat()                     # off: leave the gateway now; on: take jobs now
+        return web.json_response({"worker": worker_id, **state})
+
+    async def browser_token(request: web.Request) -> web.Response:
+        local_only(request)                         # the web back end on this machine proxies the screen
+        if browser is None:
+            return _error(404, "Kite's browser is not configured")
+        return web.json_response({"token": browser.token})
+
     app.router.add_get("/v1/models", models)
+    app.router.add_post("/kite/switch", switch)
+    app.router.add_get("/kite/browser/token", browser_token)
     app.router.add_post("/v1/chat/completions", chat)
     app.router.add_get("/status", status)
     app.router.add_post("/kite/wake", wake)

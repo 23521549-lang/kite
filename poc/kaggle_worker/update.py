@@ -18,6 +18,12 @@ from typing import Callable
 REPO = Path(__file__).resolve().parents[2]
 NOTEBOOK = "poc/kaggle_worker/kaggle_model_worker.ipynb"
 SERVICES = ("kite-gateway", "kite-workflow-worker")
+OPTIONAL_SERVICES = ("kite-web",)          # restarted too once installed (/etc/systemd/system/<name>.service)
+UNIT_DIR = Path("/etc/systemd/system")
+
+
+def services(unit_dir: Path = UNIT_DIR) -> tuple[str, ...]:
+    return SERVICES + tuple(s for s in OPTIONAL_SERVICES if (unit_dir / f"{s}.service").exists())
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
@@ -67,10 +73,11 @@ def run(repo: Path = REPO, *, python: str = sys.executable, runner: Runner = sub
                 "error": "test của bản mới lỗi nên đã quay lại bản cũ: " + tests.stdout.strip()[-600:]}
     result = {**report, "updated": True, "tests": summary, "restarted": False}
     if restart:
-        done = _run(runner, ["sudo", "-n", "systemctl", "restart", *SERVICES], repo)
+        names = services()
+        done = _run(runner, ["sudo", "-n", "systemctl", "restart", *names], repo)
         result["restarted"] = done.returncode == 0
         if done.returncode != 0:
-            result["restart_with"] = f"sudo systemctl restart {' '.join(SERVICES)}"
+            result["restart_with"] = f"sudo systemctl restart {' '.join(names)}"
             result["restart_error"] = done.stderr.strip()[-300:]
     if after is not None:
         try:

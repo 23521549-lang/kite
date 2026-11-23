@@ -253,6 +253,21 @@ kite worker stop runpod-a100
 
 Kite starts the pod through RunPod's REST API v2 when a request for its models arrives from the chat (and no free Kaggle worker could take it), waits until the model server answers, and stops the pod after `--idle-minutes` (30) without a job, at the daily or monthly cap, or when it is not ready within 15 minutes. The hours it runs times `--price-hour` (default: the price RunPod reports) go to the spend ledger like an API's tokens. Answers are streamed from the pod, because RunPod's proxy closes a request that sends nothing for 100 seconds. Kite never creates or deletes pods.
 
+### Web page (back end)
+
+One owner account, with a password (argon2) and a 2FA app (TOTP); there is no sign-up. Every `/api/*` route needs the session; writes also need its CSRF token; five wrong tries lock the account for 15 minutes. Sensitive actions (sign-in, workers added or switched, apply, commit, update, bench, restart) go to the audit log (`GET /api/audit`).
+
+```sh
+~/kite/.venv/bin/pip install -e ~/kite[web]
+kite web admin --username han        # password twice, then add the key to your 2FA app and type its code
+sudo cp ~/kite/deploy/kite-web.service /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo systemctl enable --now kite-web # FastAPI on 127.0.0.1:8790
+```
+
+Through an SSH tunnel (`ssh -L 8790:127.0.0.1:8790 ...`) the page is at `http://127.0.0.1:8790` (browsers keep Secure cookies for 127.0.0.1; if yours does not, run `kite web serve --insecure-cookies` for that test). Published: restart Caddy with the new `deploy/Caddyfile` and the page is at `https://<ip-with-dashes>.sslip.io:8443/`, where `/worker/*` still goes to the gateway and `/v1/*`, `/kite/*` are refused. Until the front end (P4) is there, the page only signs in and shows the overview. Lost the phone: `kite web admin --reset` on the machine (new password and 2FA, every browser signed out).
+
+The API covers every tab: `/api/overview`; `/api/workers` (list, add, edit, delete, `start`, `stop`, `auto` = start it for the chat, `auto-click`, `browser`) and `/api/provider-types`, `/api/providers/test`; `/api/tasks` (start, apply, commit, cancel, pause, resume, instruct, note, patch); `/api/repos` (repositories, memory, `.kite.yml`); `/api/journal/{summary,events,daily}`, `/api/spend`; `/api/bench/{history,run}`; `/api/settings`, `/api/system/{doctor,update,cleanup,restart}`; `/api/opencode/*` (the OpenCode server, for Chat); WebSockets `/api/ws` (gateway status, journal events, what each running task is doing) and `/api/browser/ws` (Kite's browser for kaggle.com). Workers stay in `config.yaml` with their keys in 0600 files, so `kite worker ...` and the web always agree; a change applies after `POST /api/system/restart` (refused while a task runs, unless forced). The web's own tables (account, sessions, audit, repositories) are SQLite in the state folder, or Postgres with `--web-db postgresql+psycopg://...`.
+
 ### Adding a model, chat-only models
 
 A model the workers should serve must be in the notebook's `ROSTER`, with its dataset attached to each worker's notebook. Then:

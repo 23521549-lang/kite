@@ -403,3 +403,52 @@ def test_a_pod_that_is_off_does_not_look_connected_while_its_relay_runs():
 
     off, up, after = asyncio.run(scenario())
     assert off == (False, False) and up and not after
+
+
+# ---------------------------------------------------------------- the owner's switches (web, Worker tab)
+def test_switches_turn_an_api_worker_off_and_keep_kite_from_starting_a_worker(tmp_path):
+    from poc.kaggle_worker.starters import Switches
+
+    async def scenario():
+        switches = Switches(tmp_path / "switches.json")
+        spec = RelaySpec("groq", "openai", "https://api.groq.com/openai/v1", "k", ("llama",))
+        gateway = ModelGateway([WorkerAuth("groq", TOKEN, ("llama",))])
+        relay = RelayWorker(spec, gateway, SpendLedger(), available=lambda: switches.on("groq"))
+        await relay.beat()
+        before = gateway.present("groq")
+        async with TestClient(TestServer(create_app(gateway, switches=switches, relays={"groq": relay}))) as client:
+            off = await (await client.post("/kite/switch", json={"worker": "groq", "on": False})).json()
+            after_off = gateway.present("groq")
+            status = await (await client.get("/status")).json()
+            on = await (await client.post("/kite/switch", json={"worker": "groq", "on": True})).json()
+            bad = (await client.post("/kite/switch", json={"worker": "nobody", "on": True})).status
+        return before, off, after_off, status, on, gateway.present("groq"), bad, Switches(tmp_path / "switches.json")
+
+    before, off, after_off, status, on, after_on, bad, reloaded = asyncio.run(scenario())
+    assert before and off == {"worker": "groq", "on": False, "auto": True} and not after_off
+    assert status["workers"][0]["switch"] == {"on": False, "auto": True}
+    assert on["on"] and after_on and bad == 400
+    assert reloaded.on("groq") and reloaded.auto("groq")                   # saved to switches.json
+
+
+def test_with_auto_off_kite_does_not_start_that_notebook_or_pod(tmp_path):
+    from poc.kaggle_worker.starters import Switches
+
+    async def scenario():
+        _config, gateway, kaggle, fake, _clock = make(tmp_path)
+        ctl, *_rest = controller()
+        switches = Switches(None)
+        starters = Starters(kaggle, [ctl], switches)
+        woken = []
+        ctl.on_demand = lambda: woken.append("pod")
+        kaggle.on_demand = lambda model: woken.append(("kaggle", model))
+        switches.set("kaggle-han", auto=False)
+        switches.set("runpod", auto=False)
+        starters.on_demand("qwen3.6")
+        starters.on_demand("qwen3-32b")
+        candidates = kaggle._candidates("qwen3.6", None)
+        manual = kaggle._candidates(None, "kaggle-han")                      # kite worker start still works
+        return woken, candidates, manual
+
+    woken, candidates, manual = asyncio.run(scenario())
+    assert woken == [] and candidates == [] and manual == ["kaggle-han"]

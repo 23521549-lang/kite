@@ -322,6 +322,23 @@ def _parser() -> argparse.ArgumentParser:
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
     bench_apply.add_argument("--write", action="store_true", help="write routing.model_skill / chat_only "
                                                                   "into the config (a backup is kept)")
+    web = commands.add_parser("web", help="Kite's web page: one owner account with 2FA, an API for every tab")
+    web_commands = web.add_subparsers(dest="web_command", required=True)
+    web_admin = web_commands.add_parser(
+        "admin", help="create the owner account (password + 2FA app), or with --reset give it a new password "
+                      "and 2FA (for a lost phone; it signs every browser out)")
+    web_admin.add_argument("--username", default=None, help="account name (default: the existing one, else 'admin')")
+    web_admin.add_argument("--reset", action="store_true", help="new password and 2FA for the existing account")
+    web_admin.add_argument("--web-db", default=None, help="database URL (default: SQLite in the state folder)")
+    web_serve = web_commands.add_parser("serve", help="run the web back end on loopback (Caddy publishes it over HTTPS)")
+    web_serve.add_argument("--host", default="127.0.0.1")
+    web_serve.add_argument("--port", type=int, default=8790)
+    web_serve.add_argument("--web-db", default=None, help="database URL (default: SQLite in the state folder; Postgres: "
+                                                      "postgresql+psycopg://user:pass@host/db)")
+    web_serve.add_argument("--allow-root", action="append", type=Path, default=[],
+                           help="folders whose Git repositories tasks may use (default: the home folder)")
+    web_serve.add_argument("--insecure-cookies", action="store_true",
+                           help="cookies without Secure, for a plain-http test on this machine only")
     journal = commands.add_parser("journal", help="what Kite did: model requests, task runs, lead-agent "
                                                   "actions, your notes (to trace and improve)")
     journal_commands = journal.add_subparsers(dest="journal_command", required=True)
@@ -834,6 +851,149 @@ def _journal_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _web_store(args: argparse.Namespace):
+    from .web.db import Store, connect, sqlite_url
+
+    store = Store(connect(args.web_db or sqlite_url(args.config.parent / "web.sqlite3")))
+    store.migrate()
+    return store
+
+
+def _web_command(args: argparse.Namespace) -> int:
+    from .web import security as sec
+
+    store = _web_store(args)
+    sealer = sec.Sealer(args.config.parent / "secrets" / "web_key")
+    if args.web_command == "admin":
+        return _web_admin(args, store, sealer)
+    return _web_serve(args, store, sealer)
+
+
+def _web_admin(args: argparse.Namespace, store, sealer) -> int:
+    from .web import security as sec
+
+    existing = store.user_by_name(args.username) if args.username else None
+    if existing is None and store.user_count():
+        from sqlalchemy import select
+
+        from .web.db import users
+
+        with store.engine.connect() as conn:
+            name = conn.execute(select(users.c.username)).scalar()
+        existing = store.user_by_name(name)
+    if existing is not None and not args.reset:
+        raise ConfigError(f"đã có tài khoản {existing.username}; quên mật khẩu hoặc mất điện thoại: "
+                          "kite web admin --reset")
+    username = existing.username if existing else (args.username or "admin")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{3,64}", username):
+        raise ConfigError("tên đăng nhập 3-64 ký tự: chữ, số, '.', '_', '-'")
+    password = getpass.getpass(f"Mật khẩu mới cho {username} (ít nhất {sec.MIN_PASSWORD} ký tự): ")
+    problem = sec.password_problem(password)
+    if problem:
+        raise ConfigError(problem)
+    if getpass.getpass("Nhập lại mật khẩu: ") != password:
+        raise ConfigError("hai lần nhập không khớp")
+    secret = sec.new_totp_secret()
+    print("Thêm Kite vào app xác thực (Google Authenticator, Aegis, 1Password...):", file=sys.stderr)
+    print(f"  khóa: {secret}", file=sys.stderr)
+    print(f"  hoặc liên kết: {sec.otpauth_uri(secret, username)}", file=sys.stderr)
+    code = input("Mã 6 số app đang hiện: ").strip()
+    counter = sec.verify_totp(secret, code, now=time.time())
+    if counter is None:
+        raise ConfigError("mã chưa đúng (giờ trên điện thoại có lệch không?); chạy lại lệnh")
+    hashed = sec.hash_password(password)
+    if existing is None:
+        store.create_user(username, hashed, sealer.seal(secret))
+        user = store.user_by_name(username)
+        store.update_user(user.id, totp_last=counter)
+        store.audit(username, "local", "admin_created", username, True)
+    else:
+        store.update_user(existing.id, password_hash=hashed, totp_secret=sealer.seal(secret), totp_pending=None,
+                          totp_last=counter, failed=0, locked_until=0.0, password_changed_at=time.time())
+        store.drop_sessions(existing.id)
+        store.audit(username, "local", "admin_reset", username, True)
+    _emit({"account": username, "2fa": "đã bật", "reset": existing is not None,
+           "next": ["sudo cp deploy/kite-web.service /etc/systemd/system/ && sudo systemctl daemon-reload",
+                    "sudo systemctl enable --now kite-web"]})
+    return 0
+
+
+def _web_serve(args: argparse.Namespace, store, sealer) -> int:
+    import aiohttp
+    import uvicorn
+
+    from .mcp_server import KiteOps
+    from .web.app import GatewayDown, WebContext, create_app
+
+    if not store.user_count():
+        raise ConfigError("chưa có tài khoản: chạy kite web admin trước")
+    config = _load_operator_config(args)
+    config_path = args.config.resolve()
+    chat_dir = Path.home() / "kite-chat"
+
+    def ops_factory(current):
+        return KiteOps(current, db_path=_db_path(args), state_dir=args.config.parent,
+                       allowed_roots=args.allow_root or [Path.home()],
+                       chat_dir=chat_dir if chat_dir.is_dir() else None,
+                       kite_command=[*_kite_executable(), "--config", str(config_path)], config_path=config_path)
+
+    base = f"http://{config.gateway.host}:{config.gateway.port}"
+
+    async def gateway(method: str, path: str, body: dict | None) -> dict:
+        timeout = aiohttp.ClientTimeout(total=600 if path in ("/kite/wake", "/kite/browser/open") else 30)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(method, base + path, json=body, timeout=timeout) as response:
+                    data = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            raise GatewayDown(f"{type(exc).__name__}") from exc
+        if response.status >= 400:
+            raise ValueError((data or {}).get("error") or f"gateway HTTP {response.status}")
+        return data
+
+    async def restart(services: list[str]) -> dict:
+        done = await asyncio.to_thread(subprocess.run, ["sudo", "-n", "systemctl", "restart", *services],
+                                       capture_output=True, text=True, timeout=120)
+        return {"ok": done.returncode == 0, "services": services, "error": done.stderr.strip()[-300:] or None}
+
+    cache: dict = {"at": 0.0, "value": None}
+
+    async def quota() -> dict:
+        if time.time() - cache["at"] < 600:
+            return cache["value"]
+
+        def read() -> dict:
+            from .doctor import default_probes, gpu_quota
+            from .launcher import kaggle_command
+
+            out = {}
+            for p in load_config(config_path).providers:
+                token = p.secrets.get("kaggle_api_token", "")
+                if p.adapter == "pull" and p.enabled and token.startswith("file:"):
+                    status, detail, _fix = gpu_quota(default_probes(), kaggle_command(), token[5:])
+                    out[p.effective_worker_id] = {"status": status, "detail": detail}
+            return out
+
+        cache.update(at=time.time(), value=await asyncio.to_thread(read))
+        return cache["value"]
+
+    password_file = args.config.parent / "secrets" / "opencode_server_password"
+    dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    ctx = WebContext(config_path, store, sealer, ops_factory=ops_factory, gateway=gateway,
+                     secure_cookies=not args.insecure_cookies,
+                     opencode_url=f"http://{config.opencode_host}:{config.opencode_port}",
+                     opencode_password=password_file.read_text(encoding="utf-8").strip() if password_file.is_file() else None,
+                     gateway_ws=f"ws://{config.gateway.host}:{config.gateway.port}", restart=restart,
+                     dist=dist if dist.is_dir() else None, quota=quota)
+    _emit({"web": f"http://{args.host}:{args.port}", "db": str(store.engine.url.render_as_string(hide_password=True)),
+           "page": "giao diện đầy đủ ở P4" if not ctx.dist else str(dist)})
+    sys.stdout.flush()
+    uvicorn.Server(uvicorn.Config(create_app(ctx), host=args.host, port=args.port, proxy_headers=False,
+                                  server_header=False, date_header=False, log_level="warning",
+                                  ws_max_size=1 << 20)).run()
+    return 0
+
+
 def _db_path(args: argparse.Namespace) -> Path:
     return args.db if args.db is not None else args.config.parent / "scheduler.sqlite3"
 
@@ -929,7 +1089,12 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
     specs = relay_specs(config)
     gateway.paid = {spec.worker_id for spec in specs if spec.paid}
     ledger = SpendLedger(journal.read("spend"))
-    relays = {spec.worker_id: RelayWorker(spec, gateway, ledger, notify=notifier, journal=journal.write)
+    from .starters import Starters, Switches
+
+    switches = Switches(state_dir / "switches.json")
+    relays = {spec.worker_id: RelayWorker(spec, gateway, ledger, notify=notifier, journal=journal.write,
+                                          # an API worker switched off (web, Worker tab) takes no job
+                                          available=None if spec.pod else (lambda wid=spec.worker_id: switches.on(wid)))
               for spec in specs}
     pods = []
     for p in config.providers:
@@ -941,9 +1106,7 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
                    for relay in relays.values()]
     launcher = None
     if kaggle is not None or pods:
-        from .starters import Starters
-
-        launcher = Starters(kaggle, pods)
+        launcher = Starters(kaggle, pods, switches)
         gateway.on_demand = launcher.on_demand
         gateway.starting = launcher.starting
         gateway.wait_note = launcher.wait_note
@@ -961,7 +1124,8 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
                                    "run_type": str(headers.get("X-Kite-Run-Type", ""))[:20]})
         return worker_bundle(launch)
 
-    runner = web.AppRunner(create_app(gateway, launcher=launcher, worker_code=worker_code, browser=browser))
+    runner = web.AppRunner(create_app(gateway, launcher=launcher, worker_code=worker_code, browser=browser,
+                                      switches=switches, relays=relays))
     await runner.setup()
     hosts = [config.gateway.host]
     if config.sandbox is not None:
@@ -1547,6 +1711,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _mcp_command(args)
     if args.command == "chat":
         return _chat_command(args)
+    if args.command == "web":
+        return _web_command(args)
     if args.command == "journal":
         return _journal_command(args)
     if args.command == "bench":
@@ -1693,7 +1859,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox",
-                        "mcp", "chat", "bench", "journal", "cleanup", "model", "notify", "memory", "update"}:
+                        "mcp", "chat", "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

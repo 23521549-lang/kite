@@ -9,16 +9,65 @@ for that model (none is configured, or its starts keep failing).
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+from pathlib import Path
 import sys
 from typing import Any
 
 from .launcher import MAX_FAILURES
 
 
+class Switches:
+    """The owner's switches per worker, kept in ``<state>/switches.json`` (the web's Worker tab, P3):
+
+    * ``on``: an API worker takes jobs only while it is on (off: it leaves the gateway at once);
+    * ``auto``: Kite may start this Kaggle notebook or rented machine when the chat needs it.
+
+    Both default to true. A Kaggle notebook or pod is turned off by stopping it (``/kite/stop``)."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = Path(path) if path else None
+        self.values: dict[str, dict[str, bool]] = {}
+        if self.path is not None:
+            try:
+                saved = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(saved, dict):
+                    self.values = {k: {f: bool(v) for f, v in d.items() if f in ("on", "auto")}
+                                   for k, d in saved.items() if isinstance(d, dict)}
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    def on(self, worker: str) -> bool:
+        return self.values.get(worker, {}).get("on", True)
+
+    def auto(self, worker: str) -> bool:
+        return self.values.get(worker, {}).get("auto", True)
+
+    def set(self, worker: str, *, on: bool | None = None, auto: bool | None = None) -> dict[str, bool]:
+        entry = self.values.setdefault(worker, {})
+        if on is not None:
+            entry["on"] = bool(on)
+        if auto is not None:
+            entry["auto"] = bool(auto)
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.path.with_name(self.path.name + ".tmp")
+            temp.write_text(json.dumps(self.values, indent=1), encoding="utf-8")
+            os.replace(temp, self.path)
+        return {"on": self.on(worker), "auto": self.auto(worker)}
+
+    def report(self, workers) -> dict[str, dict[str, bool]]:
+        return {w: {"on": self.on(w), "auto": self.auto(w)} for w in workers}
+
+
 class Starters:
-    def __init__(self, kaggle=None, pods=()) -> None:
+    def __init__(self, kaggle=None, pods=(), switches: Switches | None = None) -> None:
         self.kaggle = kaggle
         self.pods = {pod.worker_id: pod for pod in pods}
+        self.switches = switches or Switches(None)
+        if kaggle is not None:
+            kaggle.allow = self.switches.auto       # autostart only for workers whose "auto" is on
 
     @property
     def states(self) -> list[str]:
@@ -28,18 +77,19 @@ class Starters:
         if self.kaggle is None or model is None:
             return False
         return any(model in self.kaggle.gateway.workers[wid].model_ids and state.failures < MAX_FAILURES
-                   for wid, state in self.kaggle.states.items())
+                   and self.switches.auto(wid) for wid, state in self.kaggle.states.items())
 
-    def _pods_for(self, model: str | None) -> list:
-        return [pod for pod in self.pods.values() if model is not None and pod.serves(model)]
+    def _pods_for(self, model: str | None, *, auto_only: bool = False) -> list:
+        return [pod for pod in self.pods.values() if model is not None and pod.serves(model)
+                and (not auto_only or self.switches.auto(pod.worker_id))]
 
     # ------------------------------------------------------------------ gateway hooks
     def on_demand(self, model: str) -> None:
         if self._kaggle_can(model):
             self.kaggle.on_demand(model)
             return
-        pods = self._pods_for(model)
-        if pods and not any(p.s.state in ("starting", "up") for p in pods):
+        pods = self._pods_for(model, auto_only=True)
+        if pods and not any(p.s.state in ("starting", "up") for p in self._pods_for(model)):
             pods[0].on_demand()
 
     def starting(self, model: str) -> bool:
