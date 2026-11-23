@@ -507,3 +507,12 @@ def test_waiting_for_a_worker_polls_the_gateway_until_one_serves_the_model():
     assert len(slept) == 2 and len(said) == 1
     assert not bench.wait_for_worker("http://x/status", "qwen3.6", log=said.append, timeout=0,
                                      fetch=lambda url: {"workers": []}, sleep=slept.append)
+
+
+def test_waiting_for_a_worker_says_how_to_start_one_once():
+    said, answers = [], iter([{"workers": []}, {"workers": []},
+                              {"workers": [{"alive": True, "models": ["qwen3.6"]}]}])
+    assert bench.wait_for_worker("http://gw/status", "qwen3.6", log=said.append, poll=0,
+                                 fetch=lambda url: next(answers), sleep=lambda s: None,
+                                 note="chưa có worker: bấm Save Version")
+    assert said == ["chưa có worker: bấm Save Version"]

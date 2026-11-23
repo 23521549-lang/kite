@@ -99,6 +99,15 @@ class Job:
 CONTEXT_FULL = ("context size has been exceeded", "exceeds the available context size")
 
 
+def starts_a_worker(tag: str | None) -> bool:
+    """Requests that may start a Kaggle notebook (autostart) when no worker serves them: the person's
+    chat in OpenCode (tag ``chat``) and the tasks it started (``chat-...``, best-of-N helpers too).
+    A bench run, a task started from the command line or an untagged caller waits for a worker
+    instead: 23 Nov, Kite pushed a notebook while nobody was chatting and the GPU quota paid for it.
+    The rule the person asked for: start Kaggle only when they are in the chat and no worker is up."""
+    return bool(tag) and (tag == "chat" or tag.startswith("chat-"))
+
+
 StatusHook = Callable[[WorkerState, bool], Awaitable[None] | None]
 
 
@@ -303,7 +312,7 @@ class ModelGateway:
         self.jobs[job.job_id] = job
         self._queue.append(job.job_id)
         self._notify()
-        if self.on_demand is not None and not self.serving(model):
+        if self.on_demand is not None and not self.serving(model) and starts_a_worker(tag):
             try:
                 self.on_demand(model)
             except Exception as exc:          # starting a worker must never fail the request

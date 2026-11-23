@@ -750,6 +750,21 @@ def test_a_chat_with_no_worker_gets_a_status_note_at_once_and_starts_one():
     asyncio.run(scenario())
 
 
+def test_only_the_chat_and_its_tasks_start_a_kaggle_notebook():
+    # The person: push to Kaggle only when I am in OpenCode and no worker is up, never while I do nothing.
+    async def scenario():
+        woken = []
+        gateway = make_gateway(on_demand=woken.append)
+        jobs = [await gateway.submit({"model": "qwen3.6", "messages": []}, tag=tag)
+                for tag in ("bench-qwen3-6-r1-usage-404-174746", None, "task-2", "chat", "chat-20261123-ab12",
+                            "chat-20261123-ab12-b2")]
+        for job in jobs:
+            gateway.cancel(job)
+        return woken
+
+    assert asyncio.run(scenario()) == ["qwen3.6", "qwen3.6", "qwen3.6"]
+
+
 def test_a_queued_request_keeps_waiting_past_the_timeout_while_a_worker_is_starting():
     async def scenario():
         now = [1000.0]

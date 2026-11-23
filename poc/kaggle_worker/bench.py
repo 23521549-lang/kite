@@ -125,8 +125,10 @@ def infra_errors(records: list[dict]) -> list[str]:
 
 def wait_for_worker(status_url: str, model: str, *, log: Callable[[str], None] = print,
                     timeout: float = 4 * 3600, poll: float = 60,
-                    fetch: Callable[[str], dict] | None = None, sleep: Callable[[float], None] = time.sleep) -> bool:
-    """Block until a connected, ready worker serves ``model`` (the gateway's /status), or timeout."""
+                    fetch: Callable[[str], dict] | None = None, sleep: Callable[[float], None] = time.sleep,
+                    note: str = "") -> bool:
+    """Block until a connected, ready worker serves ``model`` (the gateway's /status), or timeout.
+    ``note`` is what to say (once) while waiting."""
     def get(url: str) -> dict:
         with urllib.request.urlopen(url, timeout=15) as response:
             return json.loads(response.read())
@@ -144,7 +146,7 @@ def wait_for_worker(status_url: str, model: str, *, log: Callable[[str], None] =
         if time.monotonic() > deadline:
             return False
         if not said:
-            log(f"chưa có worker cho {model}: chờ worker kết nối lại rồi chạy tiếp")
+            log(note or f"chưa có worker cho {model}: chờ worker kết nối lại rồi chạy tiếp")
             said = True
         sleep(poll)
 

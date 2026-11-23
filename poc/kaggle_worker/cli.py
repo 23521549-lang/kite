@@ -1061,6 +1061,7 @@ def _bench_command(args: argparse.Namespace) -> int:
     log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code"
         f" | harness {harness}")
     try:
+        _bench_wait_for_workers(config, models, log)
         results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
                                   run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log,
                                   meta={"harness": harness, **({"label": args.label} if args.label else {})})
@@ -1069,6 +1070,23 @@ def _bench_command(args: argparse.Namespace) -> int:
     _emit({"out": str(out), "report": str(out / "README.md"),
            "summary": {m: bench.summarize(entry) for m, entry in results["models"].items()}})
     return 0
+
+
+def _bench_wait_for_workers(config, models: list[str], log: Callable[[str], None]) -> None:
+    """A bench run never starts a Kaggle notebook (only the chat does, see gateway.starts_a_worker):
+    with no worker up it says how to start one and waits, up to 4 hours."""
+    from . import bench
+    from .launcher import kaggle_url
+
+    status_url = f"http://{config.gateway.host}:{config.gateway.port}/status"
+    pages = [kaggle_url(p.launch.kernel) for p in config.providers
+             if p.adapter == "pull" and p.enabled and p.launch is not None]
+    for model in dict.fromkeys(config.gateway.aliases.get(m, {}).get("model", m) for m in models):
+        note = (f"chưa có worker cho {model}: bench không tự bật Kaggle. Bật notebook "
+                + (f"(mở {pages[0]} rồi bấm Save Version) " if pages else "")
+                + "hoặc chạy `kite worker start <worker>`; bench chờ worker tối đa 4 giờ rồi chạy")
+        if not bench.wait_for_worker(status_url, model, log=log, note=note):
+            raise ConfigError(f"không có worker cho {model} sau 4 giờ: bench dừng")
 
 
 def _sandbox_command(args: argparse.Namespace) -> int:
