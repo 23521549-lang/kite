@@ -535,7 +535,9 @@ class OpenCodeStub(BaseHTTPRequestHandler):
         self._record()
         if self.path == "/api/info":
             return self._answer(200, {"version": "2.4.0", "urls": ["http://127.0.0.1"]})
-        self._answer(200, {"data": [{"id": "ses_1"}]})
+        self._answer(200, {"data": [{"id": "ses_1", "time": {"created": 1, "updated": 5, "busy": 5, "idle": 4}},
+                                    {"id": "ses_0", "time": {"created": 1, "updated": 3, "busy": 2, "idle": 3}},
+                                    {"id": "ses_9", "parentID": "ses_1", "time": {"created": 1, "updated": 5, "busy": 5}}]})
 
     def do_POST(self):
         body = self._record()
@@ -571,7 +573,7 @@ def test_the_chat_goes_to_the_opencode_server_behind_the_session(site, opencode)
     assert client.get("/api/opencode/api/session").status_code == 401           # no session: nothing reaches it
     headers = signed_in(site)
     listed = client.get("/api/opencode/api/session?directory=/home/han&limit=5")
-    assert listed.status_code == 200 and listed.json() == {"data": [{"id": "ses_1"}]}
+    assert listed.status_code == 200 and [item["id"] for item in listed.json()["data"]] == ["ses_1", "ses_0", "ses_9"]
     assert client.post("/api/opencode/api/session/ses_1/prompt", json={"text": "x"}).status_code == 403   # no CSRF
     sent = client.post("/api/opencode/api/session/ses_1/prompt", headers=headers, json={"text": "chào"})
     assert sent.status_code == 200
@@ -582,6 +584,8 @@ def test_the_chat_goes_to_the_opencode_server_behind_the_session(site, opencode)
     assert any(r["action"] == "chat_message" for r in site["store"].audit_rows())
     info = client.get("/api/chat/info").json()
     assert info["ready"] and info["opencode"] == {"reachable": True, "version": "2.4.0", "error": None}
+    assert info["busy"] == 1                       # ses_1 works now; ses_0 is idle; ses_9 is a sub-agent
+    assert opencode["seen"][-1][1].startswith("/api/session?directory=")
 
 
 def test_the_web_reaches_only_the_chat_routes_of_opencode_and_only_with_chat_fields(site, opencode):

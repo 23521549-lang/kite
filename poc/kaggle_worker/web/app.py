@@ -136,6 +136,15 @@ class WebContext:
         return self.opencode_url, self.opencode_password
 
 
+def _session_busy(item: Any) -> bool:
+    """An OpenCode 2 session is working when its last ``busy`` time is after its last ``idle`` time."""
+    times = item.get("time") if isinstance(item, dict) else None
+    if not isinstance(times, dict) or item.get("parentID") or times.get("archived"):
+        return False
+    busy, idle = times.get("busy"), times.get("idle")
+    return isinstance(busy, (int, float)) and (not isinstance(idle, (int, float)) or busy > idle)
+
+
 def find_opencode(home: Path, fallback_url: str, fallback_password: str | None) -> tuple[str, str | None]:
     """OpenCode 2 runs one background server per user (the TUI and the web chat share it): it writes its
     address and password to ``~/.local/state/opencode/service.json``. Only a loopback address is used.
@@ -897,21 +906,30 @@ def create_app(ctx: WebContext) -> FastAPI:
         url, password = await asyncio.to_thread(ctx.opencode)
         report: dict[str, Any] = {"chat_dir": str(ctx.chat_dir) if ctx.chat_dir else None,
                                   "ready": bool(ctx.chat_dir and (ctx.chat_dir / "opencode.json").is_file()),
-                                  "tested_version": OPENCODE_TESTED,
+                                  "tested_version": OPENCODE_TESTED, "busy": 0,
                                   "opencode": {"reachable": False, "version": None, "error": None}}
         factory = ctx.http_factory or aiohttp.ClientSession
+        headers = opencode_headers(password)
+        data = sessions = None
         try:
             async with factory() as client:
-                async with client.get(f"{url}/api/info", headers=opencode_headers(password),
+                async with client.get(f"{url}/api/info", headers=headers,
                                       timeout=aiohttp.ClientTimeout(total=5)) as response:
                     data = await response.json(content_type=None) if response.status == 200 else None
                     if response.status != 200:
                         report["opencode"]["error"] = f"HTTP {response.status}"
+                if isinstance(data, dict) and ctx.chat_dir is not None:
+                    # How many chat sessions are working now: the lead agent's desk in the 3D office.
+                    async with client.get(f"{url}/api/session", headers=headers,
+                                          params={"directory": str(ctx.chat_dir), "limit": "30"},
+                                          timeout=aiohttp.ClientTimeout(total=5)) as response:
+                        sessions = await response.json(content_type=None) if response.status == 200 else None
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-            data = None
             report["opencode"]["error"] = type(exc).__name__
         if isinstance(data, dict):
             report["opencode"].update(reachable=True, version=data.get("version"))
+        if isinstance(sessions, dict) and isinstance(sessions.get("data"), list):
+            report["busy"] = sum(1 for item in sessions["data"] if _session_busy(item))
         return report
 
     def opencode_route(method: str, path: str) -> frozenset | None:

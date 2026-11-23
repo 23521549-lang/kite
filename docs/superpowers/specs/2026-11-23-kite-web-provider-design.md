@@ -174,6 +174,14 @@ Task, journal, memory và bench giữ chỗ lưu hiện tại trước, sau đó
 - `kite update` tự cài thư viện mới khi `pyproject.toml` hoặc `requirements.txt` đổi, và tự build lại trang khi `web/` đổi. Build lỗi thì giữ bản cũ.
 - Tổng quan ở P4 là bản 2D. Bản 3D làm ở P5.
 
+**Đã chốt khi làm P5 (24/11):**
+- Văn phòng 3D dùng **three.js** trực tiếp, không dùng React Three Fiber và drei: ít thư viện hơn, và cảnh chỉ có một component React bọc lại.
+- Bàn, robot, tủ gateway, hàng chờ đều **dựng từ khối đơn giản trong code**, không tải file model, nên không có tài sản nào cần kiểm tra giấy phép.
+- Phần 3D là **chunk tải riêng**, chỉ tải khi mở tab Tổng quan ở chế độ 3D. Máy không có WebGL, điện thoại, hoặc người dùng đã chọn 2D thì dùng thẻ 2D.
+- Chữ trên cảnh giữ **cùng cỡ trên màn hình** dù phóng to hay thu nhỏ. Màn hình hẹp thì chữ nhỏ hơn, bàn xếp 2 cột và không hiện thẻ task.
+- Chỉ chuyển động khi có việc thật: worker đang chạy task, đang khởi động hoặc lỗi, request đi qua gateway, chat đang trả lời. Văn phòng rảnh thì đứng yên và không vẽ lại khung hình.
+- `GET /api/chat/info` có thêm `busy` (số phiên chat đang chạy) để bàn agent trưởng biết khi nào đang trả lời.
+
 ## 6. Triển khai (làm sau cùng)
 1. **Hạ tầng (theo cloud):** Terraform cho AWS tạo EC2 t3.medium, EBS cho `/var/lib/kite`, security group (443, SSH theo IP chủ), Elastic IP, IAM tối thiểu. State lưu trong S3. GitHub Actions đăng nhập AWS bằng OIDC, không giữ AWS key dài hạn. Máy có sẵn ở nơi khác thì bỏ qua bước này.
 2. **Bộ cài (mọi máy Ubuntu):** chạy lại bao nhiêu lần cũng được. Cài Docker, tạo thư mục dữ liệu, sinh secret ngay trên máy, ghi cấu hình mặc định, chọn kiểu truy cập (sslip.io, tên miền, hoặc mạng riêng), dựng compose, cài dịch vụ tự cập nhật, tạo tài khoản admin. Máy mới thì cloud-init gọi bộ cài lúc khởi động lần đầu.

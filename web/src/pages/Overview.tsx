@@ -1,17 +1,98 @@
-import { Badge, Card, Group, SimpleGrid, Stack, Table, Text, Title } from '@mantine/core'
-import { get, type Overview as OverviewData } from '../api'
+import { Badge, Card, Group, SegmentedControl, SimpleGrid, Stack, Table, Text, Title, useComputedColorScheme } from '@mantine/core'
+import { useMediaQuery } from '@mantine/hooks'
+import { Suspense, lazy, useMemo, useState } from 'react'
+import { get, type Activity, type Overview as OverviewData, type WorkerRow } from '../api'
 import { Dot, Empty, Loading, Page, StateBadge } from '../components/common'
+import type { OfficeState, Pick, WorkerState } from '../office/scene'
 import { go } from '../router'
 import { useKite } from '../store'
 import { ago, short, usd, useLoad, workerState } from '../util'
 
+// three.js is only downloaded when the 3D office is shown.
+const Office3D = lazy(() => import('../office/Office3D'))
+const MODE_KEY = 'kite.overview.mode'
 const PHASES: Record<string, string> = { fast_path: 'đường nhanh', review: 'rà soát' }
+
+function hasWebGL(): boolean {
+  try {
+    const canvas = document.createElement('canvas')
+    return !!(canvas.getContext('webgl2') || canvas.getContext('webgl'))
+  } catch {
+    return false
+  }
+}
+
+function savedMode(): '3d' | '2d' {
+  try {
+    const value = localStorage.getItem(MODE_KEY)
+    if (value === '2d' || value === '3d') return value
+  } catch {
+    /* no storage: the default */
+  }
+  // Phones start with the cards: five desks on a small screen are hard to read.
+  return window.matchMedia?.('(max-width: 640px)').matches ? '2d' : '3d'
+}
+
+function officeWorker(w: WorkerRow): OfficeState['workers'][number] {
+  const st = workerState(w)
+  const state: WorkerState =
+    w.start?.state === 'error'
+      ? 'error'
+      : w.alive && w.busy
+        ? 'busy'
+        : w.alive && !w.draining
+          ? 'idle'
+          : st.label === 'đang khởi động' || w.draining
+            ? 'starting'
+            : 'off'
+  return {
+    id: w.id,
+    type: w.type,
+    state,
+    stateLabel: st.label,
+    model: w.loaded_model ?? w.models[0] ?? '',
+    running: w.running,
+    slots: w.slots ?? w.concurrency,
+  }
+}
+
+function officeTask(a: Activity): OfficeState['tasks'][number] {
+  const step = [a.step ? `bước ${a.step}` : null, a.action ? `vừa ${a.action}` : null].filter(Boolean).join(' · ')
+  return { id: a.task_id, goal: short(a.goal || a.task_id, 70), worker: a.worker, step: step || null }
+}
+
+function onPick(pick: Pick) {
+  if (pick.kind === 'worker') go('/workers')
+  else if (pick.kind === 'task') go(`/tasks/${encodeURIComponent(pick.id)}`)
+  else if (pick.kind === 'lead') go('/chat')
+  else if (pick.kind === 'gateway') go('/journal')
+  else go('/tasks')
+}
 
 export default function Overview() {
   const { data, error } = useLoad(() => get<OverviewData>('/api/overview'), [], 10000)
   const activity = useKite((s) => s.activity)
   const events = useKite((s) => s.events)
-  if (!data) return <Loading error={error} />
+  const gatewayUp = useKite((s) => s.gatewayUp)
+  const chat = useLoad(() => get<{ busy?: number }>('/api/chat/info'), [], 15000)
+  const dark = useComputedColorScheme('dark') === 'dark'
+  const small = useMediaQuery('(max-width: 48em)')
+  const [webgl] = useState(hasWebGL)
+  const [mode, setMode] = useState<'3d' | '2d'>(() => (hasWebGL() ? savedMode() : '2d'))
+  const office = useMemo<OfficeState | null>(
+    () =>
+      data
+        ? {
+            workers: data.workers.map(officeWorker),
+            tasks: activity.map(officeTask),
+            chatBusy: (chat.data?.busy ?? 0) > 0,
+            gatewayUp: gatewayUp ?? data.gateway_up,
+            dark,
+          }
+        : null,
+    [data, activity, chat.data?.busy, gatewayUp, dark],
+  )
+  if (!data || !office) return <Loading error={error} />
   const quota = data.gpu_quota ?? {}
   return (
     <Page title="Tổng quan">
@@ -33,42 +114,40 @@ export default function Overview() {
           ))}
         </Card>
       ) : null}
-      <Title order={4}>Worker</Title>
-      {data.workers.length ? (
-        <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
-          {data.workers.map((w) => {
-            const st = workerState(w)
-            return (
-              <Card key={w.id} withBorder className="clickable" onClick={() => go('/workers')}>
-                <Group justify="space-between">
-                  <Group gap={8}>
-                    <Dot color={st.color} />
-                    <Text fw={600}>{w.id}</Text>
-                  </Group>
-                  <Badge variant="light" color={st.color}>
-                    {st.label}
-                  </Badge>
-                </Group>
-                <Text size="sm" c="dimmed" mt={4}>
-                  {w.type} · {w.loaded_model ? `đang nạp ${w.loaded_model}` : w.models.slice(0, 3).join(', ')}
-                </Text>
-                {w.alive && w.busy ? (
-                  <Text size="sm" mt={4}>
-                    {w.running}/{w.slots ?? w.concurrency} việc đang chạy
-                  </Text>
-                ) : null}
-                {w.start?.detail ? (
-                  <Text size="xs" c="yellow" mt={4}>
-                    {short(w.start.detail, 140)}
-                  </Text>
-                ) : null}
-              </Card>
-            )
-          })}
-        </SimpleGrid>
-      ) : (
-        <Empty>Chưa có worker nào: thêm ở tab Provider.</Empty>
-      )}
+      <Card withBorder p="xs">
+        <Group justify="space-between" px={6} pb={6}>
+          <Text fw={600}>Văn phòng Kite</Text>
+          <SegmentedControl
+            size="xs"
+            data={[
+              { value: '3d', label: '3D', disabled: !webgl },
+              { value: '2d', label: '2D' },
+            ]}
+            value={mode}
+            onChange={(v) => {
+              const next = v === '3d' ? '3d' : '2d'
+              setMode(next)
+              try {
+                localStorage.setItem(MODE_KEY, next)
+              } catch {
+                /* the choice lasts for this visit only */
+              }
+            }}
+          />
+        </Group>
+        {mode === '3d' ? (
+          <Suspense fallback={<Loading label="Đang tải văn phòng 3D…" />}>
+            <Office3D state={office} onPick={onPick} height={small ? 360 : 500} />
+          </Suspense>
+        ) : (
+          <WorkerCards workers={data.workers} />
+        )}
+        {!webgl ? (
+          <Text size="xs" c="dimmed" px={6} pt={6}>
+            Trình duyệt này không có WebGL nên chỉ xem được 2D.
+          </Text>
+        ) : null}
+      </Card>
       <Title order={4}>Đang làm</Title>
       {activity.length ? (
         <Stack gap="xs">
@@ -149,6 +228,43 @@ export default function Overview() {
         </Card>
       </SimpleGrid>
     </Page>
+  )
+}
+
+function WorkerCards({ workers }: { workers: WorkerRow[] }) {
+  if (!workers.length) return <Empty>Chưa có worker nào: thêm ở tab Provider.</Empty>
+  return (
+    <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} p={6}>
+      {workers.map((w) => {
+        const st = workerState(w)
+        return (
+          <Card key={w.id} withBorder className="clickable" onClick={() => go('/workers')}>
+            <Group justify="space-between">
+              <Group gap={8}>
+                <Dot color={st.color} />
+                <Text fw={600}>{w.id}</Text>
+              </Group>
+              <Badge variant="light" color={st.color}>
+                {st.label}
+              </Badge>
+            </Group>
+            <Text size="sm" c="dimmed" mt={4}>
+              {w.type} · {w.loaded_model ? `đang nạp ${w.loaded_model}` : w.models.slice(0, 3).join(', ')}
+            </Text>
+            {w.alive && w.busy ? (
+              <Text size="sm" mt={4}>
+                {w.running}/{w.slots ?? w.concurrency} việc đang chạy
+              </Text>
+            ) : null}
+            {w.start?.detail ? (
+              <Text size="xs" c="yellow" mt={4}>
+                {short(w.start.detail, 140)}
+              </Text>
+            ) : null}
+          </Card>
+        )
+      })}
+    </SimpleGrid>
   )
 }
 
