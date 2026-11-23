@@ -129,6 +129,20 @@ def gpu_quota(p: Probes, command: str, token_file: str) -> tuple[str, str, str]:
         "gần hết: bộ đo dài (polyglot ~7–11 giờ) để tuần sau" if low else "")
 
 
+def browser_missing() -> str:
+    """What Kite's browser still needs on this machine ("" when nothing): Python packages, Chromium."""
+    import importlib.util
+
+    lacking = [name for name in ("playwright", "cryptography") if importlib.util.find_spec(name) is None]
+    if lacking:
+        return "gói " + ", ".join(lacking)
+    roots = [Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"])] if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") else []
+    roots.append(Path.home() / ".cache" / "ms-playwright")
+    if not any(root.is_dir() and any(child.name.startswith("chromium") for child in root.iterdir()) for root in roots):
+        return "Chromium của Playwright"
+    return ""
+
+
 def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = None) -> list[Check]:
     p = probes or default_probes()
     checks: list[Check] = []
@@ -151,11 +165,22 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
             day, month = ledger.spent(provider.effective_worker_id)
             caps = [(day, r.daily_cap, "hôm nay"), (month, r.monthly_cap, "tháng này")]
             near = [f"{spent:.2f}/{cap:.2f} USD {when}" for spent, cap, when in caps if cap and spent >= 0.8 * cap]
-            detail = f"{r.kind} {r.base_url}; đã chi {day:.2f} USD hôm nay, {month:.2f} USD tháng này" + (
+            what = (f"máy {r.pod.provider} {r.pod.pod_id} (tự tắt sau {r.pod.idle_minutes} phút rảnh)" if r.pod
+                    else f"{r.kind} {r.base_url}")
+            detail = f"{what}; đã chi {day:.2f} USD hôm nay, {month:.2f} USD tháng này" + (
                 f" (hạn mức {r.daily_cap or '-'}/ngày, {r.monthly_cap or '-'}/tháng)" if r.daily_cap or r.monthly_cap
-                else ("" if not (r.price_in or r.price_out) else "; chưa đặt hạn mức chi"))
-            add(f"worker API {provider.effective_worker_id}", WARN if near else OK, detail,
+                else ("" if not (r.price_in or r.price_out or r.pod) else "; chưa đặt hạn mức chi"))
+            add(f"{'máy thuê' if r.pod else 'worker API'} {provider.effective_worker_id}", WARN if near else OK, detail,
                 f"gần hoặc chạm hạn mức ({', '.join(near)}): nâng caps trong config hoặc chờ làm mới" if near else "")
+
+    # ---- Kite's browser for kaggle.com (launch.via: browser, or Save Version by hand through Kite)
+    browser_workers = [pr.effective_worker_id for pr in pulls if pr.launch is not None and pr.launch.via == "browser"]
+    if browser_workers:
+        missing = browser_missing()
+        add("trình duyệt Kite", FAIL if missing else OK,
+            f"thiếu {missing}" if missing else f"có Playwright và Chromium (cho {', '.join(browser_workers)})",
+            "~/kite/.venv/bin/pip install -e ~/kite[browser] && sudo ~/kite/.venv/bin/playwright install-deps "
+            "chromium && ~/kite/.venv/bin/playwright install chromium" if missing else "")
 
     # ---- secrets: present, private
     for provider in config.providers:
@@ -203,7 +228,7 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
                     + (f", {worker.get('running')}/{worker.get('slots')} request đang chạy" if worker.get("busy") else "")
                     + (f", {worker.get('slots')} request cùng lúc" if (worker.get("slots") or 1) > 1
                        and not worker.get("busy") else ""))
-                if worker.get("version") != WORKER_VERSION:
+                if worker.get("version") != WORKER_VERSION and not str(worker.get("version")).startswith("relay-"):
                     # A notebook started by hand runs whatever was saved on Kaggle: step 2 of the full-test
                     # day had no streaming because the session predated the new worker code.
                     add(f"notebook {worker.get('worker_id')}", WARN,

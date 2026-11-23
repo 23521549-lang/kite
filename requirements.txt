@@ -1,4 +1,5 @@
 # Install the project and its pinned runtime dependencies from pyproject.toml.
 # The [codemap] extra brings graphify (local code map, no network or LLM); [kaggle] the Kaggle CLI
-# that autostart uses to run worker notebooks.
--e .[codemap,kaggle]
+# that autostart uses to run worker notebooks; [browser] Kite's own browser for kaggle.com (then run
+# `playwright install --with-deps chromium`).
+-e .[codemap,kaggle,browser]

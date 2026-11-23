@@ -57,6 +57,17 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
+class PodConfig:
+    """A rented GPU machine Kite starts when work arrives and stops when idle (pods.py)."""
+    pod_id: str                          # the pod's id in the provider's console (RunPod: Pods page)
+    provider: str = "runpod"
+    port: int = 8000                     # the model server's HTTP port, exposed through the provider's proxy
+    price_hour: float | None = None      # USD per hour while the pod runs; None: the price the provider reports
+    idle_minutes: int = 30               # stop the pod after this long without a job
+    start_timeout: float = 900.0         # seconds from "start" until the model server answers
+
+
+@dataclass(frozen=True)
 class RelayConfig:
     kind: str                            # openai (any OpenAI-compatible API) | anthropic
     base_url: str
@@ -66,6 +77,42 @@ class RelayConfig:
     daily_cap: float | None = None       # USD; at the cap the worker stops taking jobs until 00:00 UTC
     monthly_cap: float | None = None     # USD; until the 1st (UTC)
     timeout: float = 600.0
+    # Read the answer as it is generated (SSE) and pass it on to a streaming client. Always on for a
+    # pod: RunPod's proxy closes a request that has sent nothing for 100 seconds.
+    stream: bool = False
+    pod: PodConfig | None = None
+
+
+POD_PROVIDERS = ("runpod",)
+_POD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{3,63}$")
+
+
+def _validate_pod(raw: Any, where: str, secrets: dict) -> PodConfig:
+    pod = _mapping(raw, where)
+    unknown = set(pod) - {"provider", "id", "port", "price_hour", "idle_minutes", "start_timeout_seconds"}
+    if unknown:
+        raise ConfigError(f"{where} has unsupported fields: {', '.join(sorted(unknown))}")
+    provider = pod.get("provider", "runpod")
+    if provider not in POD_PROVIDERS:
+        raise ConfigError(f"{where}.provider must be one of {', '.join(POD_PROVIDERS)}")
+    pod_id = pod.get("id")
+    if not isinstance(pod_id, str) or not _POD_ID.fullmatch(pod_id):
+        raise ConfigError(f"{where}.id must be the pod id from the provider's console")
+    port = pod.get("port", 8000)
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ConfigError(f"{where}.port must be between 1 and 65535")
+    price = pod.get("price_hour")
+    if price is not None and (isinstance(price, bool) or not isinstance(price, (int, float)) or price < 0):
+        raise ConfigError(f"{where}.price_hour must be a non-negative number of USD")
+    idle = pod.get("idle_minutes", 30)
+    if not isinstance(idle, int) or isinstance(idle, bool) or not 5 <= idle <= 720:
+        raise ConfigError(f"{where}.idle_minutes must be between 5 and 720")
+    start = _number(pod.get("start_timeout_seconds", 900), f"{where}.start_timeout_seconds", minimum=60)
+    if start > 3600:
+        raise ConfigError(f"{where}.start_timeout_seconds must be at most 3600")
+    if not secrets.get("runpod_api_key"):
+        raise ConfigError(f"{where}: a pod needs secrets.runpod_api_key (RunPod API key, scope pods:write)")
+    return PodConfig(pod_id, provider, port, None if price is None else float(price), idle, float(start))
 
 
 _PRIVATE_HOST = re.compile(r"^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|"
@@ -76,13 +123,23 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
     from urllib.parse import urlparse
 
     r = _mapping(raw, where)
-    unknown = set(r) - {"kind", "base_url", "upstream", "price", "caps", "timeout_seconds"}
+    unknown = set(r) - {"kind", "base_url", "upstream", "price", "caps", "timeout_seconds", "stream", "pod"}
     if unknown:
         raise ConfigError(f"{where} has unsupported fields: {', '.join(sorted(unknown))}")
     kind = r.get("kind")
     if kind not in ("openai", "anthropic"):
         raise ConfigError(f"{where}.kind must be openai or anthropic")
+    pod = _validate_pod(r["pod"], f"{where}.pod", secrets) if r.get("pod") is not None else None
+    if pod is not None and kind != "openai":
+        raise ConfigError(f"{where}: a pod serves an OpenAI-compatible API (vLLM, llama-server): kind openai")
+    stream = r.get("stream", False)
+    if not isinstance(stream, bool):
+        raise ConfigError(f"{where}.stream must be true or false")
+    if stream and kind != "openai":
+        raise ConfigError(f"{where}.stream is for OpenAI-compatible APIs")
     base_url = r.get("base_url") or ("https://api.anthropic.com" if kind == "anthropic" else None)
+    if pod is not None and not base_url:
+        base_url = f"https://{pod.pod_id}-{pod.port}.proxy.runpod.net/v1"
     url = urlparse(base_url) if isinstance(base_url, str) else None
     if url is None or url.scheme not in ("https", "http") or not url.hostname:
         raise ConfigError(f"{where}.base_url must be an http(s) URL")
@@ -115,7 +172,7 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
         raise ConfigError(f"{where}.timeout_seconds must be between 1 and 3600")
     return RelayConfig(kind, base_url.rstrip("/"), tuple((k, v.strip()) for k, v in upstream.items()),
                        numbers["price_in"], numbers["price_out"], numbers["daily_cap"], numbers["monthly_cap"],
-                       numbers["timeout"])
+                       numbers["timeout"], stream or pod is not None, pod)
 
 
 @dataclass(frozen=True)
@@ -129,9 +186,18 @@ class LaunchConfig:
     max_hours: float = 11.5             # Kaggle ends sessions at 12 h
     model: str | None = None            # model to load first when no request names one
     kaggle_username: str | None = None  # only with a legacy key (secrets.kaggle_key)
+    # How a run starts. "api": Kite pushes the notebook through the Kaggle API (Kaggle may queue it for
+    # hours). "browser": Kite opens the notebook in its own browser (browser.py), where you press Save
+    # Version, or Kite presses it when you switched "Kite tự bấm" on.
+    via: str = "api"
+    # What Kite pushes: "stub" is one small cell that downloads the worker code from Kite when it runs
+    # (stub.py), so a run never has old code; "full" is this repository's whole notebook.
+    notebook: str = "stub"
 
 
 LAUNCH_TOKEN_MODES = ("kaggle-secret", "per-launch")
+LAUNCH_VIA = ("api", "browser")
+LAUNCH_NOTEBOOKS = ("stub", "full")
 _KERNEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}/[a-z0-9][a-z0-9-]{0,99}$")
 _ACCELERATOR = re.compile(r"^[A-Za-z0-9]{2,40}$")
 
@@ -139,7 +205,7 @@ _ACCELERATOR = re.compile(r"^[A-Za-z0-9]{2,40}$")
 def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tuple[str, ...]) -> LaunchConfig:
     launch = _mapping(raw, label)
     unknown = set(launch) - {"kernel", "idle_minutes", "token", "accelerator", "max_hours", "model",
-                             "kaggle_username"}
+                             "kaggle_username", "via", "notebook"}
     if unknown:
         raise ConfigError(f"{label} has unsupported fields")
     kernel = launch.get("kernel")
@@ -166,7 +232,13 @@ def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tupl
     if not secrets.get("kaggle_api_token") and not (secrets.get("kaggle_key") and username):
         raise ConfigError(f"{label} needs secrets.kaggle_api_token (or secrets.kaggle_key with "
                           "launch.kaggle_username) to run the notebook through the Kaggle API")
-    return LaunchConfig(kernel, idle, token, accelerator, hours, model, username)
+    via = launch.get("via", "api")
+    if via not in LAUNCH_VIA:
+        raise ConfigError(f"{label}.via must be one of {', '.join(LAUNCH_VIA)}")
+    notebook = launch.get("notebook", "stub")
+    if notebook not in LAUNCH_NOTEBOOKS:
+        raise ConfigError(f"{label}.notebook must be one of {', '.join(LAUNCH_NOTEBOOKS)}")
+    return LaunchConfig(kernel, idle, token, accelerator, hours, model, username, via, notebook)
 
 
 @dataclass(frozen=True)

@@ -249,6 +249,9 @@ def spend_summary(records: list[dict]) -> dict:
         worker = str(record.get("worker"))
         entry = out.setdefault(worker, {"usd": 0.0, "requests": 0, "prompt_tokens": 0, "completion_tokens": 0})
         entry["usd"] = round(entry["usd"] + float(record.get("usd") or 0), 6)
+        if record.get("kind") == "pod":       # hours a rented machine ran (pods.py), not a request
+            entry["hours"] = round(entry.get("hours", 0.0) + float(record.get("hours") or 0), 4)
+            continue
         entry["requests"] += 1
         entry["prompt_tokens"] += int(record.get("prompt_tokens") or 0)
         entry["completion_tokens"] += int(record.get("completion_tokens") or 0)
@@ -271,6 +274,9 @@ def launch_summary(records: list[dict]) -> dict:
         "connected_by_hand": sum(r.get("event") == "alive" and bool(r.get("by_hand")) for r in records),
         "failed": events.get("failed", 0),
         "cancelled": events.get("cancelled", 0),
+        # launch.via browser: starts that waited for Save Version by hand; bootstrap notebooks that fetched code
+        "waiting_for_click": events.get("waiting", 0),
+        "code_downloads": events.get("code", 0),
         # pushed -> Kaggle running (its queue); pushed -> worker connected (queue + model load)
         "kaggle_queue": minutes(r.get("queued_s") for r in records if r.get("event") == "running"),
         "to_connect": minutes(r.get("since_push_s") for r in records if r.get("event") == "alive"),

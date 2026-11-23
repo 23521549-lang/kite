@@ -196,7 +196,8 @@ Mỗi đợt giao bằng patch như bây giờ. Mỗi đợt có test tự độ
 - **Chi phí:** máy t3.medium khoảng 30 USD/tháng, cộng máy cũ trong lúc chạy song song. API trả tiền chỉ tốn khi chủ thêm provider và bật worker.
 - **OpenCode server** đổi API thì chat web phải sửa theo. Phiên bản OpenCode được ghim.
 - **3D trên máy yếu:** có chế độ 2D.
-- **Còn mở:** bộ component UI cho FE; chi tiết adapter RunPod (mẫu máy, image); tên miền riêng sau này.
+- **Đã chốt (23/11):** FE dùng Mantine; RunPod: chủ tạo sẵn pod (image vLLM hoặc llama-server, cổng HTTP), Kite chỉ bật/tắt qua REST API v2 và đọc câu trả lời dạng stream (proxy RunPod cắt request im lặng quá 100 giây); trình duyệt Kaggle: Chromium + Playwright, màn hình qua CDP screencast trên WebSocket; mô hình 3D chỉ dùng tài nguyên CC0; tạm dùng sslip.io.
+- **Còn mở:** tên miền riêng sau này.
 
 ## 10. Tham khảo
 - Claw3D: https://github.com/iamlukethedev/claw3d

@@ -29,6 +29,12 @@ kaggle = [
     "kaggle==2.2.5",
     "six>=1.16",
 ]
+# Kite's own browser for kaggle.com (browser.py): Playwright drives Chromium (installed separately with
+# `playwright install --with-deps chromium`); the saved Kaggle session is encrypted (AES-GCM).
+browser = [
+    "playwright>=1.49,<2",
+    "cryptography>=42",
+]
 
 [project.scripts]
 kite = "poc.kaggle_worker.cli:console_main"

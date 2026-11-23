@@ -582,6 +582,19 @@ class ModelGateway:
                 self._queue.insert(0, job.job_id)
                 self._notify()
 
+    def first_queued_model(self, worker_id: str) -> str | None:
+        """The model of the oldest waiting request this worker could take (what a notebook that is
+        starting should load first)."""
+        worker = self.workers.get(worker_id)
+        if worker is None:
+            return None
+        for job_id in self._queue:
+            job = self.jobs.get(job_id)
+            if (job is not None and job.worker_id is None and job.model != ANY_MODEL
+                    and job.model in worker.model_ids and job.pinned in (None, worker_id)):
+                return job.model
+        return None
+
     def _worker_coming(self, model: str) -> bool:
         """A worker for ``model`` is connected (busy, or loading a model) or being started: a queued
         request is worth keeping."""
@@ -659,10 +672,29 @@ def _error(status: int, message: str) -> web.Response:
     return web.json_response({"error": {"message": message, "type": "kite_gateway"}}, status=status)
 
 
+LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _hostname(value: str | None) -> str | None:
+    """``host[:port]`` or a URL -> its host name, lower case, without IPv6 brackets."""
+    from urllib.parse import urlsplit
+
+    if not value:
+        return None
+    try:
+        host = urlsplit(value if "//" in value else "//" + value).hostname
+    except ValueError:
+        return None
+    return host.lower() if host else None
+
+
 def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
-               launcher: Any = None) -> web.Application:
+               launcher: Any = None, worker_code: Callable[[str, Mapping[str, str]], dict] | None = None,
+               browser: Any = None) -> web.Application:
     """``launcher`` (optional) starts workers on demand: ``wake(model=, worker=, reason=)``,
-    ``status()``; see launcher.py."""
+    ``status()``, and ``stop(worker)`` for workers it stops itself; see starters.py.
+    ``worker_code`` answers ``GET /worker/code`` for the bootstrap notebook (stub.py).
+    ``browser`` is Kite's own browser for kaggle.com (browser.py), served on loopback only."""
     app = web.Application(client_max_size=max_body_bytes)
 
     async def models(_request: web.Request) -> web.Response:
@@ -807,6 +839,24 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
         # network (which can reach the gateway's second address) must not start or stop workers.
         if request.remote not in ("127.0.0.1", "::1"):
             raise web.HTTPForbidden(text="local only")
+        # Through an SSH tunnel the owner's own browser reaches loopback too: refuse a page of another
+        # site (Origin) and a name that only resolves here (DNS rebinding: Host is not loopback).
+        if _hostname(request.host) not in LOCAL_HOSTS:
+            raise web.HTTPForbidden(text="local only: open it as http://127.0.0.1:<port>")
+        origin = request.headers.get("Origin")
+        if origin is not None and _hostname(origin) not in LOCAL_HOSTS:
+            raise web.HTTPForbidden(text="local only: request from another site")
+
+    async def code(request: web.Request) -> web.Response:
+        worker_id = worker_id_or_401(request)
+        if worker_code is None:
+            return _error(404, "this gateway does not serve worker code")
+        try:
+            bundle = worker_code(worker_id, request.headers)
+        except Exception as exc:              # a broken notebook file must not take the gateway down
+            print(f"kite gateway: worker code for {worker_id}: {exc}", file=sys.stderr)
+            return _error(500, "cannot read the worker notebook on the gateway")
+        return web.json_response(bundle)
 
     async def wake(request: web.Request) -> web.Response:
         local_only(request)
@@ -846,6 +896,11 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
         except (json.JSONDecodeError, UnicodeDecodeError):
             return _error(400, "body must be JSON")
         worker_id = body.get("worker") if isinstance(body, dict) else None
+        stopper = getattr(launcher, "stop", None)
+        if stopper is not None:
+            stopped = await stopper(str(worker_id))      # a rented machine: Kite turns it off itself
+            if stopped is not None:
+                return web.json_response({"worker": worker_id, **stopped})
         try:
             gateway.request_stop(str(worker_id))
         except ValueError as exc:
@@ -863,6 +918,11 @@ def create_app(gateway: ModelGateway, *, max_body_bytes: int = 32 * 1024 * 1024,
     app.router.add_get("/worker/jobs", jobs)
     app.router.add_post("/worker/jobs/{job_id}/chunks", chunks)
     app.router.add_post("/worker/jobs/{job_id}/result", result)
+    app.router.add_get("/worker/code", code)
+    if browser is not None:
+        from .browser import add_routes
+
+        add_routes(app, browser, local_only)
     return app
 
 

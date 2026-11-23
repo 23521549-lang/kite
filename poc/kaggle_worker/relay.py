@@ -8,6 +8,10 @@ its worker and the retries therefore work the same for every provider. Each job 
   Gemini's compatible endpoint, vLLM, Ollama, llama-server...);
 - ``anthropic``: Anthropic's Messages API, translated to and from the OpenAI chat format.
 
+With ``stream`` (always for a rented machine, pods.py), the answer is read as it is generated (SSE)
+and its chunks go straight to a streaming client, like a Kaggle worker's; RunPod's proxy closes a
+request that has sent nothing for 100 seconds, so a long answer needs it.
+
 The token usage of every answer is priced and written to the spend ledger (journal file ``spend``).
 A worker that reaches its daily or monthly cap stops taking jobs, so the queue goes to the other
 workers, and the owner is told once (ntfy). Keys never reach a log, the journal or a prompt.
@@ -39,6 +43,13 @@ class RelayError(RuntimeError):
         self.retryable = retryable
 
 
+class RelayCancelled(Exception):
+    """The client no longer wants the answer (it went away, the task was cancelled)."""
+
+
+ChunkSink = Callable[[dict], bool]          # a streamed chunk -> False when nobody wants the rest
+
+
 @dataclass(frozen=True)
 class RelaySpec:
     worker_id: str
@@ -53,10 +64,12 @@ class RelaySpec:
     daily_cap: float | None = None      # USD
     monthly_cap: float | None = None    # USD
     timeout: float = 600.0
+    stream: bool = False                # read the answer as SSE (OpenAI-compatible only)
+    pod: Any = None                     # config.PodConfig of a rented machine Kite starts and stops
 
     @property
     def paid(self) -> bool:
-        return self.price_in > 0 or self.price_out > 0
+        return self.price_in > 0 or self.price_out > 0 or self.pod is not None
 
     def upstream_model(self, model: str) -> str:
         return self.upstream.get(model, model)
@@ -116,10 +129,14 @@ def openai_body(spec: RelaySpec, body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-async def openai_call(spec: RelaySpec, body: dict[str, Any], session) -> dict[str, Any]:
+async def openai_call(spec: RelaySpec, body: dict[str, Any], session, sink: ChunkSink | None = None) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     if spec.api_key:
         headers["Authorization"] = f"Bearer {spec.api_key}"
+    if spec.stream:
+        return await _stream(session, spec.base_url.rstrip("/") + "/chat/completions",
+                             {**openai_body(spec, body), "stream": True, "stream_options": {"include_usage": True}},
+                             headers, spec.timeout, sink)
     data = await _post(session, spec.base_url.rstrip("/") + "/chat/completions", openai_body(spec, body),
                        headers, spec.timeout)
     if not isinstance(data.get("choices"), list) or not data["choices"]:
@@ -249,7 +266,7 @@ def anthropic_to_openai(data: dict[str, Any], model: str) -> dict[str, Any]:
                       "total_tokens": prompt + completion}}
 
 
-async def anthropic_call(spec: RelaySpec, body: dict[str, Any], session) -> dict[str, Any]:
+async def anthropic_call(spec: RelaySpec, body: dict[str, Any], session, sink: ChunkSink | None = None) -> dict[str, Any]:
     headers = {"Content-Type": "application/json", "anthropic-version": ANTHROPIC_VERSION}
     if spec.api_key:
         headers["x-api-key"] = spec.api_key
@@ -278,6 +295,47 @@ async def _post(session, url: str, payload: dict, headers: dict, timeout: float)
         raise RelayError(f"cannot reach the provider ({type(exc).__name__})", retryable=True) from exc
 
 
+async def _stream(session, url: str, payload: dict, headers: dict, timeout: float,
+                  sink: ChunkSink | None) -> dict:
+    """POST with stream: true; pass each chunk to ``sink`` and return the whole answer."""
+    import aiohttp
+
+    from .pull_worker import assemble_stream
+
+    chunks: list[dict] = []
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(
+                total=timeout, sock_read=min(timeout, 300))) as response:
+            if response.status >= 400:
+                text = await response.text()
+                raise RelayError(f"HTTP {response.status}: {text[:300]}", retryable=response.status in RETRYABLE)
+            async for raw in response.content:
+                line = raw.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise RelayError("the provider sent a stream that is not JSON") from exc
+                if not isinstance(chunk, dict):
+                    continue
+                if "error" in chunk:
+                    raise RelayError(f"the provider stopped: {str(chunk['error'])[:300]}")
+                chunks.append(chunk)
+                if sink is not None and chunk.get("choices") and not sink(chunk):
+                    raise RelayCancelled()
+    except asyncio.TimeoutError as exc:
+        raise RelayError(f"no answer within {timeout:.0f}s", retryable=not chunks) from exc
+    except aiohttp.ClientError as exc:
+        raise RelayError(f"cannot reach the provider ({type(exc).__name__})", retryable=not chunks) from exc
+    if not any(chunk.get("choices") for chunk in chunks):
+        raise RelayError("the provider's stream had no answer", retryable=True)
+    return assemble_stream(chunks)
+
+
 CALLS = {"openai": openai_call, "anthropic": anthropic_call}
 
 
@@ -287,13 +345,27 @@ class RelayWorker:
 
     def __init__(self, spec: RelaySpec, gateway, ledger: SpendLedger, *, notify=None,
                  journal: Callable[[str, dict], None] | None = None, clock: Callable[[], float] = time.time,
-                 retry_delay: float = 2.0) -> None:
+                 retry_delay: float = 2.0, available: Callable[[], bool] | None = None) -> None:
         self.spec, self.gateway, self.ledger = spec, gateway, ledger
         self.notify, self.journal, self.clock = notify, journal, clock
         self.retry_delay = retry_delay
         self.capped: str | None = None
+        # A rented machine is up only while Kite runs it (pods.py): no heartbeat while it is off, so the
+        # gateway sees no worker for its models and may start it.
+        self.available = available
+        self.beating = False
+        self.active = 0                       # jobs being answered now
+        self.last_active = clock()            # when the last job started or ended (idle stop)
 
     async def beat(self) -> None:
+        if self.available is not None and not self.available():
+            if self.beating:                  # leave at once instead of after the heartbeat timeout
+                self.beating = False
+                await self.gateway.heartbeat(self.spec.worker_id, {
+                    "ready": False, "draining": True, "slots": self.spec.slots,
+                    "version": f"relay-{self.spec.kind}"})
+            return
+        self.beating = True
         reason = self.ledger.over_cap(self.spec, self.clock())
         if reason and reason != self.capped:
             self._record("launches", {"event": "capped", "worker": self.spec.worker_id, "reason": reason})
@@ -308,15 +380,35 @@ class RelayWorker:
             "version": f"relay-{self.spec.kind}"})
 
     async def serve(self, job, session) -> None:
+        self.active += 1
+        self.last_active = self.clock()
+        try:
+            await self._serve(job, session)
+        finally:
+            self.active -= 1
+            self.last_active = self.clock()
+
+    async def _serve(self, job, session) -> None:
         call = CALLS[self.spec.kind]
         error = None
+        sent = [0]
+
+        def sink(chunk: dict) -> bool:
+            # In-process: the chunk goes straight to the client's stream (False: the client went away).
+            if not self.gateway.add_chunks(self.spec.worker_id, job.job_id, sent[0], [chunk]):
+                return False
+            sent[0] += 1
+            return True
+
         for attempt in range(2):
             try:
-                response = await call(self.spec, job.body, session)
+                response = await call(self.spec, job.body, session, sink)
                 break
+            except RelayCancelled:
+                return                        # the gateway already dropped the job
             except RelayError as exc:
                 error = exc
-                if not exc.retryable or attempt:
+                if not exc.retryable or attempt or sent[0]:
                     self.gateway.complete(self.spec.worker_id, job.job_id,
                                           {"status": "error", "error": f"{self.spec.worker_id}: {exc}"})
                     return
@@ -350,6 +442,10 @@ class RelayWorker:
 
             async def slot() -> None:
                 while True:
+                    if self.available is not None and not self.available():
+                        # Waiting for jobs counts as being connected: a pod that is off must not look up.
+                        await asyncio.sleep(min(beat_every, 1.0))
+                        continue
                     job = await self.gateway.next_job(self.spec.worker_id, beat_every)
                     if job is not None:
                         await self.serve(job, session)
@@ -379,7 +475,8 @@ def relay_specs(config) -> list[RelaySpec]:
         key = resolve_secret(p.secrets["api_key"]) if p.secrets.get("api_key") else None
         specs.append(RelaySpec(p.effective_worker_id, r.kind, r.base_url, key, p.model_ids, dict(r.upstream),
                                slots=p.concurrency, price_in=r.price_in, price_out=r.price_out,
-                               daily_cap=r.daily_cap, monthly_cap=r.monthly_cap, timeout=r.timeout))
+                               daily_cap=r.daily_cap, monthly_cap=r.monthly_cap, timeout=r.timeout,
+                               stream=r.stream, pod=r.pod))
     return specs
 
 

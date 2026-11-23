@@ -221,6 +221,38 @@ kite worker spend
 
 Routing between workers: a free worker gets a request first (a paid one waits 5 s for it); a task keeps the worker that took its first request until that worker is gone, stopped or at its cap; the model name `kite-auto` goes to any free worker, which answers with its own model.
 
+### Bootstrap notebook (stub)
+
+`kite worker stub kaggle-han` prints one cell. Paste it in place of the notebook's old cells once (keep its inputs, GPU T4 x2, Internet and the `KITE_WORKER_TOKEN` Secret) and press Save Version. Each run then downloads the worker code from the gateway (`GET /worker/code`, published through Caddy with the rest of `/worker/*`) and runs it, so a notebook never runs old code after `kite update`. The gateway also says which model to load first (the oldest request waiting for that worker) and how many idle minutes end the session. Autostart pushes this stub too (`launch.notebook: stub`, the default; `full` pushes the whole notebook as before).
+
+### Kite's browser for kaggle.com
+
+Kaggle starts a run at once when Save Version is pressed on kaggle.com, while a run pushed through its API may wait in a queue for hours. Kite therefore has its own Chromium on the gateway machine (`browser.py`), streamed to `http://127.0.0.1:8787/kite/browser` (loopback only: `ssh -L 8787:127.0.0.1:8787 ubuntu@<machine>`, later the web's Worker tab).
+
+```sh
+~/kite/.venv/bin/pip install -e ~/kite[browser]
+sudo ~/kite/.venv/bin/playwright install-deps chromium && ~/kite/.venv/bin/playwright install chromium
+kite worker autostart kaggle-han --kernel <user>/<slug> --via browser
+kite worker browser kaggle-han                 # opens the notebook editor in Kite's browser
+kite worker browser kaggle-han --auto-click on # optional: Kite presses Save Version itself
+```
+
+Sign in to Kaggle there once with email and password (Google's sign-in may refuse a browser on a server); the session is saved encrypted (AES-GCM, key in `secrets/browser_key`, 0600). Only kaggle.com pages open in it. With `launch.via: browser`, a request that needs the worker opens the notebook there and tells you (chat note and ntfy) to press Save Version → Save & Run All → Save; Kite waits up to an hour for Kaggle to show the new run. "Kite tự bấm" (`--auto-click on`, or the switch on the page) is off by default: Kaggle's terms forbid automated access outside its API, so switching it on is your decision. If Kaggle changes its page and the click fails, you are asked to press it yourself. Chromium closes after 10 minutes without a viewer.
+
+### Rented GPU machines (RunPod)
+
+Create the pod once in RunPod's console: a GPU, an image that serves an OpenAI-compatible API on `0.0.0.0` (for example `vllm serve Qwen/Qwen3-32B --port 8000 --api-key <key> --served-model-name Qwen/Qwen3-32B`), port 8000 exposed as HTTP, and a volume for the model files. Then:
+
+```sh
+kite worker add-runpod runpod-a100 --pod-id <pod id> --model qwen3-32b=Qwen/Qwen3-32B \
+  --daily-cap 5 --monthly-cap 40          # asks for the RunPod API key (pods:write) and the server's key
+sudo systemctl restart kite-gateway
+kite worker start runpod-a100             # or just chat with model qwen3-32b
+kite worker stop runpod-a100
+```
+
+Kite starts the pod through RunPod's REST API v2 when a request for its models arrives from the chat (and no free Kaggle worker could take it), waits until the model server answers, and stops the pod after `--idle-minutes` (30) without a job, at the daily or monthly cap, or when it is not ready within 15 minutes. The hours it runs times `--price-hour` (default: the price RunPod reports) go to the spend ledger like an API's tokens. Answers are streamed from the pod, because RunPod's proxy closes a request that sends nothing for 100 seconds. Kite never creates or deletes pods.
+
 ### Adding a model, chat-only models
 
 A model the workers should serve must be in the notebook's `ROSTER`, with its dataset attached to each worker's notebook. Then:

@@ -14,6 +14,15 @@ Kaggle API credentials are read from the provider's secrets (``kaggle_api_token`
 ``kaggle_key`` with ``launch.kaggle_username``) and handed to the Kaggle CLI in its environment
 only; ``KAGGLE_API_TOKEN`` points at the 0600 secret file, so the token is never copied.
 
+What is pushed: by default the bootstrap notebook (``launch.notebook: stub``, stub.py), one cell that
+downloads the worker code from the gateway when it runs; ``full`` pushes this repository's notebook.
+
+``launch.via: browser``: instead of pushing through the API (which Kaggle may queue for hours), Kite
+opens the notebook's editor in its own browser (browser.py). With the owner's "Kite tự bấm" switch
+on, Kite presses Save Version -> Save & Run All -> Save there; otherwise the owner presses them (the
+start then waits in state ``waiting`` until Kaggle shows a new run). Kaggle gives Secrets to a run
+saved on kaggle.com, so the notebook's ``KITE_WORKER_TOKEN`` works.
+
 Worker token: ``kaggle-secret`` (default) keeps using the notebook's Kaggle Secret
 ``KITE_WORKER_TOKEN``. Kaggle may not attach Secrets to a version pushed through the API; then the
 run fails at the worker cell and ``kite worker status`` shows it. ``per-launch`` instead writes a
@@ -39,6 +48,7 @@ import time
 from typing import Any, Callable
 
 from .config import KiteConfig, LaunchConfig, resolve_secret
+from .stub import stub_notebook
 
 NOTEBOOK = Path(__file__).with_name("kaggle_model_worker.ipynb")
 LAUNCH_LINE = re.compile(r"^KITE_LAUNCH = \{\}.*$", re.M)
@@ -49,6 +59,7 @@ LAUNCH_WINDOW_SECONDS = 6 * 3600       # a pushed run starts well within this; l
 # hand at the same moment ran at once). After this long in the queue, tell the person to press it.
 QUEUE_NOTIFY_SECONDS = 180.0
 MAX_FAILURES = 2                       # runs that stopped before connecting: then wait for `--force`
+WAIT_CLICK_SECONDS = 3600.0            # launch.via browser: how long to wait for Save Version by hand
 
 
 def kaggle_url(kernel: str) -> str:
@@ -124,7 +135,7 @@ def inject_launch(notebook: dict, values: dict[str, Any]) -> dict:
 class LaunchState:
     worker_id: str
     spec: LaunchConfig
-    state: str = "idle"            # idle | launching | starting | alive | error
+    state: str = "idle"            # idle | launching | waiting (for Save Version by hand) | starting | alive | error
     since: float = 0.0
     detail: str = ""
     version: str | None = None
@@ -176,8 +187,15 @@ class KaggleLauncher:
                  clock: Callable[[], float] = time.time, notebook: Path = NOTEBOOK,
                  command: str | None = None, startup_seconds: float = 1500.0, retry_seconds: float = 600.0,
                  grace_seconds: float | None = None, sleep: Callable[[float], Any] = asyncio.sleep,
-                 notify: Callable[..., None] | None = None, journal: Callable[[dict], None] | None = None) -> None:
+                 notify: Callable[..., None] | None = None, journal: Callable[[dict], None] | None = None,
+                 browser: Any = None, auto_click: Callable[[str], bool] | None = None) -> None:
         self.config = config
+        self.browser = browser          # browser.KiteBrowser for launch.via: browser
+        if auto_click is None:
+            from .browser import auto_click_on
+
+            auto_click = lambda worker: auto_click_on(Path(state_dir), worker)   # noqa: E731
+        self.auto_click = auto_click    # the owner's "Kite tự bấm" switch, read at each start
         self.notify = notify            # ntfy: (title, message, tags=, priority=); never carries code or goals
         self.journal = journal          # one line per push / run start / connect / failure ("launches")
         self.gateway = gateway
@@ -268,9 +286,14 @@ class KaggleLauncher:
         except Exception as exc:
             print(f"kite gateway: notify error: {exc}", file=sys.stderr)
 
+    def browser_hint(self) -> str:
+        port = self.config.gateway.port
+        return (f"Trình duyệt Kite: ssh -L {port}:127.0.0.1:{port} vào máy Kite, rồi mở "
+                f"http://127.0.0.1:{port}/kite/browser")
+
     def starting(self, model: str) -> bool:
         """Gateway hook: a worker that serves ``model`` is being started (keep its requests queued)."""
-        return any(state.state in ("launching", "starting")
+        return any(state.state in ("launching", "waiting", "starting")
                    for wid, state in self.states.items() if model in self.gateway.workers[wid].model_ids)
 
     def wait_note(self, model: str) -> str:
@@ -289,6 +312,9 @@ class KaggleLauncher:
                          else "Kite đang bật notebook"),
             "error": f"lần bật trước bị lỗi: {state.detail}"[:300],
         }.get(state.state, "Kite đang bật notebook")
+        if state.state == "waiting":
+            return (f"Worker {state.worker_id} chưa chạy nên chưa trả lời được: {state.detail}. "
+                    f"{self.browser_hint()}. Worker kết nối khoảng 2–3 phút sau khi notebook chạy; khi đó nhắn lại.")
         return (f"Worker {state.worker_id} chưa chạy nên chưa trả lời được ({doing}). Muốn nhanh: mở "
                 f"{kaggle_url(state.spec.kernel)} rồi bấm Save Version (Save & Run All); Kaggle thường cấp "
                 "GPU ngay cho cách này. Worker kết nối khoảng 2–3 phút sau khi notebook chạy; khi đó nhắn lại.")
@@ -316,7 +342,11 @@ class KaggleLauncher:
                 launch["gateway_url"] = self.config.gateway.public_url
             if spec.token == "per-launch":
                 launch["token"] = self._new_launch_token(worker_id, spec.max_hours)
-            notebook = inject_launch(json.loads(self.notebook.read_text(encoding="utf-8")), launch)
+            # The bootstrap notebook needs the gateway's public address to fetch the worker code.
+            base = (stub_notebook(self.config.gateway.public_url)
+                    if spec.notebook == "stub" and self.config.gateway.public_url
+                    else json.loads(self.notebook.read_text(encoding="utf-8")))
+            notebook = inject_launch(base, launch)
             code_file.write_text(json.dumps(notebook, ensure_ascii=False, indent=1), encoding="utf-8")
             meta.update(code_file=code_file.name, enable_gpu=True, enable_internet=True, is_private=True)
             meta.pop("enable_tpu", None)
@@ -343,7 +373,7 @@ class KaggleLauncher:
         if self.gateway.present(state.worker_id):
             if state.state != "alive":
                 now = self.clock()
-                if state.state in ("launching", "starting"):
+                if state.state in ("launching", "waiting", "starting"):
                     self._record(state, "alive",
                                  since_push_s=round(now - state.pushed_at) if state.pushed_at else None,
                                  queued_s=round((state.running_at or now) - state.pushed_at)
@@ -390,7 +420,7 @@ class KaggleLauncher:
         for wid in candidates:
             state = self.states[wid]
             self._refresh(state)
-            if state.state == "alive" or (state.state in ("launching", "starting") and not force):
+            if state.state == "alive" or (state.state in ("launching", "waiting", "starting") and not force):
                 return {"worker": wid, **state.report(self.clock())}
         for wid in candidates:
             state = self.states[wid]
@@ -406,7 +436,7 @@ class KaggleLauncher:
     async def _launch(self, state: LaunchState, model: str | None, reason: str, force: bool) -> dict[str, Any]:
         async with state.lock:
             self._refresh(state)
-            if state.state == "alive" or (state.state in ("launching", "starting") and not force):
+            if state.state == "alive" or (state.state in ("launching", "waiting", "starting") and not force):
                 return {"worker": state.worker_id, **state.report(self.clock())}
             state.state, state.since, state.reason, state.detail = "launching", self.clock(), reason, ""
             try:
@@ -417,6 +447,8 @@ class KaggleLauncher:
                     state.state, state.detail = "starting", f"Kaggle đang chạy notebook ({status})"
                 elif status is None and "404" not in detail and "not found" not in detail.lower():
                     state.state, state.detail = "error", "không đọc được trạng thái trên Kaggle: " + detail
+                elif state.spec.via == "browser":
+                    await self._start_in_browser(state)
                 else:
                     ok, error, version = await asyncio.to_thread(self._push, state.worker_id, model, reason)
                     if ok:
@@ -437,11 +469,67 @@ class KaggleLauncher:
                 print(f"kite gateway: autostart {state.worker_id}: {state.detail}", file=sys.stderr)
             return {"worker": state.worker_id, **state.report(self.clock())}
 
+    async def _start_in_browser(self, state: LaunchState) -> None:
+        """launch.via: browser. Open the notebook's editor in Kite's browser; press Save Version only
+        when the owner switched "Kite tự bấm" on for this worker."""
+        if self.browser is None:
+            state.state = "error"
+            state.detail = ("launch.via: browser cần trình duyệt Kite: pip install -e .[browser] rồi "
+                            "playwright install --with-deps chromium, restart kite-gateway")
+            return
+        clicks = bool(self.auto_click(state.worker_id))
+        try:
+            if clicks:
+                result = await self.browser.save_version(state.spec.kernel)
+            else:
+                await self.browser.open(kaggle_url(state.spec.kernel))
+                result = None
+        except Exception as exc:
+            state.state, state.detail = "error", f"trình duyệt Kite lỗi: {type(exc).__name__}: {exc}"[:300]
+            state.failures += 1
+            self._record(state, "failed", via="browser", error=state.detail)
+            return
+        now = self.clock()
+        state.pushed_at, state.running_at, state.notified, state.version = now, 0.0, False, None
+        if result and result.get("ok"):
+            state.state = "starting"
+            state.saw("queued", now)
+            state.detail = "Kite đã bấm Save Version trong trình duyệt của Kite; chờ Kaggle chạy notebook"
+            self._record(state, "push", via="browser", clicked=True)
+            return
+        why = ("Kaggle đòi đăng nhập" if result and result.get("step") == "login"
+               else f"Kite không bấm được (bước {result.get('step')})" if result else "")
+        state.state = "waiting"
+        state.detail = ((why + ": " if why else "notebook đã mở trong trình duyệt Kite: ")
+                        + "bấm Save Version → Save & Run All → Save")
+        self._record(state, "waiting", via="browser", step=(result or {}).get("step"))
+        self._tell("Kite cần bạn bấm Save Version", f"{state.worker_id}: {state.detail}. {self.browser_hint()}")
+
+    async def _check_waiting(self, state: LaunchState) -> None:
+        """launch.via: browser, nobody pressed yet: a new queued or running run means someone did."""
+        now = self.clock()
+        status, _detail = await asyncio.to_thread(self.kernel_status, state.worker_id)
+        if status in RUNNING:
+            state.state, state.since = "starting", now
+            state.saw(status, now)
+            state.detail = "có bản chạy mới trên Kaggle; chờ worker kết nối"
+            self._record(state, "push", via="browser", clicked=False)
+        elif now - state.since >= WAIT_CLICK_SECONDS:
+            state.state, state.since = "idle", now
+            state.detail = "hết chờ bấm Save Version; Kite mở lại khi có việc"
+            self._record(state, "cancelled", via="browser")
+        else:
+            state.detail = (state.detail.split(" (chờ ")[0]
+                            + f" (chờ {round((now - state.since) / 60)} phút)")
+
     async def check_starting(self) -> None:
         """While a start has not connected, ask Kaggle every minute what the run is doing: say how long it
         has been queued or running, and report a run that stopped at once instead of waiting it out."""
         for state in self.states.values():
             self._refresh(state)
+            if state.state == "waiting":
+                await self._check_waiting(state)
+                continue
             if state.state != "starting":
                 continue
             now = self.clock()

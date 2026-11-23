@@ -180,6 +180,12 @@ def _parser() -> argparse.ArgumentParser:
                                 "(default), or the notebook's Kaggle Secret (Kaggle does not give Secrets "
                                 "to a run pushed through its API)")
     autostart.add_argument("--model", default=None, help="model to load first when nothing asks for one")
+    autostart.add_argument("--via", choices=["api", "browser"], default=None,
+                           help="api: push through the Kaggle API (may queue for hours); browser: open the "
+                                "notebook in Kite's browser and press Save Version there (default: keep, else api)")
+    autostart.add_argument("--notebook", choices=["stub", "full"], default=None,
+                           help="what a push sends: stub (one cell that downloads the worker code from Kite; "
+                                "default) or full (this repository's whole notebook)")
     autostart.add_argument("--off", action="store_true", help="remove autostart from this worker")
     start = worker_commands.add_parser("start", help="start the worker's Kaggle notebook now (autostart)")
     start.add_argument("worker_id")
@@ -210,6 +216,37 @@ def _parser() -> argparse.ArgumentParser:
     add_api.add_argument("--monthly-cap", type=float, default=None, help="USD per month; then the worker stops")
     add_api.add_argument("--concurrency", type=int, default=2, help="requests at once (default 2)")
     add_api.add_argument("--no-key", action="store_true", help="the API needs no key (a server on this machine)")
+    add_pod = worker_commands.add_parser(
+        "add-runpod", help="add a rented GPU machine (an existing RunPod pod that serves an OpenAI-compatible "
+                           "API, e.g. vLLM): Kite starts it when work arrives and stops it when idle; asks for "
+                           "the RunPod API key and the model server's key without echo")
+    add_pod.add_argument("worker_id", help="new worker id, e.g. runpod-a100 (lowercase, digits, '-')")
+    add_pod.add_argument("--pod-id", required=True, help="the pod's id on RunPod's Pods page")
+    add_pod.add_argument("--port", type=int, default=8000, help="the model server's port, exposed as HTTP (default 8000)")
+    add_pod.add_argument("--model", action="append", required=True, metavar="NAME[=SERVED_NAME]",
+                         help="a model the pod serves, under the name Kite uses; '=...' gives the name the server "
+                              "knows (vLLM: --served-model-name); repeat for more")
+    add_pod.add_argument("--price-hour", type=float, default=None,
+                         help="USD per hour while the pod runs (default: the price RunPod reports)")
+    add_pod.add_argument("--idle-minutes", type=int, default=30, help="stop the pod after this long without a job")
+    add_pod.add_argument("--daily-cap", type=float, default=None, help="USD per day; then the pod is stopped")
+    add_pod.add_argument("--monthly-cap", type=float, default=None, help="USD per month; then the pod is stopped")
+    add_pod.add_argument("--concurrency", type=int, default=4, help="requests at once (default 4)")
+    add_pod.add_argument("--base-url", default=None,
+                         help="the server's base URL (default https://<pod>-<port>.proxy.runpod.net/v1)")
+    add_pod.add_argument("--no-key", action="store_true", help="the model server needs no API key")
+    stub = worker_commands.add_parser(
+        "stub", help="print the bootstrap cell for the worker's Kaggle notebook: paste it in place of the old cells "
+                     "once; every run then downloads the newest worker code from Kite")
+    stub.add_argument("worker_id")
+    browser = worker_commands.add_parser(
+        "browser", help="Kite's own browser for kaggle.com: open the worker's notebook there, or switch "
+                        "'Kite tự bấm' (Kite presses Save Version itself; off by default)")
+    browser.add_argument("worker_id")
+    browser.add_argument("--auto-click", choices=["on", "off"], default=None,
+                         help="Kite presses Save Version -> Save & Run All -> Save itself when the worker must "
+                              "start. Kaggle's terms forbid automated access outside its API: your decision")
+    browser.add_argument("--close", action="store_true", help="close the browser now")
     worker_commands.add_parser("spend", help="what each API worker cost today and this month, against its caps")
     worker_status = worker_commands.add_parser("status", help="connected workers and autostart state "
                                                               "(from the gateway)")
@@ -393,6 +430,116 @@ def _worker_add_api(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_add_runpod(args: argparse.Namespace) -> int:
+    """Add a relay provider with ``relay.pod`` (pods.py); keys in 0600 files; backup + validate."""
+    import yaml
+
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    providers = raw.get("providers") or []
+    if any(args.worker_id in (p.get("id"), p.get("worker_id")) for p in providers):
+        raise ConfigError(f"worker {args.worker_id} already exists")
+    names, upstream = [], {}
+    for item in args.model:
+        name, _, target = item.partition("=")
+        names.append(name.strip())
+        if target.strip():
+            upstream[name.strip()] = target.strip()
+    pod: dict = {"provider": "runpod", "id": args.pod_id, "port": args.port, "idle_minutes": args.idle_minutes}
+    if args.price_hour is not None:
+        pod["price_hour"] = args.price_hour
+    relay: dict = {"kind": "openai", "pod": pod, "timeout_seconds": 1800}
+    if args.base_url:
+        relay["base_url"] = args.base_url
+    if upstream:
+        relay["upstream"] = upstream
+    caps = {k: v for k, v in (("daily_usd", args.daily_cap), ("monthly_usd", args.monthly_cap)) if v is not None}
+    if caps:
+        relay["caps"] = caps
+    secrets_dir = args.config.parent / "secrets"
+    runpod_key = secrets_dir / f"runpod_api_key_{args.worker_id}"
+    server_key = secrets_dir / f"api_key_{args.worker_id}"
+    provider = {"id": args.worker_id, "adapter": "relay", "enabled": True, "owner": "self", "model": names[0],
+                "models": names[1:], "capabilities": ["coding"],
+                "quota": {"gpu_seconds": 0, "concurrency": args.concurrency},
+                "secrets": {"runpod_api_key": f"file:{runpod_key}"}, "relay": relay}
+    if not args.no_key:
+        provider["secrets"]["api_key"] = f"file:{server_key}"
+    raw["providers"] = [*providers, provider]
+    validate_config(raw)                      # before asking for keys: a typo costs nothing
+    report: dict[str, object] = {"added": args.worker_id, "pod": args.pod_id, "models": names}
+    asks = [(runpod_key, "RunPod API key (console.runpod.io -> Settings -> API Keys, quyền pods:write)", True)]
+    if not args.no_key:
+        asks.append((server_key, "API key của model server trên pod (vLLM --api-key)", False))
+    for path, label, required in asks:
+        if path.exists():
+            report[path.name] = "dùng lại file có sẵn"
+            continue
+        value = getpass.getpass(f"{label} (không hiện ra màn hình): ").strip()
+        if not value:
+            raise ConfigError(f"{path.name}: key is empty")
+        secrets_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(secrets_dir, 0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value + "\n")
+        report[path.name] = f"đã lưu {path} (0600)"
+    report["backup"] = str(_save_config(args.config, raw))
+    if not caps:
+        report["warning"] = "máy thuê chưa có hạn mức chi: thêm --daily-cap / --monthly-cap khi tạo lại"
+    report["next"] = ["sudo systemctl restart kite-gateway", f"kite worker start {args.worker_id}",
+                      "kite worker status", "kite worker spend"]
+    _emit(report)
+    return 0
+
+
+def _worker_stub(args: argparse.Namespace) -> int:
+    from .stub import stub_source
+
+    config = _load_operator_config(args)
+    provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)
+    if provider is None or provider.adapter != "pull":
+        raise ConfigError(f"no pull worker {args.worker_id} in the config")
+    if not config.gateway.public_url:
+        raise ConfigError("gateway.public_url is not set: the notebook needs it to download the worker code")
+    kernel = provider.launch.kernel if provider.launch else "<user>/<notebook>"
+    print(f"""# Notebook khởi động cho {args.worker_id}. Làm một lần trên Kaggle:
+#  1. Mở https://www.kaggle.com/code/{kernel}/edit
+#  2. Xóa hết các ô cũ (giữ nguyên Input/dataset, GPU T4 x2, Internet, Secret KITE_WORKER_TOKEN).
+#  3. Dán toàn bộ phần dưới vào một ô code, rồi Save Version -> Save & Run All -> Save.
+# Từ đó mỗi lần chạy tải code worker mới nhất từ Kite; không phải dán lại sau mỗi lần cập nhật.
+""")
+    print(stub_source(config.gateway.public_url))
+    return 0
+
+
+def _worker_browser(args: argparse.Namespace) -> int:
+    from .browser import set_auto_click
+
+    config = _load_operator_config(args)
+    provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)
+    if provider is None or provider.adapter != "pull" or provider.launch is None:
+        raise ConfigError(f"{args.worker_id} has no notebook: kite worker autostart {args.worker_id} --kernel <user>/<slug>")
+    port = config.gateway.port
+    page = f"http://127.0.0.1:{port}/kite/browser"
+    if args.auto_click is not None:
+        set_auto_click(args.config.parent, args.worker_id, args.auto_click == "on")
+        _emit({"worker": args.worker_id, "auto_click": args.auto_click == "on",
+               "note": ("Kite sẽ tự bấm Save Version khi cần bật worker này (điều khoản Kaggle cấm thao tác tự "
+                        "động ngoài API: bạn chịu rủi ro). Tắt: --auto-click off"
+                        if args.auto_click == "on" else "Kite chỉ mở notebook; bạn tự bấm Save Version"),
+               "via": provider.launch.via})
+        return 0
+    if args.close:
+        _emit(_gateway_call(config, "POST", "/kite/browser/open", {"close": True}, timeout=60))
+        return 0
+    report = _gateway_call(config, "POST", "/kite/browser/open", {"worker": args.worker_id}, timeout=180)
+    _emit({"opened": report.get("url"), "title": report.get("title"), "error": report.get("error") or None,
+           "see_it": [f"trên máy của bạn: ssh -L {port}:127.0.0.1:{port} <user>@<máy Kite>",
+                      f"rồi mở {page} trong trình duyệt"],
+           "then": "đăng nhập Kaggle (email + mật khẩu) nếu được hỏi, bấm Save Version -> Save & Run All -> Save"})
+    return 0
+
+
 def _worker_spend(args: argparse.Namespace) -> int:
     from .relay import SpendLedger
 
@@ -403,11 +550,17 @@ def _worker_spend(args: argparse.Namespace) -> int:
         if p.adapter != "relay" or p.relay is None:
             continue
         day, month = ledger.spent(p.effective_worker_id)
-        rows.append({"worker": p.effective_worker_id, "enabled": p.enabled, "kind": p.relay.kind,
-                     "today_usd": round(day, 4), "daily_cap": p.relay.daily_cap,
-                     "month_usd": round(month, 4), "monthly_cap": p.relay.monthly_cap,
-                     "price_per_mtok": {"input": p.relay.price_in, "output": p.relay.price_out}})
-    _emit({"workers": rows, "note": "giờ UTC; số tiền tính từ token mỗi câu trả lời nhân giá bạn nhập"})
+        row = {"worker": p.effective_worker_id, "enabled": p.enabled, "kind": p.relay.kind,
+               "today_usd": round(day, 4), "daily_cap": p.relay.daily_cap,
+               "month_usd": round(month, 4), "monthly_cap": p.relay.monthly_cap}
+        if p.relay.pod is not None:
+            row.update(kind=p.relay.pod.provider, pod=p.relay.pod.pod_id,
+                       price_hour=p.relay.pod.price_hour if p.relay.pod.price_hour is not None else "giá RunPod báo")
+        else:
+            row["price_per_mtok"] = {"input": p.relay.price_in, "output": p.relay.price_out}
+        rows.append(row)
+    _emit({"workers": rows, "note": "giờ UTC; API: token mỗi câu trả lời nhân giá bạn nhập; máy thuê: số giờ "
+                                    "máy bật nhân giá theo giờ"})
     return 0
 
 
@@ -510,9 +663,13 @@ def _worker_autostart(args: argparse.Namespace) -> int:
             report["token_file"] = str(token_path)
         if reference is None:
             provider.setdefault("secrets", {})["kaggle_api_token"] = f"file:{token_path.resolve()}"
+        old = provider.get("launch") or {}
         launch = {"kernel": args.kernel, "idle_minutes": args.idle_minutes, "token": args.token}
         if args.model:
             launch["model"] = args.model
+        for key, value in (("via", args.via or old.get("via")), ("notebook", args.notebook or old.get("notebook"))):
+            if value:
+                launch[key] = value
         provider["launch"] = launch
         report.update(autostart=True, launch=launch)
     validate_config(raw)
@@ -635,7 +792,7 @@ def _worker_status_text(report: dict) -> str:
             slots = worker.get("slots") or 1
             state += (f", đang làm {worker.get('running') or 1}/{slots} việc" if worker.get("busy")
                       else f", rảnh ({slots} việc cùng lúc)" if slots > 1 else ", rảnh")
-            if worker.get("version") != WORKER_VERSION:
+            if worker.get("version") != WORKER_VERSION and not str(worker.get("version")).startswith("relay-"):
                 state += f"; notebook cũ (chạy: kite worker restart {worker.get('worker_id')})"
         else:
             state = "đang dừng (draining)" if worker.get("draining") else "chưa kết nối"
@@ -744,29 +901,67 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
         on_worker_status=on_status,
         journal=lambda record: Journal(args.config.parent / "journal").write("gateway", record),
     )
-    launcher = None
-    if any(p.launch is not None for p in config.providers if p.adapter == "pull" and p.enabled):
+    state_dir = args.config.parent
+    journal = Journal(state_dir / "journal")
+    notifier = _notifier(config)
+    kernels = {p.effective_worker_id: p.launch.kernel for p in config.providers
+               if p.adapter == "pull" and p.enabled and p.launch is not None}
+    browser = None
+    if kernels:
+        # Kite's own browser for kaggle.com (browser.py): Chromium starts only when it is used.
+        from .browser import KiteBrowser
+
+        browser = KiteBrowser(state_dir, kernels=kernels)
+        browser_watch = asyncio.get_running_loop().create_task(browser.watch())   # noqa: F841 (kept alive)
+    kaggle = None
+    if kernels:
         from .launcher import KaggleLauncher
 
-        launcher = KaggleLauncher(
-            config, gateway, state_dir=args.config.parent, notify=_notifier(config),
-            journal=lambda record: Journal(args.config.parent / "journal").write("launches", record))
-        launcher.load_tokens()
-        gateway.on_demand = launcher.on_demand
-        gateway.starting = launcher.starting
-        gateway.wait_note = launcher.wait_note
-        watcher = asyncio.get_running_loop().create_task(launcher.watch())   # noqa: F841 (kept alive)
-    # Workers Kite calls itself (relay.py): paid APIs, servers by URL. They take jobs from the same queue.
+        kaggle = KaggleLauncher(
+            config, gateway, state_dir=state_dir, notify=notifier, browser=browser,
+            journal=lambda record: journal.write("launches", record))
+        kaggle.load_tokens()
+    # Workers Kite calls itself (relay.py): paid APIs, servers by URL, rented machines (pods.py). They take
+    # jobs from the same queue.
+    from .pods import PodController, RunPodClient
     from .relay import RelayWorker, SpendLedger, relay_specs
 
     specs = relay_specs(config)
     gateway.paid = {spec.worker_id for spec in specs if spec.paid}
-    journal = Journal(args.config.parent / "journal")
     ledger = SpendLedger(journal.read("spend"))
-    relay_tasks = [asyncio.get_running_loop().create_task(  # noqa: F841 (kept alive)
-        RelayWorker(spec, gateway, ledger, notify=_notifier(config), journal=journal.write).run())
-        for spec in specs]
-    runner = web.AppRunner(create_app(gateway, launcher=launcher))
+    relays = {spec.worker_id: RelayWorker(spec, gateway, ledger, notify=notifier, journal=journal.write)
+              for spec in specs}
+    pods = []
+    for p in config.providers:
+        if p.adapter == "relay" and p.enabled and p.relay is not None and p.relay.pod is not None:
+            relay = relays[p.effective_worker_id]
+            pods.append(PodController(relay.spec, RunPodClient(resolve_secret(p.secrets["runpod_api_key"])),
+                                      relay, ledger, notify=notifier, journal=journal.write))
+    relay_tasks = [asyncio.get_running_loop().create_task(relay.run())   # noqa: F841 (kept alive)
+                   for relay in relays.values()]
+    launcher = None
+    if kaggle is not None or pods:
+        from .starters import Starters
+
+        launcher = Starters(kaggle, pods)
+        gateway.on_demand = launcher.on_demand
+        gateway.starting = launcher.starting
+        gateway.wait_note = launcher.wait_note
+        watcher = asyncio.get_running_loop().create_task(launcher.watch())   # noqa: F841 (kept alive)
+
+    def worker_code(worker_id: str, headers) -> dict:
+        """GET /worker/code: the bootstrap notebook (stub.py) asks for the worker code and this run's values."""
+        from .stub import launch_for, worker_bundle
+
+        spec = next((p.launch for p in config.providers if p.effective_worker_id == worker_id and p.launch), None)
+        launch = launch_for(worker_id, now=time.time(), idle_minutes=spec.idle_minutes if spec else 30,
+                            model=gateway.first_queued_model(worker_id) or (spec.model if spec else None),
+                            gateway_url=config.gateway.public_url)
+        journal.write("launches", {"event": "code", "worker": worker_id, "model": launch.get("model"),
+                                   "run_type": str(headers.get("X-Kite-Run-Type", ""))[:20]})
+        return worker_bundle(launch)
+
+    runner = web.AppRunner(create_app(gateway, launcher=launcher, worker_code=worker_code, browser=browser))
     await runner.setup()
     hosts = [config.gateway.host]
     if config.sandbox is not None:
@@ -783,8 +978,10 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
     _emit({"listening": [f"http://{h}:{config.gateway.port}" for h in hosts],
            "public_url": config.gateway.public_url,
            "workers": [w.worker_id for w in workers], "models": gateway.served_models(),
-           "api_workers": [spec.worker_id for spec in specs],
-           "autostart": sorted(launcher.states) if launcher else []})
+           "api_workers": [spec.worker_id for spec in specs if spec.pod is None],
+           "pods": [pod.worker_id for pod in pods],
+           "autostart": launcher.states if launcher else [],
+           "browser": f"http://127.0.0.1:{config.gateway.port}/kite/browser" if browser else None})
     sys.stdout.flush()
     try:
         await asyncio.Event().wait()
@@ -1360,6 +1557,12 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _worker_autostart(args)
     if args.command == "worker" and args.worker_command == "add-api":
         return _worker_add_api(args)
+    if args.command == "worker" and args.worker_command == "add-runpod":
+        return _worker_add_runpod(args)
+    if args.command == "worker" and args.worker_command == "stub":
+        return _worker_stub(args)
+    if args.command == "worker" and args.worker_command == "browser":
+        return _worker_browser(args)
     if args.command == "worker" and args.worker_command == "spend":
         return _worker_spend(args)
     if args.command == "worker" and args.worker_command == "restart":
