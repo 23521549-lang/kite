@@ -207,9 +207,12 @@ def test_machine_tools_ask_first_and_run_detached(tmp_path):
         asyncio.run(ops.update_kite(confirm=True))
 
 
-def test_kite_update_tests_the_new_code_and_goes_back_when_it_fails(tmp_path):
+def test_kite_update_tests_the_new_code_and_goes_back_when_it_fails(tmp_path, monkeypatch):
     from poc.kaggle_worker import update
 
+    units = tmp_path / "units"                     # not this machine's /etc/systemd/system
+    units.mkdir()
+    monkeypatch.setattr(update, "UNIT_DIR", units)
     origin, _ = make_repo(tmp_path, "origin")
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
@@ -240,6 +243,8 @@ def test_kite_update_tests_the_new_code_and_goes_back_when_it_fails(tmp_path):
     assert done["updated"] and done["restarted"] and done["chat"] == "ok" and done["tests"] == "370 passed"
     assert calls[-1] == ["sudo", "-n", "systemctl", "restart", "kite-gateway", "kite-workflow-worker"]
     assert update.run(clone, python="python3", runner=passing)["note"] == "Kite đã là bản mới nhất"
+    (units / "kite-web.service").write_text("[Unit]\n")                # the web is restarted once installed
+    assert update.services() == ("kite-gateway", "kite-workflow-worker", "kite-web")
 
 
 def test_cleanup_and_history_also_see_bench_folders_written_to_the_home_folder(tmp_path):

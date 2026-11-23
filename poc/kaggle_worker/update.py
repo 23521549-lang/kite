@@ -27,7 +27,8 @@ OPTIONAL_SERVICES = ("kite-web",)          # restarted too once installed (/etc/
 UNIT_DIR = Path("/etc/systemd/system")
 
 
-def services(unit_dir: Path = UNIT_DIR) -> tuple[str, ...]:
+def services(unit_dir: Path | None = None) -> tuple[str, ...]:
+    unit_dir = unit_dir or UNIT_DIR
     return SERVICES + tuple(s for s in OPTIONAL_SERVICES if (unit_dir / f"{s}.service").exists())
 Runner = Callable[..., subprocess.CompletedProcess]
 
