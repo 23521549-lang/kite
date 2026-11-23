@@ -1,0 +1,23 @@
+# systemd unit for OpenCode 2's background server, the one the `opencode` TUI and the web Chat tab share.
+# It listens on loopback only and writes its address and password to
+# ~/.local/state/opencode/service.json, where kite-web reads them. Install (stop the one the TUI started):
+#   ~/.opencode/bin/opencode service stop
+#   sudo cp deploy/kite-opencode.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now kite-opencode
+# `kite chat reload` and `kite update` stop it to load new Kite tools; systemd starts it again.
+[Unit]
+Description=OpenCode background server for Kite's chat
+After=network-online.target kite-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/.opencode/bin/opencode serve --service
+Restart=always
+RestartSec=2
+Environment=PATH=/home/ubuntu/.opencode/bin:/home/ubuntu/kite/.venv/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

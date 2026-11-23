@@ -5,18 +5,23 @@ Step 2 of the full-test day: every change meant SSH, ``git pull``, ``pytest``, `
 ``run`` does the EC2 part in one go and refuses to leave a broken Kite behind: the tests run on the
 new code first, and a failure puts the old commit back before anything is restarted.
 
+New libraries (pyproject.toml or requirements.txt changed) are installed before the tests, with uv like
+the bootstrap; the web front end is rebuilt after them when its sources changed (webui.py).
+
 Kite still never pushes: the code reaches GitHub from the person's own machine.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Callable
 
 REPO = Path(__file__).resolve().parents[2]
 NOTEBOOK = "poc/kaggle_worker/kaggle_model_worker.ipynb"
+DEPENDENCY_FILES = ("pyproject.toml", "requirements.txt")
 SERVICES = ("kite-gateway", "kite-workflow-worker")
 OPTIONAL_SERVICES = ("kite-web",)          # restarted too once installed (/etc/systemd/system/<name>.service)
 UNIT_DIR = Path("/etc/systemd/system")
@@ -29,6 +34,15 @@ Runner = Callable[..., subprocess.CompletedProcess]
 
 def _run(runner: Runner, cmd: list[str], cwd: Path, timeout: int = 120) -> subprocess.CompletedProcess:
     return runner(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+
+
+def install_command(python: str, repo: Path) -> list[str]:
+    """How the venv gets the project's libraries: uv (as the bootstrap made it, a uv venv has no pip),
+    else pip."""
+    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    if Path(uv).is_file():
+        return [uv, "pip", "install", "-q", "--python", python, "-r", str(repo / "requirements.txt")]
+    return [python, "-m", "pip", "install", "-q", "-r", str(repo / "requirements.txt")]
 
 
 def plan(repo: Path = REPO, runner: Runner = subprocess.run) -> dict:
@@ -65,6 +79,15 @@ def run(repo: Path = REPO, *, python: str = sys.executable, runner: Runner = sub
     pulled = git("pull", "--ff-only", "-q")
     if pulled.returncode != 0:
         return {**report, "updated": False, "error": "git pull lỗi: " + pulled.stderr.strip()[-300:]}
+    changed = git("diff", "--name-only", old, "HEAD", "--", *DEPENDENCY_FILES).stdout.split()
+    if changed and (repo / "requirements.txt").is_file():
+        installed = _run(runner, install_command(python, repo), repo, timeout=1800)
+        if installed.returncode != 0:
+            git("reset", "--hard", "-q", old)
+            return {**report, "updated": False,
+                    "error": "cài thư viện mới lỗi nên đã quay lại bản cũ: "
+                             + (installed.stderr or installed.stdout).strip()[-600:]}
+        report["libraries"] = "đã cài thư viện mới (" + ", ".join(changed) + " đổi)"
     tests = _run(runner, [python, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"], repo, timeout=1800)
     summary = (tests.stdout.strip().splitlines() or [""])[-1][-200:]
     if tests.returncode != 0:
@@ -72,6 +95,13 @@ def run(repo: Path = REPO, *, python: str = sys.executable, runner: Runner = sub
         return {**report, "updated": False, "tests": summary,
                 "error": "test của bản mới lỗi nên đã quay lại bản cũ: " + tests.stdout.strip()[-600:]}
     result = {**report, "updated": True, "tests": summary, "restarted": False}
+    if (repo / "web" / "package.json").is_file():
+        from . import webui
+
+        try:
+            result.update(webui.build(repo / "web", python=python, runner=runner))
+        except Exception as exc:              # the back end is updated; the page keeps its last build
+            result["ui_error"] = f"{type(exc).__name__}: {exc}"[:300]
     if restart:
         names = services()
         done = _run(runner, ["sudo", "-n", "systemctl", "restart", *names], repo)

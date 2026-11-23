@@ -339,6 +339,9 @@ def _parser() -> argparse.ArgumentParser:
                            help="folders whose Git repositories tasks may use (default: the home folder)")
     web_serve.add_argument("--insecure-cookies", action="store_true",
                            help="cookies without Secure, for a plain-http test on this machine only")
+    web_build = web_commands.add_parser("build", help="build the page (web/ → web/dist) with the ui extra's Node.js; "
+                                                      "kite update does this when the page changed")
+    web_build.add_argument("--force", action="store_true", help="build even when the sources did not change")
     journal = commands.add_parser("journal", help="what Kite did: model requests, task runs, lead-agent "
                                                   "actions, your notes (to trace and improve)")
     journal_commands = journal.add_subparsers(dest="journal_command", required=True)
@@ -862,6 +865,14 @@ def _web_store(args: argparse.Namespace):
 def _web_command(args: argparse.Namespace) -> int:
     from .web import security as sec
 
+    if args.web_command == "build":
+        from . import webui
+
+        report = webui.build(force=args.force)
+        if "ui_error" not in report:
+            report["next"] = "tải lại trang web (kite-web đọc web/dist ở mỗi lần tải, không cần khởi động lại)"
+        _emit(report)
+        return 1 if "ui_error" in report else 0
     store = _web_store(args)
     sealer = sec.Sealer(args.config.parent / "secrets" / "web_key")
     if args.web_command == "admin":
@@ -979,14 +990,21 @@ def _web_serve(args: argparse.Namespace, store, sealer) -> int:
 
     password_file = args.config.parent / "secrets" / "opencode_server_password"
     dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    fallback_url = f"http://{config.opencode_host}:{config.opencode_port}"
+
+    def opencode_locator() -> tuple[str, str | None]:
+        from .web.app import find_opencode
+
+        fallback = password_file.read_text(encoding="utf-8").strip() if password_file.is_file() else None
+        return find_opencode(Path.home(), fallback_url, fallback)
+
+    # dist is looked up on each request: `kite web build` (or kite update) swaps a new one in.
     ctx = WebContext(config_path, store, sealer, ops_factory=ops_factory, gateway=gateway,
-                     secure_cookies=not args.insecure_cookies,
-                     opencode_url=f"http://{config.opencode_host}:{config.opencode_port}",
-                     opencode_password=password_file.read_text(encoding="utf-8").strip() if password_file.is_file() else None,
-                     gateway_ws=f"ws://{config.gateway.host}:{config.gateway.port}", restart=restart,
-                     dist=dist if dist.is_dir() else None, quota=quota)
+                     secure_cookies=not args.insecure_cookies, opencode_locator=opencode_locator,
+                     chat_dir=chat_dir, gateway_ws=f"ws://{config.gateway.host}:{config.gateway.port}",
+                     restart=restart, dist=dist, quota=quota)
     _emit({"web": f"http://{args.host}:{args.port}", "db": str(store.engine.url.render_as_string(hide_password=True)),
-           "page": "giao diện đầy đủ ở P4" if not ctx.dist else str(dist)})
+           "page": str(dist) if (dist / "index.html").is_file() else "chưa build giao diện: kite web build"})
     sys.stdout.flush()
     uvicorn.Server(uvicorn.Config(create_app(ctx), host=args.host, port=args.port, proxy_headers=False,
                                   server_header=False, date_header=False, log_level="warning",

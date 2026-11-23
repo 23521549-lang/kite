@@ -179,8 +179,22 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
         missing = browser_missing()
         add("trình duyệt Kite", FAIL if missing else OK,
             f"thiếu {missing}" if missing else f"có Playwright và Chromium (cho {', '.join(browser_workers)})",
-            "~/kite/.venv/bin/pip install -e ~/kite[browser] && sudo ~/kite/.venv/bin/playwright install-deps "
-            "chromium && ~/kite/.venv/bin/playwright install chromium" if missing else "")
+            "cd ~/kite && ~/.local/bin/uv pip install --python .venv/bin/python -e '.[browser]' && "
+            "sudo apt-get install -y libatomic1 && sudo .venv/bin/playwright install-deps chromium && "
+            ".venv/bin/playwright install chromium" if missing else "")
+
+    # ---- the web page (only where the kite-web service is installed)
+    from .update import UNIT_DIR
+
+    if (UNIT_DIR / "kite-web.service").exists():
+        from . import webui
+
+        page = webui.status()
+        if page.get("present"):
+            add("giao diện web", OK if page["current"] else WARN,
+                "đã build, đúng bản code" if page["current"] else
+                ("đã build nhưng cũ hơn code" if page["built"] else "chưa build (web đang hiện trang rút gọn)"),
+                "" if page["current"] else "kite web build")
 
     # ---- secrets: present, private
     for provider in config.providers:

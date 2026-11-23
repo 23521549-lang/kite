@@ -165,6 +165,15 @@ Task, journal, memory và bench giữ chỗ lưu hiện tại trước, sau đó
 
 **Đã chốt khi làm P3 (23/11):** worker và provider vẫn nằm trong `config.yaml`, key nằm trong file 0600, để lệnh `kite worker ...` và web luôn thấy cùng một danh sách; bảng `providers`, `workers`, `spend_ledger` chưa cần. Bảng của web (`users`, `sessions`, `login_attempts`, `audit_log`, `repos`, `settings`) dùng SQLite trong thư mục state khi chạy trên máy hiện tại, Postgres khi triển khai bằng compose (P6). Migration dùng bảng `schema_version` và các bước viết trong code thay cho Alembic, vì mới có một phiên bản schema.
 
+**Đã chốt khi làm P4 (23/11):**
+- **Chat** dùng server chạy nền của **OpenCode 2** (`opencode serve --service`, giữ chạy bằng `deploy/kite-opencode.service`). Đây cũng là server mà TUI `opencode` dùng, nên phiên chat trên web và trên terminal là một. Web đọc địa chỉ loopback và mật khẩu của server trong `~/.local/state/opencode/service.json`. API v2 (`/api/session/...`, `/api/event`) đã được thử với bản **2.4.0**.
+- Web chỉ mở **đúng các đường chat cần**: phiên trong `~/kite-chat`, tin nhắn, gửi prompt (chỉ text), dừng, đổi agent, trả lời xin quyền và câu hỏi, luồng sự kiện. Không mở shell, terminal, file hay credential của OpenCode.
+- Xin quyền từ web chỉ cho **một lần** hoặc **từ chối**. "Luôn cho phép" vẫn chỉ chọn được trên terminal.
+- **FE:** React 19, TypeScript, Vite 8, Mantine 9, Zustand; markdown bằng `marked` cộng `DOMPurify`. Phiên bản ghim trong `package-lock.json`.
+- **Node.js** lấy từ extra `ui` (gói `nodejs-wheel` cài vào venv của Kite), nên không cần cài gói hệ thống.
+- `kite update` tự cài thư viện mới khi `pyproject.toml` hoặc `requirements.txt` đổi, và tự build lại trang khi `web/` đổi. Build lỗi thì giữ bản cũ.
+- Tổng quan ở P4 là bản 2D. Bản 3D làm ở P5.
+
 ## 6. Triển khai (làm sau cùng)
 1. **Hạ tầng (theo cloud):** Terraform cho AWS tạo EC2 t3.medium, EBS cho `/var/lib/kite`, security group (443, SSH theo IP chủ), Elastic IP, IAM tối thiểu. State lưu trong S3. GitHub Actions đăng nhập AWS bằng OIDC, không giữ AWS key dài hạn. Máy có sẵn ở nơi khác thì bỏ qua bước này.
 2. **Bộ cài (mọi máy Ubuntu):** chạy lại bao nhiêu lần cũng được. Cài Docker, tạo thư mục dữ liệu, sinh secret ngay trên máy, ghi cấu hình mặc định, chọn kiểu truy cập (sslip.io, tên miền, hoặc mạng riêng), dựng compose, cài dịch vụ tự cập nhật, tạo tài khoản admin. Máy mới thì cloud-init gọi bộ cài lúc khởi động lần đầu.

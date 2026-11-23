@@ -513,49 +513,150 @@ def test_the_event_feed_needs_a_session_and_a_same_site_origin(site):
 
 
 class OpenCodeStub(BaseHTTPRequestHandler):
+    """OpenCode 2's server, as far as the Chat tab uses it."""
     seen: list = []
 
-    def do_GET(self):
-        self.seen.append(("GET", self.path, self.headers.get("Authorization")))
-        body = json.dumps([{"id": "ses_1"}]).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+    def _answer(self, status, payload=None):
+        body = json.dumps(payload).encode() if payload is not None else b""
+        self.send_response(status)
+        if payload is not None:
+            self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self):
+    def _record(self):
         length = int(self.headers.get("Content-Length") or 0)
-        self.seen.append(("POST", self.path, self.rfile.read(length).decode()))
-        self.send_response(204)
-        self.end_headers()
+        body = self.rfile.read(length).decode() if length else ""
+        self.seen.append((self.command, self.path, self.headers.get("Authorization"), body))
+        return body
+
+    def do_GET(self):
+        self._record()
+        if self.path == "/api/info":
+            return self._answer(200, {"version": "2.4.0", "urls": ["http://127.0.0.1"]})
+        self._answer(200, {"data": [{"id": "ses_1"}]})
+
+    def do_POST(self):
+        body = self._record()
+        self._answer(200, {"data": {"id": "ses_2", "echo": json.loads(body or "{}")}})
+
+    def do_PATCH(self):
+        self.do_POST()
+
+    def do_DELETE(self):
+        self._record()
+        self._answer(204)
 
     def log_message(self, *args):
         pass
 
 
-def test_the_chat_goes_to_the_opencode_server_behind_the_session(site):
+@pytest.fixture
+def opencode(site, tmp_path):
+    OpenCodeStub.seen = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), OpenCodeStub)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        site["ctx"].opencode_url = f"http://127.0.0.1:{server.server_port}"
-        site["ctx"].opencode_password = "oc-pass"
-        headers = signed_in(site)
-        client = site["client"]
-        listed = client.get("/api/opencode/session?directory=/home/han")
-        assert listed.status_code == 200 and listed.json() == [{"id": "ses_1"}]
-        assert client.post("/api/opencode/session/ses_1/prompt_async", json={"parts": []}).status_code == 403
-        sent = client.post("/api/opencode/session/ses_1/prompt_async", headers=headers,
-                           json={"parts": [{"type": "text", "text": "chào"}]})
-        assert sent.status_code == 204
-        assert client.get("/api/opencode/../etc/passwd").status_code in (400, 404)
-    finally:
-        server.shutdown()
-    method, path, authorization = OpenCodeStub.seen[0]
-    assert path == "/session?directory=%2Fhome%2Fhan" or path == "/session?directory=/home/han"
+    chat = tmp_path / "kite-chat"
+    chat.mkdir()
+    (chat / "opencode.json").write_text("{}")
+    site["ctx"].chat_dir = chat
+    site["ctx"].opencode_locator = lambda: (f"http://127.0.0.1:{server.server_port}", "oc-pass")
+    yield {"seen": OpenCodeStub.seen, "chat": chat}
+    server.shutdown()
+
+
+def test_the_chat_goes_to_the_opencode_server_behind_the_session(site, opencode):
+    client = site["client"]
+    assert client.get("/api/opencode/api/session").status_code == 401           # no session: nothing reaches it
+    headers = signed_in(site)
+    listed = client.get("/api/opencode/api/session?directory=/home/han&limit=5")
+    assert listed.status_code == 200 and listed.json() == {"data": [{"id": "ses_1"}]}
+    assert client.post("/api/opencode/api/session/ses_1/prompt", json={"text": "x"}).status_code == 403   # no CSRF
+    sent = client.post("/api/opencode/api/session/ses_1/prompt", headers=headers, json={"text": "chào"})
+    assert sent.status_code == 200
+    method, path, authorization, body = opencode["seen"][0]
+    assert path in ("/api/session?directory=%2Fhome%2Fhan&limit=5", "/api/session?directory=/home/han&limit=5")
     assert authorization.startswith("Basic ")
-    assert OpenCodeStub.seen[1][0] == "POST" and "chào" in OpenCodeStub.seen[1][2]
+    assert opencode["seen"][1][:2] == ("POST", "/api/session/ses_1/prompt") and json.loads(opencode["seen"][1][3]) == {"text": "chào"}
     assert any(r["action"] == "chat_message" for r in site["store"].audit_rows())
+    info = client.get("/api/chat/info").json()
+    assert info["ready"] and info["opencode"] == {"reachable": True, "version": "2.4.0", "error": None}
+
+
+def test_the_web_reaches_only_the_chat_routes_of_opencode_and_only_with_chat_fields(site, opencode):
+    client, headers = site["client"], signed_in(site)
+    # Its shell, terminal, files, credentials and session moves are not the Chat tab's.
+    for method, path in (("POST", "api/session/ses_1/shell"), ("GET", "api/pty"), ("POST", "api/pty"),
+                         ("GET", "api/fs/read/etc/passwd"), ("POST", "api/experimental/fs/write"),
+                         ("GET", "api/credential"), ("POST", "api/session/ses_1/move"), ("GET", "doc"),
+                         ("GET", "session"), ("POST", "api/session/ses_1/prompt_async")):
+        assert client.request(method, f"/api/opencode/{path}", headers=headers, json={}).status_code == 403, path
+    # A prompt is text: no host files attached, no permission rules slipped in.
+    assert client.post("/api/opencode/api/session/ses_1/prompt", headers=headers,
+                       json={"text": "x", "files": [{"path": "/etc/shadow"}]}).status_code == 400
+    assert client.post("/api/opencode/api/session", headers=headers,
+                       json={"permissions": [{"action": "*", "effect": "allow"}]}).status_code == 400
+    assert client.patch("/api/opencode/api/session/ses_1", headers=headers,
+                        json={"permissions": []}).status_code == 400
+    # "Always allow" outlives the chat folder's rules: once or reject only.
+    assert client.post("/api/opencode/api/session/ses_1/permission/per_1/reply", headers=headers,
+                       json={"decision": "always"}).status_code == 400
+    assert client.post("/api/opencode/api/session/ses_1/permission/per_1/reply", headers=headers,
+                       json={"decision": "once"}).status_code == 200
+    assert not any("shell" in s[1] or "pty" in s[1] or "/fs/" in s[1] for s in opencode["seen"])
+    # A new session is always in Kite's chat folder, whatever the browser says.
+    made = client.post("/api/opencode/api/session", headers=headers, json={})
+    assert made.json()["data"]["echo"] == {"location": {"directory": str(opencode["chat"])}}
+    renamed = client.patch("/api/opencode/api/session/ses_1", headers=headers, json={"title": "Sửa parser"})
+    assert renamed.json()["data"]["echo"] == {"title": "Sửa parser"}
+    assert client.delete("/api/opencode/api/session/ses_1", headers=headers).status_code == 204
+    assert client.post("/api/opencode/api/session/ses_1/interrupt", headers=headers).status_code == 200
+    answered = client.post("/api/opencode/api/session/ses_1/form/frm_1/reply", headers=headers,
+                           json={"answer": {"q0": "kite"}})
+    assert answered.json()["data"]["echo"] == {"answer": {"q0": "kite"}}
+    (opencode["chat"] / "opencode.json").unlink()
+    assert client.post("/api/opencode/api/session", headers=headers, json={}).status_code == 409
+
+
+def test_the_opencode_service_is_found_where_opencode_2_writes_it(tmp_path):
+    from poc.kaggle_worker.web.app import find_opencode
+
+    home = tmp_path
+    assert find_opencode(home, "http://127.0.0.1:4096", "from-secret") == ("http://127.0.0.1:4096", "from-secret")
+    state = home / ".local" / "state" / "opencode"
+    state.mkdir(parents=True)
+    (state / "service.json").write_text(json.dumps({"url": "http://127.0.0.1:49374", "password": "p1"}))
+    assert find_opencode(home, "http://127.0.0.1:4096", None) == ("http://127.0.0.1:49374", "p1")
+    (state / "service.json").write_text(json.dumps({"url": "http://127.0.0.1:49374/"}))
+    config = home / ".config" / "opencode"
+    config.mkdir(parents=True)
+    (config / "service.json").write_text(json.dumps({"password": "p2"}))
+    assert find_opencode(home, "http://127.0.0.1:4096", None) == ("http://127.0.0.1:49374", "p2")
+    # Only a loopback address: a file pointing elsewhere is not followed.
+    (state / "service.json").write_text(json.dumps({"url": "http://10.0.0.9:49374", "password": "p1"}))
+    assert find_opencode(home, "http://127.0.0.1:4096", "s") == ("http://127.0.0.1:4096", "s")
+    (state / "service.json").write_text("not json")
+    assert find_opencode(home, "http://127.0.0.1:4096", "s") == ("http://127.0.0.1:4096", "s")
+
+
+def test_the_built_page_is_served_with_cache_rules_and_a_fallback_for_every_tab(site, tmp_path):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><div id=root></div>")
+    (dist / "assets" / "index-abc.js").write_text("console.log(1)")
+    (dist / ".kite-source").write_text("hash")
+    client = site["client"]
+    assert "Kite" in client.get("/").text                     # not built yet: the small login page
+    site["ctx"].dist = dist
+    page = client.get("/chat/ses_1")
+    assert page.status_code == 200 and "id=root" in page.text and page.headers["cache-control"] == "no-cache"
+    assert "script-src 'self'" in page.headers["content-security-policy"]
+    asset = client.get("/assets/index-abc.js")
+    assert asset.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert client.get("/assets/missing.js").status_code == 404
+    assert "id=root" in client.get("/.kite-source").text      # dot files are never served
+    assert client.get("/../config.json").status_code in (200, 404) and "providers" not in client.get("/../config.json").text
 
 
 # ---------------------------------------------------------------- kite web admin

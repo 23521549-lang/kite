@@ -46,6 +46,11 @@ web = [
     "cryptography>=42",
     "httpx>=0.27",
 ]
+# Node.js for building the web page (web/ → web/dist, `kite web build`): node and npm inside Kite's venv,
+# so no system package is needed. Docker images build the page in their own Node stage instead.
+ui = [
+    "nodejs-wheel>=24,<25",
+]
 
 [project.scripts]
 kite = "poc.kaggle_worker.cli:console_main"
@@ -58,3 +63,7 @@ namespaces = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+filterwarnings = [
+    # FastAPI's TestClient (tests only) warns that starlette prefers httpx2; the web itself does not use it.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]

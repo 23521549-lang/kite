@@ -15,3 +15,8 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+# web page: npm packages and builds (kite web build)
+web/node_modules/
+web/dist/
+web/.dist-new/
+web/.dist-old/

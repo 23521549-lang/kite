@@ -1,5 +1,5 @@
 """The web back end: FastAPI routes for every tab, the events WebSocket, and two proxies (the OpenCode
-server for Chat, Kite's browser for the Worker tab).
+server for Chat, Kite's browser for the Worker tab), and the built front end (web/dist).
 
 Security (spec 5.4): one account; argon2 password and TOTP, both needed; 5 wrong tries lock the account
 for 15 minutes and 20 from one address in 15 minutes block that address; the session cookie is
@@ -41,6 +41,26 @@ CSP = ("default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe
        "connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; "
        "object-src 'none'")
 GatewayCall = Callable[[str, str, dict | None], Awaitable[dict]]
+OPENCODE_TESTED = "2.4.0"            # the OpenCode version the Chat tab was built and tested against
+_SID = r"[A-Za-z0-9_-]{1,80}"
+# The OpenCode routes the Chat tab needs, and the body fields it may send: nothing else of the OpenCode
+# server (its shell, terminal, file and credential routes) is reachable from the web. A new session is
+# always made in the chat folder (Kite sets its location), and a prompt carries text only.
+OPENCODE_ROUTES: tuple[tuple[frozenset, re.Pattern, frozenset | None], ...] = tuple(
+    (frozenset(methods.split()), re.compile(pattern.replace("{S}", _SID)), None if keys is None else frozenset(keys))
+    for methods, pattern, keys in (
+        ("GET", r"api/(info|agent|model|event|permission/request)", None),
+        ("GET", r"api/session", None),
+        ("POST", r"api/session", ("agent",)),
+        ("GET DELETE", r"api/session/{S}", None),
+        ("PATCH", r"api/session/{S}", ("title", "archived")),
+        ("GET", r"api/session/{S}/(message|permission|form)", None),
+        ("POST", r"api/session/{S}/prompt", ("text",)),
+        ("POST", r"api/session/{S}/interrupt", ()),
+        ("POST", r"api/session/{S}/agent", ("agent",)),
+        ("POST", r"api/session/{S}/permission/{S}/reply", ("decision", "message")),
+        ("POST", r"api/session/{S}/form/{S}/reply", ("answer",)),
+    ))
 
 
 class GatewayDown(RuntimeError):
@@ -64,11 +84,14 @@ class WebContext:
                  opencode_password: str | None = None, gateway_ws: str = "ws://127.0.0.1:8787",
                  restart: Callable[[list[str]], Awaitable[dict]] | None = None, dist: Path | None = None,
                  http_factory: Callable | None = None, ledger_factory: Callable[[], Any] | None = None,
-                 quota: Callable[[], Awaitable[dict]] | None = None, events_every: float = 2.0) -> None:
+                 quota: Callable[[], Awaitable[dict]] | None = None, events_every: float = 2.0,
+                 opencode_locator: Callable[[], tuple[str, str | None]] | None = None,
+                 chat_dir: Path | None = None) -> None:
         self.config_path = Path(config_path)
         self.store, self.sealer, self.gateway = store, sealer, gateway
         self.clock, self.secure_cookies = clock, secure_cookies
         self.opencode_url, self.opencode_password = opencode_url.rstrip("/"), opencode_password
+        self.opencode_locator, self.chat_dir = opencode_locator, chat_dir
         self.gateway_ws, self.restart, self.dist = gateway_ws.rstrip("/"), restart, dist
         self.http_factory, self.quota, self.events_every = http_factory, quota, events_every
         self._ops_factory, self._ledger_factory = ops_factory, ledger_factory
@@ -103,6 +126,37 @@ class WebContext:
 
     def journal(self) -> Journal:
         return Journal(self.state_dir / "journal")
+
+    def opencode(self) -> tuple[str, str | None]:
+        """Where the OpenCode server listens and its password (found again on every call: the background
+        service may have restarted)."""
+        if self.opencode_locator is not None:
+            url, password = self.opencode_locator()
+            return url.rstrip("/"), password
+        return self.opencode_url, self.opencode_password
+
+
+def find_opencode(home: Path, fallback_url: str, fallback_password: str | None) -> tuple[str, str | None]:
+    """OpenCode 2 runs one background server per user (the TUI and the web chat share it): it writes its
+    address and password to ``~/.local/state/opencode/service.json``. Only a loopback address is used.
+    Without that file: the address in Kite's config and the password in ``secrets/opencode_server_password``."""
+    url, password = fallback_url, fallback_password
+    try:
+        data = json.loads((home / ".local" / "state" / "opencode" / "service.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("url"), str):
+        host = urlsplit(data["url"]).hostname
+        if host in ("127.0.0.1", "localhost", "::1"):
+            url = data["url"]
+            password = data.get("password") if isinstance(data.get("password"), str) else None
+            if password is None:
+                try:
+                    saved = json.loads((home / ".config" / "opencode" / "service.json").read_text(encoding="utf-8"))
+                    password = saved.get("password") if isinstance(saved, dict) else None
+                except (OSError, ValueError):
+                    password = None
+    return url.rstrip("/"), password
 
 
 # ---------------------------------------------------------------- request bodies
@@ -828,32 +882,81 @@ def create_app(ctx: WebContext) -> FastAPI:
         return {"rows": ctx.store.audit_rows(limit, before)}
 
     # ------------------------------------------------------------------ Chat: the OpenCode server
+    def opencode_headers(password: str | None) -> dict[str, str]:
+        if not password:
+            return {}
+        import base64
+
+        return {"Authorization": "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode()}
+
+    @app.get("/api/chat/info")
+    async def chat_info(request: Request):
+        auth(request)
+        import aiohttp
+
+        url, password = await asyncio.to_thread(ctx.opencode)
+        report: dict[str, Any] = {"chat_dir": str(ctx.chat_dir) if ctx.chat_dir else None,
+                                  "ready": bool(ctx.chat_dir and (ctx.chat_dir / "opencode.json").is_file()),
+                                  "tested_version": OPENCODE_TESTED,
+                                  "opencode": {"reachable": False, "version": None, "error": None}}
+        factory = ctx.http_factory or aiohttp.ClientSession
+        try:
+            async with factory() as client:
+                async with client.get(f"{url}/api/info", headers=opencode_headers(password),
+                                      timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    data = await response.json(content_type=None) if response.status == 200 else None
+                    if response.status != 200:
+                        report["opencode"]["error"] = f"HTTP {response.status}"
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            data = None
+            report["opencode"]["error"] = type(exc).__name__
+        if isinstance(data, dict):
+            report["opencode"].update(reachable=True, version=data.get("version"))
+        return report
+
+    def opencode_route(method: str, path: str) -> frozenset | None:
+        for methods, pattern, keys in OPENCODE_ROUTES:
+            if method in methods and pattern.fullmatch(path):
+                return keys if keys is not None else frozenset()
+        raise HTTPException(403, "web không mở đường này của OpenCode")
+
     @app.api_route("/api/opencode/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     async def opencode(path: str, request: Request):
         session = auth(request)
-        if not re.fullmatch(r"[A-Za-z0-9/_.:-]{0,300}", path) or ".." in path:
-            raise HTTPException(400, "đường dẫn không hợp lệ")
+        keys = opencode_route(request.method, path)
         import aiohttp
 
-        url = f"{ctx.opencode_url}/{path}"
-        headers = {k: v for k, v in request.headers.items() if k.lower() in ("content-type", "accept", "last-event-id")}
-        if ctx.opencode_password:
-            import base64
-
-            basic = base64.b64encode(f"opencode:{ctx.opencode_password}".encode()).decode()
-            headers["Authorization"] = f"Basic {basic}"
-        body = await request.body() if request.method not in SAFE_METHODS else None
+        body: bytes | None = None
+        if request.method not in SAFE_METHODS and request.method != "DELETE":
+            data = await _json(request) if await request.body() else {}
+            extra = set(data) - set(keys)
+            if extra:
+                raise HTTPException(400, f"OpenCode: không gửi được {', '.join(sorted(extra))} từ web")
+            if path == "api/session":
+                if ctx.chat_dir is None or not (ctx.chat_dir / "opencode.json").is_file():
+                    raise HTTPException(409, "chưa có thư mục chat của Kite: chạy kite chat setup")
+                data["location"] = {"directory": str(ctx.chat_dir)}
+            if path.endswith("/reply") and "decision" in data and data["decision"] not in ("once", "reject"):
+                # "Always allow" outlives the chat folder's opencode.json (it is saved for every project).
+                raise HTTPException(400, "từ web chỉ cho phép một lần hoặc từ chối")
+            body = json.dumps(data, ensure_ascii=False).encode()
+        url, password = await asyncio.to_thread(ctx.opencode)
+        headers = {k: v for k, v in request.headers.items() if k.lower() in ("accept", "last-event-id")}
+        headers.update(opencode_headers(password))
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         factory = ctx.http_factory or aiohttp.ClientSession
         client = factory()
         try:
-            upstream = await client.request(request.method, url, params=list(request.query_params.multi_items()),
+            upstream = await client.request(request.method, f"{url}/{path}",
+                                            params=list(request.query_params.multi_items()),
                                             data=body, headers=headers,
                                             timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
         except aiohttp.ClientError as exc:
             await client.close()
-            raise HTTPException(502, f"không gọi được OpenCode server ({type(exc).__name__}); "
+            raise HTTPException(502, f"không gọi được OpenCode ({type(exc).__name__}); "
                                      "kiểm tra dịch vụ kite-opencode") from exc
-        if request.method not in SAFE_METHODS and path.rstrip("/").split("/")[-1] in ("prompt_async", "message", "shell"):
+        if path.endswith("/prompt"):
             audit(session, "chat_message", path[:200])
 
         async def stream():
@@ -956,9 +1059,13 @@ def create_app(ctx: WebContext) -> FastAPI:
             raise HTTPException(404, "không có API này")
         if ctx.dist is not None and (ctx.dist / "index.html").is_file():
             target = (ctx.dist / path).resolve()
-            if path and target.is_file() and ctx.dist.resolve() in target.parents:
-                return FileResponse(target)
-            return FileResponse(ctx.dist / "index.html")
+            if path and target.is_file() and ctx.dist.resolve() in target.parents and not target.name.startswith("."):
+                # Vite puts a content hash in every asset name: a new build never reuses one.
+                cache = "public, max-age=31536000, immutable" if path.startswith("assets/") else "no-cache"
+                return FileResponse(target, headers={"Cache-Control": cache})
+            if path.startswith("assets/"):
+                raise HTTPException(404, "không có file này")
+            return FileResponse(ctx.dist / "index.html", headers={"Cache-Control": "no-cache"})
         return HTMLResponse(MINI_PAGE)
 
     return app
@@ -1101,7 +1208,7 @@ pre{background:#20232a;padding:12px;border-radius:8px;overflow:auto;font-size:12
 form{max-width:340px}.muted{color:#9aa0aa}
 </style></head><body><main>
 <h1>Kite</h1>
-<p class="muted">Giao diện đầy đủ đến ở bước P4. Trang này để đăng nhập và xem trạng thái.</p>
+<p class="muted">Giao diện đầy đủ chưa được build trên máy này (chạy <code>kite web build</code>). Trang này để đăng nhập và xem trạng thái.</p>
 <form id="login"><input id="u" placeholder="Tên đăng nhập" autocomplete="username">
 <input id="p" type="password" placeholder="Mật khẩu" autocomplete="current-password">
 <input id="c" placeholder="Mã 2FA (6 số)" inputmode="numeric" autocomplete="one-time-code">
