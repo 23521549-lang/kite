@@ -60,6 +60,7 @@ jobs:
         run: |
           printf 'KITE_IMAGE=kite:test\n' > /tmp/images.env
           printf '%s\n' KITE_DOMAIN=example.invalid TEMPORAL_POSTGRES_PASSWORD=x KITE_WEB_DB_PASSWORD=y \
+            TEMPORAL_VISIBILITY_POSTGRES_PASSWORD=z TEMPORAL_SETUP_POSTGRES_PASSWORD=w \
             DOCKER_GID=999 KITE_ACCESS=public > /tmp/stack.env
           docker compose -p kite --project-directory deploy/stack --env-file /tmp/stack.env \
             --env-file /tmp/images.env -f deploy/stack/compose.yaml config --quiet
