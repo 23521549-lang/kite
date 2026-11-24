@@ -82,6 +82,7 @@ export type SessionRow = { id?: number; ip?: string; user_agent?: string; create
 export type WorkerRow = {
   id: string
   type: 'kaggle' | 'openai' | 'anthropic' | 'runpod' | string
+  brand: string
   enabled: boolean
   owner: string
   models: string[]

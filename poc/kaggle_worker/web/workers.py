@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from ..config import ConfigError, validate_config
 
@@ -46,6 +47,11 @@ PROVIDER_TYPES = [
 ]
 SECRET_FIELDS = ("api_key", "runpod_api_key", "kaggle_api_token")
 
+try:
+    from .presets import PROVIDER_PRESETS
+except ImportError:  # the brand catalog (presets.py) is optional: without it every relay is "custom"
+    PROVIDER_PRESETS = []
+
 
 def kind_of(provider) -> str:
     if provider.adapter == "pull":
@@ -53,6 +59,27 @@ def kind_of(provider) -> str:
     if provider.relay is not None and provider.relay.pod is not None:
         return "runpod"
     return provider.relay.kind if provider.relay is not None else provider.adapter
+
+
+def brand_for(provider, presets=PROVIDER_PRESETS) -> str:
+    """The brand a worker belongs to, derived — never stored in config. A pod is RunPod whatever
+    its (auto-derived proxy) URL says; a relay is the preset whose base_url has the same host;
+    an unmatched relay host is a custom endpoint; a pull worker is Kaggle."""
+    relay = provider.relay
+    if relay is not None and relay.pod is not None:
+        return "RunPod"
+    if relay is not None and relay.base_url:
+        host = urlparse(relay.base_url).hostname
+        if host:
+            for preset in presets:
+                if urlparse(str(preset.get("base_url") or "")).hostname == host:
+                    return str(preset.get("label") or preset.get("brand") or host)
+            return f"Tùy chỉnh ({host})"
+    if provider.adapter == "pull":
+        return "Kaggle"
+    kind = kind_of(provider)
+    label = next((t["label"] for t in PROVIDER_TYPES if t["type"] == kind), None)
+    return label or kind
 
 
 # ---------------------------------------------------------------- reading
@@ -68,7 +95,8 @@ def worker_rows(config, status: dict | None, ledger, auto_click: Callable[[str],
         kind = kind_of(p)
         day, month = ledger.spent(wid) if ledger is not None else (0.0, 0.0)
         row: dict[str, Any] = {
-            "id": wid, "type": kind, "enabled": p.enabled, "owner": p.owner, "models": list(p.model_ids),
+            "id": wid, "type": kind, "brand": brand_for(p, PROVIDER_PRESETS),
+            "enabled": p.enabled, "owner": p.owner, "models": list(p.model_ids),
             "concurrency": p.concurrency, "alive": bool(seen.get("alive")), "busy": bool(seen.get("busy")),
             "running": seen.get("running", 0), "slots": seen.get("slots"), "loaded_model": seen.get("loaded_model"),
             "version": seen.get("version"), "draining": bool(seen.get("draining")),
