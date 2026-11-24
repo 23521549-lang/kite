@@ -2,7 +2,7 @@
 
 Each task gets its own clone of the repository, mounted into throw-away containers:
 
-1. **setup** (optional, with network): runs the operator-declared install command, for example
+1. **setup** (optional, no network unless the operator opts in): runs the operator-declared install command, for example
    ``pip install -r requirements.txt`` or ``npm ci``. Python packages go to ``/deps`` (a per-task
    directory shared with the next steps). Files the setup step creates in the repository are
    committed as a separate "setup" commit so they never end up in the agent's patch.
@@ -91,7 +91,10 @@ class SandboxSettings:
     test_timeout_seconds: int = 900
     test_command: str = "python -m pytest -q"
     setup_command: str = ""
-    setup_network: str = "bridge"
+    # The setup step runs a command the repository itself declares: by default it gets NO
+    # network (decision D3). The operator may opt a setup network in (e.g. "bridge") in the
+    # sandbox settings; run_task warns the first time a repository's setup runs with one.
+    setup_network: str = "none"
     # File holding the gateway's sandbox client token (written by the gateway at boot, 0600);
     # the agent container presents it as X-Kite-Task-Token (see read_sandbox_token). "" = take
     # the path from the KITE_SANDBOX_TOKEN_FILE environment variable; unset there too = no token
@@ -2156,6 +2159,33 @@ def _run_watched(settings: SandboxSettings, *, name: str, args: list[str], timeo
     return proc.returncode, output
 
 
+def _warn_setup_network_once(state_dir: Path, repo: Path, network: str, task_id: str,
+                             log: Callable[[str], None]) -> None:
+    """Warn, once per repository, that its setup step runs with Internet access.
+
+    The setup command comes from the repository itself, so network access for it is a
+    deliberate operator opt-in (``setup_network``); the marker file in the state dir keeps
+    the warning to the first task of each repository instead of repeating it every run.
+    """
+    marker = Path(state_dir) / "setup-network-warned.txt"
+    key = str(Path(repo).resolve())
+    try:
+        seen = marker.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        seen = []
+    if key in seen:
+        return
+    log(f"[{task_id}] CẢNH BÁO: repo {key} chạy bước cài đặt (setup) CÓ Internet "
+        f"(setup_network={network}) — lệnh setup do repo khai báo sẽ có mạng; "
+        "đây là lần cảnh báo đầu tiên cho repo này")
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with marker.open("a", encoding="utf-8") as handle:
+            handle.write(key + "\n")
+    except OSError:
+        pass
+
+
 def _write_result(root: Path, run: SandboxRun) -> SandboxRun:
     (root / "result.json").write_text(json.dumps(run.to_dict(), indent=2, ensure_ascii=False),
                                       encoding="utf-8")
@@ -2187,8 +2217,9 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         setup_command=settings.setup_command if setup_command is None else setup_command,
         test_command=settings.test_command if test_command is None else test_command)
 
-    # 1. Setup: the only step with network access, and it runs only the declared command.
-    #    Already installed for these dependency files (deps cache): reuse, no setup at all.
+    # 1. Setup: runs only the declared command, with no network unless the operator opted a
+    #    setup network in. Already installed for these dependency files (deps cache): reuse,
+    #    no setup at all.
     key = deps_key(settings, workspace, run.setup_command) if settings.deps_cache else None
     cached = cached_deps(deps_cache, key)
     if cached is not None:
@@ -2196,7 +2227,11 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.setup_exit_code, run.setup_cached = 0, True
         log(f"[{task_id}] dùng lại thư viện đã cài ({cached.name}), bỏ qua bước cài")
     elif run.setup_command:
-        log(f"[{task_id}] cài thư viện (có mạng): {run.setup_command}")
+        if settings.setup_network != "none":
+            _warn_setup_network_once(state_dir, Path(repo), settings.setup_network, task_id, log)
+            log(f"[{task_id}] cài thư viện (mạng: {settings.setup_network}): {run.setup_command}")
+        else:
+            log(f"[{task_id}] cài thư viện (không mạng): {run.setup_command}")
         before = workspace_state(workspace)
         name = container_name("setup", task_id)
         started = time.monotonic()

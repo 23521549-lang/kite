@@ -771,6 +771,31 @@ def test_edit_blocks_apply_all_or_nothing_and_stay_inside_the_repo(tmp_path):
 
 
 
+def test_setup_network_defaults_to_none_and_an_opt_in_warns_once_per_repo(tmp_path):
+    from dataclasses import replace
+
+    assert sbx.SandboxSettings().setup_network == "none"
+    repo = make_repo(tmp_path)
+    lines: list[str] = []
+    opted_in = replace(SETTINGS, setup_network="bridge")
+    for task_id in ("net1", "net2"):
+        fake = FakeDocker()
+        sbx.run_task(opted_in, repo=repo, goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                     state_dir=tmp_path / "state", task_id=task_id, runner=fake,
+                     log=lines.append, setup_command="pip install x")
+        assert value_after(fake.call("setup"), "--network") == "bridge"
+    warnings = [line for line in lines if "CẢNH BÁO" in line]
+    assert len(warnings) == 1 and "setup_network=bridge" in warnings[0]     # first time only
+    # The default: setup runs with no network at all, and no warning is emitted.
+    quiet: list[str] = []
+    fake = FakeDocker()
+    sbx.run_task(SETTINGS, repo=repo, goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                 state_dir=tmp_path / "state2", task_id="net3", runner=fake,
+                 log=quiet.append, setup_command="pip install x")
+    assert value_after(fake.call("setup"), "--network") == "none"
+    assert not any("CẢNH BÁO" in line for line in quiet)
+
+
 def test_agent_config_carries_the_sandbox_token_when_the_token_file_exists(tmp_path):
     token_file = tmp_path / "sandbox_client_token"
     token_file.write_text("tok-abc-123\n", encoding="utf-8")
