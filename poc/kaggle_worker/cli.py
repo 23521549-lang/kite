@@ -195,6 +195,10 @@ def _parser() -> argparse.ArgumentParser:
     token = worker_commands.add_parser("token", help="create a worker token (printed once)")
     token.add_argument("worker_id")
     token.add_argument("--force", action="store_true", help="replace an existing token (rotation)")
+    rotate = worker_commands.add_parser("rotate-token", help="rotate a pull worker's long-lived token: "
+                                                     "replace the stored token, print the new one once, "
+                                                     "and say how to update the worker's Kaggle Secret")
+    rotate.add_argument("worker_id")
     add = worker_commands.add_parser("add", help="add a pull worker (e.g. another Kaggle account) to the config, "
                                                  "copying an existing worker's models and settings")
     add.add_argument("worker_id", help="new worker id, e.g. kaggle-an (lowercase, digits, '-')")
@@ -729,6 +733,10 @@ def _worker_autostart(args: argparse.Namespace) -> int:
                 launch[key] = value
         provider["launch"] = launch
         report.update(autostart=True, launch=launch)
+        if args.token == "kaggle-secret":
+            report["warning"] = ("launch.token: kaggle-secret: token worker trong Kaggle Secret không tự "
+                                 "hết hạn; nếu nghi lộ, xoay vòng bằng `kite worker rotate-token` rồi "
+                                 "cập nhật Kaggle Secret")
     validate_config(raw)
     backup = args.config.with_name(f"{args.config.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
     shutil.copy2(args.config, backup)
@@ -1922,6 +1930,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _worker_restart(args)
     if args.command == "worker" and args.worker_command in ("start", "stop", "status"):
         return _worker_remote(args)
+    if args.command == "worker" and args.worker_command == "rotate-token":
+        args.force = True    # rotation is the token command below, with replacement allowed
     if args.command == "worker":
         config = _load_operator_config(args)
         provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)

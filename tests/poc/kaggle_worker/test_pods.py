@@ -28,10 +28,12 @@ def pod_raw(tmp_path, **pod):
     raw = raw_config(tmp_path)
     secrets = tmp_path / "secrets"
     (secrets / "runpod_api_key_runpod").write_text("rp-secret\n")
+    (secrets / "api_key_runpod").write_text("vllm-secret\n")
     raw["providers"].append({
         "id": "runpod", "adapter": "relay", "enabled": True, "owner": "self", "model": "qwen3-32b",
         "capabilities": ["coding"], "quota": {"gpu_seconds": 0, "concurrency": 4},
-        "secrets": {"runpod_api_key": f"file:{secrets / 'runpod_api_key_runpod'}"},
+        "secrets": {"runpod_api_key": f"file:{secrets / 'runpod_api_key_runpod'}",
+                    "api_key": f"file:{secrets / 'api_key_runpod'}"},
         "relay": {"kind": "openai", "pod": {"id": "abc123xyz", **pod}, "caps": {"daily_usd": 5}}})
     return raw
 
@@ -58,6 +60,13 @@ def test_a_pod_is_an_openai_relay_that_streams_through_runpods_proxy(tmp_path):
     raw["providers"][1]["relay"]["kind"] = "anthropic"
     raw["providers"][1]["secrets"]["api_key"] = raw["providers"][1]["secrets"]["runpod_api_key"]
     with pytest.raises(ConfigError, match="kind openai"):
+        validate_config(raw)
+
+
+def test_a_pod_relay_without_a_server_api_key_is_rejected(tmp_path):
+    raw = pod_raw(tmp_path)
+    del raw["providers"][1]["secrets"]["api_key"]
+    with pytest.raises(ConfigError, match="--api-key"):
         validate_config(raw)
 
 

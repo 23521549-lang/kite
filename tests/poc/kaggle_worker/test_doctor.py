@@ -192,5 +192,6 @@ def test_autostart_checks_the_token_mode_and_reads_the_gpu_quota(tmp_path):
     fake.run = run
     named = by_name(run_checks(validate_config(raw), path, fake))
     assert named["tự bật kaggle-han"].status == "warn" and "--token per-launch" in named["tự bật kaggle-han"].fix
+    assert named["token kaggle-han"].status == "warn" and "rotate-token" in named["token kaggle-han"].fix
     quota = named["quota GPU kaggle-han"]
     assert quota.status == "warn" and quota.detail == "còn 2.50h / 30.00h, làm mới 2026-11-28T00:00"
