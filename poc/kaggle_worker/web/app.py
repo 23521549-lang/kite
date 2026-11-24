@@ -34,6 +34,7 @@ from ..journal import FILES, Journal, read_jsonl, summarize
 from ..mcp_server import KiteToolError
 from . import security as sec
 from . import workers as wk
+from .presets import PROVIDER_PRESETS
 from .db import Store, User
 
 IDLE_SECONDS = 12 * 3600
@@ -585,6 +586,11 @@ def create_app(ctx: WebContext) -> FastAPI:
     async def provider_types(request: Request):
         auth(request)
         return {"types": wk.PROVIDER_TYPES}
+
+    @app.get("/api/provider-presets")
+    async def provider_presets(request: Request):
+        auth(request)
+        return {"presets": PROVIDER_PRESETS}
 
     @app.post("/api/providers/test")
     async def provider_test(request: Request):

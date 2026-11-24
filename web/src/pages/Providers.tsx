@@ -50,6 +50,16 @@ const FIELDS: Record<string, FieldDef> = {
 
 type Values = Record<string, any>
 
+type ProviderPreset = {
+  brand: string
+  label: string
+  type: string
+  base_url: string
+  models: { id: string; price_in: number; price_out: number; context: number }[]
+  note: string
+  catalog_date: string
+}
+
 function FieldInput({ name, value, onChange, editing }: { name: string; value: any; onChange: (v: any) => void; editing?: boolean }) {
   const f = FIELDS[name] ?? { label: name, kind: 'text' }
   const common = { label: f.label, description: f.description, placeholder: f.placeholder, required: f.required && !editing }
@@ -236,6 +246,25 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
   const set = (k: string) => (v: any) => setValues((s) => ({ ...s, [k]: v }))
   const fields = type.fields.filter((f) => !(type.type === 'anthropic' && f === 'base_url'))
   const body = () => ({ ...values, type: type.type, models: values.models ?? [] })
+  const isRelay = type.type === 'openai' || type.type === 'anthropic'
+  const presets = useLoad(() => get<{ presets: ProviderPreset[] }>('/api/provider-presets'), [])
+  const brandOptions = (presets.data?.presets ?? []).filter((p) => p.type === type.type)
+  const [brand, setBrand] = useState('custom')
+  const applyBrand = (b: string | null) => {
+    const value = b ?? 'custom'
+    setBrand(value)
+    const preset = brandOptions.find((p) => p.brand === value)
+    if (!preset) return
+    setValues((s) => {
+      const next = { ...s }
+      if (fields.includes('base_url')) next.base_url = preset.base_url
+      if (fields.includes('models')) next.models = preset.models.map((m) => m.id)
+      const first = preset.models[0]
+      if (first && fields.includes('price_in')) next.price_in = first.price_in
+      if (first && fields.includes('price_out')) next.price_out = first.price_out
+      return next
+    })
+  }
   return (
     <Modal opened onClose={onClose} title={`Thêm worker: ${type.label}`} size="lg">
       {added ? (
@@ -265,6 +294,23 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
         </Stack>
       ) : (
         <Stack>
+          {isRelay && brandOptions.length ? (
+            <Stack gap={4}>
+              <Select
+                label="Hãng"
+                description="Chọn hãng để điền sẵn Base URL, model gợi ý và giá tham chiếu; mọi ô vẫn sửa tay được."
+                data={[{ value: 'custom', label: 'Tùy chỉnh (tự nhập)' }, ...brandOptions.map((p) => ({ value: p.brand, label: p.label }))]}
+                value={brand}
+                onChange={applyBrand}
+                allowDeselect={false}
+              />
+              {brand !== 'custom' ? (
+                <Text size="xs" c="dimmed">
+                  {brandOptions.find((p) => p.brand === brand)?.note}
+                </Text>
+              ) : null}
+            </Stack>
+          ) : null}
           {fields.map((f) => (
             <FieldInput key={f} name={f} value={values[f]} onChange={set(f)} />
           ))}
