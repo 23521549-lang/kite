@@ -147,8 +147,11 @@ def test_run_task_collects_patch_and_verifies_with_its_own_test_run(tmp_path):
 
 
 def test_setup_runs_first_with_network_and_its_files_stay_out_of_the_patch(tmp_path):
+    from dataclasses import replace
+
     fake = FakeDocker()
-    _repo, run = run_task(tmp_path, fake, "t5", setup_command="pip install -r requirements.txt")
+    _repo, run = run_task(tmp_path, fake, "t5", settings=replace(SETTINGS, setup_network="bridge"),
+                          setup_command="pip install -r requirements.txt")
     kinds = [fake.kind(c) for c in fake.calls]
     assert kinds == ["setup", "agent", "test", "review"]
     setup, agent, test = fake.call("setup"), fake.call("agent"), fake.call("test")
