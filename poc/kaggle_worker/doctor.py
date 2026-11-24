@@ -278,6 +278,10 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
                 add(f"tự bật {wid}", WARN, "notebook đọc Kaggle Secret, mà Kaggle không gắn Secrets cho bản Kite "
                     "đẩy qua API (lỗi HTTP 400): bản tự bật sẽ dừng ở ô worker",
                     f"kite worker autostart {wid} --kernel {provider.launch.kernel} --token per-launch")
+                add(f"token {wid}", WARN, "launch.token: kaggle-secret: token worker trong Kaggle Secret là token "
+                    "dài hạn, không tự hết hạn — ai đọc được Secret là mạo danh worker mãi cho tới khi xoay vòng",
+                    f"kite worker rotate-token {wid} rồi cập nhật Kaggle Secret, hoặc đặt "
+                    "launch.token: per-launch")
             reference = provider.secrets.get("kaggle_api_token", "")
             if found and reference.startswith("file:"):
                 add(f"quota GPU {wid}", *gpu_quota(p, command, reference[5:]))

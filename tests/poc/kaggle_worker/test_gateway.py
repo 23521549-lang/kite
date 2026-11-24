@@ -250,6 +250,20 @@ def test_worker_token_and_opencode_config_commands(tmp_path, capsys):
     assert set(provider["models"]) == {"qwen3.6", "devstral", "qwen3.6-fast"}
 
 
+def test_worker_rotate_token_replaces_the_stored_token(tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_base_config(tmp_path)))
+    assert cli.main(["--config", str(config_path), "worker", "token", "kaggle-han"]) == 0
+    first = json.loads(capsys.readouterr().out)["token"]
+    assert cli.main(["--config", str(config_path), "worker", "rotate-token", "kaggle-han"]) == 0
+    rotated = json.loads(capsys.readouterr().out)
+    token_path = tmp_path / "secrets" / "worker_token_kaggle-han"
+    assert rotated["token"] != first and token_path.read_text().strip() == rotated["token"]
+    assert "KITE_WORKER_TOKEN" in rotated["next"]          # the owner must update the Kaggle Secret
+    if os.name != "nt":
+        assert token_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_status_lists_models_and_answers_carry_the_requested_model_name():
     async def scenario():
         gateway = make_gateway()

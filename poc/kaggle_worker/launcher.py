@@ -23,11 +23,12 @@ on, Kite presses Save Version -> Save & Run All -> Save there; otherwise the own
 start then waits in state ``waiting`` until Kaggle shows a new run). Kaggle gives Secrets to a run
 saved on kaggle.com, so the notebook's ``KITE_WORKER_TOKEN`` works.
 
-Worker token: ``kaggle-secret`` (default) keeps using the notebook's Kaggle Secret
-``KITE_WORKER_TOKEN``. Kaggle may not attach Secrets to a version pushed through the API; then the
-run fails at the worker cell and ``kite worker status`` shows it. ``per-launch`` instead writes a
-fresh token into the pushed notebook that the gateway accepts only until that run's time is up
-(the gateway keeps its SHA-256 digest, never the token).
+Worker token: ``per-launch`` (the default, as in config.py) writes a fresh token into the pushed
+notebook that the gateway accepts only until that run's time is up (the gateway keeps its SHA-256
+digest, never the token). ``kaggle-secret`` instead keeps using the notebook's Kaggle Secret
+``KITE_WORKER_TOKEN`` — a long-lived token that never expires on its own; rotate it with
+``kite worker rotate-token`` if it may have leaked. Kaggle may not attach Secrets to a version
+pushed through the API; then the run fails at the worker cell and ``kite worker status`` shows it.
 """
 from __future__ import annotations
 
