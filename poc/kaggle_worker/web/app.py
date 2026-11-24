@@ -2,7 +2,10 @@
 server for Chat, Kite's browser for the Worker tab), and the built front end (web/dist).
 
 Security (spec 5.4): one account; argon2 password and TOTP, both needed; 5 wrong tries lock the account
-for 15 minutes and 20 from one address in 15 minutes block that address; the session cookie is
+for 15 minutes and 20 from one address in 15 minutes block that address — the same counting guards
+re-authentication for sensitive actions, an expired lock restarts the count, and a lock is audited and
+notified; 8 one-time recovery codes stand in for a lost authenticator; a session seen from a new
+address or browser must re-authenticate before it can write again; the session cookie is
 ``__Host-`` prefixed, HttpOnly, Secure, SameSite=Strict, 12 hours idle and 7 days at most; every write
 needs the session's CSRF token in ``X-CSRF-Token`` and a same-site Origin; WebSockets check Origin;
 answers carry a strict Content-Security-Policy; there is no /docs. Sensitive actions go to the audit log.
@@ -74,6 +77,10 @@ class Session:
     user: User
     csrf: str
     ip: str
+    agent: str = ""
+    # The request's address or browser differs from the ones this session was opened from: reads keep
+    # working, but writes wait for a fresh password + 2FA (see auth() and check_second_factor).
+    needs_reauth: bool = False
 
 
 class WebContext:
@@ -173,7 +180,7 @@ def find_opencode(home: Path, fallback_url: str, fallback_password: str | None) 
 class LoginIn(BaseModel):
     username: str = Field(max_length=64)
     password: str = Field(max_length=200)
-    code: str = Field(max_length=12)
+    code: str = Field(max_length=20)        # a 6-digit TOTP code, or a one-time recovery code (XXXX-XXXX-XXXX)
 
 
 class PasswordIn(BaseModel):
@@ -330,7 +337,9 @@ def create_app(ctx: WebContext) -> FastAPI:
             return None
         if now - row.last_seen > 60:
             ctx.store.touch_session(sid)
-        return Session(sid, user, row.csrf, client_ip(request))
+        ip, agent = client_ip(request), request.headers.get("user-agent", "")
+        drift = bool((row.ip and row.ip != ip) or (row.agent and row.agent != agent))
+        return Session(sid, user, row.csrf, ip, agent, drift)
 
     @app.middleware("http")
     async def require_session(request: Request, call_next):
@@ -340,6 +349,11 @@ def create_app(ctx: WebContext) -> FastAPI:
                 return JSONResponse({"error": "cần đăng nhập"}, status_code=401,
                                     headers={"Cache-Control": "no-store"})
         return await call_next(request)
+
+    # Writes stay open on a drifted session only where re-authentication itself happens (and signing
+    # out, which must always work); a successful check_second_factor adopts the new address/browser.
+    REAUTH_PATHS = ("/api/auth/password", "/api/auth/totp/begin", "/api/auth/totp/confirm",
+                    "/api/auth/logout")
 
     def auth(request: Request) -> Session:
         session = session_of(request)
@@ -351,12 +365,47 @@ def create_app(ctx: WebContext) -> FastAPI:
                 raise HTTPException(403, "yêu cầu từ trang khác")
             if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), session.csrf):
                 raise HTTPException(403, "thiếu mã CSRF")
+            if session.needs_reauth and request.url.path not in REAUTH_PATHS:
+                raise HTTPException(403, "phiên đăng nhập đã đổi địa chỉ IP hoặc trình duyệt; "
+                                         "nhập lại mật khẩu và mã 2FA ở trang tài khoản để tiếp tục")
         return session
 
     def audit(session: Session | None, action: str, target: str = "", ok: bool = True,
               detail: dict | None = None, *, ip: str = "", username: str = "") -> None:
         ctx.store.audit(session.user.username if session else username, session.ip if session else ip, action,
                         target, ok, detail)
+
+    def note_lockout(username: str, ip: str) -> None:
+        """Best effort: tell the owner the account just locked (ntfy, when configured — the same
+        mechanism the settings page tests). A notification problem never breaks signing in."""
+        try:
+            config = ctx.config()
+            if not config.notify.ntfy:
+                return
+            from .. import notify
+            from ..config import resolve_secret
+
+            notify.send(resolve_secret(config.notify.ntfy), "Kite: tài khoản web bị khóa",
+                        f"Tài khoản {username} tạm khóa {LOCK_SECONDS // 60} phút vì nhập sai nhiều lần "
+                        f"(lần gần nhất từ {ip}). Nếu không phải bạn, hãy kiểm tra máy.")
+        except Exception:
+            pass
+
+    def register_failure(user: User, ip: str, now: float) -> bool:
+        """One more wrong try against the account (sign-in or re-authentication — both count the same).
+        True when this try locks the account; the lock is audited as its own event. A lock that has
+        already expired starts the count from zero, so the owner is never one typo away from a fresh
+        lock for the rest of time — an attacker must spend a full set of tries on every lock."""
+        base = 0 if 0 < user.locked_until <= now else user.failed
+        failed = base + 1
+        locked = failed >= LOCK_AFTER
+        ctx.store.update_user(user.id, failed=failed,
+                              locked_until=now + LOCK_SECONDS if locked else (0.0 if base == 0
+                                                                              else user.locked_until))
+        if locked:
+            ctx.store.audit(user.username, ip, "lockout", user.username, False,
+                            {"minutes": LOCK_SECONDS // 60})
+        return locked
 
     def set_cookie(response: Response, token: str) -> None:
         response.set_cookie(ctx.cookie, token, max_age=ABSOLUTE_SECONDS, httponly=True, secure=ctx.secure_cookies,
@@ -382,18 +431,23 @@ def create_app(ctx: WebContext) -> FastAPI:
                                      "vì nhập sai nhiều lần")
         password_ok = await asyncio.to_thread(sec.verify_password, user.password_hash if user else None, body.password)
         counter = None
+        via_recovery = False
         if user is not None and password_ok:
             counter = sec.verify_totp(ctx.sealer.unseal(user.totp_secret), body.code, now=now,
                                       last_counter=user.totp_last)
-        if user is None or not password_ok or counter is None:
+            if counter is None:
+                # A one-time recovery code stands in for the 2FA code exactly once (it is spent here,
+                # and only ever behind a correct password).
+                via_recovery = await asyncio.to_thread(ctx.store.use_recovery_code, user.id,
+                                                       sec.recovery_digest(body.code))
+        if user is None or not password_ok or (counter is None and not via_recovery):
             ctx.store.attempt(ip, body.username, False)
-            if user is not None:
-                failed = user.failed + 1
-                ctx.store.update_user(user.id, failed=failed,
-                                      locked_until=now + LOCK_SECONDS if failed >= LOCK_AFTER else user.locked_until)
+            if user is not None and register_failure(user, ip, now):
+                await asyncio.to_thread(note_lockout, user.username, ip)
             audit(None, "login", body.username[:64], False, ip=ip, username=body.username[:64])
             raise HTTPException(401, "sai tên đăng nhập, mật khẩu hoặc mã 2FA")
-        ctx.store.update_user(user.id, failed=0, locked_until=0.0, totp_last=counter)
+        ctx.store.update_user(user.id, failed=0, locked_until=0.0,
+                              **({"totp_last": counter} if counter is not None else {}))
         ctx.store.attempt(ip, user.username, True)
         ctx.store.prune_sessions(idle=IDLE_SECONDS, absolute=ABSOLUTE_SECONDS)
         token, csrf = sec.new_token(), sec.new_token()
@@ -401,7 +455,7 @@ def create_app(ctx: WebContext) -> FastAPI:
         if await asyncio.to_thread(_needs_rehash, user.password_hash):
             ctx.store.update_user(user.id, password_hash=await asyncio.to_thread(sec.hash_password, body.password))
         set_cookie(response, token)
-        ctx.store.audit(user.username, ip, "login", user.username, True)
+        ctx.store.audit(user.username, ip, "login_recovery" if via_recovery else "login", user.username, True)
         return {"username": user.username, "csrf": csrf}
 
     @app.post("/api/auth/logout")
@@ -426,12 +480,31 @@ def create_app(ctx: WebContext) -> FastAPI:
         return {"dropped": dropped}
 
     def check_second_factor(session: Session, password: str, code: str) -> int:
+        """Re-proving both factors for a sensitive action, with the same protections as signing in:
+        the per-address limit, the account's failure counter and its lock all apply here too — a
+        session on its own is not a licence to guess at the password and the 2FA code forever.
+        Success clears the counter (like a sign-in) and adopts the session's current address and
+        browser, which is what releases a session that drifted (see session_of)."""
         user = ctx.store.user(session.user.id)
-        counter = sec.verify_totp(ctx.sealer.unseal(user.totp_secret), code, now=ctx.clock(),
+        now, ip = ctx.clock(), session.ip
+        if ctx.store.failures_from(ip, IP_WINDOW) >= IP_LIMIT:
+            audit(session, "reauth", ok=False, detail={"reason": "ip_limited"})
+            raise HTTPException(429, "quá nhiều lần nhập sai từ địa chỉ này; thử lại sau 15 phút")
+        if user.locked_until > now:
+            raise HTTPException(429, f"tài khoản tạm khóa {round((user.locked_until - now) / 60) or 1} phút "
+                                     "vì nhập sai nhiều lần")
+        counter = sec.verify_totp(ctx.sealer.unseal(user.totp_secret), code, now=now,
                                   last_counter=user.totp_last)
         if not sec.verify_password(user.password_hash, password) or counter is None:
+            ctx.store.attempt(ip, user.username, False)
+            locked = register_failure(user, ip, now)
             audit(session, "reauth", ok=False)
+            if locked:
+                note_lockout(user.username, ip)
             raise HTTPException(403, "mật khẩu hoặc mã 2FA không đúng")
+        ctx.store.attempt(ip, user.username, True)
+        ctx.store.update_user(user.id, failed=0, locked_until=0.0)
+        ctx.store.update_session_fingerprint(session.sid, ip, session.agent)
         return counter
 
     @app.post("/api/auth/password")
@@ -469,8 +542,12 @@ def create_app(ctx: WebContext) -> FastAPI:
         if counter is None:
             raise HTTPException(400, "mã chưa đúng; kiểm tra giờ trên điện thoại")
         ctx.store.update_user(user.id, totp_secret=user.totp_pending, totp_pending=None, totp_last=counter)
+        codes = sec.new_recovery_codes()
+        ctx.store.replace_recovery_codes(user.id, [sec.recovery_digest(c) for c in codes])
         audit(session, "totp_changed")
-        return {"ok": True}
+        return {"ok": True, "recovery_codes": codes,
+                "next": "lưu các mã khôi phục này ở nơi an toàn (chỉ hiện lần này): mỗi mã đăng nhập "
+                        "thay mã 2FA được đúng một lần khi mất điện thoại"}
 
     # ------------------------------------------------------------------ gateway helpers
     async def gateway_status() -> dict | None:
@@ -527,7 +604,7 @@ def create_app(ctx: WebContext) -> FastAPI:
         session = auth(request)
         body = await _json(request)
         try:
-            report = wk.add_worker(ctx.config_path, body)
+            report = wk.add_worker(ctx.config_path, body, sealer=ctx.sealer)
         except ConfigError as exc:
             audit(session, "worker_add", str(body.get("id", "")), False, {"error": str(exc), "type": body.get("type")})
             raise
@@ -538,7 +615,7 @@ def create_app(ctx: WebContext) -> FastAPI:
     async def edit_worker(worker_id: str, request: Request):
         session = auth(request)
         body = await _json(request)
-        report = wk.update_worker(ctx.config_path, worker_id, body)
+        report = wk.update_worker(ctx.config_path, worker_id, body, sealer=ctx.sealer)
         audit(session, "worker_update", worker_id, True,
               {"fields": [k for k in body if k not in wk.SECRET_FIELDS],
                "keys_changed": [k for k in body if k in wk.SECRET_FIELDS]})
