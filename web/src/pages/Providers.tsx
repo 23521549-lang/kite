@@ -272,6 +272,18 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
             <Alert color={test.ok ? 'teal' : 'red'} title={test.ok ? 'Kết nối được' : 'Chưa kết nối được'}>
               {test.detail}
               {test.models?.length ? <Text size="xs" mt={4}>Model: {test.models.slice(0, 20).join(', ')}</Text> : null}
+              {test.model_tested ? (
+                <Text size="xs" mt={4}>
+                  Model đã thử: {test.model_tested} — {test.model_ok ? 'gọi được' : 'chưa gọi được'}
+                  {typeof test.latency_ms === 'number' ? ` · độ trễ ${test.latency_ms} ms` : ''}
+                  {test.chat_detail ? ` · ${test.chat_detail}` : ''}
+                </Text>
+              ) : null}
+              {test.usage_reported === false ? (
+                <Text size="xs" mt={4} c="orange.7">
+                  API không trả usage — chi phí sẽ tính theo ước lượng
+                </Text>
+              ) : null}
             </Alert>
           ) : null}
           <Group justify="space-between">

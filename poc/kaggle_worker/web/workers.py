@@ -360,9 +360,13 @@ async def test_connection(body: dict, *, session_factory=None, runner=None) -> d
                     text = await response.text()
                     if response.status != 200:
                         return {"ok": False, "detail": f"HTTP {response.status}: {text[:200]}"}
-            data = json.loads(text) if text.strip() else {}
-            models = [m.get("id") for m in data.get("data") or [] if isinstance(m, dict)][:50]
-            return {"ok": True, "detail": f"kết nối được; {len(models)} model", "models": models}
+                data = json.loads(text) if text.strip() else {}
+                models = [m.get("id") for m in data.get("data") or [] if isinstance(m, dict)][:50]
+                result = {"ok": True, "detail": f"kết nối được; {len(models)} model", "models": models}
+                model = _typed_model(body) or (models[0] if models else None)
+                if model:
+                    result.update(await _chat_probe(session, kind, base, headers, model, timeout))
+                return result
         if kind == "runpod":
             from ..pods import PodError, RunPodClient
 
@@ -378,6 +382,52 @@ async def test_connection(body: dict, *, session_factory=None, runner=None) -> d
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         return {"ok": False, "detail": f"không kết nối được ({type(exc).__name__})"}
     return {"ok": False, "detail": f"không thử được loại {kind}"}
+
+
+def _typed_model(body: dict) -> str | None:
+    """The first model the owner typed in the form ('name' or 'name=the-api's-own-id'): the id the API
+    itself knows is the one a test call has to use."""
+    for item in body.get("models") or []:
+        name, _, target = str(item).partition("=")
+        if name.strip():
+            return (target or name).strip()
+    return None
+
+
+async def _chat_probe(session, kind: str, base: str, headers: dict, model: str, timeout) -> dict:
+    """One smallest-possible chat call against a listed API: proves the model itself answers (not only
+    that the key lists models), times it, and notes whether the API reports token usage — without a
+    usage figure Kite can only estimate what every later call costs. A failed probe never undoes the
+    successful listing: the caller still gets ok=True with model_ok=False and the reason in chat_detail."""
+    import aiohttp
+
+    if kind == "anthropic":
+        url, payload = base + "/v1/messages", {"model": model, "max_tokens": 1,
+                                               "messages": [{"role": "user", "content": "ping"}]}
+    else:
+        url, payload = base + "/chat/completions", {"model": model, "max_tokens": 1,
+                                                    "messages": [{"role": "user", "content": "ping"}]}
+    probe: dict[str, Any] = {"model_tested": model}
+    started = time.monotonic()
+    try:
+        async with session.post(url, headers=headers, json=payload, timeout=timeout) as response:
+            text = await response.text()
+            probe["latency_ms"] = round((time.monotonic() - started) * 1000)
+            if response.status != 200:
+                probe.update(model_ok=False, chat_detail=f"HTTP {response.status}: {text[:200]}")
+                return probe
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        probe["latency_ms"] = round((time.monotonic() - started) * 1000)
+        probe.update(model_ok=False, chat_detail=f"không gọi được ({type(exc).__name__})")
+        return probe
+    try:
+        data = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError:
+        data = {}
+    usage = data.get("usage") if isinstance(data, dict) else None
+    probe["model_ok"] = True
+    probe["usage_reported"] = isinstance(usage, dict) and bool(usage)
+    return probe
 
 
 def _kaggle_test(body: dict, runner=None) -> dict:

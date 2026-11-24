@@ -3,6 +3,7 @@ the session, the audit log, workers edited through config.yaml, tasks through Ki
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -768,6 +769,108 @@ def test_testing_a_key_lists_the_apis_models_and_saves_nothing(site):
     assert not list((site["path"] / "secrets").glob("api_key_*"))
     types = site["client"].get("/api/provider-types").json()["types"]
     assert [t["type"] for t in types] == ["kaggle", "openai", "anthropic", "runpod"]
+
+
+class _FakeResponse:
+    def __init__(self, status, payload):
+        self.status = status
+        self._text = payload if isinstance(payload, str) else json.dumps(payload)
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    """aiohttp-shaped stand-in for test_connection: canned answers keyed by (method, url suffix)."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls: list[tuple] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def _respond(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        for (verb, suffix), response in self.routes.items():
+            if verb == method and url.endswith(suffix):
+                return response
+        return _FakeResponse(404, {"error": "no route"})
+
+    def get(self, url, **kwargs):
+        return self._respond("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self._respond("POST", url, **kwargs)
+
+
+def _probe(kind, routes, **body):
+    from poc.kaggle_worker.web import workers as wk
+
+    session = _FakeSession(routes)
+    body.setdefault("api_key", "sk-good")
+    return asyncio.run(wk.test_connection(body, session_factory=lambda: session)), session
+
+
+_LISTED = _FakeResponse(200, {"data": [{"id": "m1"}, {"id": "m2"}]})
+
+
+def test_a_connection_test_now_calls_the_model_and_sees_usage():
+    result, session = _probe("openai", {("GET", "/models"): _LISTED,
+                                        ("POST", "/chat/completions"): _FakeResponse(
+                                            200, {"usage": {"prompt_tokens": 1, "completion_tokens": 1}})},
+                             type="openai", base_url="https://api.example/v1", models=["m1"])
+    assert result["ok"] and result["model_tested"] == "m1" and result["model_ok"]
+    assert result["usage_reported"] is True
+    assert isinstance(result["latency_ms"], int) and result["latency_ms"] >= 0
+    post = next(call for call in session.calls if call[0] == "POST")
+    assert post[2]["json"]["model"] == "m1" and post[2]["json"]["max_tokens"] == 1
+
+
+def test_a_connection_test_warns_when_the_api_reports_no_usage():
+    result, _ = _probe("openai", {("GET", "/models"): _LISTED,
+                                  ("POST", "/chat/completions"): _FakeResponse(200, {"choices": []})},
+                       type="openai", base_url="https://api.example/v1", models=["m1"])
+    assert result["ok"] and result["model_ok"] and result["usage_reported"] is False
+
+
+def test_a_failed_chat_call_keeps_the_successful_listing():
+    result, _ = _probe("openai", {("GET", "/models"): _LISTED,
+                                  ("POST", "/chat/completions"): _FakeResponse(500, {"error": "boom"})},
+                       type="openai", base_url="https://api.example/v1", models=["m1"])
+    assert result["ok"] and result["models"] == ["m1", "m2"]
+    assert result["model_ok"] is False and "500" in result["chat_detail"]
+
+
+def test_a_connection_test_uses_the_first_listed_model_and_the_apis_own_id_for_an_alias():
+    routes = {("GET", "/models"): _LISTED,
+              ("POST", "/chat/completions"): _FakeResponse(200, {"usage": {"total_tokens": 2}})}
+    listed, _ = _probe("openai", routes, type="openai", base_url="https://api.example/v1")
+    assert listed["model_tested"] == "m1"
+    aliased, session = _probe("openai", routes, type="openai", base_url="https://api.example/v1",
+                              models=["chat=m2"])
+    assert aliased["model_tested"] == "m2"
+    assert next(call for call in session.calls if call[0] == "POST")[2]["json"]["model"] == "m2"
+
+
+def test_a_connection_test_probes_anthropic_with_a_messages_call():
+    result, session = _probe("anthropic", {("GET", "/v1/models"): _LISTED,
+                                           ("POST", "/v1/messages"): _FakeResponse(
+                                               200, {"usage": {"input_tokens": 1, "output_tokens": 1}})},
+                             type="anthropic", models=["claude-test"])
+    assert result["ok"] and result["model_tested"] == "claude-test" and result["model_ok"]
+    assert result["usage_reported"] is True and result["latency_ms"] >= 0
+    post = next(call for call in session.calls if call[0] == "POST")
+    assert post[2]["json"]["max_tokens"] == 1 and post[2]["headers"]["x-api-key"] == "sk-good"
 
 
 def test_the_other_tabs_answer(site):
