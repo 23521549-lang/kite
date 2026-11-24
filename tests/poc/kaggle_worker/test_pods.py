@@ -452,3 +452,49 @@ def test_with_auto_off_kite_does_not_start_that_notebook_or_pod(tmp_path):
 
     woken, candidates, manual = asyncio.run(scenario())
     assert woken == [] and candidates == [] and manual == ["kaggle-han"]
+
+
+def test_a_gateway_restart_counts_the_pods_full_uptime(tmp_path):
+    """The pod keeps billing while the gateway is down: adoption resumes from the saved cursor."""
+    from poc.kaggle_worker.config import PodConfig
+    from poc.kaggle_worker.spend_ledger import SpendStore
+
+    async def scenario():
+        store = SpendStore(tmp_path / "spend.sqlite3")
+        clock = {"now": DAY}
+        pod = PodConfig("abc123xyz", price_hour=1.0, idle_minutes=30, start_timeout=900)
+        spec = RelaySpec("runpod", "openai", "https://abc123xyz-8000.proxy.runpod.net/v1", "vllm-key",
+                         ("qwen3-32b",), slots=2, stream=True, pod=pod)
+        fake = FakeRunPod(statuses=())
+        fake.status = "RUNNING"
+
+        async def health():
+            return True
+
+        async def sleep(seconds):
+            clock["now"] += seconds
+
+        def life():
+            gateway = ModelGateway([WorkerAuth("runpod", TOKEN, ("qwen3-32b",))], clock=lambda: clock["now"])
+            ledger = SpendLedger(clock=lambda: clock["now"], store=store)
+            relay = RelayWorker(spec, gateway, ledger, clock=lambda: clock["now"])
+            return PodController(spec, fake, relay, ledger, clock=lambda: clock["now"], sleep=sleep,
+                                 health=health, store=store), ledger
+
+        ctl1, ledger1 = life()
+        await ctl1.adopt()
+        await settle(ctl1)
+        clock["now"] += 600
+        ctl1._accrue()
+        cursor = store.pod_cursor("runpod")
+        # The gateway dies here — no stop, no final accrual. The pod bills on for 20 more minutes.
+        clock["now"] += 1200
+        ctl2, ledger2 = life()
+        await ctl2.adopt()
+        resumed_from = ctl2.s.billed_from
+        ctl2._accrue()
+        return cursor, resumed_from, ledger2.spent("runpod", clock["now"])[0], clock["now"]
+
+    cursor, resumed_from, total, now = asyncio.run(scenario())
+    assert cursor is not None and resumed_from == cursor < now     # resumed where life 1 stopped counting
+    assert total == pytest.approx((now - DAY) / 3600 * 1.0, abs=1e-6)
