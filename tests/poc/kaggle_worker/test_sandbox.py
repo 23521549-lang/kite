@@ -771,6 +771,31 @@ def test_edit_blocks_apply_all_or_nothing_and_stay_inside_the_repo(tmp_path):
 
 
 
+def test_edit_blocks_reject_a_symlink_that_escapes_the_workspace(tmp_path):
+    from poc.kaggle_worker import editblocks as eb
+
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("token = 'old'\n")
+    (workspace / "docs").symlink_to(outside, target_is_directory=True)
+    (workspace / "link.py").symlink_to(outside / "secret.py")
+    # Through a linked directory and through a linked file: both resolve outside.
+    for path in ("docs/secret.py", "docs/new.py", "link.py"):
+        with pytest.raises(eb.EditError, match="symlink escape"):
+            eb._safe_path(workspace, path)
+    with pytest.raises(eb.EditError, match="symlink escape"):
+        eb.apply(workspace, eb.parse("docs/new.py\n<<<<<<< SEARCH\n=======\nx = 1\n>>>>>>> REPLACE"))
+    assert not (outside / "new.py").exists() and (outside / "secret.py").read_text() == "token = 'old'\n"
+    # A symlink that stays inside the workspace is fine, and so is a plain path.
+    (workspace / "real.py").write_text("x = 1\n")
+    (workspace / "alias.py").symlink_to(workspace / "real.py")
+    assert eb._safe_path(workspace, "alias.py") == (workspace / "real.py").resolve()
+    assert eb.apply(workspace, eb.parse(
+        "real.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE")) == ["real.py"]
+
+
 def test_a_block_that_names_the_wrong_file_goes_to_the_one_file_with_its_search_text(tmp_path):
     from poc.kaggle_worker import editblocks as eb
 
