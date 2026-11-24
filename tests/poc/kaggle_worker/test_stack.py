@@ -279,6 +279,16 @@ def test_kite_services_run_like_on_the_development_machine_and_only_caddy_faces_
         assert (ROOT / "deploy" / "stack" / "systemd" / unit).is_file()
 
 
+def test_the_installer_refuses_a_docker_key_with_the_wrong_fingerprint():
+    script = (ROOT / "deploy" / "stack" / "install.sh").read_text(encoding="utf-8")
+    # Docker's official apt signing key fingerprint, spaces removed: the download is only trusted
+    # when the key that arrived carries exactly this fingerprint.
+    assert "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" in script
+    check = script.index("9DC858229FC7DD38854AE2D88D81803C0EBFCD88")
+    assert "exit 1" in script[check:check + 400]                    # a mismatch aborts the install
+    assert check < script.index("docker.sources")                   # and it happens before the repo is used
+
+
 def test_pinned_versions_agree_across_the_image_and_the_code():
     app = (ROOT / "poc" / "kaggle_worker" / "web" / "app.py").read_text(encoding="utf-8")
     OPENCODE_TESTED = re.search(r'^OPENCODE_TESTED = "([^"]+)"', app, re.M).group(1)

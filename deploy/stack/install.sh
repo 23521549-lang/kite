@@ -49,6 +49,11 @@ if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; t
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc
   fi
+  docker_key_fingerprint="$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')"
+  if [[ "$docker_key_fingerprint" != "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" ]]; then
+    echo "khóa ký của Docker không đúng dấu vân tay (thấy: ${docker_key_fingerprint:-không đọc được}) — dừng, không cài" >&2
+    exit 1
+  fi
   cat >/etc/apt/sources.list.d/docker.sources <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
