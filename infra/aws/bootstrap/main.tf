@@ -120,7 +120,7 @@ data "aws_iam_policy_document" "trust" {
     condition {
       test     = "StringLike"
       variable = "${local.oidc}:sub"
-      values   = [
+      values = [
         "repo:${var.github_repository}:environment:${var.github_environment}",
         "repo:${local.owner}@*/${local.name}@*:environment:${var.github_environment}",
       ]
