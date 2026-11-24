@@ -39,7 +39,8 @@ jobs:
       TF_VAR_access: ${{ vars.KITE_ACCESS || 'public' }}
       TF_VAR_domain: ${{ vars.KITE_DOMAIN || '' }}
       TF_VAR_image: ghcr.io/${{ github.repository_owner }}/kite
-      TF_VAR_installer_url: https://raw.githubusercontent.com/${{ github.repository }}/main/deploy/stack/install.sh
+      # TF_VAR_installer_url is deliberately NOT set here: the pinned-commit default in
+      # infra/aws/variables.tf decides which installer a new machine runs.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6

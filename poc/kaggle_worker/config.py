@@ -319,7 +319,7 @@ class SandboxConfig:
     test_timeout_seconds: int = 900
     test_command: str = "python -m pytest -q"
     setup_command: str = ""
-    setup_network: str = "bridge"
+    setup_network: str = "none"
     setup_timeout_seconds: int = 1800
     docker_command: tuple[str, ...] = ("docker",)
     fix_rounds: int = 2
@@ -658,7 +658,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
     setup_command = sb.get("setup_command", "")
     if not isinstance(setup_command, str):
         raise ConfigError("sandbox.setup_command must be a string ('' for no setup)")
-    setup_network = sb.get("setup_network", "bridge")
+    setup_network = sb.get("setup_network", "none")
     if not isinstance(setup_network, str) or not _NETWORK.fullmatch(setup_network) or setup_network == "host":
         raise ConfigError("sandbox.setup_network must name a Docker network other than host")
     docker_command = sb.get("docker_command", ["docker"])

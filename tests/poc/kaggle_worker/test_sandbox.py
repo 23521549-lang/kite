@@ -363,7 +363,7 @@ def test_sandbox_config_validation_and_settings():
     settings = sandbox_settings_from_config(validate_config(_config(
         gateway_host="172.19.0.1", memory="1g", setup_command="pip install -r requirements.txt")))
     assert settings.gateway_url == "http://172.19.0.1:8787/v1" and settings.memory == "1g"
-    assert settings.setup_command == "pip install -r requirements.txt" and settings.setup_network == "bridge"
+    assert settings.setup_command == "pip install -r requirements.txt" and settings.setup_network == "none"
     assert (settings.fast_retries, settings.fast_parallel) == (0, True)
     tuned = sandbox_settings_from_config(validate_config(_config(fast_retries=1, fast_parallel=False)))
     assert (tuned.fast_retries, tuned.fast_parallel) == (1, False)
