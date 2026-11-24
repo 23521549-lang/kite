@@ -147,8 +147,11 @@ def test_run_task_collects_patch_and_verifies_with_its_own_test_run(tmp_path):
 
 
 def test_setup_runs_first_with_network_and_its_files_stay_out_of_the_patch(tmp_path):
+    from dataclasses import replace
+
     fake = FakeDocker()
-    _repo, run = run_task(tmp_path, fake, "t5", setup_command="pip install -r requirements.txt")
+    _repo, run = run_task(tmp_path, fake, "t5", settings=replace(SETTINGS, setup_network="bridge"),
+                          setup_command="pip install -r requirements.txt")
     kinds = [fake.kind(c) for c in fake.calls]
     assert kinds == ["setup", "agent", "test", "review"]
     setup, agent, test = fake.call("setup"), fake.call("agent"), fake.call("test")
@@ -312,13 +315,37 @@ def test_doctor_reports_every_isolation_check(tmp_path):
             return subprocess.CompletedProcess(cmd, 0, "2.3.0\n", "")
         if "python" in cmd:
             return subprocess.CompletedProcess(cmd, 0, json.dumps({
-                "gateway": 200, "internet": "URLError", "host_secrets_visible": False, "uid": 1000}) + "\n", "")
+                "gateway": 200, "internet": "URLError", "host_secrets_visible": False, "uid": 1000,
+                "host_ssh_reachable": False, "host_https_reachable": False}) + "\n", "")
         raise AssertionError(cmd)
 
     checks = sbx.doctor(SETTINGS, runner=fake)
     assert set(checks) == {"docker", "image", "network_internal", "gateway_reachable",
-                           "internet_blocked", "host_secrets_hidden", "non_root", "opencode"}
+                           "internet_blocked", "host_ports_blocked", "host_secrets_hidden",
+                           "non_root", "opencode"}
     assert all(check["ok"] for check in checks.values())
+
+
+def test_doctor_flags_a_host_port_the_sandbox_can_reach(tmp_path):
+    def fake(cmd, *, timeout=None):
+        cmd = list(cmd)
+        if cmd[1:3] == ["version", "--format"]:
+            return subprocess.CompletedProcess(cmd, 0, "29.0\n", "")
+        if cmd[1:3] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+        if cmd[1:3] == ["network", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, "true\n", "")
+        if cmd[-2:] == ["opencode", "--version"]:
+            return subprocess.CompletedProcess(cmd, 0, "2.3.0\n", "")
+        if "python" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({
+                "gateway": 200, "internet": "URLError", "host_secrets_visible": False, "uid": 1000,
+                "host_ssh_reachable": True, "host_https_reachable": False}) + "\n", "")
+        raise AssertionError(cmd)
+
+    checks = sbx.doctor(SETTINGS, runner=fake)
+    assert checks["host_ports_blocked"]["ok"] is False
+    assert "firewall" in checks["host_ports_blocked"]["detail"]
 
 
 def _config(**sandbox):
@@ -769,6 +796,92 @@ def test_edit_blocks_apply_all_or_nothing_and_stay_inside_the_repo(tmp_path):
     with pytest.raises(eb.EditError, match="more than one place"):
         eb.apply(tmp_path, eb.parse("d.py\n<<<<<<< SEARCH\na = 1\n=======\na = 0\n>>>>>>> REPLACE"))
 
+
+
+def test_workspace_over_the_limit_aborts_the_task(tmp_path):
+    from dataclasses import replace
+
+    (tmp_path / "big.bin").write_bytes(b"x" * 2048)
+    with pytest.raises(sbx.SandboxError, match="over the sandbox limit"):
+        sbx.check_workspace_limit(replace(SETTINGS, workspace_limit_bytes=1024), tmp_path)
+    sbx.check_workspace_limit(replace(SETTINGS, workspace_limit_bytes=4096), tmp_path)   # under: fine
+    sbx.check_workspace_limit(replace(SETTINGS, workspace_limit_bytes=0), tmp_path)      # 0 = no limit
+    # End to end: the agent step writes into the workspace, then the guard stops the task.
+    fake = FakeDocker()
+    (tmp_path / "r").mkdir()
+    with pytest.raises(sbx.SandboxError, match="over the sandbox limit"):
+        sbx.run_task(replace(SETTINGS, workspace_limit_bytes=10), repo=make_repo(tmp_path / "r"),
+                     goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                     state_dir=tmp_path / "state", task_id="big1", runner=fake, log=lambda _m: None)
+    # And every container gets no swap beyond its memory limit.
+    args = sbx.docker_run_args(SETTINGS, name="kite-agent-t1", workspace=tmp_path, network="none")
+    assert value_after(args, "--memory-swap") == value_after(args, "--memory") == SETTINGS.memory
+
+
+def test_setup_network_defaults_to_none_and_an_opt_in_warns_once_per_repo(tmp_path):
+    from dataclasses import replace
+
+    assert sbx.SandboxSettings().setup_network == "none"
+    repo = make_repo(tmp_path)
+    lines: list[str] = []
+    opted_in = replace(SETTINGS, setup_network="bridge")
+    for task_id in ("net1", "net2"):
+        fake = FakeDocker()
+        sbx.run_task(opted_in, repo=repo, goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                     state_dir=tmp_path / "state", task_id=task_id, runner=fake,
+                     log=lines.append, setup_command="pip install x")
+        assert value_after(fake.call("setup"), "--network") == "bridge"
+    warnings = [line for line in lines if "CẢNH BÁO" in line]
+    assert len(warnings) == 1 and "setup_network=bridge" in warnings[0]     # first time only
+    # The default: setup runs with no network at all, and no warning is emitted.
+    quiet: list[str] = []
+    fake = FakeDocker()
+    sbx.run_task(SETTINGS, repo=repo, goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                 state_dir=tmp_path / "state2", task_id="net3", runner=fake,
+                 log=quiet.append, setup_command="pip install x")
+    assert value_after(fake.call("setup"), "--network") == "none"
+    assert not any("CẢNH BÁO" in line for line in quiet)
+
+
+def test_agent_config_carries_the_sandbox_token_when_the_token_file_exists(tmp_path):
+    token_file = tmp_path / "sandbox_client_token"
+    token_file.write_text("tok-abc-123\n", encoding="utf-8")
+    settings = sbx.SandboxSettings(sandbox_token_file=str(token_file))
+    config = sbx.agent_config(settings, model="m", models=["m"], task_tag="sbx-1")
+    headers = config["provider"]["kite"]["options"]["headers"]
+    assert headers["X-Kite-Task-Token"] == "tok-abc-123" and headers["X-Kite-Task"] == "sbx-1"
+    # Missing file (older gateway): no header, no crash.
+    missing = sbx.SandboxSettings(sandbox_token_file=str(tmp_path / "nope"))
+    config = sbx.agent_config(missing, model="m", models=["m"], task_tag="sbx-1")
+    assert "X-Kite-Task-Token" not in config["provider"]["kite"]["options"]["headers"]
+    # Nothing configured at all: no header either.
+    config = sbx.agent_config(sbx.SandboxSettings(), model="m", models=["m"], task_tag="sbx-1")
+    assert "X-Kite-Task-Token" not in config["provider"]["kite"]["options"]["headers"]
+
+
+def test_edit_blocks_reject_a_symlink_that_escapes_the_workspace(tmp_path):
+    from poc.kaggle_worker import editblocks as eb
+
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("token = 'old'\n")
+    (workspace / "docs").symlink_to(outside, target_is_directory=True)
+    (workspace / "link.py").symlink_to(outside / "secret.py")
+    # Through a linked directory and through a linked file: both resolve outside.
+    for path in ("docs/secret.py", "docs/new.py", "link.py"):
+        with pytest.raises(eb.EditError, match="symlink escape"):
+            eb._safe_path(workspace, path)
+    with pytest.raises(eb.EditError, match="symlink escape"):
+        eb.apply(workspace, eb.parse("docs/new.py\n<<<<<<< SEARCH\n=======\nx = 1\n>>>>>>> REPLACE"))
+    assert not (outside / "new.py").exists() and (outside / "secret.py").read_text() == "token = 'old'\n"
+    # A symlink that stays inside the workspace is fine, and so is a plain path.
+    (workspace / "real.py").write_text("x = 1\n")
+    (workspace / "alias.py").symlink_to(workspace / "real.py")
+    assert eb._safe_path(workspace, "alias.py") == (workspace / "real.py").resolve()
+    assert eb.apply(workspace, eb.parse(
+        "real.py\n<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE")) == ["real.py"]
 
 
 def test_a_block_that_names_the_wrong_file_goes_to_the_one_file_with_its_search_text(tmp_path):

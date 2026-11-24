@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 from dataclasses import asdict
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1791,6 +1792,25 @@ def _bench_wait_for_workers(config, models: list[str], log: Callable[[str], None
             raise ConfigError(f"không có worker cho {model} sau 4 giờ: bench dừng")
 
 
+def _check_opencode_binary(binary: Path) -> None:
+    """Only the pinned OpenCode build may be baked into the local sandbox image.
+
+    Mirrors the root Dockerfile's check of the npm package: the host's binary must hash to
+    OPENCODE_BIN_SHA512 in deploy/opencode.env (the SHA-512 of the binary inside the package
+    whose own SHA-512 is OPENCODE_SHA512).
+    """
+    pins = {}
+    for line in (REPO_ROOT / "deploy" / "opencode.env").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, _, value = line.partition("=")
+            pins[key.strip()] = value.strip()
+    expected = pins.get("OPENCODE_BIN_SHA512", "")
+    if not expected or hashlib.sha512(binary.read_bytes()).hexdigest() != expected:
+        raise ConfigError(
+            "the host's opencode binary does not match OPENCODE_BIN_SHA512 in deploy/opencode.env; "
+            "refusing to bake an unverified binary into the sandbox image")
+
+
 def _sandbox_command(args: argparse.Namespace) -> int:
     from . import sandbox as sbx
 
@@ -1800,6 +1820,7 @@ def _sandbox_command(args: argparse.Namespace) -> int:
         opencode = shutil.which("opencode") or str(Path.home() / ".opencode" / "bin" / "opencode")
         if not Path(opencode).is_file():
             raise ConfigError("opencode binary not found on the host; run the bootstrap first")
+        _check_opencode_binary(Path(opencode).resolve())
         network_gateway = sbx.ensure_network(settings)
         print("Đang build image sandbox (vài phút)...", file=sys.stderr)
         image = sbx.build_image(settings, dockerfile=REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",

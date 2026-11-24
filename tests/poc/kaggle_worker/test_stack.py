@@ -253,7 +253,10 @@ def test_kite_services_run_like_on_the_development_machine_and_only_caddy_faces_
     services = compose()["services"]
     for name in ("gateway", "worker", "web", "opencode"):
         svc = services[name]
-        assert svc["network_mode"] == "host" and svc["pid"] == "host" and svc["user"] == "1000:1000"
+        assert svc["network_mode"] == "host" and svc["user"] == "1000:1000"
+        # Only the worker shares the host's process space (its activities share PID-based
+        # state with the chat processes); the others must not see host PIDs.
+        assert svc.get("pid") == ("host" if name == "worker" else None)
         assert "ports" not in svc and svc["image"].startswith("${KITE_IMAGE")
         assert "/var/lib/kite:/var/lib/kite" in svc["volumes"]
         assert svc["healthcheck"]["test"] == ["CMD", "kite", "stack", "health", name]
@@ -287,6 +290,18 @@ def test_the_installer_refuses_a_docker_key_with_the_wrong_fingerprint():
     check = script.index("9DC858229FC7DD38854AE2D88D81803C0EBFCD88")
     assert "exit 1" in script[check:check + 400]                    # a mismatch aborts the install
     assert check < script.index("docker.sources")                   # and it happens before the repo is used
+
+
+def test_third_party_images_are_pinned_by_digest_and_temporal_passwords_are_split():
+    services = compose()["services"]
+    for name in ("postgres", "web-db", "temporal", "temporal-setup", "caddy"):
+        assert "@sha256:" in services[name]["image"], name
+    setup_env = services["temporal-setup"]["environment"]
+    assert "TEMPORAL_SETUP_POSTGRES_PASSWORD" in setup_env["POSTGRES_PWD"]
+    temporal_env = services["temporal"]["environment"]
+    assert "TEMPORAL_POSTGRES_PASSWORD" in temporal_env["SQL_PASSWORD"]
+    assert "TEMPORAL_VISIBILITY_POSTGRES_PASSWORD" in temporal_env["VISIBILITY_SQL_PASSWORD"]
+    assert "TEMPORAL_POSTGRES_PASSWORD" in services["postgres"]["environment"]["POSTGRES_PASSWORD"]
 
 
 def test_pinned_versions_agree_across_the_image_and_the_code():
