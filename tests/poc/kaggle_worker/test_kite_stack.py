@@ -263,3 +263,12 @@ def test_signature_checking_is_off_until_the_machine_asks_for_it(host):
     stack, docker = host["stack"], host["docker"]
     assert stack.update(force=True)["last"]["result"] == "updated"
     assert not cosign_calls(docker)
+
+
+def test_each_temporal_consumer_gets_its_own_generated_password_and_existing_ones_survive():
+    made = ks.generated_secrets({})
+    assert set(made) == set(ks.SECRET_KEYS) and len(set(made.values())) == len(made)
+    assert all(len(value) >= 32 for value in made.values())
+    kept = ks.generated_secrets({"TEMPORAL_POSTGRES_PASSWORD": "giu-nguyen", "KITE_WEB_DB_PASSWORD": "cung-the"})
+    assert kept["TEMPORAL_POSTGRES_PASSWORD"] == "giu-nguyen" and kept["KITE_WEB_DB_PASSWORD"] == "cung-the"
+    assert ks.generated_secrets(kept) == kept                  # a re-run changes nothing

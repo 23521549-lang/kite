@@ -107,6 +107,8 @@ def short(digest: str) -> str:
 
 
 COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
+SECRET_KEYS = ("TEMPORAL_POSTGRES_PASSWORD", "TEMPORAL_VISIBILITY_POSTGRES_PASSWORD",
+               "TEMPORAL_SETUP_POSTGRES_PASSWORD", "KITE_WEB_DB_PASSWORD")
 
 
 def find_cosign() -> str | None:
@@ -119,6 +121,13 @@ def signature_identity(image_repo: str) -> str:
     image repo is ghcr.io/<owner>/<repo>; both images are signed by that one workflow."""
     path = image_repo.split("/", 1)[1] if "/" in image_repo else image_repo
     return rf"^https://github\.com/{re.escape(path)}/\.github/workflows/ci\.yml@"
+
+
+def generated_secrets(env: dict[str, str]) -> dict[str, str]:
+    """The machine's passwords: the ones it already has are kept word for word, the missing ones
+    are made here. Temporal's side gets one password per consumer (the server itself, its
+    visibility store, the schema setup) plus the web database's, instead of one shared password."""
+    return {key: env.get(key) or secrets.token_urlsafe(32) for key in SECRET_KEYS}
 
 
 class Stack:
@@ -578,8 +587,7 @@ class Stack:
             "KITE_VERIFY_IMAGE_SIGNATURES": env.get("KITE_VERIFY_IMAGE_SIGNATURES", "1"),
             "TZ": timezone or env.get("TZ") or self.host_timezone(),
             "DOCKER_GID": str(grp.getgrnam("docker").gr_gid),
-            "TEMPORAL_POSTGRES_PASSWORD": env.get("TEMPORAL_POSTGRES_PASSWORD") or secrets.token_urlsafe(32),
-            "KITE_WEB_DB_PASSWORD": env.get("KITE_WEB_DB_PASSWORD") or secrets.token_urlsafe(32),
+            **generated_secrets(env),
         }
         if values["KITE_ACCESS"] not in ("public", "private"):
             raise StackError("--access là public hoặc private")
