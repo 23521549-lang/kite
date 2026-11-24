@@ -674,6 +674,20 @@ class SandboxActivityBackend:
         scratch = await asyncio.to_thread(sbx.scratch_files, work, patch_base)
         changed = await asyncio.to_thread(sbx.collect_patch, work, patch_base, patch_path)
         verified = status in ("ok", "stuck") and test_code == 0 and check_code in (None, 0) and bool(changed)
+        verified_reason = ""
+        if tests_edited:
+            # The patch is already collected, so the tree can be touched: put the base commit's
+            # tests back and re-run them as the verification of record (patched code + pristine
+            # tests). A patch that weakens a test to pass is caught here — and even when the
+            # pristine tests pass, a result whose patch edits existing tests is never "verified":
+            # the person must look at the test changes themselves.
+            verified = False
+            verified_reason = (f"patch changed existing tests ({', '.join(tests_edited)}): verification "
+                               "re-ran with those tests restored from the base commit, and the result "
+                               "is not marked verified — review the test changes in the patch")
+            if test_command:
+                await asyncio.to_thread(sbx.restore_base_files, work, patch_base, tests_edited)
+                test_code, test_output, _ran = await run_tests("verify", test_output)
         patch = patch_path.read_text(encoding="utf-8")
 
         lines = [f"Agent {route.model_id} on {route.worker_id}: {status} (exit {code}, {seconds}s"
@@ -704,8 +718,8 @@ class SandboxActivityBackend:
                         if tools["tool_calls"] else "")
                      + f"; patch +{added}/-{removed} lines.")
         if tests_edited:
-            lines.append(f"NOTE: existing tests were changed: {', '.join(tests_edited)} - check that this was "
-                         "intended and not just to make tests pass.")
+            lines.append(f"NOT VERIFIED: {verified_reason}. The test verdict below is that pristine-test "
+                         "re-run (the patch itself still contains the test changes).")
         if scratch:
             lines.append(f"NOTE: new files that look like experiments: {', '.join(scratch)} - drop them if they "
                          "are not part of the change.")
@@ -735,7 +749,7 @@ class SandboxActivityBackend:
             "check_command": check_ran, "check_exit_code": check_code, "scratch_files": scratch,
             "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode, "repro": repro,
             "fast_attempts": fast_attempts, "patch_added": added, "patch_removed": removed, **tools, **usage,
-            "verified": verified,
+            "verified": verified, "verified_reason": verified_reason,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
         run = {"task_id": task.task_id, "task_type": task.task_type, "repo": task.repo_path,
                "model": route.model_id, "worker": route.worker_id, "goal": short(task.goal, 500),
@@ -745,6 +759,7 @@ class SandboxActivityBackend:
                "tests_edited": tests_edited, "check_exit": check_code, "scratch_files": scratch,
                "fast_path": fast_status, "fast_seconds": fast_seconds, "review_mode": review_mode,
                "repro": repro, "fast_attempts": fast_attempts, "verified": verified,
+               "verified_reason": verified_reason,
                "changed_files": changed, "lines_added": added, "lines_removed": removed,
                "context_chars": len(context), **tools, **usage}
         trace = read_jsonl(root / "trace.jsonl")          # the whole task, setup included

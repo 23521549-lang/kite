@@ -1,0 +1,52 @@
+"""One-time confirmation codes: binding, expiry, single-use, hashed at rest."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from poc.kaggle_worker import confirm
+
+
+def test_issue_check_consume_round_trip(tmp_path):
+    code = confirm.issue_code(tmp_path, "apply", "task-1", "hash-a", clock=lambda: 1000.0)
+    confirm.check_code(tmp_path, "apply", "task-1", "hash-a", code, clock=lambda: 1001.0)
+    confirm.consume_code(tmp_path, "apply", "task-1", "hash-a", code, clock=lambda: 1002.0)
+    with pytest.raises(confirm.ConfirmError, match="đã được dùng"):
+        confirm.check_code(tmp_path, "apply", "task-1", "hash-a", code, clock=lambda: 1003.0)
+
+
+def test_codes_are_stored_hashed_only(tmp_path):
+    code = confirm.issue_code(tmp_path, "commit", "task-1", "hash-a")
+    stored = (tmp_path / "confirmations.json").read_text(encoding="utf-8")
+    assert code not in stored
+    record = json.loads(stored)
+    assert len(record) == 1 and list(record.values())[0]["action"] == "commit"
+
+
+def test_wrong_binding_is_refused(tmp_path):
+    code = confirm.issue_code(tmp_path, "apply", "task-1", "hash-a")
+    for action, task_id, patch_hash in (("commit", "task-1", "hash-a"),
+                                        ("apply", "task-2", "hash-a"),
+                                        ("apply", "task-1", "hash-b")):
+        with pytest.raises(confirm.ConfirmError, match="không khớp"):
+            confirm.check_code(tmp_path, action, task_id, patch_hash, code)
+
+
+def test_expired_and_unknown_codes_are_refused(tmp_path):
+    code = confirm.issue_code(tmp_path, "apply", "task-1", "hash-a", clock=lambda: 1000.0)
+    with pytest.raises(confirm.ConfirmError, match="hết hạn"):
+        confirm.check_code(tmp_path, "apply", "task-1", "hash-a", code,
+                           clock=lambda: 1000.0 + confirm.CODE_TTL_SECONDS + 1)
+    with pytest.raises(confirm.ConfirmError, match="không đúng"):
+        confirm.check_code(tmp_path, "apply", "task-1", "hash-a", "ma-khong-co-that")
+    with pytest.raises(confirm.ConfirmError, match="thiếu mã"):
+        confirm.check_code(tmp_path, "apply", "task-1", "hash-a", "")
+
+
+def test_patch_sha256_matches_file_bytes(tmp_path):
+    patch = tmp_path / "result.patch"
+    patch.write_text("diff --git a/x b/x\n", encoding="utf-8")
+    assert confirm.patch_sha256(patch.read_bytes()) == confirm.patch_sha256("diff --git a/x b/x\n")
