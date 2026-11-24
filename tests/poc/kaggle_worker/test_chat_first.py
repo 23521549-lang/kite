@@ -116,7 +116,9 @@ def test_applying_a_follow_up_result_swaps_out_the_previous_one(tmp_path):
     client.state[task_id] = "COMPLETED"
     client.outcomes[task_id] = SimpleNamespace(status="READY_FOR_REVIEW", review_bundle=None,
                                                checkpoint_path=str(patch.parent / "checkpoint.json"))
-    applied = asyncio.run(ops.apply_result(task_id))
+    from tests.poc.kaggle_worker.test_mcp_server import owner_code
+
+    applied = asyncio.run(ops.apply_result(task_id, owner_code(ops, "apply", task_id)))
     assert "chat-prev-0001" in applied["replaced"]
     assert (repo / "helpers.py").read_text() == "ZERO = 0\nONE = 1\n"
 
@@ -146,18 +148,27 @@ def test_remember_goes_into_the_chats_agents_file_and_a_repo_lesson_into_its_tas
     (chat / "AGENTS.md").write_text(files["AGENTS.md"])
     ops = make_ops(tmp_path, FakeClient())
     ops.chat_dir = chat
+    # What the model proposes is inert until the owner approves it in their own terminal.
     saved = asyncio.run(ops.remember("Luôn hỏi trước khi tạo task sửa tiếp"))
-    assert saved["agents_md_updated"] and "Luôn hỏi trước khi tạo task sửa tiếp" in (chat / "AGENTS.md").read_text()
-    asyncio.run(ops.remember("Dùng .get cho khóa tùy chọn", repo=str(repo)))
+    assert saved["saved"] == "pending" and memory.preferences(ops.state_dir) == []
+    assert "Luôn hỏi" not in (chat / "AGENTS.md").read_text()
+    memory.approve_pending(ops.state_dir, saved["pending_id"])
+    memory.refresh_agents_file(chat / "AGENTS.md", ops.state_dir)
+    assert "Luôn hỏi trước khi tạo task sửa tiếp" in (chat / "AGENTS.md").read_text()
+    proposed = asyncio.run(ops.remember("Dùng .get cho khóa tùy chọn", repo=str(repo)))
+    assert "Dùng .get" not in memory.lessons_note(ops.state_dir, repo)
+    memory.approve_pending(ops.state_dir, proposed["pending_id"])
     shown = asyncio.run(ops.memory_show(str(repo)))
     assert shown["chat"][0].startswith("1. ") and "Dùng .get" in shown["lessons"][0]
+    assert shown["pending"] == []
     assert "Dùng .get" in memory.lessons_note(ops.state_dir, repo)
     asyncio.run(ops.memory_forget(1))
     assert "Luôn hỏi" not in (chat / "AGENTS.md").read_text() and memory.preferences(ops.state_dir) == []
     with pytest.raises(KiteToolError):
         asyncio.run(ops.memory_forget(9, repo=str(repo)))
-    # A new chat setup keeps what the person asked to remember.
-    asyncio.run(ops.remember("Trả lời ngắn"))
+    # A new chat setup keeps what the person asked to remember (once approved).
+    saved = asyncio.run(ops.remember("Trả lời ngắn"))
+    memory.approve_pending(ops.state_dir, saved["pending_id"])
     again = chat_files(make_config(tmp_path), lead_model="qwen3.6", kite_command=["kite"], allowed_roots=[tmp_path],
                        state_dir=ops.state_dir)
     assert "## Người dùng đã dặn" in again["AGENTS.md"] and "Trả lời ngắn" in again["AGENTS.md"]
