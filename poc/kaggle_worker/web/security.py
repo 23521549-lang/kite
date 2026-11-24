@@ -103,6 +103,55 @@ def digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+# ---------------------------------------------------------------- recovery codes (one-time, in place of TOTP)
+RECOVERY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"     # no 0/O/1/I/L: read aloud without confusion
+RECOVERY_COUNT = 8
+
+
+def new_recovery_codes(count: int = RECOVERY_COUNT) -> list[str]:
+    """Fresh one-time codes, shown to the owner exactly once; only their digests are ever stored."""
+    codes = []
+    for _ in range(count):
+        raw = "".join(token_secrets.choice(RECOVERY_ALPHABET) for _ in range(12))
+        codes.append(f"{raw[:4]}-{raw[4:8]}-{raw[8:]}")
+    return codes
+
+
+def recovery_digest(code: str) -> str:
+    """The stored form of a recovery code: the digest of the code with dashes and case removed, so the
+    owner can type it back sloppily and it still matches — and a database copy alone cannot log in."""
+    return digest("".join(ch for ch in str(code).upper() if ch.isalnum()))
+
+
+# ---------------------------------------------------------------- sealing under a passphrase (key backups)
+def seal_with_passphrase(text: str, passphrase: str) -> str:
+    """Encrypt ``text`` under a passphrase the owner types (PBKDF2-HMAC-SHA256 + AES-256-GCM), for
+    backups that leave the machine — the web key export. The blob is salt|nonce|ciphertext, base64."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    salt, nonce = token_secrets.token_bytes(16), token_secrets.token_bytes(12)
+    key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt,
+                     iterations=600_000).derive(passphrase.encode("utf-8"))
+    return base64.b64encode(salt + nonce + AESGCM(key).encrypt(nonce, text.encode(), b"kite-web-backup")).decode()
+
+
+def unseal_with_passphrase(blob: str, passphrase: str) -> str:
+    """What :func:`seal_with_passphrase` sealed; a wrong passphrase raises ValueError."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    try:
+        raw = base64.b64decode(blob)
+        key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=raw[:16],
+                         iterations=600_000).derive(passphrase.encode("utf-8"))
+        return AESGCM(key).decrypt(raw[16:28], raw[28:], b"kite-web-backup").decode()
+    except Exception as exc:
+        raise ValueError("cannot open the backup (wrong passphrase or damaged text)") from exc
+
+
 # ---------------------------------------------------------------- sealing (AES-GCM, key in a 0600 file)
 class Sealer:
     """Encrypts small secrets kept in the database (the TOTP secret) with a key that never leaves the
@@ -127,6 +176,16 @@ class Sealer:
         with os.fdopen(fd, "w", encoding="ascii") as stream:
             stream.write(base64.b64encode(key).decode("ascii") + "\n")
         return key
+
+    def fingerprint(self) -> str:
+        """A short identifier of the current key, safe to store next to sealed data: it names the key
+        without giving it away, so a swapped or regenerated key file is detectable (see the canary
+        the CLI keeps in the settings table)."""
+        return hashlib.sha256(self._key()).hexdigest()[:16]
+
+    def key_text(self) -> str:
+        """The key itself, base64 — only for the owner's passphrase-encrypted backup (web admin)."""
+        return base64.b64encode(self._key()).decode("ascii")
 
     def seal(self, text: str) -> str:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM

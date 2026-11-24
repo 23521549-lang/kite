@@ -380,6 +380,9 @@ def _parser() -> argparse.ArgumentParser:
                       "and 2FA (for a lost phone; it signs every browser out)")
     web_admin.add_argument("--username", default=None, help="account name (default: the existing one, else 'admin')")
     web_admin.add_argument("--reset", action="store_true", help="new password and 2FA for the existing account")
+    web_admin.add_argument("--export-key", action="store_true",
+                           help="print the web encryption key (secrets/web_key) encrypted under a passphrase "
+                                "you type: the backup that restores 2FA on another machine")
     web_admin.add_argument("--web-db", default=os.environ.get("KITE_WEB_DB") or None,
                            help="database URL (default: $KITE_WEB_DB, else SQLite in the state folder)")
     web_serve = web_commands.add_parser("serve", help="run the web back end on loopback (Caddy publishes it over HTTPS)")
@@ -932,6 +935,62 @@ def _web_store(args: argparse.Namespace):
     return store
 
 
+_SEALER_CANARY = "kite-sealer-canary"
+
+
+def _sealer_canary_write(store, sealer) -> None:
+    """Record which web key the sealed data belongs to (its fingerprint + a sealed canary text), so a
+    key file that was lost and silently regenerated is caught at startup instead of surfacing as a
+    2FA that quietly stops working."""
+    from .web import security as sec
+
+    store.set_setting("sealer_canary", {"fingerprint": sealer.fingerprint(),
+                                        "check": sealer.seal(_SEALER_CANARY)})
+
+
+def _check_sealer_canary(store, sealer) -> None:
+    """Refuse to serve when the web key does not open what is already sealed. The first run that
+    finds an account adopts the current key — but only after proving it opens the stored 2FA secret."""
+    from .web import security as sec
+
+    canary = store.setting("sealer_canary")
+    if canary:
+        ok = canary.get("fingerprint") == sealer.fingerprint()
+        if ok:
+            try:
+                ok = sealer.unseal(canary.get("check", "")) == _SEALER_CANARY
+            except Exception:
+                ok = False
+        if not ok:
+            raise ConfigError("khóa mã hóa web (secrets/web_key) không khớp với dữ liệu đã niêm phong: "
+                              "khôi phục file web_key từ bản sao lưu (kite web admin --export-key), hoặc "
+                              "đặt lại tài khoản bằng `kite web admin --reset`")
+        return
+    if store.user_count():
+        from sqlalchemy import select
+
+        from .web.db import users
+
+        with store.engine.connect() as conn:
+            sealed = conn.execute(select(users.c.totp_secret)).first()
+        try:
+            if sealed:
+                sealer.unseal(sealed[0])
+        except Exception as exc:
+            raise ConfigError("khóa mã hóa web (secrets/web_key) không mở được mã 2FA đã lưu: khôi phục "
+                              "file web_key từ bản sao lưu, hoặc đặt lại tài khoản bằng "
+                              "`kite web admin --reset`") from exc
+        _sealer_canary_write(store, sealer)
+
+
+def _refuse_insecure_cookies(host: str, insecure: bool) -> None:
+    """--insecure-cookies drops the Secure attribute: only ever on loopback, enforced, not just
+    promised in the help text — a session cookie sniffed off plain HTTP is the whole account."""
+    if insecure and host not in ("127.0.0.1", "::1", "localhost"):
+        raise ConfigError("--insecure-cookies chỉ dùng được khi web chạy trên loopback "
+                          "(--host 127.0.0.1); ra ngoài loopback phải có HTTPS và cookie Secure")
+
+
 def _web_command(args: argparse.Namespace) -> int:
     from .web import security as sec
 
@@ -947,12 +1006,39 @@ def _web_command(args: argparse.Namespace) -> int:
     sealer = sec.Sealer(args.config.parent / "secrets" / "web_key")
     if args.web_command == "admin":
         return _web_admin(args, store, sealer)
+    _check_sealer_canary(store, sealer)
     return _web_serve(args, store, sealer)
+
+
+def _web_export_key(store, sealer) -> int:
+    """The web key, encrypted under a passphrase the owner types: the backup that makes a lost
+    ``secrets/web_key`` recoverable instead of a permanent 2FA lockout. Shown once, here."""
+    from .web import security as sec
+
+    if not store.user_count():
+        raise ConfigError("chưa có tài khoản web: chưa có khóa nào để sao lưu")
+    passphrase = getpass.getpass("Mật khẩu cho bản sao lưu khóa (ít nhất 12 ký tự): ")
+    problem = sec.password_problem(passphrase)
+    if problem:
+        raise ConfigError(problem)
+    if getpass.getpass("Nhập lại mật khẩu: ") != passphrase:
+        raise ConfigError("hai lần nhập không khớp")
+    blob = sec.seal_with_passphrase(sealer.key_text(), passphrase)
+    print("Bản sao lưu khóa web (đã mã hóa bằng mật khẩu trên; giữ cùng nhau ở nơi khác máy này):",
+          file=sys.stderr)
+    print(f"  {blob}", file=sys.stderr)
+    store.audit("local", "local", "web_key_exported", "", True)
+    _emit({"web_key_backup": "đã in ở trên (dạng mã hóa)",
+           "next": "mất secrets/web_key mà không có bản này và mật khẩu của nó là mất 2FA: "
+                   "chỉ còn `kite web admin --reset`"})
+    return 0
 
 
 def _web_admin(args: argparse.Namespace, store, sealer) -> int:
     from .web import security as sec
 
+    if args.export_key:
+        return _web_export_key(store, sealer)
     existing = store.user_by_name(args.username) if args.username else None
     if existing is None and store.user_count():
         from sqlalchemy import select
@@ -984,15 +1070,22 @@ def _web_admin(args: argparse.Namespace, store, sealer) -> int:
         raise ConfigError("mã chưa đúng (giờ trên điện thoại có lệch không?); chạy lại lệnh")
     hashed = sec.hash_password(password)
     if existing is None:
-        store.create_user(username, hashed, sealer.seal(secret))
-        user = store.user_by_name(username)
-        store.update_user(user.id, totp_last=counter)
+        user_id = store.create_user(username, hashed, sealer.seal(secret))
+        store.update_user(user_id, totp_last=counter)
         store.audit(username, "local", "admin_created", username, True)
     else:
+        user_id = existing.id
         store.update_user(existing.id, password_hash=hashed, totp_secret=sealer.seal(secret), totp_pending=None,
                           totp_last=counter, failed=0, locked_until=0.0, password_changed_at=time.time())
         store.drop_sessions(existing.id)
         store.audit(username, "local", "admin_reset", username, True)
+    codes = sec.new_recovery_codes()
+    store.replace_recovery_codes(user_id, [sec.recovery_digest(c) for c in codes])
+    print("Mã khôi phục 2FA (mỗi mã đăng nhập thay mã 2FA được đúng một lần; lưu ở nơi an toàn, "
+          "chỉ hiện lần này):", file=sys.stderr)
+    for recovery in codes:
+        print(f"  {recovery}", file=sys.stderr)
+    _sealer_canary_write(store, sealer)
     _emit({"account": username, "2fa": "đã bật", "reset": existing is not None,
            "next": ["sudo cp deploy/kite-web.service /etc/systemd/system/ && sudo systemctl daemon-reload",
                     "sudo systemctl enable --now kite-web"]})
@@ -1006,6 +1099,7 @@ def _web_serve(args: argparse.Namespace, store, sealer) -> int:
     from .mcp_server import KiteOps
     from .web.app import GatewayDown, WebContext, create_app
 
+    _refuse_insecure_cookies(args.host, args.insecure_cookies)
     if not store.user_count():
         # Serve anyway (a new Compose machine is healthy before its owner exists): signing in says what to do.
         print("kite web: chưa có tài khoản; tạo bằng `kite web admin` (máy Compose: sudo kite-stack admin)",

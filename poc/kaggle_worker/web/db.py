@@ -41,6 +41,14 @@ sessions = Table(
     Column("ip", String(64), nullable=False, default=""),
     Column("agent", String(200), nullable=False, default=""),
 )
+recovery_codes = Table(
+    "recovery_codes", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", Integer, nullable=False, index=True),
+    Column("code_hash", String(64), nullable=False),     # security.recovery_digest of the code
+    Column("created_at", Float, nullable=False),
+    Column("used_at", Float),                            # set once, when the code logs its owner in
+)
 login_attempts = Table(
     "login_attempts", metadata,
     Column("id", Integer, primary_key=True),
@@ -174,6 +182,41 @@ class Store:
     def drop_session(self, sid: str) -> None:
         with self.engine.begin() as conn:
             conn.execute(delete(sessions).where(sessions.c.id == sid))
+
+    def update_session_fingerprint(self, sid: str, ip: str, agent: str) -> None:
+        """Adopt the address/browser a session is now seen from (after a successful re-authentication):
+        the drift check in the web compares every request against these stored values."""
+        with self.engine.begin() as conn:
+            conn.execute(update(sessions).where(sessions.c.id == sid).values(ip=ip[:64], agent=agent[:200]))
+
+    # ------------------------------------------------------------------ recovery codes
+    def replace_recovery_codes(self, user_id: int, code_hashes: list[str]) -> None:
+        """A fresh set replaces the old one whole (a new 2FA key retires the previous codes)."""
+        now = self.clock()
+        with self.engine.begin() as conn:
+            conn.execute(delete(recovery_codes).where(recovery_codes.c.user_id == user_id))
+            conn.execute(insert(recovery_codes),
+                         [{"user_id": user_id, "code_hash": h, "created_at": now, "used_at": None}
+                          for h in code_hashes])
+
+    def use_recovery_code(self, user_id: int, code_hash: str) -> bool:
+        """Spend one code: True only the first time its digest is presented (the update is guarded on
+        ``used_at IS NULL``, so two simultaneous tries cannot both get in)."""
+        with self.engine.begin() as conn:
+            row = conn.execute(select(recovery_codes.c.id).where(
+                (recovery_codes.c.user_id == user_id) & (recovery_codes.c.code_hash == code_hash)
+                & recovery_codes.c.used_at.is_(None))).first()
+            if row is None:
+                return False
+            spent = conn.execute(update(recovery_codes).where(
+                (recovery_codes.c.id == row[0]) & recovery_codes.c.used_at.is_(None)
+            ).values(used_at=self.clock()))
+            return spent.rowcount > 0
+
+    def recovery_codes_left(self, user_id: int) -> int:
+        with self.engine.connect() as conn:
+            return conn.execute(select(func.count()).select_from(recovery_codes).where(
+                (recovery_codes.c.user_id == user_id) & recovery_codes.c.used_at.is_(None))).scalar_one()
 
     def drop_sessions(self, user_id: int, *, keep: str | None = None) -> int:
         with self.engine.begin() as conn:
