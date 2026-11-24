@@ -12,9 +12,13 @@ With ``stream`` (always for a rented machine, pods.py), the answer is read as it
 and its chunks go straight to a streaming client, like a Kaggle worker's; RunPod's proxy closes a
 request that has sent nothing for 100 seconds, so a long answer needs it.
 
-The token usage of every answer is priced and written to the spend ledger (journal file ``spend``).
-A worker that reaches its daily or monthly cap stops taking jobs, so the queue goes to the other
-workers, and the owner is told once (ntfy). Keys never reach a log, the journal or a prompt.
+The token usage of every answer is priced into the spend ledger. Before a paid request runs, its
+estimated maximum cost is reserved against the daily/monthly caps; afterwards the hold settles
+at the real cost — or at the full estimate when the provider reports no usage, never at zero.
+Settled amounts live in a small SQLite store (spend_ledger.py), so the caps survive journal
+loss; the journal still gets its human-readable ``spend`` lines. A worker that reaches its cap
+stops taking jobs, so the queue goes to the other workers, and the owner is told once (ntfy).
+Keys never reach a log, the journal or a prompt.
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ class RelaySpec:
     timeout: float = 600.0
     stream: bool = False                # read the answer as SSE (OpenAI-compatible only)
     pod: Any = None                     # config.PodConfig of a rented machine Kite starts and stops
+    max_tokens: int = 8192              # ceiling for one answer, clamps the spend reservation estimate
 
     @property
     def paid(self) -> bool:
@@ -79,6 +84,25 @@ class RelaySpec:
         prompt, completion = int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
         return (prompt * self.price_in + completion * self.price_out) / 1_000_000
 
+    def estimate(self, body: dict[str, Any]) -> float:
+        """The most this request can cost: the reservation held against the caps before it runs.
+
+        The answer is bounded by the request's ``max_tokens`` clamped to this worker's ceiling
+        (a request without one is estimated at the ceiling). Prompt tokens are not known before
+        the call, so they are estimated from the messages' size (about 4 characters per token,
+        the usual rough ratio) — deliberately generous, because settling releases the difference.
+        """
+        wanted = body.get("max_tokens") or body.get("max_completion_tokens")
+        if not isinstance(wanted, int) or isinstance(wanted, bool) or wanted <= 0:
+            wanted = self.max_tokens
+        completion = min(wanted, self.max_tokens)
+        try:
+            prompt_chars = len(json.dumps(body.get("messages") or [], ensure_ascii=False))
+        except (TypeError, ValueError):
+            prompt_chars = 0
+        prompt = prompt_chars // 4 + 1
+        return (prompt * self.price_in + completion * self.price_out) / 1_000_000
+
 
 def _day(ts: float) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(ts))
@@ -88,28 +112,55 @@ def _month(ts: float) -> str:
     return time.strftime("%Y-%m", time.gmtime(ts))
 
 
-class SpendLedger:
-    """USD spent per worker, per UTC day and month, rebuilt from the journal's ``spend`` records."""
+# A reservation older than this is forgotten: a request cannot run longer than the largest
+# provider timeout (3600s), so a hold older than 2 hours belongs to a serve loop that died.
+RESERVATION_MAX_AGE = 7200.0
 
-    def __init__(self, records: list[dict] = (), *, clock: Callable[[], float] = time.time) -> None:
+
+class SpendLedger:
+    """USD spent per worker, per UTC day and month, plus the money held by in-flight requests.
+
+    With a ``store`` (spend_ledger.SpendStore) the settled amounts are durable: the totals are
+    loaded from the SQLite database and every ``add`` is written through, so deleting the
+    journal no longer resets the caps. ``records`` are then the journal's old ``spend`` lines,
+    imported into the store exactly once. Without a store the ledger is memory-only, as before.
+
+    Caps are enforced twice: ``over_cap`` on settled money (the heartbeat gate) and ``reserve``
+    before a paid request runs — the reservation holds the request's estimated maximum cost, so
+    requests in flight cannot together overspend the cap by more than their own estimates.
+    Reservations live in memory only: a gateway restart releases them, which is correct because
+    the requests they held died with the process.
+    """
+
+    def __init__(self, records: list[dict] = (), *, clock: Callable[[], float] = time.time,
+                 store=None) -> None:
         self.clock = clock
-        self.days: dict[tuple[str, str], float] = {}
+        self.store = store
+        self.day: dict[tuple[str, str], float] = {}
         self.months: dict[tuple[str, str], float] = {}
+        if store is not None:
+            store.import_journal_once(list(records))
+            records = store.records()
         for record in records:
             worker, usd, ts = record.get("worker"), record.get("usd"), record.get("ts")
             if isinstance(worker, str) and isinstance(usd, (int, float)) and isinstance(ts, (int, float)):
                 self._count(worker, float(usd), float(ts))
+        self._reservations: dict[str, tuple[str, float, float]] = {}   # id -> (worker, usd, ts)
+        self._reservation_seq = 0
 
     def _count(self, worker: str, usd: float, ts: float) -> None:
-        self.days[(worker, _day(ts))] = self.days.get((worker, _day(ts)), 0.0) + usd
+        self.day[(worker, _day(ts))] = self.day.get((worker, _day(ts)), 0.0) + usd
         self.months[(worker, _month(ts))] = self.months.get((worker, _month(ts)), 0.0) + usd
 
     def add(self, worker: str, usd: float, ts: float | None = None) -> None:
-        self._count(worker, usd, self.clock() if ts is None else ts)
+        ts = self.clock() if ts is None else ts
+        self._count(worker, usd, ts)
+        if self.store is not None:
+            self.store.add(worker, usd, ts)
 
     def spent(self, worker: str, now: float | None = None) -> tuple[float, float]:
         now = self.clock() if now is None else now
-        return self.days.get((worker, _day(now)), 0.0), self.months.get((worker, _month(now)), 0.0)
+        return self.day.get((worker, _day(now)), 0.0), self.months.get((worker, _month(now)), 0.0)
 
     def over_cap(self, spec: RelaySpec, now: float | None = None) -> str | None:
         """Why this worker may not take more jobs now, or None."""
@@ -120,12 +171,62 @@ class SpendLedger:
             return f"đã chi {month:.2f}/{spec.monthly_cap:.2f} USD tháng này (làm mới ngày 1, UTC)"
         return None
 
+    # ------------------------------------------------------------------ reservations
+    def reserved(self, worker: str, now: float | None = None) -> tuple[float, float]:
+        """(day, month) USD currently held by this worker's in-flight requests."""
+        now = self.clock() if now is None else now
+        day = month = 0.0
+        for held_worker, usd, ts in list(self._reservations.values()):
+            if now - ts > RESERVATION_MAX_AGE:
+                continue
+            if held_worker != worker:
+                continue
+            if _day(ts) == _day(now):
+                day += usd
+            if _month(ts) == _month(now):
+                month += usd
+        return day, month
+
+    def reserve(self, spec: RelaySpec, estimate: float, now: float | None = None) -> str | None:
+        """Hold ``estimate`` USD against ``spec``'s caps; a reservation id, or None if the hold
+        itself would pass a cap (settled + held + estimate). Synchronous on purpose: the check
+        and the hold are one step, so two serve loops of the same worker cannot both pass."""
+        now = self.clock() if now is None else now
+        stale = [rid for rid, (_w, _u, ts) in self._reservations.items() if now - ts > RESERVATION_MAX_AGE]
+        for rid in stale:
+            del self._reservations[rid]
+        day, month = self.spent(spec.worker_id, now)
+        held_day, held_month = self.reserved(spec.worker_id, now)
+        if spec.daily_cap is not None and day + held_day + estimate > spec.daily_cap:
+            return None
+        if spec.monthly_cap is not None and month + held_month + estimate > spec.monthly_cap:
+            return None
+        self._reservation_seq += 1
+        rid = f"r{self._reservation_seq}"
+        self._reservations[rid] = (spec.worker_id, float(estimate), now)
+        return rid
+
+    def settle(self, reservation: str | None, actual: float, ts: float | None = None) -> None:
+        """Release a hold and count what was really spent (durable, through the store)."""
+        held = self._reservations.pop(reservation, None) if reservation else None
+        if held is None:
+            return
+        self.add(held[0], actual, ts)
+
+    def release(self, reservation: str | None) -> None:
+        """Drop a hold without counting anything (the provider was never charged)."""
+        if reservation:
+            self._reservations.pop(reservation, None)
+
 
 # ---------------------------------------------------------------- OpenAI-compatible
 def openai_body(spec: RelaySpec, body: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in body.items() if k in OPENAI_PARAMS}
     out["model"] = spec.upstream_model(str(body.get("model", "")))
     out["stream"] = False
+    for key in ("max_tokens", "max_completion_tokens"):
+        if isinstance(out.get(key), int) and not isinstance(out[key], bool) and out[key] > spec.max_tokens:
+            out[key] = spec.max_tokens          # the ceiling the spend reservation was sized with
     return out
 
 
@@ -213,7 +314,8 @@ def anthropic_body(spec: RelaySpec, body: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "model": spec.upstream_model(str(body.get("model", ""))),
         "messages": messages,
-        "max_tokens": int(body.get("max_tokens") or body.get("max_completion_tokens") or 8192),
+        "max_tokens": min(int(body.get("max_tokens") or body.get("max_completion_tokens") or 8192),
+                          spec.max_tokens),
     }
     if any(system):
         out["system"] = "\n\n".join(s for s in system if s)
@@ -393,6 +495,16 @@ class RelayWorker:
         error = None
         sent = [0]
 
+        # Money first: hold this request's estimated maximum against the caps before spending
+        # anything. A refused hold fails the job here — the provider is never called.
+        estimate = self.spec.estimate(job.body) if self.spec.paid else 0.0
+        reservation = self.ledger.reserve(self.spec, estimate, self.clock()) if self.spec.paid else None
+        if self.spec.paid and reservation is None:
+            self.gateway.complete(self.spec.worker_id, job.job_id, {
+                "status": "error",
+                "error": f"{self.spec.worker_id}: spend cap reached (a new request would pass it)"})
+            return
+
         def sink(chunk: dict) -> bool:
             # In-process: the chunk goes straight to the client's stream (False: the client went away).
             if not self.gateway.add_chunks(self.spec.worker_id, job.job_id, sent[0], [chunk]):
@@ -405,25 +517,36 @@ class RelayWorker:
                 response = await call(self.spec, job.body, session, sink)
                 break
             except RelayCancelled:
+                self.ledger.release(reservation)
                 return                        # the gateway already dropped the job
             except RelayError as exc:
                 error = exc
                 if not exc.retryable or attempt or sent[0]:
+                    self.ledger.release(reservation)
                     self.gateway.complete(self.spec.worker_id, job.job_id,
                                           {"status": "error", "error": f"{self.spec.worker_id}: {exc}"})
                     return
                 await asyncio.sleep(self.retry_delay)
         else:     # pragma: no cover - the loop always breaks or returns
             raise AssertionError(error)
-        usd = self.spec.cost(response.get("usage"))
-        if usd:
-            self.ledger.add(self.spec.worker_id, usd, self.clock())
         usage = response.get("usage") or {}
+        tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+        # No usage from the provider settles at the full estimate, never at zero: the provider
+        # still charged for the answer, it just did not say how much.
+        at_estimate = bool(self.spec.paid and not tokens)
+        usd = estimate if at_estimate else self.spec.cost(usage)
+        if reservation is not None:
+            if usd:
+                self.ledger.settle(reservation, usd, self.clock())
+            else:
+                self.ledger.release(reservation)
+        elif usd:
+            self.ledger.add(self.spec.worker_id, usd, self.clock())
         self._record("spend", {"worker": self.spec.worker_id, "model": job.model,
                                "upstream": self.spec.upstream_model(job.model), "tag": job.tag,
                                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
                                "completion_tokens": int(usage.get("completion_tokens") or 0),
-                               "usd": round(usd, 6)})
+                               "usd": round(usd, 6), "estimated": at_estimate})
         self.gateway.complete(self.spec.worker_id, job.job_id, {"status": "ok", "response": response})
         if self.ledger.over_cap(self.spec, self.clock()):
             await self.beat()             # stop taking jobs now, not at the next heartbeat
@@ -476,7 +599,7 @@ def relay_specs(config) -> list[RelaySpec]:
         specs.append(RelaySpec(p.effective_worker_id, r.kind, r.base_url, key, p.model_ids, dict(r.upstream),
                                slots=p.concurrency, price_in=r.price_in, price_out=r.price_out,
                                daily_cap=r.daily_cap, monthly_cap=r.monthly_cap, timeout=r.timeout,
-                               stream=r.stream, pod=r.pod))
+                               stream=r.stream, pod=r.pod, max_tokens=r.max_tokens))
     return specs
 
 

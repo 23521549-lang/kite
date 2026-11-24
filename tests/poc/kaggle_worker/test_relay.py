@@ -16,6 +16,7 @@ from poc.kaggle_worker.gateway import ANY_MODEL, ModelGateway, WorkerAuth, creat
 from poc.kaggle_worker.journal import Journal, summarize
 from poc.kaggle_worker.relay import (RelaySpec, RelayWorker, SpendLedger, anthropic_body, anthropic_to_openai,
                                      openai_body, relay_specs)
+from poc.kaggle_worker.spend_ledger import SpendStore
 
 from tests.poc.kaggle_worker.test_launcher import raw_config
 
@@ -327,3 +328,100 @@ def test_doctor_shows_api_workers_and_warns_near_the_cap(tmp_path):
     checks = {c.name: c for c in run_checks(config, tmp_path / "config.yaml", probes()[0])}
     check = checks["worker API openrouter"]
     assert check.status == "warn" and "0.85/1.00 USD hôm nay" in check.fix
+
+
+
+# ------------------------------------------------------------------ reservations & the durable store
+def test_reservations_hold_money_against_the_cap_until_they_settle_or_release():
+    capped = spec("https://provider.example", daily_cap=1.0, monthly_cap=10.0)
+    ledger = SpendLedger(clock=lambda: DAY)
+    first = ledger.reserve(capped, 0.4, DAY)
+    second = ledger.reserve(capped, 0.4, DAY)
+    assert first and second
+    assert ledger.reserve(capped, 0.4, DAY) is None            # 0.4 + 0.4 + 0.4 would pass the cap
+    assert ledger.reserved("api", DAY) == pytest.approx((0.8, 0.8))
+    ledger.settle(first, 0.3, DAY)                             # really spent less than the hold
+    assert ledger.spent("api", DAY) == pytest.approx((0.3, 0.3))
+    assert ledger.reserve(capped, 0.4, DAY) is None            # 0.3 settled + 0.4 held + 0.4 new > cap
+    ledger.release(second)
+    assert ledger.reserved("api", DAY) == (0.0, 0.0)
+    assert ledger.reserve(capped, 0.4, DAY) is not None        # room again once the hold is gone
+    assert ledger.reserved("api", DAY) == pytest.approx((0.4, 0.4))
+    ledger.settle("no-such-reservation", 5.0, DAY)             # unknown holds change nothing
+    assert ledger.spent("api", DAY) == pytest.approx((0.3, 0.3))
+
+
+def test_the_estimate_is_clamped_to_the_configured_ceiling():
+    worker = spec("https://provider.example", max_tokens=1000)
+    body = {"model": "gpt", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 999999}
+    # 1000 completion tokens at the output price (clamped from 999999), plus the prompt estimate.
+    prompt_tokens = len(json.dumps(body["messages"], ensure_ascii=False)) // 4 + 1
+    assert worker.estimate(body) == pytest.approx((prompt_tokens * 2.0 + 1000 * 8.0) / 1_000_000)
+    no_limit = {"model": "gpt", "messages": [{"role": "user", "content": "hi"}]}
+    assert worker.estimate(no_limit) == worker.estimate(body)  # no max_tokens: estimated at the ceiling
+
+
+def test_two_requests_in_flight_cannot_pass_the_cap_together():
+    async def scenario():
+        seen = []
+        upstream = TestServer(fake_provider([(200, openai_answer())] * 2, seen))
+        await upstream.start_server()
+        gateway = ModelGateway([WorkerAuth("api", TOKEN, ("gpt",))])
+        # One answer's estimate (8192 output tokens at $8/M) is ~0.066: a 0.10 cap fits exactly one.
+        relay = RelayWorker(spec(str(upstream.make_url("/v1")), daily_cap=0.10, slots=2),
+                            gateway, SpendLedger(clock=lambda: DAY), clock=lambda: DAY)
+        task = asyncio.create_task(relay.run(beat_every=0.05))
+        jobs = [await gateway.submit({"model": "gpt", "messages": [{"role": "user", "content": "hi"}]},
+                                     tag="chat") for _ in range(2)]
+        outcomes = []
+        for job in jobs:
+            try:
+                outcomes.append(("ok", await asyncio.wait_for(job.future, 5)))
+            except Exception as exc:                            # GatewayError: the refused request
+                outcomes.append(("error", str(exc)))
+        task.cancel()
+        await upstream.close()
+        return outcomes, len(seen), relay.ledger.spent("api", DAY)
+
+    outcomes, calls, spent = asyncio.run(scenario())
+    assert sorted(kind for kind, _ in outcomes) == ["error", "ok"]
+    assert "spend cap" in next(text for kind, text in outcomes if kind == "error")
+    assert calls == 1                                          # the refused request never reached the provider
+    assert spent[0] == pytest.approx(0.006) and spent[0] <= 0.10
+
+
+def test_an_answer_without_usage_settles_at_the_estimate_never_at_zero():
+    async def scenario():
+        seen, records = [], []
+        answer = openai_answer()
+        del answer["usage"]                                    # this provider never reports usage
+        upstream = TestServer(fake_provider([(200, answer)], seen))
+        await upstream.start_server()
+        gateway = ModelGateway([WorkerAuth("api", TOKEN, ("gpt",))])
+        relay = RelayWorker(spec(str(upstream.make_url("/v1"))), gateway, SpendLedger(clock=lambda: DAY),
+                            journal=lambda name, record: records.append((name, record)), clock=lambda: DAY)
+        task = asyncio.create_task(relay.run(beat_every=0.05))
+        job = await gateway.submit({"model": "gpt", "messages": [{"role": "user", "content": "hi"}],
+                                    "max_tokens": 1000}, tag="chat")
+        await asyncio.wait_for(job.future, 5)
+        task.cancel()
+        await upstream.close()
+        return relay.ledger.spent("api", DAY), records, relay.spec.estimate(job.body)
+
+    spent, records, estimate = asyncio.run(scenario())
+    assert estimate > 0 and spent[0] == pytest.approx(estimate)
+    spend = [r for name, r in records if name == "spend"]
+    assert spend[0]["usd"] == pytest.approx(estimate) and spend[0]["estimated"] is True
+
+
+def test_the_ledger_survives_journal_loss_and_imports_the_journal_once(tmp_path):
+    store = SpendStore(tmp_path / "spend.sqlite3")
+    journal_records = [{"worker": "api", "usd": 0.4, "ts": DAY}]
+    ledger = SpendLedger(journal_records, clock=lambda: DAY, store=store)
+    assert ledger.spent("api", DAY) == pytest.approx((0.4, 0.4))     # old journal money not forgotten
+    ledger.add("api", 0.1, DAY)
+    # The journal is gone now; a fresh ledger over the same store must see the same totals.
+    fresh = SpendLedger(clock=lambda: DAY, store=store)
+    assert fresh.spent("api", DAY) == pytest.approx((0.5, 0.5))
+    again = SpendLedger(journal_records, clock=lambda: DAY, store=store)
+    assert again.spent("api", DAY) == pytest.approx((0.5, 0.5))       # import ran once, not per start
