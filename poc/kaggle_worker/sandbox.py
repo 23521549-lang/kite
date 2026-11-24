@@ -92,6 +92,11 @@ class SandboxSettings:
     test_command: str = "python -m pytest -q"
     setup_command: str = ""
     setup_network: str = "bridge"
+    # File holding the gateway's sandbox client token (written by the gateway at boot, 0600);
+    # the agent container presents it as X-Kite-Task-Token (see read_sandbox_token). "" = take
+    # the path from the KITE_SANDBOX_TOKEN_FILE environment variable; unset there too = no token
+    # (an older gateway that does not check one).
+    sandbox_token_file: str = ""
     setup_timeout_seconds: int = 1800
     docker_command: tuple[str, ...] = ("docker",)
     uid: int = field(default_factory=_default_uid)
@@ -253,6 +258,28 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
     return args
 
 
+def sandbox_token_path(settings: SandboxSettings) -> Path | None:
+    """Where the gateway's sandbox client token lives, per the settings or the environment."""
+    raw = settings.sandbox_token_file or os.environ.get("KITE_SANDBOX_TOKEN_FILE", "")
+    return Path(raw) if raw else None
+
+
+def read_sandbox_token(settings: SandboxSettings) -> str | None:
+    """The sandbox client token, or None when none is configured or the file cannot be read.
+
+    The gateway (re)writes this file at boot and checks the ``X-Kite-Task-Token`` header on
+    requests coming from the sandbox network; a missing file means an older gateway, so the
+    agent runs without the header (run_task warns about that case).
+    """
+    path = sandbox_token_path(settings)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 def agent_config(settings: SandboxSettings, *, model: str, models, small_model: str | None = None,
                  task_tag: str | None = None, worker_pin: str | None = None) -> dict:
     """OpenCode config for the sandbox: gateway provider, default model, no permission prompts.
@@ -276,6 +303,9 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
         headers["X-Kite-Task"] = task_tag
     if worker_pin:
         headers["X-Kite-Worker"] = worker_pin
+    token = read_sandbox_token(settings)
+    if token:
+        headers["X-Kite-Task-Token"] = token
     if headers:
         config["provider"]["kite"]["options"]["headers"] = headers
     if small_model:
@@ -2188,6 +2218,10 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
 
     # 2. Agent (internal network, gateway only), then 3. Kite's own tests (no network at all).
     #    When the tests fail, the agent gets the failing output and tries again (settings.fix_rounds).
+    token_path = sandbox_token_path(settings)
+    if token_path is not None and read_sandbox_token(settings) is None:
+        log(f"[{task_id}] cảnh báo: không đọc được token sandbox ở {token_path} — gateway chưa ghi "
+            "file này (gateway cũ?); agent chạy mà không có header X-Kite-Task-Token")
     config_file = root / "opencode.json"
     config_file.write_text(json.dumps(agent_config(settings, model=model, models=models, small_model=small_model,
                                                    task_tag=task_id, worker_pin=worker_pin), indent=2),

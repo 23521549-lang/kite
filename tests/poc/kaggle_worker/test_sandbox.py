@@ -771,6 +771,22 @@ def test_edit_blocks_apply_all_or_nothing_and_stay_inside_the_repo(tmp_path):
 
 
 
+def test_agent_config_carries_the_sandbox_token_when_the_token_file_exists(tmp_path):
+    token_file = tmp_path / "sandbox_client_token"
+    token_file.write_text("tok-abc-123\n", encoding="utf-8")
+    settings = sbx.SandboxSettings(sandbox_token_file=str(token_file))
+    config = sbx.agent_config(settings, model="m", models=["m"], task_tag="sbx-1")
+    headers = config["provider"]["kite"]["options"]["headers"]
+    assert headers["X-Kite-Task-Token"] == "tok-abc-123" and headers["X-Kite-Task"] == "sbx-1"
+    # Missing file (older gateway): no header, no crash.
+    missing = sbx.SandboxSettings(sandbox_token_file=str(tmp_path / "nope"))
+    config = sbx.agent_config(missing, model="m", models=["m"], task_tag="sbx-1")
+    assert "X-Kite-Task-Token" not in config["provider"]["kite"]["options"]["headers"]
+    # Nothing configured at all: no header either.
+    config = sbx.agent_config(sbx.SandboxSettings(), model="m", models=["m"], task_tag="sbx-1")
+    assert "X-Kite-Task-Token" not in config["provider"]["kite"]["options"]["headers"]
+
+
 def test_edit_blocks_reject_a_symlink_that_escapes_the_workspace(tmp_path):
     from poc.kaggle_worker import editblocks as eb
 
