@@ -4,14 +4,23 @@ Like a project's ``CLAUDE.md``, but written by Kite: each ``bad`` note on a task
 chat, ``kite journal note TASK --bad "why"``) becomes one line in ``<state>/memory/<repo>.md``, and
 every later task on that repository gets the most recent lines in its goal. The file stays on the
 Kite host (never in the repository) and is plain Markdown: read it, edit it or delete lines by hand.
+
+Anything the chat *model* proposes (the ``remember`` / ``note_task`` MCP tools) does NOT land here
+directly: it waits in a pending queue (``pending.json`` below) until the owner approves it with
+``kite memory approve <id>`` — a poisoned task result must not be able to plant standing
+instructions. Notes the owner types in their own terminal (``kite journal note``) skip the queue.
+Entries approved from the queue carry a provenance label with the approval date.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 from pathlib import Path
 import re
 import time
+import uuid
 
 from .journal import read_jsonl
 
@@ -165,6 +174,97 @@ def refresh_agents_file(agents: Path, state_dir: Path) -> bool:
                   flags=re.S)
     Path(agents).write_text(text.rstrip("\n") + "\n" + preferences_block(state_dir), encoding="utf-8")
     return True
+
+
+# ---------------------------------------------------------------------- the pending queue
+# Model-proposed lessons and preferences wait here (JSON, newest last) until the owner approves or
+# rejects them from their own terminal. Approving writes the entry into the effective store above
+# with a provenance label; rejecting drops it. Nothing in this section is read by task goals or by
+# the chat's AGENTS.md — only the effective stores are.
+
+def pending_path(state_dir: Path) -> Path:
+    return Path(state_dir) / "memory" / "pending.json"
+
+
+def _load_pending(state_dir: Path) -> list[dict]:
+    try:
+        data = json.loads(pending_path(state_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _save_pending(state_dir: Path, entries: list[dict]) -> None:
+    path = pending_path(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(entries, stream, indent=1, ensure_ascii=False)
+    os.replace(temp, path)
+
+
+def _propose(state_dir: Path, entry: dict, *, clock=time.time) -> dict:
+    entries = _load_pending(state_dir)
+    entry = {**entry, "id": uuid.uuid4().hex[:8], "created_at": clock()}
+    entries.append(entry)
+    _save_pending(state_dir, entries)
+    return entry
+
+
+def propose_lesson(state_dir: Path, repo: str | Path, task_id: str, text: str, *, clock=time.time) -> dict:
+    """Queue a model-proposed lesson for ``repo``; effective only after the owner approves it."""
+    return _propose(state_dir, {"kind": "lesson", "repo": str(Path(repo).expanduser().resolve()),
+                                "task_id": task_id, "text": " ".join(text.split())[:LINE_CHARS]}, clock=clock)
+
+
+def propose_preference(state_dir: Path, text: str, *, clock=time.time) -> dict:
+    """Queue a model-proposed standing preference; effective only after the owner approves it."""
+    return _propose(state_dir, {"kind": "preference", "repo": "", "task_id": "chat",
+                                "text": " ".join(text.split())[:LINE_CHARS]}, clock=clock)
+
+
+def propose_note(state_dir: Path, task_id: str, verdict: str, text: str) -> dict | None:
+    """The pending-queue twin of :func:`remember_note` for the chat path: a ``bad`` verdict with a
+    reason becomes a *proposed* lesson for the task's repository, or None when nothing is queued."""
+    if verdict != "bad" or not text.strip():
+        return None
+    repo = repo_of_task(state_dir, task_id)
+    if repo is None:
+        return None
+    return propose_lesson(state_dir, repo, task_id, text)
+
+
+def list_pending(state_dir: Path) -> list[dict]:
+    """Every queued entry, oldest first: {id, kind, repo, task_id, text, created_at}."""
+    return _load_pending(state_dir)
+
+
+def _take_pending(state_dir: Path, entry_id: str) -> dict:
+    entries = _load_pending(state_dir)
+    for index, entry in enumerate(entries):
+        if entry.get("id") == entry_id:
+            entries.pop(index)
+            _save_pending(state_dir, entries)
+            return entry
+    raise ValueError(f"không có mục chờ duyệt '{entry_id}'; xem danh sách bằng `kite memory list-pending`")
+
+
+def approve_pending(state_dir: Path, entry_id: str, *, clock=time.time) -> dict:
+    """Move one queued entry into the effective store, labelled with its approval date."""
+    entry = _take_pending(state_dir, entry_id)
+    label = f" (chủ máy đã duyệt {time.strftime('%Y-%m-%d', time.localtime(clock()))})"
+    if entry["kind"] == "lesson":
+        path = remember(state_dir, entry["repo"], entry.get("task_id") or "chat",
+                        entry["text"] + label, clock=clock)
+    else:
+        path = add_preference(state_dir, entry["text"] + label, clock=clock)
+    return {**entry, "approved": True, "file": str(path)}
+
+
+def reject_pending(state_dir: Path, entry_id: str) -> dict:
+    """Drop one queued entry without making it effective."""
+    return {**_take_pending(state_dir, entry_id), "approved": False}
 
 
 # ---------------------------------------------------------------------- how a repository is tested

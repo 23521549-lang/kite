@@ -173,6 +173,15 @@ def test_status_and_result_report_progress_then_the_review_bundle(tmp_path):
         asyncio.run(ops.task_status("unknown-task"))
 
 
+def owner_code(ops: KiteOps, action: str, task_id: str) -> str:
+    """A confirmation code the way the owner gets one: `kite tasks confirm` in their own terminal."""
+    from poc.kaggle_worker import confirm
+    from poc.kaggle_worker.backend import task_slug
+
+    patch = ops.state_dir / "tasks" / task_slug(task_id) / "result.patch"
+    return confirm.issue_code(ops.state_dir, action, task_id, confirm.patch_sha256(patch.read_bytes()))
+
+
 def test_apply_result_applies_the_patch_without_committing(tmp_path):
     from poc.kaggle_worker.backend import task_slug
 
@@ -193,13 +202,15 @@ def test_apply_result_applies_the_patch_without_committing(tmp_path):
     client.state[task_id] = "COMPLETED"
     client.outcomes[task_id] = CodingTaskOutcome(task_id, "READY_FOR_REVIEW", str(checkpoint), ReviewBundle(
         task_id, "lease", "kaggle-han", head, patch, "Kite test run: PASSED", 20))
-    applied = asyncio.run(ops.apply_result(task_id))
+    with pytest.raises(KiteToolError, match="thiếu mã xác nhận"):
+        asyncio.run(ops.apply_result(task_id))
+    applied = asyncio.run(ops.apply_result(task_id, owner_code(ops, "apply", task_id)))
     assert applied["files"] == ["calc.py"] and applied["committed"] is False
     assert (repo / "calc.py").read_text() == "x = 2\n"
     assert subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                           capture_output=True, text=True).stdout.strip() == head
     with pytest.raises(KiteToolError, match="chưa commit"):
-        asyncio.run(ops.apply_result(task_id))
+        asyncio.run(ops.apply_result(task_id, owner_code(ops, "apply", task_id)))
 
 
 def finished_task(tmp_path: Path, client: FakeClient, ops: KiteOps, repo: Path, head: str) -> str:
@@ -236,11 +247,13 @@ def test_commit_result_commits_only_the_applied_patch_files(tmp_path):
     task_id = finished_task(tmp_path, client, ops, repo, head)
     with pytest.raises(KiteToolError, match="chưa được áp"):
         asyncio.run(ops.commit_result(task_id, "Add median"))
-    asyncio.run(ops.apply_result(task_id))
+    asyncio.run(ops.apply_result(task_id, owner_code(ops, "apply", task_id)))
     (repo / "other.txt").write_text("not part of the patch\n")
     with pytest.raises(KiteToolError, match="trống"):
         asyncio.run(ops.commit_result(task_id, "  "))
-    committed = asyncio.run(ops.commit_result(task_id, "Add median"))
+    with pytest.raises(KiteToolError, match="thiếu mã xác nhận"):
+        asyncio.run(ops.commit_result(task_id, "Add median"))
+    committed = asyncio.run(ops.commit_result(task_id, "Add median", owner_code(ops, "commit", task_id)))
     assert committed["committed"] and not committed["pushed"] and sorted(committed["files"]) == ["calc.py", "notes.md"]
     assert git_out(repo, "log", "-1", "--format=%s") == "Add median"
     assert sorted(git_out(repo, "show", "--name-only", "--format=", "HEAD").split()) == ["calc.py", "notes.md"]
@@ -252,11 +265,11 @@ def test_commit_result_refuses_when_other_files_are_staged(tmp_path):
     client = FakeClient()
     ops = make_ops(tmp_path, client)
     task_id = finished_task(tmp_path, client, ops, repo, head)
-    asyncio.run(ops.apply_result(task_id))
+    asyncio.run(ops.apply_result(task_id, owner_code(ops, "apply", task_id)))
     (repo / "staged.txt").write_text("x\n")
     subprocess.run(["git", "-C", str(repo), "add", "staged.txt"], check=True)
     with pytest.raises(KiteToolError, match="staged.txt"):
-        asyncio.run(ops.commit_result(task_id, "Add median"))
+        asyncio.run(ops.commit_result(task_id, "Add median", owner_code(ops, "commit", task_id)))
     assert git_out(repo, "rev-parse", "HEAD") == head
 
 

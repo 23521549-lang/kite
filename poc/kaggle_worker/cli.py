@@ -105,6 +105,19 @@ def _parser() -> argparse.ArgumentParser:
     memory_forget = memory_commands.add_parser("forget", help="remove one lesson (its number in `memory show`)")
     memory_forget.add_argument("repo", help="path of the repository")
     memory_forget.add_argument("number", type=int, help="1 = the oldest lesson")
+    memory_commands.add_parser("list-pending", help="memory entries the chat model proposed, waiting for "
+                                                    "your approval (they have no effect yet)")
+    memory_approve = memory_commands.add_parser("approve", help="approve one pending memory entry: it "
+                                                                  "becomes effective, labelled with today")
+    memory_approve.add_argument("entry_id", help="the id shown by `memory list-pending`")
+    memory_reject = memory_commands.add_parser("reject", help="reject one pending memory entry (dropped)")
+    memory_reject.add_argument("entry_id", help="the id shown by `memory list-pending`")
+    tasks = commands.add_parser("tasks", help="owner confirmations for finished tasks")
+    tasks_commands = tasks.add_subparsers(dest="tasks_command", required=True)
+    tasks_confirm = tasks_commands.add_parser(
+        "confirm", help="show a finished task's patch hash and mint the one-time codes the chat needs "
+                        "for apply_result / commit_result (15 minutes, single use)")
+    tasks_confirm.add_argument("task_id")
     update = commands.add_parser("update", help="update Kite on this machine: git pull, run the tests, restart the "
                                                 "services (the old commit comes back if the tests fail)")
     update.add_argument("--yes", action="store_true", help="do it (default: only show what is new)")
@@ -1323,9 +1336,47 @@ def _notify_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tasks_confirm(args: argparse.Namespace) -> int:
+    """The owner's side of the apply/commit gate: show the patch's hash and stats, then mint the
+    one-time codes. Run by the person in their own terminal — never by the chat model."""
+    from . import confirm
+    from .backend import task_slug
+
+    state_dir = args.config.parent
+    root = state_dir / "tasks" / task_slug(args.task_id)
+    patch_path = root / "result.patch"
+    if not patch_path.is_file() or patch_path.stat().st_size == 0:
+        raise ConfigError(f"task {args.task_id} chưa có patch kết quả ở {patch_path}")
+    patch = patch_path.read_bytes()
+    digest = confirm.patch_sha256(patch)
+    text = patch.decode("utf-8", errors="replace")
+    files = [line.split(" b/", 1)[-1] for line in text.splitlines() if line.startswith("diff --git ")]
+    added = sum(1 for line in text.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in text.splitlines() if line.startswith("-") and not line.startswith("---"))
+    _emit({"task_id": args.task_id, "patch_sha256": digest, "patch_file": str(patch_path),
+           "files": files, "lines": f"+{added}/-{removed}",
+           "apply_code": confirm.issue_code(state_dir, "apply", args.task_id, digest),
+           "commit_code": confirm.issue_code(state_dir, "commit", args.task_id, digest),
+           "expires_in_minutes": confirm.CODE_TTL_SECONDS // 60,
+           "note": "mỗi mã dùng 1 lần cho đúng thao tác của nó; đưa mã cho chat sau khi bạn đã xem patch "
+                   "và đối chiếu patch_sha256 với task_result"})
+    return 0
+
+
 def _memory_command(args: argparse.Namespace) -> int:
     from . import memory
 
+    if args.memory_command == "list-pending":
+        _emit({"pending": memory.list_pending(args.config.parent)})
+        return 0
+    if args.memory_command in ("approve", "reject"):
+        try:
+            done = (memory.approve_pending if args.memory_command == "approve" else memory.reject_pending)(
+                args.config.parent, args.entry_id)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        _emit(done)
+        return 0
     path = memory.memory_path(args.config.parent, args.repo)
     if args.memory_command == "forget":
         removed = memory.forget(path, args.number)
@@ -1815,6 +1866,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _memory_command(args)
     if args.command == "update":
         return _update_command(args)
+    if args.command == "tasks":
+        return _tasks_confirm(args)
     if args.command == "busy":
         return _busy_command(args)
     if args.command == "stack":
@@ -2056,7 +2109,8 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox", "mcp", "chat",
-                        "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web", "busy", "stack"}:
+                        "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web", "busy", "stack",
+                        "tasks"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

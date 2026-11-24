@@ -2059,6 +2059,14 @@ def commit_setup_changes(workspace: Path) -> str:
     return _git(workspace, "rev-parse", "HEAD")
 
 
+def restore_base_files(workspace: Path, base: str, files: Sequence[str]) -> None:
+    """Put ``files`` back to their content at ``base`` in the working tree (and the index), undoing
+    whatever the tree currently does to them — including a deletion. Used by the backend's final
+    verification: tests the patch edited are restored so the verdict runs on pristine tests."""
+    if files:
+        _git(Path(workspace), "checkout", base, "--", *files)
+
+
 def collect_patch(workspace: Path, base: str, patch_path: Path) -> list[str]:
     """Write every change since ``base`` (including new files) as a patch; return file names."""
     _git(workspace, "add", "-A")
