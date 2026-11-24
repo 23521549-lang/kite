@@ -97,7 +97,8 @@ class RelaySpec:
             wanted = self.max_tokens
         completion = min(wanted, self.max_tokens)
         try:
-            prompt_chars = len(json.dumps(body.get("messages") or [], ensure_ascii=False))
+            prompt_chars = len(json.dumps(body.get("messages") or [], ensure_ascii=False)) \
+                + len(json.dumps(body.get("tools") or [], ensure_ascii=False))
         except (TypeError, ValueError):
             prompt_chars = 0
         prompt = prompt_chars // 4 + 1

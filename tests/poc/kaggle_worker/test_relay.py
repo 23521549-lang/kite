@@ -355,7 +355,9 @@ def test_the_estimate_is_clamped_to_the_configured_ceiling():
     worker = spec("https://provider.example", max_tokens=1000)
     body = {"model": "gpt", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 999999}
     # 1000 completion tokens at the output price (clamped from 999999), plus the prompt estimate.
-    prompt_tokens = len(json.dumps(body["messages"], ensure_ascii=False)) // 4 + 1
+    prompt_chars = len(json.dumps(body["messages"], ensure_ascii=False)) \
+        + len(json.dumps(body.get("tools") or [], ensure_ascii=False))
+    prompt_tokens = prompt_chars // 4 + 1
     assert worker.estimate(body) == pytest.approx((prompt_tokens * 2.0 + 1000 * 8.0) / 1_000_000)
     no_limit = {"model": "gpt", "messages": [{"role": "user", "content": "hi"}]}
     assert worker.estimate(no_limit) == worker.estimate(body)  # no max_tokens: estimated at the ceiling

@@ -62,19 +62,28 @@ class SpendStore:
         counts the same journal lines twice. Records after the import are the store's own.
         """
         with self._lock:
-            done = self._db.execute("SELECT value FROM meta WHERE key = 'journal_imported'").fetchone()
-            if done:
-                return 0
-            count = 0
-            for record in records:
-                worker, usd, ts = record.get("worker"), record.get("usd"), record.get("ts")
-                if isinstance(worker, str) and isinstance(usd, (int, float)) and isinstance(ts, (int, float)):
-                    self._db.execute("INSERT INTO spend (worker, usd, ts) VALUES (?, ?, ?)",
-                                     (worker, float(usd), float(ts)))
-                    count += 1
-            self._db.execute("INSERT INTO meta (key, value) VALUES ('journal_imported', '1')")
-            self._db.commit()
-            return count
+            # BEGIN IMMEDIATE takes the database write lock up front: the gateway and a
+            # short-lived CLI run must not both pass the flag check and import twice.
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                done = self._db.execute(
+                    "SELECT value FROM meta WHERE key = 'journal_imported'").fetchone()
+                if done:
+                    self._db.execute("COMMIT")
+                    return 0
+                count = 0
+                for record in records:
+                    worker, usd, ts = record.get("worker"), record.get("usd"), record.get("ts")
+                    if isinstance(worker, str) and isinstance(usd, (int, float)) and isinstance(ts, (int, float)):
+                        self._db.execute("INSERT INTO spend (worker, usd, ts) VALUES (?, ?, ?)",
+                                         (worker, float(usd), float(ts)))
+                        count += 1
+                self._db.execute("INSERT INTO meta (key, value) VALUES ('journal_imported', '1')")
+                self._db.execute("COMMIT")
+                return count
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
 
     # ------------------------------------------------------------------ pod billing cursors
     def pod_cursor(self, worker: str) -> float | None:

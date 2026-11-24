@@ -212,7 +212,8 @@ class PodController:
 
     # ------------------------------------------------------------------ start / stop
     async def adopt(self) -> None:
-        """At gateway start: a pod that is already running is taken over (and billed from now)."""
+        """At gateway start: a pod that is already running is taken over; billing resumes from
+        the saved cursor, so the hours this process was down are counted too."""
         try:
             pod = await self.client.get(self.pod.pod_id)
         except PodError as exc:
@@ -226,6 +227,8 @@ class PodController:
             self.s.reason = "adopted"
             self._set("starting", "máy đang chạy từ trước; chờ model server trả lời")
             self._spawn(self._wait_up())
+        elif self.store is not None:
+            self.store.set_pod_cursor(self.worker_id, None)   # not running: the old billing period is over
 
     def on_demand(self) -> None:
         """Gateway hook (through starters.py): a request for one of this pod's models is waiting."""
@@ -260,7 +263,10 @@ class PodController:
                 pod = {}
             self._price_from(pod)
             self.s.pod_status = pod.get("status") or self.s.pod_status
-            self.s.billed_from = self.s.billed_from or self._resume_cursor()
+            # Billing (re)starts now; a saved cursor is only resumed by adopt(), which knows
+            # the pod kept running while this process was down. Here it could be stale (the
+            # pod was stopped while Kite was away) and would bill time the pod was off.
+            self.s.billed_from = self.s.billed_from or self.clock()
             self._save_cursor()
             self._record("launches", {"event": "push", "kind": "pod", "pod": self.pod.pod_id, "reason": reason,
                                       "price_hour": self.price})
