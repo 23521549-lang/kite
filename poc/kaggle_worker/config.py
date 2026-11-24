@@ -714,6 +714,20 @@ def resolve_secret(reference: str) -> str:
             value = Path(reference[5:]).read_text(encoding="utf-8")
         except OSError as exc:
             raise ConfigError(f"cannot read secret file {reference[5:]}") from exc
+        value = value.strip()
+        if value.startswith("kite-sealed:v1:"):
+            # The web layer seals provider secret files at rest under the web key, which lives
+            # beside them in the same secrets folder; unseal here so the gateway and CLI read
+            # the same files the web wrote.
+            from .web.security import Sealer
+
+            key_file = Path(reference[5:]).parent / "web_key"
+            if not key_file.exists():
+                raise ConfigError(f"secret file {reference[5:]} is sealed but {key_file} is missing")
+            try:
+                value = Sealer(key_file).unseal(value[len("kite-sealed:v1:"):])
+            except Exception as exc:
+                raise ConfigError(f"cannot unseal secret file {reference[5:]}") from exc
     else:
         raise ConfigError("secret reference must be env:NAME or file:PATH")
     value = value.strip()
