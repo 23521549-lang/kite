@@ -120,7 +120,7 @@ data "aws_iam_policy_document" "trust" {
     condition {
       test     = "StringLike"
       variable = "${local.oidc}:sub"
-      values   = [
+      values = [
         "repo:${var.github_repository}:environment:${var.github_environment}",
         "repo:${local.owner}@*/${local.name}@*:environment:${var.github_environment}",
       ]
@@ -134,30 +134,158 @@ resource "aws_iam_role" "infra" {
   max_session_duration = 3600
 }
 
-# What infra/aws needs: EC2 (instance, data volume, address, security group, key pair), the Ubuntu image
-# id from SSM's public parameters, and the state bucket. No IAM: the machine gets no AWS role.
-resource "aws_iam_role_policy_attachment" "ec2" {
-  role       = aws_iam_role.infra.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2FullAccess"
-}
-
+# What infra/aws needs: EC2 for Kite's own resources only (instance, data volume, address, security
+# group, key pair, and the dedicated VPC), the Ubuntu image id from SSM's public parameters, and the
+# state bucket. No IAM: the machine gets no AWS role. EC2 is scoped three ways: everything is limited
+# to this region; creating a resource requires tagging it Project=kite in the request; acting on an
+# existing resource requires it to already carry that tag (infra/aws sets it via provider default
+# tags). Describe calls cannot be tag-conditioned in EC2, so they are region-scoped only.
 data "aws_iam_policy_document" "infra" {
   statement {
+    sid       = "StateBucket"
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.state.arn]
   }
   statement {
+    sid       = "StateObjects"
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
     resources = ["${aws_s3_bucket.state.arn}/*"]
   }
   statement {
+    sid       = "UbuntuImageId"
     actions   = ["ssm:GetParameter", "ssm:GetParameters"]
     resources = ["arn:aws:ssm:*::parameter/aws/service/canonical/*"]
+  }
+  statement {
+    sid = "EC2Describe"
+    actions = [
+      "ec2:DescribeAddresses",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeInstances",
+      "ec2:DescribeInternetGateways",
+      "ec2:DescribeKeyPairs",
+      "ec2:DescribeRouteTables",
+      "ec2:DescribeSecurityGroupRules",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeTags",
+      "ec2:DescribeVolumes",
+      "ec2:DescribeVpcs",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+  }
+  statement {
+    sid = "EC2CreateTagged"
+    actions = [
+      "ec2:AllocateAddress",
+      "ec2:CreateInternetGateway",
+      "ec2:CreateRouteTable",
+      "ec2:CreateSecurityGroup",
+      "ec2:CreateSubnet",
+      "ec2:CreateVolume",
+      "ec2:CreateVpc",
+      "ec2:RunInstances",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Project"
+      values   = ["kite"]
+    }
+  }
+  statement {
+    sid = "EC2ManageOwn"
+    actions = [
+      "ec2:AssociateAddress",
+      "ec2:AssociateRouteTable",
+      "ec2:AttachInternetGateway",
+      "ec2:AttachVolume",
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:AuthorizeSecurityGroupIngress",
+      "ec2:CreateRoute",
+      "ec2:DeleteInternetGateway",
+      "ec2:DeleteRoute",
+      "ec2:DeleteRouteTable",
+      "ec2:DeleteSecurityGroup",
+      "ec2:DeleteSubnet",
+      "ec2:DeleteVolume",
+      "ec2:DeleteVpc",
+      "ec2:DetachInternetGateway",
+      "ec2:DetachVolume",
+      "ec2:DisassociateAddress",
+      "ec2:DisassociateRouteTable",
+      "ec2:ModifyInstanceAttribute",
+      "ec2:ModifySubnetAttribute",
+      "ec2:ModifyVolume",
+      "ec2:ModifyVpcAttribute",
+      "ec2:ReleaseAddress",
+      "ec2:ReplaceRoute",
+      "ec2:RevokeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupIngress",
+      "ec2:StartInstances",
+      "ec2:StopInstances",
+      "ec2:TerminateInstances",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = ["kite"]
+    }
+  }
+  # Key pairs: ImportKeyPair does not reliably carry the project's tags in the request, so the pair
+  # cannot be tag-conditioned at creation; region scope only (the pair's name is fixed by infra/aws).
+  statement {
+    sid = "EC2KeyPair"
+    actions = [
+      "ec2:DeleteKeyPair",
+      "ec2:ImportKeyPair",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+  }
+  # Tag edits after creation (the provider reconciles tags on every apply).
+  statement {
+    sid = "EC2TagOwn"
+    actions = [
+      "ec2:CreateTags",
+      "ec2:DeleteTags",
+    ]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.region]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = ["kite"]
+    }
   }
 }
 
 resource "aws_iam_role_policy" "infra" {
-  name   = "kite-infra-state-and-images"
+  name   = "kite-infra-scoped"
   role   = aws_iam_role.infra.id
   policy = data.aws_iam_policy_document.infra.json
 }

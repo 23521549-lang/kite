@@ -117,15 +117,40 @@ def _save(path: Path, raw: dict) -> Path:
     return backup
 
 
-def write_secret(path: Path, value: str) -> None:
-    """A key in its own 0600 file (atomic; the folder 0700). The value never goes back to the browser."""
+SEALED_PREFIX = "kite-sealed:v1:"
+
+
+def write_secret(path: Path, value: str, sealer=None) -> None:
+    """A key in its own 0600 file (atomic; the folder 0700). The value never goes back to the browser.
+
+    With a ``sealer`` (the web's AES-256-GCM Sealer) the content is sealed under the web key and
+    marked with :data:`SEALED_PREFIX`, so a copy of the secrets folder alone does not hand the keys
+    over. Without one (the CLI) the file keeps the legacy plaintext form ``resolve_secret`` reads.
+    Readers that meet the prefix must unseal with the same key — see :func:`read_secret`."""
+    content = value.strip()
+    if sealer is not None:
+        content = SEALED_PREFIX + sealer.seal(content)
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
     temp = path.with_name(path.name + ".tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(value.strip() + "\n")
+        stream.write(content + "\n")
     os.replace(temp, path)
+
+
+def read_secret(path: Path, sealer=None) -> str:
+    """What a secret file holds. A sealed file needs the sealer that sealed it. A legacy plaintext
+    file read with a sealer is rewritten sealed — the migration to sealed-at-rest happens on the
+    first read through the web layer, with permissions unchanged."""
+    text = path.read_text(encoding="utf-8").strip()
+    if text.startswith(SEALED_PREFIX):
+        if sealer is None:
+            raise ConfigError(f"{path.name} đã được niêm phong (sealed); cần khóa web để đọc")
+        return sealer.unseal(text[len(SEALED_PREFIX):])
+    if sealer is not None and text:
+        write_secret(path, text, sealer=sealer)
+    return text
 
 
 def _models(items: list[str]) -> tuple[list[str], dict[str, str]]:
@@ -219,14 +244,14 @@ def build_provider(body: dict, raw: dict, secrets_dir: Path) -> tuple[dict, dict
     return provider, files, report
 
 
-def add_worker(config_path: Path, body: dict) -> dict:
+def add_worker(config_path: Path, body: dict, sealer=None) -> dict:
     raw = _load(config_path)
     secrets_dir = config_path.parent / "secrets"
     provider, files, report = build_provider(body, raw, secrets_dir)
     raw["providers"] = [*(raw.get("providers") or []), provider]
     validate_config(raw)                       # before any key is written: a typo costs nothing
     for path, value in files.items():
-        write_secret(path, value)
+        write_secret(path, value, sealer=sealer)
     report["backup"] = str(_save(config_path, raw))
     report["restart_needed"] = True
     return report
@@ -236,7 +261,7 @@ EDITABLE = {"enabled", "price_in", "price_out", "price_hour", "daily_cap", "mont
             "concurrency", "via", "kernel", "base_url", "models", *SECRET_FIELDS}
 
 
-def update_worker(config_path: Path, worker_id: str, changes: dict) -> dict:
+def update_worker(config_path: Path, worker_id: str, changes: dict, sealer=None) -> dict:
     unknown = set(changes) - EDITABLE
     if unknown:
         raise ConfigError(f"không sửa được: {', '.join(sorted(unknown))}")
@@ -288,7 +313,7 @@ def update_worker(config_path: Path, worker_id: str, changes: dict) -> dict:
             raise ConfigError(f"{key} không áp dụng cho worker {worker_id}")
     validate_config(raw)
     for path, value in files.items():
-        write_secret(path, value)
+        write_secret(path, value, sealer=sealer)
     backup = _save(config_path, raw)
     return {"updated": worker_id, "fields": sorted(changes), "backup": str(backup), "restart_needed": True}
 

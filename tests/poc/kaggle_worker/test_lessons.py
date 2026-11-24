@@ -163,5 +163,9 @@ def test_a_bad_note_from_the_cli_or_the_chat_becomes_a_lesson(tmp_path, capsys):
     Journal(tmp_path / "state" / "journal").write("tasks", {"task_id": "t-chat", "repo": str(repo)})
     saved = asyncio.run(ops.note_task("t-chat", "bad", "Đổi tên hàm public"))
     assert saved["remembered_for_repo"] is True
-    assert memory.lessons(tmp_path / "state", repo)[-1].endswith("(t-chat): Đổi tên hàm public")
+    # From the chat the lesson is only PROPOSED: inert until the owner approves it.
+    assert memory.lessons(tmp_path / "state", repo) == []
+    memory.approve_pending(tmp_path / "state", saved["pending_id"])
+    lesson = memory.lessons(tmp_path / "state", repo)[-1]
+    assert "(t-chat): Đổi tên hàm public" in lesson and "chủ máy đã duyệt" in lesson
     assert asyncio.run(ops.note_task("t-chat", "good", "ổn"))["remembered_for_repo"] is False

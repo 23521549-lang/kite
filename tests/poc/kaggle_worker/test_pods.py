@@ -28,10 +28,12 @@ def pod_raw(tmp_path, **pod):
     raw = raw_config(tmp_path)
     secrets = tmp_path / "secrets"
     (secrets / "runpod_api_key_runpod").write_text("rp-secret\n")
+    (secrets / "api_key_runpod").write_text("vllm-secret\n")
     raw["providers"].append({
         "id": "runpod", "adapter": "relay", "enabled": True, "owner": "self", "model": "qwen3-32b",
         "capabilities": ["coding"], "quota": {"gpu_seconds": 0, "concurrency": 4},
-        "secrets": {"runpod_api_key": f"file:{secrets / 'runpod_api_key_runpod'}"},
+        "secrets": {"runpod_api_key": f"file:{secrets / 'runpod_api_key_runpod'}",
+                    "api_key": f"file:{secrets / 'api_key_runpod'}"},
         "relay": {"kind": "openai", "pod": {"id": "abc123xyz", **pod}, "caps": {"daily_usd": 5}}})
     return raw
 
@@ -58,6 +60,13 @@ def test_a_pod_is_an_openai_relay_that_streams_through_runpods_proxy(tmp_path):
     raw["providers"][1]["relay"]["kind"] = "anthropic"
     raw["providers"][1]["secrets"]["api_key"] = raw["providers"][1]["secrets"]["runpod_api_key"]
     with pytest.raises(ConfigError, match="kind openai"):
+        validate_config(raw)
+
+
+def test_a_pod_relay_without_a_server_api_key_is_rejected(tmp_path):
+    raw = pod_raw(tmp_path)
+    del raw["providers"][1]["secrets"]["api_key"]
+    with pytest.raises(ConfigError, match="--api-key"):
         validate_config(raw)
 
 
@@ -452,3 +461,49 @@ def test_with_auto_off_kite_does_not_start_that_notebook_or_pod(tmp_path):
 
     woken, candidates, manual = asyncio.run(scenario())
     assert woken == [] and candidates == [] and manual == ["kaggle-han"]
+
+
+def test_a_gateway_restart_counts_the_pods_full_uptime(tmp_path):
+    """The pod keeps billing while the gateway is down: adoption resumes from the saved cursor."""
+    from poc.kaggle_worker.config import PodConfig
+    from poc.kaggle_worker.spend_ledger import SpendStore
+
+    async def scenario():
+        store = SpendStore(tmp_path / "spend.sqlite3")
+        clock = {"now": DAY}
+        pod = PodConfig("abc123xyz", price_hour=1.0, idle_minutes=30, start_timeout=900)
+        spec = RelaySpec("runpod", "openai", "https://abc123xyz-8000.proxy.runpod.net/v1", "vllm-key",
+                         ("qwen3-32b",), slots=2, stream=True, pod=pod)
+        fake = FakeRunPod(statuses=())
+        fake.status = "RUNNING"
+
+        async def health():
+            return True
+
+        async def sleep(seconds):
+            clock["now"] += seconds
+
+        def life():
+            gateway = ModelGateway([WorkerAuth("runpod", TOKEN, ("qwen3-32b",))], clock=lambda: clock["now"])
+            ledger = SpendLedger(clock=lambda: clock["now"], store=store)
+            relay = RelayWorker(spec, gateway, ledger, clock=lambda: clock["now"])
+            return PodController(spec, fake, relay, ledger, clock=lambda: clock["now"], sleep=sleep,
+                                 health=health, store=store), ledger
+
+        ctl1, ledger1 = life()
+        await ctl1.adopt()
+        await settle(ctl1)
+        clock["now"] += 600
+        ctl1._accrue()
+        cursor = store.pod_cursor("runpod")
+        # The gateway dies here — no stop, no final accrual. The pod bills on for 20 more minutes.
+        clock["now"] += 1200
+        ctl2, ledger2 = life()
+        await ctl2.adopt()
+        resumed_from = ctl2.s.billed_from
+        ctl2._accrue()
+        return cursor, resumed_from, ledger2.spent("runpod", clock["now"])[0], clock["now"]
+
+    cursor, resumed_from, total, now = asyncio.run(scenario())
+    assert cursor is not None and resumed_from == cursor < now     # resumed where life 1 stopped counting
+    assert total == pytest.approx((now - DAY) / 3600 * 1.0, abs=1e-6)

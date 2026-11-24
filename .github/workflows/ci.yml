@@ -16,10 +16,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
           cache: pip
@@ -38,8 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
       - name: Node.js
@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Compose file
         run: |
           printf 'KITE_IMAGE=kite:test\n' > /tmp/images.env
@@ -74,8 +74,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: hashicorp/setup-terraform@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
       - name: Format and validation
         run: |
           terraform fmt -check -recursive infra
@@ -87,31 +87,33 @@ jobs:
   # Images for the Compose deployment, only from main once every check above passed: sha-<commit>, and
   # `stable`, the tag kite-stack on the machines follows.
   images:
-    needs: [tests, web, deploy]
+    needs: [tests, web, deploy, terraform]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
       contents: read
       packages: write
+      id-token: write # keyless cosign signing of the pushed images (OIDC, this job only)
     env:
       KITE_IMAGE: ghcr.io/${{ github.repository_owner }}/kite
       SANDBOX_IMAGE: ghcr.io/${{ github.repository_owner }}/kite-sandbox
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Commit
         id: commit
         run: |
           echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "date=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Kite image
-        uses: docker/build-push-action@v7
+        id: kite_image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           push: true
@@ -129,7 +131,8 @@ jobs:
       - name: Sandbox build context
         run: bash deploy/sandbox/context.sh "${{ runner.temp }}/sandbox"
       - name: Sandbox image
-        uses: docker/build-push-action@v7
+        id: sandbox_image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ${{ runner.temp }}/sandbox
           push: true
@@ -141,3 +144,10 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha,scope=sandbox
           cache-to: type=gha,scope=sandbox,mode=max
+      # Keyless signing (Sigstore, GitHub OIDC identity of this workflow): machines verify these
+      # signatures before adopting an update, so a re-tagged or foreign image is refused.
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign images
+        run: |
+          cosign sign --yes "${{ env.KITE_IMAGE }}@${{ steps.kite_image.outputs.digest }}"
+          cosign sign --yes "${{ env.SANDBOX_IMAGE }}@${{ steps.sandbox_image.outputs.digest }}"

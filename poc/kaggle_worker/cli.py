@@ -7,6 +7,7 @@ import asyncio
 import dataclasses
 from dataclasses import asdict
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -105,6 +106,19 @@ def _parser() -> argparse.ArgumentParser:
     memory_forget = memory_commands.add_parser("forget", help="remove one lesson (its number in `memory show`)")
     memory_forget.add_argument("repo", help="path of the repository")
     memory_forget.add_argument("number", type=int, help="1 = the oldest lesson")
+    memory_commands.add_parser("list-pending", help="memory entries the chat model proposed, waiting for "
+                                                    "your approval (they have no effect yet)")
+    memory_approve = memory_commands.add_parser("approve", help="approve one pending memory entry: it "
+                                                                  "becomes effective, labelled with today")
+    memory_approve.add_argument("entry_id", help="the id shown by `memory list-pending`")
+    memory_reject = memory_commands.add_parser("reject", help="reject one pending memory entry (dropped)")
+    memory_reject.add_argument("entry_id", help="the id shown by `memory list-pending`")
+    tasks = commands.add_parser("tasks", help="owner confirmations for finished tasks")
+    tasks_commands = tasks.add_subparsers(dest="tasks_command", required=True)
+    tasks_confirm = tasks_commands.add_parser(
+        "confirm", help="show a finished task's patch hash and mint the one-time codes the chat needs "
+                        "for apply_result / commit_result (15 minutes, single use)")
+    tasks_confirm.add_argument("task_id")
     update = commands.add_parser("update", help="update Kite on this machine: git pull, run the tests, restart the "
                                                 "services (the old commit comes back if the tests fail)")
     update.add_argument("--yes", action="store_true", help="do it (default: only show what is new)")
@@ -195,6 +209,10 @@ def _parser() -> argparse.ArgumentParser:
     token = worker_commands.add_parser("token", help="create a worker token (printed once)")
     token.add_argument("worker_id")
     token.add_argument("--force", action="store_true", help="replace an existing token (rotation)")
+    rotate = worker_commands.add_parser("rotate-token", help="rotate a pull worker's long-lived token: "
+                                                     "replace the stored token, print the new one once, "
+                                                     "and say how to update the worker's Kaggle Secret")
+    rotate.add_argument("worker_id")
     add = worker_commands.add_parser("add", help="add a pull worker (e.g. another Kaggle account) to the config, "
                                                  "copying an existing worker's models and settings")
     add.add_argument("worker_id", help="new worker id, e.g. kaggle-an (lowercase, digits, '-')")
@@ -362,6 +380,9 @@ def _parser() -> argparse.ArgumentParser:
                       "and 2FA (for a lost phone; it signs every browser out)")
     web_admin.add_argument("--username", default=None, help="account name (default: the existing one, else 'admin')")
     web_admin.add_argument("--reset", action="store_true", help="new password and 2FA for the existing account")
+    web_admin.add_argument("--export-key", action="store_true",
+                           help="print the web encryption key (secrets/web_key) encrypted under a passphrase "
+                                "you type: the backup that restores 2FA on another machine")
     web_admin.add_argument("--web-db", default=os.environ.get("KITE_WEB_DB") or None,
                            help="database URL (default: $KITE_WEB_DB, else SQLite in the state folder)")
     web_serve = web_commands.add_parser("serve", help="run the web back end on loopback (Caddy publishes it over HTTPS)")
@@ -597,9 +618,11 @@ def _worker_browser(args: argparse.Namespace) -> int:
 
 def _worker_spend(args: argparse.Namespace) -> int:
     from .relay import SpendLedger
+    from .spend_ledger import SpendStore
 
     config = _load_operator_config(args)
-    ledger = SpendLedger(Journal(args.config.parent / "journal").read("spend"))
+    ledger = SpendLedger(Journal(args.config.parent / "journal").read("spend"),
+                         store=SpendStore(args.config.parent / "spend.sqlite3"))
     rows = []
     for p in config.providers:
         if p.adapter != "relay" or p.relay is None:
@@ -727,6 +750,10 @@ def _worker_autostart(args: argparse.Namespace) -> int:
                 launch[key] = value
         provider["launch"] = launch
         report.update(autostart=True, launch=launch)
+        if args.token == "kaggle-secret":
+            report["warning"] = ("launch.token: kaggle-secret: token worker trong Kaggle Secret không tự "
+                                 "hết hạn; nếu nghi lộ, xoay vòng bằng `kite worker rotate-token` rồi "
+                                 "cập nhật Kaggle Secret")
     validate_config(raw)
     backup = args.config.with_name(f"{args.config.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
     shutil.copy2(args.config, backup)
@@ -908,6 +935,62 @@ def _web_store(args: argparse.Namespace):
     return store
 
 
+_SEALER_CANARY = "kite-sealer-canary"
+
+
+def _sealer_canary_write(store, sealer) -> None:
+    """Record which web key the sealed data belongs to (its fingerprint + a sealed canary text), so a
+    key file that was lost and silently regenerated is caught at startup instead of surfacing as a
+    2FA that quietly stops working."""
+    from .web import security as sec
+
+    store.set_setting("sealer_canary", {"fingerprint": sealer.fingerprint(),
+                                        "check": sealer.seal(_SEALER_CANARY)})
+
+
+def _check_sealer_canary(store, sealer) -> None:
+    """Refuse to serve when the web key does not open what is already sealed. The first run that
+    finds an account adopts the current key — but only after proving it opens the stored 2FA secret."""
+    from .web import security as sec
+
+    canary = store.setting("sealer_canary")
+    if canary:
+        ok = canary.get("fingerprint") == sealer.fingerprint()
+        if ok:
+            try:
+                ok = sealer.unseal(canary.get("check", "")) == _SEALER_CANARY
+            except Exception:
+                ok = False
+        if not ok:
+            raise ConfigError("khóa mã hóa web (secrets/web_key) không khớp với dữ liệu đã niêm phong: "
+                              "khôi phục file web_key từ bản sao lưu (kite web admin --export-key), hoặc "
+                              "đặt lại tài khoản bằng `kite web admin --reset`")
+        return
+    if store.user_count():
+        from sqlalchemy import select
+
+        from .web.db import users
+
+        with store.engine.connect() as conn:
+            sealed = conn.execute(select(users.c.totp_secret)).first()
+        try:
+            if sealed:
+                sealer.unseal(sealed[0])
+        except Exception as exc:
+            raise ConfigError("khóa mã hóa web (secrets/web_key) không mở được mã 2FA đã lưu: khôi phục "
+                              "file web_key từ bản sao lưu, hoặc đặt lại tài khoản bằng "
+                              "`kite web admin --reset`") from exc
+        _sealer_canary_write(store, sealer)
+
+
+def _refuse_insecure_cookies(host: str, insecure: bool) -> None:
+    """--insecure-cookies drops the Secure attribute: only ever on loopback, enforced, not just
+    promised in the help text — a session cookie sniffed off plain HTTP is the whole account."""
+    if insecure and host not in ("127.0.0.1", "::1", "localhost"):
+        raise ConfigError("--insecure-cookies chỉ dùng được khi web chạy trên loopback "
+                          "(--host 127.0.0.1); ra ngoài loopback phải có HTTPS và cookie Secure")
+
+
 def _web_command(args: argparse.Namespace) -> int:
     from .web import security as sec
 
@@ -923,12 +1006,39 @@ def _web_command(args: argparse.Namespace) -> int:
     sealer = sec.Sealer(args.config.parent / "secrets" / "web_key")
     if args.web_command == "admin":
         return _web_admin(args, store, sealer)
+    _check_sealer_canary(store, sealer)
     return _web_serve(args, store, sealer)
+
+
+def _web_export_key(store, sealer) -> int:
+    """The web key, encrypted under a passphrase the owner types: the backup that makes a lost
+    ``secrets/web_key`` recoverable instead of a permanent 2FA lockout. Shown once, here."""
+    from .web import security as sec
+
+    if not store.user_count():
+        raise ConfigError("chưa có tài khoản web: chưa có khóa nào để sao lưu")
+    passphrase = getpass.getpass("Mật khẩu cho bản sao lưu khóa (ít nhất 12 ký tự): ")
+    problem = sec.password_problem(passphrase)
+    if problem:
+        raise ConfigError(problem)
+    if getpass.getpass("Nhập lại mật khẩu: ") != passphrase:
+        raise ConfigError("hai lần nhập không khớp")
+    blob = sec.seal_with_passphrase(sealer.key_text(), passphrase)
+    print("Bản sao lưu khóa web (đã mã hóa bằng mật khẩu trên; giữ cùng nhau ở nơi khác máy này):",
+          file=sys.stderr)
+    print(f"  {blob}", file=sys.stderr)
+    store.audit("local", "local", "web_key_exported", "", True)
+    _emit({"web_key_backup": "đã in ở trên (dạng mã hóa)",
+           "next": "mất secrets/web_key mà không có bản này và mật khẩu của nó là mất 2FA: "
+                   "chỉ còn `kite web admin --reset`"})
+    return 0
 
 
 def _web_admin(args: argparse.Namespace, store, sealer) -> int:
     from .web import security as sec
 
+    if args.export_key:
+        return _web_export_key(store, sealer)
     existing = store.user_by_name(args.username) if args.username else None
     if existing is None and store.user_count():
         from sqlalchemy import select
@@ -960,15 +1070,22 @@ def _web_admin(args: argparse.Namespace, store, sealer) -> int:
         raise ConfigError("mã chưa đúng (giờ trên điện thoại có lệch không?); chạy lại lệnh")
     hashed = sec.hash_password(password)
     if existing is None:
-        store.create_user(username, hashed, sealer.seal(secret))
-        user = store.user_by_name(username)
-        store.update_user(user.id, totp_last=counter)
+        user_id = store.create_user(username, hashed, sealer.seal(secret))
+        store.update_user(user_id, totp_last=counter)
         store.audit(username, "local", "admin_created", username, True)
     else:
+        user_id = existing.id
         store.update_user(existing.id, password_hash=hashed, totp_secret=sealer.seal(secret), totp_pending=None,
                           totp_last=counter, failed=0, locked_until=0.0, password_changed_at=time.time())
         store.drop_sessions(existing.id)
         store.audit(username, "local", "admin_reset", username, True)
+    codes = sec.new_recovery_codes()
+    store.replace_recovery_codes(user_id, [sec.recovery_digest(c) for c in codes])
+    print("Mã khôi phục 2FA (mỗi mã đăng nhập thay mã 2FA được đúng một lần; lưu ở nơi an toàn, "
+          "chỉ hiện lần này):", file=sys.stderr)
+    for recovery in codes:
+        print(f"  {recovery}", file=sys.stderr)
+    _sealer_canary_write(store, sealer)
     _emit({"account": username, "2fa": "đã bật", "reset": existing is not None,
            "next": ["sudo cp deploy/kite-web.service /etc/systemd/system/ && sudo systemctl daemon-reload",
                     "sudo systemctl enable --now kite-web"]})
@@ -982,6 +1099,7 @@ def _web_serve(args: argparse.Namespace, store, sealer) -> int:
     from .mcp_server import KiteOps
     from .web.app import GatewayDown, WebContext, create_app
 
+    _refuse_insecure_cookies(args.host, args.insecure_cookies)
     if not store.user_count():
         # Serve anyway (a new Compose machine is healthy before its owner exists): signing in says what to do.
         print("kite web: chưa có tài khoản; tạo bằng `kite web admin` (máy Compose: sudo kite-stack admin)",
@@ -1161,7 +1279,10 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
 
     specs = relay_specs(config)
     gateway.paid = {spec.worker_id for spec in specs if spec.paid}
-    ledger = SpendLedger(journal.read("spend"))
+    from .spend_ledger import SpendStore
+
+    # Settled spend is durable (SQLite in the state dir); the journal's old records import once.
+    ledger = SpendLedger(journal.read("spend"), store=SpendStore(state_dir / "spend.sqlite3"))
     from .starters import Starters, Switches
 
     switches = Switches(state_dir / "switches.json")
@@ -1197,8 +1318,19 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
                                    "run_type": str(headers.get("X-Kite-Run-Type", ""))[:20]})
         return worker_bundle(launch)
 
+    sandbox_digest = None
+    if config.sandbox is not None:
+        # One sandbox client token per gateway boot: the plaintext goes to a 0600 file the
+        # sandbox side reads; only its digest stays in this process (gateway.py).
+        from .gateway import issue_sandbox_client_token
+
+        token_file = Path(os.environ.get("KITE_SANDBOX_TOKEN_FILE")
+                          or state_dir / "secrets" / "sandbox_client_token")
+        sandbox_digest = issue_sandbox_client_token(token_file)
     runner = web.AppRunner(create_app(gateway, launcher=launcher, worker_code=worker_code, browser=browser,
-                                      switches=switches, relays=relays))
+                                      switches=switches, relays=relays,
+                                      sandbox_host=config.sandbox.gateway_host if config.sandbox else None,
+                                      sandbox_token_digest=sandbox_digest))
     await runner.setup()
     hosts = [config.gateway.host]
     if config.sandbox is not None:
@@ -1299,9 +1431,47 @@ def _notify_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tasks_confirm(args: argparse.Namespace) -> int:
+    """The owner's side of the apply/commit gate: show the patch's hash and stats, then mint the
+    one-time codes. Run by the person in their own terminal — never by the chat model."""
+    from . import confirm
+    from .backend import task_slug
+
+    state_dir = args.config.parent
+    root = state_dir / "tasks" / task_slug(args.task_id)
+    patch_path = root / "result.patch"
+    if not patch_path.is_file() or patch_path.stat().st_size == 0:
+        raise ConfigError(f"task {args.task_id} chưa có patch kết quả ở {patch_path}")
+    patch = patch_path.read_bytes()
+    digest = confirm.patch_sha256(patch)
+    text = patch.decode("utf-8", errors="replace")
+    files = [line.split(" b/", 1)[-1] for line in text.splitlines() if line.startswith("diff --git ")]
+    added = sum(1 for line in text.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in text.splitlines() if line.startswith("-") and not line.startswith("---"))
+    _emit({"task_id": args.task_id, "patch_sha256": digest, "patch_file": str(patch_path),
+           "files": files, "lines": f"+{added}/-{removed}",
+           "apply_code": confirm.issue_code(state_dir, "apply", args.task_id, digest),
+           "commit_code": confirm.issue_code(state_dir, "commit", args.task_id, digest),
+           "expires_in_minutes": confirm.CODE_TTL_SECONDS // 60,
+           "note": "mỗi mã dùng 1 lần cho đúng thao tác của nó; đưa mã cho chat sau khi bạn đã xem patch "
+                   "và đối chiếu patch_sha256 với task_result"})
+    return 0
+
+
 def _memory_command(args: argparse.Namespace) -> int:
     from . import memory
 
+    if args.memory_command == "list-pending":
+        _emit({"pending": memory.list_pending(args.config.parent)})
+        return 0
+    if args.memory_command in ("approve", "reject"):
+        try:
+            done = (memory.approve_pending if args.memory_command == "approve" else memory.reject_pending)(
+                args.config.parent, args.entry_id)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        _emit(done)
+        return 0
     path = memory.memory_path(args.config.parent, args.repo)
     if args.memory_command == "forget":
         removed = memory.forget(path, args.number)
@@ -1716,6 +1886,25 @@ def _bench_wait_for_workers(config, models: list[str], log: Callable[[str], None
             raise ConfigError(f"không có worker cho {model} sau 4 giờ: bench dừng")
 
 
+def _check_opencode_binary(binary: Path) -> None:
+    """Only the pinned OpenCode build may be baked into the local sandbox image.
+
+    Mirrors the root Dockerfile's check of the npm package: the host's binary must hash to
+    OPENCODE_BIN_SHA512 in deploy/opencode.env (the SHA-512 of the binary inside the package
+    whose own SHA-512 is OPENCODE_SHA512).
+    """
+    pins = {}
+    for line in (REPO_ROOT / "deploy" / "opencode.env").read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, _, value = line.partition("=")
+            pins[key.strip()] = value.strip()
+    expected = pins.get("OPENCODE_BIN_SHA512", "")
+    if not expected or hashlib.sha512(binary.read_bytes()).hexdigest() != expected:
+        raise ConfigError(
+            "the host's opencode binary does not match OPENCODE_BIN_SHA512 in deploy/opencode.env; "
+            "refusing to bake an unverified binary into the sandbox image")
+
+
 def _sandbox_command(args: argparse.Namespace) -> int:
     from . import sandbox as sbx
 
@@ -1725,6 +1914,7 @@ def _sandbox_command(args: argparse.Namespace) -> int:
         opencode = shutil.which("opencode") or str(Path.home() / ".opencode" / "bin" / "opencode")
         if not Path(opencode).is_file():
             raise ConfigError("opencode binary not found on the host; run the bootstrap first")
+        _check_opencode_binary(Path(opencode).resolve())
         network_gateway = sbx.ensure_network(settings)
         print("Đang build image sandbox (vài phút)...", file=sys.stderr)
         image = sbx.build_image(settings, dockerfile=REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",
@@ -1791,6 +1981,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _memory_command(args)
     if args.command == "update":
         return _update_command(args)
+    if args.command == "tasks":
+        return _tasks_confirm(args)
     if args.command == "busy":
         return _busy_command(args)
     if args.command == "stack":
@@ -1906,6 +2098,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _worker_restart(args)
     if args.command == "worker" and args.worker_command in ("start", "stop", "status"):
         return _worker_remote(args)
+    if args.command == "worker" and args.worker_command == "rotate-token":
+        args.force = True    # rotation is the token command below, with replacement allowed
     if args.command == "worker":
         config = _load_operator_config(args)
         provider = next((p for p in config.providers if p.effective_worker_id == args.worker_id), None)
@@ -2030,7 +2224,8 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox", "mcp", "chat",
-                        "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web", "busy", "stack"}:
+                        "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web", "busy", "stack",
+                        "tasks"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

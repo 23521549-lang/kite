@@ -23,11 +23,12 @@ on, Kite presses Save Version -> Save & Run All -> Save there; otherwise the own
 start then waits in state ``waiting`` until Kaggle shows a new run). Kaggle gives Secrets to a run
 saved on kaggle.com, so the notebook's ``KITE_WORKER_TOKEN`` works.
 
-Worker token: ``kaggle-secret`` (default) keeps using the notebook's Kaggle Secret
-``KITE_WORKER_TOKEN``. Kaggle may not attach Secrets to a version pushed through the API; then the
-run fails at the worker cell and ``kite worker status`` shows it. ``per-launch`` instead writes a
-fresh token into the pushed notebook that the gateway accepts only until that run's time is up
-(the gateway keeps its SHA-256 digest, never the token).
+Worker token: ``per-launch`` (the default, as in config.py) writes a fresh token into the pushed
+notebook that the gateway accepts only until that run's time is up (the gateway keeps its SHA-256
+digest, never the token). ``kaggle-secret`` instead keeps using the notebook's Kaggle Secret
+``KITE_WORKER_TOKEN`` — a long-lived token that never expires on its own; rotate it with
+``kite worker rotate-token`` if it may have leaked. Kaggle may not attach Secrets to a version
+pushed through the API; then the run fails at the worker cell and ``kite worker status`` shows it.
 """
 from __future__ import annotations
 
@@ -343,6 +344,9 @@ class KaggleLauncher:
                 launch["gateway_url"] = self.config.gateway.public_url
             if spec.token == "per-launch":
                 launch["token"] = self._new_launch_token(worker_id, spec.max_hours)
+            if spec.llama_server_sha256:
+                # The notebook only runs the prebuilt llama-server when the binary hashes to this.
+                launch["llama_server_sha256"] = spec.llama_server_sha256
             # The bootstrap notebook needs the gateway's public address to fetch the worker code.
             base = (stub_notebook(self.config.gateway.public_url)
                     if spec.notebook == "stub" and self.config.gateway.public_url

@@ -366,14 +366,19 @@ def test_adding_an_api_worker_keeps_its_key_in_a_private_file_and_out_of_answers
         "daily_cap": 1})
     assert added.status_code == 200 and added.json()["restart_needed"]
     key = site["path"] / "secrets" / "api_key_openrouter"
-    assert key.read_text().strip() == "sk-very-secret" and key.stat().st_mode & 0o777 == 0o600
+    from poc.kaggle_worker.web import workers as wk
+
+    raw_key = key.read_text()
+    assert raw_key.startswith(wk.SEALED_PREFIX) and "sk-very-secret" not in raw_key   # sealed at rest
+    assert wk.read_secret(key, site["ctx"].sealer) == "sk-very-secret"
+    assert key.stat().st_mode & 0o777 == 0o600
     raw = json.loads(site["config"].read_text())
     relay = raw["providers"][-1]["relay"]
     assert relay["upstream"] == {"gpt": "openai/gpt-5-mini"} and relay["caps"] == {"daily_usd": 1}
     rows = client.get("/api/workers").json()["workers"]
     assert any(r["id"] == "openrouter" and r["type"] == "openai" for r in rows)
     edited = client.patch("/api/workers/openrouter", headers=headers, json={"daily_cap": 3, "api_key": "sk-new"})
-    assert edited.status_code == 200 and key.read_text().strip() == "sk-new"
+    assert edited.status_code == 200 and wk.read_secret(key, site["ctx"].sealer) == "sk-new"
     assert client.patch("/api/workers/openrouter", headers=headers, json={"owner": "x"}).status_code == 400
     removed = client.delete("/api/workers/openrouter", headers=headers)
     assert removed.status_code == 200 and not key.exists()
@@ -390,7 +395,11 @@ def test_a_new_kaggle_worker_gets_a_token_to_paste_into_kaggle_secrets(site):
         "kaggle_api_token": "KGAT_an", "via": "browser"})
     assert added.status_code == 200, added.text
     token = added.json()["worker_token"]
-    assert (site["path"] / "secrets" / "worker_token_kaggle-an").read_text().strip() == token
+    from poc.kaggle_worker.web import workers as wk
+
+    token_file = site["path"] / "secrets" / "worker_token_kaggle-an"
+    assert token not in token_file.read_text()                       # sealed at rest, like every web-written key
+    assert wk.read_secret(token_file, site["ctx"].sealer) == token
     provider = json.loads(site["config"].read_text())["providers"][-1]
     assert provider["launch"] == {"kernel": "an/kite-worker", "idle_minutes": 30, "token": "per-launch",
                                   "via": "browser"}
@@ -787,3 +796,139 @@ def test_the_other_tabs_answer(site):
                                                                   "cookie": cookie}) as ws:
             ws.receive_text()
     assert {"memory_add", "repo_config", "cleanup"} <= {r["action"] for r in site["store"].audit_rows()}
+
+
+# ---------------------------------------------------------------- phase 6: re-auth, recovery, sealing
+def test_reauth_guesses_lock_the_account_just_like_signin_guesses(site):
+    headers = signed_in(site)
+    client = site["client"]
+    for _ in range(5):
+        site["clock"]["now"] += 30
+        bad = client.post("/api/auth/password", headers=headers,
+                          json={"current": "sai-mat-khau", "new": "mat-khau-moi-rat-dai",
+                                "code": code(site["clock"])})
+        assert bad.status_code == 403
+    # The account is locked now: re-auth refuses outright and even a correct sign-in is refused.
+    site["clock"]["now"] += 30
+    assert client.post("/api/auth/password", headers=headers,
+                       json={"current": PASSWORD, "new": "mat-khau-moi-rat-dai",
+                             "code": code(site["clock"])}).status_code == 429
+    assert login(site, client=TestClient(client.app, base_url="https://testserver")).status_code == 429
+    assert "lockout" in [r["action"] for r in site["store"].audit_rows()]
+    site["clock"]["now"] += 901
+    assert login(site, client=TestClient(client.app, base_url="https://testserver")).status_code == 200
+
+
+def test_a_lock_that_expires_starts_the_failure_count_from_zero(site):
+    for _ in range(5):
+        assert login(site, password="sai-mat-khau-roi").status_code == 401
+    assert login(site).status_code == 429
+    site["clock"]["now"] += 901
+    assert login(site, password="sai-mat-khau-roi").status_code == 401    # one wrong try…
+    assert login(site).status_code == 200                                # …does not re-lock at once
+
+
+def test_a_recovery_code_signs_in_once_and_only_once(site):
+    codes = sec.new_recovery_codes()
+    user = site["store"].user_by_name("han")
+    site["store"].replace_recovery_codes(user.id, [sec.recovery_digest(c) for c in codes])
+    client = site["client"]
+    ok = client.post("/api/auth/login", json={"username": "han", "password": PASSWORD, "code": codes[0]})
+    assert ok.status_code == 200
+    assert site["store"].recovery_codes_left(user.id) == 7
+    assert "login_recovery" in [r["action"] for r in site["store"].audit_rows()]
+    again = TestClient(client.app, base_url="https://testserver").post(
+        "/api/auth/login", json={"username": "han", "password": PASSWORD, "code": codes[0]})
+    assert again.status_code == 401                                       # spent: never a second time
+    sloppy = TestClient(client.app, base_url="https://testserver").post(
+        "/api/auth/login", json={"username": "han", "password": PASSWORD, "code": codes[1].lower()})
+    assert sloppy.status_code == 200                                      # dashes and case do not matter
+    wrong_password = TestClient(client.app, base_url="https://testserver").post(
+        "/api/auth/login", json={"username": "han", "password": "sai-mat-khau", "code": codes[2]})
+    assert wrong_password.status_code == 401
+    assert site["store"].recovery_codes_left(user.id) == 6                # a wrong password spends nothing
+
+
+def test_setting_up_2fa_again_hands_out_fresh_recovery_codes(site):
+    headers = signed_in(site)
+    site["clock"]["now"] += 30
+    begin = site["client"].post("/api/auth/totp/begin", headers=headers,
+                                json={"password": PASSWORD, "code": code(site["clock"])})
+    new_secret = begin.json()["secret"]
+    confirm = site["client"].post("/api/auth/totp/confirm", headers=headers,
+                                  json={"code": sec.totp_now(new_secret, site["clock"]["now"])})
+    assert confirm.status_code == 200 and len(confirm.json()["recovery_codes"]) == 8
+    fresh = TestClient(site["client"].app, base_url="https://testserver")
+    ok = fresh.post("/api/auth/login", json={"username": "han", "password": PASSWORD,
+                                             "code": confirm.json()["recovery_codes"][0]})
+    assert ok.status_code == 200
+
+
+def test_a_session_that_moves_browser_must_reauth_before_writing(site):
+    headers = signed_in(site)
+    client = site["client"]
+    moved = {**headers, "User-Agent": "Mozilla/5.0 (some other browser)"}
+    assert client.get("/api/auth/me", headers=moved).status_code == 200          # reads keep working
+    blocked = client.post("/api/workers/kaggle-han/stop", headers=moved)
+    assert blocked.status_code == 403 and "2FA" in blocked.json()["error"]
+    site["clock"]["now"] += 30
+    reauth = client.post("/api/auth/totp/begin", headers=moved,
+                         json={"password": PASSWORD, "code": code(site["clock"])})
+    assert reauth.status_code == 200                                             # re-auth adopts the browser
+    assert client.post("/api/workers/kaggle-han/stop", headers=moved).status_code == 200
+
+
+def test_secret_files_seal_and_legacy_files_migrate_on_read(tmp_path):
+    from poc.kaggle_worker.web import workers as wk
+
+    sealer = sec.Sealer(tmp_path / "secrets" / "web_key")
+    path = tmp_path / "secrets" / "api_key_x"
+    wk.write_secret(path, "sk-live", sealer=sealer)
+    assert path.read_text().startswith(wk.SEALED_PREFIX) and "sk-live" not in path.read_text()
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert wk.read_secret(path, sealer) == "sk-live"
+    with pytest.raises(Exception):
+        wk.read_secret(path)                                                     # sealed needs its key
+    legacy = tmp_path / "secrets" / "api_key_old"
+    wk.write_secret(legacy, "sk-plain")                                          # the CLI's plaintext form
+    assert wk.read_secret(legacy, sealer) == "sk-plain"
+    assert legacy.read_text().startswith(wk.SEALED_PREFIX)                       # migrated by that read
+    assert wk.read_secret(legacy, sealer) == "sk-plain"
+
+
+def test_insecure_cookies_are_refused_off_loopback(tmp_path):
+    from poc.kaggle_worker.config import ConfigError
+
+    with pytest.raises(ConfigError):
+        cli._refuse_insecure_cookies("0.0.0.0", True)
+    cli._refuse_insecure_cookies("127.0.0.1", True)
+    cli._refuse_insecure_cookies("0.0.0.0", False)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw_config(tmp_path)))
+    assert cli.main(["--config", str(path), "web", "serve", "--host", "0.0.0.0",
+                     "--insecure-cookies"]) != 0
+
+
+def test_web_key_export_round_trips_and_a_swapped_key_is_caught(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw_config(tmp_path)))
+    monkeypatch.setattr(sec, "new_totp_secret", lambda: SECRET)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": PASSWORD)
+    monkeypatch.setattr("builtins.input", lambda prompt="": sec.totp_now(SECRET))
+    assert cli.main(["--config", str(path), "web", "admin", "--username", "han"]) == 0
+    capsys.readouterr()
+    assert cli.main(["--config", str(path), "web", "admin", "--export-key"]) == 0
+    blob = capsys.readouterr().err.splitlines()[-1].strip()
+    key_file_text = (tmp_path / "secrets" / "web_key").read_text().strip()
+    assert sec.unseal_with_passphrase(blob, PASSWORD) == key_file_text
+    with pytest.raises(ValueError):
+        sec.unseal_with_passphrase(blob, "mat-khau-sai-hoan-toan")
+    # The key file vanishes (a restore, a wiped folder): a fresh key is silently minted by the Sealer,
+    # and the canary check is what turns that into a loud refusal instead of a dead 2FA.
+    (tmp_path / "secrets" / "web_key").unlink()
+    store = Store(connect(sqlite_url(tmp_path / "web.sqlite3")))
+    from poc.kaggle_worker.config import ConfigError
+
+    with pytest.raises(ConfigError):
+        cli._check_sealer_canary(store, sec.Sealer(tmp_path / "secrets" / "web_key"))
+    assert cli.main(["--config", str(path), "web", "serve"]) != 0

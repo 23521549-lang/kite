@@ -81,6 +81,7 @@ class RelayConfig:
     # pod: RunPod's proxy closes a request that has sent nothing for 100 seconds.
     stream: bool = False
     pod: PodConfig | None = None
+    max_tokens: int = 8192               # ceiling for one answer; sizes the spend reservation (relay.py)
 
 
 POD_PROVIDERS = ("runpod",)
@@ -123,7 +124,8 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
     from urllib.parse import urlparse
 
     r = _mapping(raw, where)
-    unknown = set(r) - {"kind", "base_url", "upstream", "price", "caps", "timeout_seconds", "stream", "pod"}
+    unknown = set(r) - {"kind", "base_url", "upstream", "price", "caps", "timeout_seconds", "stream", "pod",
+                        "max_tokens"}
     if unknown:
         raise ConfigError(f"{where} has unsupported fields: {', '.join(sorted(unknown))}")
     kind = r.get("kind")
@@ -148,6 +150,11 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
                           "(the API key would travel in clear text)")
     if kind == "anthropic" and not secrets.get("api_key"):
         raise ConfigError(f"{where}: Anthropic needs secrets.api_key")
+    if pod is not None and not secrets.get("api_key"):
+        raise ConfigError(f"{where}: a RunPod pod's model server needs secrets.api_key — the pod's "
+                          "proxy URL follows from its id, so a server without a key is open to anyone "
+                          "who learns the id; start the server on the pod with --api-key "
+                          "(e.g. vLLM --api-key) and store that key as secrets.api_key")
     upstream = _mapping(r.get("upstream", {}), f"{where}.upstream")
     for name, target in upstream.items():
         if name not in models:
@@ -170,9 +177,12 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
         raise ConfigError(f"{where}: price takes input/output, caps take daily_usd/monthly_usd")
     if not numbers["timeout"] or numbers["timeout"] > 3600:
         raise ConfigError(f"{where}.timeout_seconds must be between 1 and 3600")
+    max_tokens = r.get("max_tokens", 8192)
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 16 <= max_tokens <= 1_000_000:
+        raise ConfigError(f"{where}.max_tokens must be an integer between 16 and 1000000")
     return RelayConfig(kind, base_url.rstrip("/"), tuple((k, v.strip()) for k, v in upstream.items()),
                        numbers["price_in"], numbers["price_out"], numbers["daily_cap"], numbers["monthly_cap"],
-                       numbers["timeout"], stream or pod is not None, pod)
+                       numbers["timeout"], stream or pod is not None, pod, max_tokens)
 
 
 @dataclass(frozen=True)
@@ -193,6 +203,10 @@ class LaunchConfig:
     # What Kite pushes: "stub" is one small cell that downloads the worker code from Kite when it runs
     # (stub.py), so a run never has old code; "full" is this repository's whole notebook.
     notebook: str = "stub"
+    # SHA-256 of the prebuilt llama-server binary in the owner's kite-llama-bin dataset. The notebook
+    # only runs the prebuilt when the file it finds hashes to this; unset or mismatched means it
+    # builds from source (pinned commit) instead of executing an unverified binary.
+    llama_server_sha256: str | None = None
 
 
 LAUNCH_TOKEN_MODES = ("kaggle-secret", "per-launch")
@@ -205,7 +219,7 @@ _ACCELERATOR = re.compile(r"^[A-Za-z0-9]{2,40}$")
 def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tuple[str, ...]) -> LaunchConfig:
     launch = _mapping(raw, label)
     unknown = set(launch) - {"kernel", "idle_minutes", "token", "accelerator", "max_hours", "model",
-                             "kaggle_username", "via", "notebook"}
+                             "kaggle_username", "via", "notebook", "llama_server_sha256"}
     if unknown:
         raise ConfigError(f"{label} has unsupported fields")
     kernel = launch.get("kernel")
@@ -238,7 +252,13 @@ def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tupl
     notebook = launch.get("notebook", "stub")
     if notebook not in LAUNCH_NOTEBOOKS:
         raise ConfigError(f"{label}.notebook must be one of {', '.join(LAUNCH_NOTEBOOKS)}")
-    return LaunchConfig(kernel, idle, token, accelerator, hours, model, username, via, notebook)
+    sha256 = launch.get("llama_server_sha256")
+    if sha256 is not None:
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+            raise ConfigError(f"{label}.llama_server_sha256 must be a 64-character hex SHA-256 digest "
+                              "(sha256sum of the llama-server binary in your kite-llama-bin dataset)")
+        sha256 = sha256.lower()
+    return LaunchConfig(kernel, idle, token, accelerator, hours, model, username, via, notebook, sha256)
 
 
 @dataclass(frozen=True)
@@ -299,7 +319,7 @@ class SandboxConfig:
     test_timeout_seconds: int = 900
     test_command: str = "python -m pytest -q"
     setup_command: str = ""
-    setup_network: str = "bridge"
+    setup_network: str = "none"
     setup_timeout_seconds: int = 1800
     docker_command: tuple[str, ...] = ("docker",)
     fix_rounds: int = 2
@@ -638,7 +658,7 @@ def _validate_sandbox(raw: Any) -> SandboxConfig | None:
     setup_command = sb.get("setup_command", "")
     if not isinstance(setup_command, str):
         raise ConfigError("sandbox.setup_command must be a string ('' for no setup)")
-    setup_network = sb.get("setup_network", "bridge")
+    setup_network = sb.get("setup_network", "none")
     if not isinstance(setup_network, str) or not _NETWORK.fullmatch(setup_network) or setup_network == "host":
         raise ConfigError("sandbox.setup_network must name a Docker network other than host")
     docker_command = sb.get("docker_command", ["docker"])
@@ -694,6 +714,20 @@ def resolve_secret(reference: str) -> str:
             value = Path(reference[5:]).read_text(encoding="utf-8")
         except OSError as exc:
             raise ConfigError(f"cannot read secret file {reference[5:]}") from exc
+        value = value.strip()
+        if value.startswith("kite-sealed:v1:"):
+            # The web layer seals provider secret files at rest under the web key, which lives
+            # beside them in the same secrets folder; unseal here so the gateway and CLI read
+            # the same files the web wrote.
+            from .web.security import Sealer
+
+            key_file = Path(reference[5:]).parent / "web_key"
+            if not key_file.exists():
+                raise ConfigError(f"secret file {reference[5:]} is sealed but {key_file} is missing")
+            try:
+                value = Sealer(key_file).unseal(value[len("kite-sealed:v1:"):])
+            except Exception as exc:
+                raise ConfigError(f"cannot unseal secret file {reference[5:]}") from exc
     else:
         raise ConfigError("secret reference must be env:NAME or file:PATH")
     value = value.strip()

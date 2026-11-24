@@ -2,18 +2,20 @@
 # pins the images by digest in images.env and updates it: never run `docker compose` on this file by hand
 # without its env files (`sudo kite-stack compose ps` passes them).
 #
-# Kite's services run from one image, share the host's network and process space, run as uid 1000 and
-# see the state folder at the same path as the host (/var/lib/kite). So they behave exactly as on the
-# development machine: the gateway and the web listen on loopback only, the task sandboxes the worker
-# starts on the host's Docker get host paths for their mounts, and a bench run's lock is seen by every
-# service. Only Caddy faces the Internet: /worker/* for the Kaggle notebooks, and the web page unless the
+# Kite's services run from one image, run as uid 1000 and see the state folder at the same path as
+# the host (/var/lib/kite). They share the host's network namespace — the stack's config wires them
+# to each other over loopback (gateway 127.0.0.1:8787, Temporal 127.0.0.1:7233, OpenCode
+# 127.0.0.1:4096) and the gateway additionally binds the host's address on the sandbox network in
+# process, which port publishing cannot replace — but they no longer share the host's process
+# space: only the worker keeps `pid: host` (its activities spawn OpenCode sessions and share
+# PID-based locks with the chat processes; the other services have no reason to see host PIDs).
+# Only Caddy faces the Internet: /worker/* for the Kaggle notebooks, and the web page unless the
 # machine was installed with --access private.
 name: kite
 
 x-kite: &kite
   image: ${KITE_IMAGE:?set by kite-stack in images.env}
   network_mode: host
-  pid: host
   user: "1000:1000"
   restart: unless-stopped
   stop_grace_period: 30s
@@ -38,7 +40,7 @@ x-health: &health
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16@sha256:820b1558a744efeda508506fd85bff573cec8b6941ff4790ef4884a526dd6e86
     restart: unless-stopped
     environment:
       POSTGRES_USER: temporal
@@ -58,14 +60,14 @@ services:
 
   # Temporal's schema (idempotent: safe on every start).
   temporal-setup:
-    image: temporalio/admin-tools:1.32.2
+    image: temporalio/admin-tools:1.32.2@sha256:4a95866efba29d7e17ab012df5232795e8b0ad0f7d5f9d1ec4df321f7792a754
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       POSTGRES_SEEDS: postgres
       POSTGRES_USER: temporal
-      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
+      POSTGRES_PWD: ${TEMPORAL_SETUP_POSTGRES_PASSWORD:?set in stack.env}
       DB_PORT: "5432"
     volumes:
       - ./temporal-setup.sh:/temporal-setup.sh:ro
@@ -74,7 +76,7 @@ services:
     logging: *logging
 
   temporal:
-    image: temporalio/server:1.32.2
+    image: temporalio/server:1.32.2@sha256:7bf69188a6232fea14869b9cef3d94aa82a1601d99517f7e86c71f22da4e0670
     depends_on:
       temporal-setup:
         condition: service_completed_successfully
@@ -86,6 +88,7 @@ services:
       POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
       POSTGRES_SEEDS: postgres
       SQL_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
+      VISIBILITY_SQL_PASSWORD: ${TEMPORAL_VISIBILITY_POSTGRES_PASSWORD:?set in stack.env}
       BIND_ON_IP: 0.0.0.0
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
     volumes:
@@ -102,7 +105,7 @@ services:
 
   # The web's own database and role in the same Postgres (idempotent).
   web-db:
-    image: postgres:16
+    image: postgres:16@sha256:820b1558a744efeda508506fd85bff573cec8b6941ff4790ef4884a526dd6e86
     depends_on:
       postgres:
         condition: service_healthy
@@ -129,6 +132,7 @@ services:
   worker:
     <<: *kite
     command: ["kite", "workflow", "worker"]
+    pid: host                  # see the header: its activities share PID-based state with the chat
     group_add:
       - "${DOCKER_GID:?set in stack.env}"
     volumes:
@@ -166,7 +170,7 @@ services:
       test: ["CMD", "kite", "stack", "health", "opencode"]
 
   caddy:
-    image: caddy:2
+    image: caddy:2@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     network_mode: host
     restart: unless-stopped
     environment:

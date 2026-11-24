@@ -2,7 +2,7 @@
 
 Each task gets its own clone of the repository, mounted into throw-away containers:
 
-1. **setup** (optional, with network): runs the operator-declared install command, for example
+1. **setup** (optional, no network unless the operator opts in): runs the operator-declared install command, for example
    ``pip install -r requirements.txt`` or ``npm ci``. Python packages go to ``/deps`` (a per-task
    directory shared with the next steps). Files the setup step creates in the repository are
    committed as a separate "setup" commit so they never end up in the agent's patch.
@@ -52,7 +52,7 @@ DEPS_ENV = (
 )
 
 PROBE = r"""
-import json, os, urllib.error, urllib.request
+import json, os, socket, urllib.error, urllib.parse, urllib.request
 def get(url):
     try:
         with urllib.request.urlopen(url, timeout=8) as response:
@@ -61,11 +61,20 @@ def get(url):
         return exc.code
     except Exception as exc:
         return type(exc).__name__
+def tcp(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True
+    except OSError:
+        return False
+gateway_host = urllib.parse.urlsplit(os.environ["KITE_GATEWAY_MODELS"]).hostname
 print(json.dumps({
     "gateway": get(os.environ["KITE_GATEWAY_MODELS"]),
     "internet": get("https://example.com"),
     "host_secrets_visible": os.path.exists("/var/lib/kite"),
     "uid": os.getuid(),
+    "host_ssh_reachable": tcp(gateway_host, 22),
+    "host_https_reachable": tcp(gateway_host, 443),
 }))
 """
 
@@ -85,13 +94,24 @@ class SandboxSettings:
     gateway_url: str = "http://172.19.0.1:8787/v1"
     host_gateway_url: str = ""       # the same gateway as Kite itself (on the host) reaches it; "" = gateway_url
     memory: str = "1g"
+    # Host-disk guard: a step that fills the workspace (on the same disk as Kite's state)
+    # aborts the task instead of the whole stack. 0 = no limit.
+    workspace_limit_bytes: int = 10 * 1024 * 1024 * 1024
     cpus: float = 1.0
     pids_limit: int = 512
     agent_timeout_seconds: int = 3600
     test_timeout_seconds: int = 900
     test_command: str = "python -m pytest -q"
     setup_command: str = ""
-    setup_network: str = "bridge"
+    # The setup step runs a command the repository itself declares: by default it gets NO
+    # network (decision D3). The operator may opt a setup network in (e.g. "bridge") in the
+    # sandbox settings; run_task warns the first time a repository's setup runs with one.
+    setup_network: str = "none"
+    # File holding the gateway's sandbox client token (written by the gateway at boot, 0600);
+    # the agent container presents it as X-Kite-Task-Token (see read_sandbox_token). "" = take
+    # the path from the KITE_SANDBOX_TOKEN_FILE environment variable; unset there too = no token
+    # (an older gateway that does not check one).
+    sandbox_token_file: str = ""
     setup_timeout_seconds: int = 1800
     docker_command: tuple[str, ...] = ("docker",)
     uid: int = field(default_factory=_default_uid)
@@ -223,6 +243,30 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
+def workspace_size(workspace: Path) -> int:
+    """Total size of the files under ``workspace`` (symlinked directories are not followed)."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(workspace):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return total
+
+
+def check_workspace_limit(settings: SandboxSettings, workspace: Path) -> None:
+    """Abort the task when the workspace grew past the configured host-disk guard."""
+    limit = settings.workspace_limit_bytes
+    if limit <= 0:
+        return
+    size = workspace_size(workspace)
+    if size > limit:
+        raise SandboxError(
+            f"workspace is {size} bytes, over the sandbox limit of {limit} bytes "
+            "(sandbox.workspace_limit_bytes); the task was stopped before it could fill the disk")
+
+
 def container_name(kind: str, task_id: str) -> str:
     return f"kite-{kind}-{task_id}"
 
@@ -236,6 +280,7 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
         "--network", network,
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--pids-limit", str(settings.pids_limit), "--memory", settings.memory,
+        "--memory-swap", settings.memory,     # no swap beyond the memory limit
         "--cpus", str(settings.cpus), "--user", f"{settings.uid}:{settings.uid}",
         "-e", "HOME=/home/kite", "-e", "OPENCODE_DISABLE_AUTOUPDATE=1",
         "-v", f"{Path(workspace).resolve()}:/work", "-w", "/work",
@@ -251,6 +296,28 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
         args += ["-v", f"{Path(config_file).resolve()}:/home/kite/.config/opencode/opencode.json:ro"]
     args.append(settings.image)
     return args
+
+
+def sandbox_token_path(settings: SandboxSettings) -> Path | None:
+    """Where the gateway's sandbox client token lives, per the settings or the environment."""
+    raw = settings.sandbox_token_file or os.environ.get("KITE_SANDBOX_TOKEN_FILE", "")
+    return Path(raw) if raw else None
+
+
+def read_sandbox_token(settings: SandboxSettings) -> str | None:
+    """The sandbox client token, or None when none is configured or the file cannot be read.
+
+    The gateway (re)writes this file at boot and checks the ``X-Kite-Task-Token`` header on
+    requests coming from the sandbox network; a missing file means an older gateway, so the
+    agent runs without the header (run_task warns about that case).
+    """
+    path = sandbox_token_path(settings)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 def agent_config(settings: SandboxSettings, *, model: str, models, small_model: str | None = None,
@@ -276,6 +343,9 @@ def agent_config(settings: SandboxSettings, *, model: str, models, small_model: 
         headers["X-Kite-Task"] = task_tag
     if worker_pin:
         headers["X-Kite-Worker"] = worker_pin
+    token = read_sandbox_token(settings)
+    if token:
+        headers["X-Kite-Task-Token"] = token
     if headers:
         config["provider"]["kite"]["options"]["headers"] = headers
     if small_model:
@@ -2059,6 +2129,14 @@ def commit_setup_changes(workspace: Path) -> str:
     return _git(workspace, "rev-parse", "HEAD")
 
 
+def restore_base_files(workspace: Path, base: str, files: Sequence[str]) -> None:
+    """Put ``files`` back to their content at ``base`` in the working tree (and the index), undoing
+    whatever the tree currently does to them — including a deletion. Used by the backend's final
+    verification: tests the patch edited are restored so the verdict runs on pristine tests."""
+    if files:
+        _git(Path(workspace), "checkout", base, "--", *files)
+
+
 def collect_patch(workspace: Path, base: str, patch_path: Path) -> list[str]:
     """Write every change since ``base`` (including new files) as a patch; return file names."""
     _git(workspace, "add", "-A")
@@ -2126,6 +2204,33 @@ def _run_watched(settings: SandboxSettings, *, name: str, args: list[str], timeo
     return proc.returncode, output
 
 
+def _warn_setup_network_once(state_dir: Path, repo: Path, network: str, task_id: str,
+                             log: Callable[[str], None]) -> None:
+    """Warn, once per repository, that its setup step runs with Internet access.
+
+    The setup command comes from the repository itself, so network access for it is a
+    deliberate operator opt-in (``setup_network``); the marker file in the state dir keeps
+    the warning to the first task of each repository instead of repeating it every run.
+    """
+    marker = Path(state_dir) / "setup-network-warned.txt"
+    key = str(Path(repo).resolve())
+    try:
+        seen = marker.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        seen = []
+    if key in seen:
+        return
+    log(f"[{task_id}] CẢNH BÁO: repo {key} chạy bước cài đặt (setup) CÓ Internet "
+        f"(setup_network={network}) — lệnh setup do repo khai báo sẽ có mạng; "
+        "đây là lần cảnh báo đầu tiên cho repo này")
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with marker.open("a", encoding="utf-8") as handle:
+            handle.write(key + "\n")
+    except OSError:
+        pass
+
+
 def _write_result(root: Path, run: SandboxRun) -> SandboxRun:
     (root / "result.json").write_text(json.dumps(run.to_dict(), indent=2, ensure_ascii=False),
                                       encoding="utf-8")
@@ -2157,8 +2262,9 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         setup_command=settings.setup_command if setup_command is None else setup_command,
         test_command=settings.test_command if test_command is None else test_command)
 
-    # 1. Setup: the only step with network access, and it runs only the declared command.
-    #    Already installed for these dependency files (deps cache): reuse, no setup at all.
+    # 1. Setup: runs only the declared command, with no network unless the operator opted a
+    #    setup network in. Already installed for these dependency files (deps cache): reuse,
+    #    no setup at all.
     key = deps_key(settings, workspace, run.setup_command) if settings.deps_cache else None
     cached = cached_deps(deps_cache, key)
     if cached is not None:
@@ -2166,7 +2272,11 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.setup_exit_code, run.setup_cached = 0, True
         log(f"[{task_id}] dùng lại thư viện đã cài ({cached.name}), bỏ qua bước cài")
     elif run.setup_command:
-        log(f"[{task_id}] cài thư viện (có mạng): {run.setup_command}")
+        if settings.setup_network != "none":
+            _warn_setup_network_once(state_dir, Path(repo), settings.setup_network, task_id, log)
+            log(f"[{task_id}] cài thư viện (mạng: {settings.setup_network}): {run.setup_command}")
+        else:
+            log(f"[{task_id}] cài thư viện (không mạng): {run.setup_command}")
         before = workspace_state(workspace)
         name = container_name("setup", task_id)
         started = time.monotonic()
@@ -2185,9 +2295,14 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         if workspace_state(workspace) == before and store_deps(deps_cache, key, deps):
             log(f"[{task_id}] đã lưu thư viện để task sau dùng lại ({key})")
         run.patch_base = commit_setup_changes(workspace)
+        check_workspace_limit(settings, workspace)
 
     # 2. Agent (internal network, gateway only), then 3. Kite's own tests (no network at all).
     #    When the tests fail, the agent gets the failing output and tries again (settings.fix_rounds).
+    token_path = sandbox_token_path(settings)
+    if token_path is not None and read_sandbox_token(settings) is None:
+        log(f"[{task_id}] cảnh báo: không đọc được token sandbox ở {token_path} — gateway chưa ghi "
+            "file này (gateway cũ?); agent chạy mà không có header X-Kite-Task-Token")
     config_file = root / "opencode.json"
     config_file.write_text(json.dumps(agent_config(settings, model=model, models=models, small_model=small_model,
                                                    task_tag=task_id, worker_pin=worker_pin), indent=2),
@@ -2323,6 +2438,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.agent_output_tail = _tail(output)
         agent_log.append(f"===== {kind} exit={run.agent_exit_code} =====\n{output}")
         count_tools(output)
+        check_workspace_limit(settings, workspace)
         if not run.test_command:
             break
         run.test_exit_code, test_output, ran = run_tests(kind, test_output)
@@ -2404,6 +2520,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                 run.review = "reverted"
                 log(f"[{task_id}] rà soát làm hỏng (agent exit {review_code}, test exit {code}, kiểm tra "
                     f"{check_code}): trả lại bản trước")
+    check_workspace_limit(settings, workspace)
     (root / "agent.log").write_text("\n".join(agent_log), encoding="utf-8")
     if test_log:
         (root / "test.log").write_text("\n".join(test_log), encoding="utf-8")
@@ -2547,6 +2664,17 @@ def doctor(settings: SandboxSettings, runner: Runner = default_runner) -> dict[s
     internet = data.get("internet")
     record("gateway_reachable", data.get("gateway") == 200, data.get("gateway"))
     record("internet_blocked", not (isinstance(internet, int) and 200 <= internet < 400), internet)
+    # The --internal network stops routed Internet, not the host itself: a sandbox container
+    # must not reach the host's own services (SSH, the public HTTPS port) through the gateway
+    # address. Kite cannot install host firewall rules from here, so this probe is the check:
+    # when it fails, the host needs a firewall rule (DOCKER-USER/iptables) that lets the
+    # sandbox subnet reach only the gateway port on the host.
+    ssh_open, https_open = data.get("host_ssh_reachable"), data.get("host_https_reachable")
+    record("host_ports_blocked", ssh_open is False and https_open is False,
+           f"ssh={ssh_open} https={https_open}" if ssh_open is False and https_open is False else
+           f"ssh={ssh_open} https={https_open}: a sandbox container can reach host services "
+           "beyond the gateway — add a host firewall rule (DOCKER-USER/iptables) allowing the "
+           "sandbox subnet to reach only the gateway port on the host")
     record("host_secrets_hidden", data.get("host_secrets_visible") is False, data.get("host_secrets_visible"))
     record("non_root", data.get("uid") not in (0, None), data.get("uid"))
     record("opencode", opencode.returncode == 0, clean_output(opencode.stdout or opencode.stderr).strip())

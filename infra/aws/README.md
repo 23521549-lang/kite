@@ -1,7 +1,8 @@
 # Kite's machine on AWS (Terraform)
 
-`infra/aws` makes an Ubuntu 24.04 instance (t3.medium), a separate encrypted gp3 disk for `/var/lib/kite`
-(never removed by a plan), an Elastic IP and a security group (443 and 80 open, 22 for your address only).
+`infra/aws` makes an Ubuntu 24.04 instance (t3.medium) in its own VPC, a separate encrypted gp3 disk for
+`/var/lib/kite` (never removed by a plan), an Elastic IP and a security group (443 open, 80 open in
+public mode only, 22 for your address only).
 At first boot the machine mounts the disk, waits for its address and runs `deploy/stack/install.sh`; from
 then on kite-stack keeps Kite updated. The machine gets no AWS role. It runs from GitHub Actions without
 any AWS key: the workflow signs in with GitHub's OIDC token.
@@ -23,6 +24,17 @@ want a confirmation before each run), and Settings > Secrets and variables > Act
 | `KITE_SSH_CIDR` | your address for SSH, e.g. `203.0.113.7/32` |
 | `KITE_SSH_PUBLIC_KEY` | one line: `ssh-ed25519 AAAA... you@laptop` |
 | `KITE_ACCESS`, `KITE_DOMAIN` | optional: `private`; your own domain pointing at the address |
+
+## After bootstrap: checklist
+
+- **Turn on required reviewers for the `aws` environment** (Settings > Environments > `aws` >
+  Required reviewers: yourself). The role from the bootstrap can only be assumed from that
+  environment, and with reviewers on, no Infra workflow run can apply anything to AWS until you
+  approve it in GitHub.
+- **Re-run step 2 whenever the bootstrap policy changes.** The role's permissions live in
+  `infra/aws/bootstrap/main.tf`; editing that file does nothing until the bootstrap is applied
+  again (`make bootstrap-infra`, or just `bash infra/aws/terraform-bootstrap.sh`). The same
+  applies when rotating back: policy changes only take effect through that re-run.
 
 ## The machine
 

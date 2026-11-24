@@ -28,3 +28,10 @@ web/.dist-old/
 *.tfplan
 # a machine export (kite stack export) holds secrets
 kite-export.tgz
+
+# Terraform variable files can hold secrets (the bootstrap fills them from .env)
+*.tfvars
+*.tfvars.json
+# Terraform crash logs can hold sensitive data
+crash.log
+crash.*.log

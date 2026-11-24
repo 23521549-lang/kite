@@ -250,6 +250,20 @@ def test_worker_token_and_opencode_config_commands(tmp_path, capsys):
     assert set(provider["models"]) == {"qwen3.6", "devstral", "qwen3.6-fast"}
 
 
+def test_worker_rotate_token_replaces_the_stored_token(tmp_path, capsys):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_base_config(tmp_path)))
+    assert cli.main(["--config", str(config_path), "worker", "token", "kaggle-han"]) == 0
+    first = json.loads(capsys.readouterr().out)["token"]
+    assert cli.main(["--config", str(config_path), "worker", "rotate-token", "kaggle-han"]) == 0
+    rotated = json.loads(capsys.readouterr().out)
+    token_path = tmp_path / "secrets" / "worker_token_kaggle-han"
+    assert rotated["token"] != first and token_path.read_text().strip() == rotated["token"]
+    assert "KITE_WORKER_TOKEN" in rotated["next"]          # the owner must update the Kaggle Secret
+    if os.name != "nt":
+        assert token_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_status_lists_models_and_answers_carry_the_requested_model_name():
     async def scenario():
         gateway = make_gateway()
@@ -781,3 +795,117 @@ def test_a_queued_request_keeps_waiting_past_the_timeout_while_a_worker_is_start
             job.future.result()
 
     asyncio.run(scenario())
+
+
+# ------------------------------------------------------------------ the sandbox listener (3.1)
+SANDBOX_HOST = "127.0.0.2"          # a second loopback address stands in for 172.19.0.1
+SANDBOX_TOKEN = "s" * 40
+
+
+async def two_binds(app):
+    """Serve one app on loopback and on the sandbox address, like the gateway process does."""
+    import aiohttp
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    first = web.TCPSite(runner, "127.0.0.1", 0)
+    await first.start()
+    port = first._server.sockets[0].getsockname()[1]
+    await web.TCPSite(runner, SANDBOX_HOST, port).start()
+    session = aiohttp.ClientSession()
+    return runner, session, f"http://127.0.0.1:{port}", f"http://{SANDBOX_HOST}:{port}"
+
+
+def sandbox_app(gateway):
+    from poc.kaggle_worker.gateway import sandbox_token_digest
+
+    return create_app(gateway, sandbox_host=SANDBOX_HOST,
+                      sandbox_token_digest=sandbox_token_digest(SANDBOX_TOKEN))
+
+
+def test_the_sandbox_listener_demands_the_client_token_and_loopback_does_not():
+    async def scenario():
+        gateway = make_gateway()
+        runner, session, local, sandboxed = await two_binds(sandbox_app(gateway))
+        try:
+            missing = await session.get(sandboxed + "/status")
+            wrong = await session.get(sandboxed + "/status", headers={"X-Kite-Task-Token": "x" * 40})
+            right = await session.get(sandboxed + "/status", headers={"X-Kite-Task-Token": SANDBOX_TOKEN})
+            models = await session.get(sandboxed + "/v1/models")
+            chat = await session.post(sandboxed + "/v1/chat/completions",
+                                      json={"model": "qwen3.6", "messages": []})
+            owner = await session.get(local + "/status")
+            return (missing.status, wrong.status, right.status, models.status, chat.status, owner.status)
+        finally:
+            await session.close()
+            await runner.cleanup()
+
+    assert asyncio.run(scenario()) == (401, 401, 200, 401, 401, 200)
+
+
+def test_a_token_carrying_sandbox_request_is_served_like_any_client():
+    async def scenario():
+        gateway = make_gateway()
+        runner, session, _local, sandboxed = await two_binds(sandbox_app(gateway))
+        try:
+            await gateway.heartbeat("w1", {"ready": True, "loaded_model": "qwen3.6"})
+            pending = asyncio.create_task(session.post(
+                sandboxed + "/v1/chat/completions", headers={"X-Kite-Task-Token": SANDBOX_TOKEN},
+                json={"model": "qwen3.6", "messages": [{"role": "user", "content": "hi"}]}))
+            job = await gateway.next_job("w1", 5)
+            assert job is not None
+            gateway.complete("w1", job.job_id, {"status": "ok", "response": COMPLETION})
+            response = await pending
+            return response.status, (await response.json())["choices"][0]["message"]["content"]
+        finally:
+            await session.close()
+            await runner.cleanup()
+
+    assert asyncio.run(scenario()) == (200, "xin chào")
+
+
+def test_a_chat_tag_from_the_sandbox_never_starts_a_worker():
+    async def scenario():
+        woken = []
+        gateway = make_gateway(on_demand=woken.append)
+        runner, session, local, sandboxed = await two_binds(sandbox_app(gateway))
+        try:
+            # The note path (tag "chat", nobody serving): answered, but nothing is started.
+            noted = await session.post(sandboxed + "/v1/chat/completions",
+                                       headers={"X-Kite-Task-Token": SANDBOX_TOKEN, "X-Kite-Task": "chat"},
+                                       json={"model": "qwen3.6", "messages": []})
+            assert noted.status == 200 and woken == []
+            # The queue path (a chat-started task's tag): the job queues, still nothing starts.
+            queued = asyncio.create_task(session.post(
+                sandboxed + "/v1/chat/completions",
+                headers={"X-Kite-Task-Token": SANDBOX_TOKEN, "X-Kite-Task": "chat-20261124-zz"},
+                json={"model": "qwen3.6", "messages": []}))
+            await asyncio.sleep(0.2)
+            assert woken == [] and gateway.status()["queued_jobs"] == 1
+            for job in list(gateway.jobs.values()):
+                gateway.cancel(job)
+            await queued
+            # The same tags from the owner's own loopback do start a worker, as before.
+            await session.post(local + "/v1/chat/completions", headers={"X-Kite-Task": "chat"},
+                               json={"model": "qwen3.6", "messages": []})
+            return woken
+        finally:
+            await session.close()
+            await runner.cleanup()
+
+    assert asyncio.run(scenario()) == ["qwen3.6"]
+
+
+def test_issue_sandbox_client_token_writes_a_0600_file_and_returns_its_digest(tmp_path):
+    import hashlib
+    import stat
+
+    from poc.kaggle_worker.gateway import issue_sandbox_client_token
+
+    path = tmp_path / "secrets" / "sandbox_client_token"
+    digest = issue_sandbox_client_token(path)
+    token = path.read_text().strip()
+    assert len(token) >= 40 and hashlib.sha256(token.encode()).hexdigest() == digest
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    again = issue_sandbox_client_token(path)                 # a new boot rotates the token
+    assert again != digest and path.read_text().strip() != token

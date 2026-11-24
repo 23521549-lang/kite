@@ -65,3 +65,20 @@ def test_inline_credential_values_are_rejected_and_redacted():
     assert "KAGGLE_TOKEN" not in safe
     assert "env:KAGGLE_TOKEN" not in safe
 
+
+
+def test_resolve_secret_reads_a_web_sealed_file(tmp_path):
+    from poc.kaggle_worker.config import resolve_secret
+    from poc.kaggle_worker.web.security import Sealer
+    from poc.kaggle_worker.web.workers import SEALED_PREFIX, write_secret
+
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    sealer = Sealer(secrets_dir / "web_key")
+    key_file = secrets_dir / "api_key_relay"
+    write_secret(key_file, "sk-live-123", sealer=sealer)
+    assert key_file.read_text(encoding="utf-8").startswith(SEALED_PREFIX)
+    assert resolve_secret(f"file:{key_file}") == "sk-live-123"
+    plain = secrets_dir / "api_key_plain"
+    plain.write_text("sk-plain-9\n", encoding="utf-8")
+    assert resolve_secret(f"file:{plain}") == "sk-plain-9"

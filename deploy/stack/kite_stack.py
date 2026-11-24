@@ -12,7 +12,10 @@ copies the compose files out of the new image into ``releases/<id>`` (so compose
 together), pins both images by digest there (images.env), points ``current`` at it and starts it. If a
 Kite service is not healthy within the deadline, ``current`` goes back to the previous release, which
 starts again; that digest is not tried again automatically. Nothing is updated while a task, a bench run
-or a chat answer is in progress (``kite busy``), unless asked with --force.
+or a chat answer is in progress (``kite busy``), unless asked with --force. When stack.env carries
+``KITE_VERIFY_IMAGE_SIGNATURES=1`` (stamped in at install), both new images must first prove the
+cosign signature of this repository's CI (keyless, GitHub OIDC): an unsigned or wrongly signed image
+is refused and the running release stays untouched.
 
 The web and the chat cannot run Docker: they leave request files in ``requests/`` (a systemd path unit
 starts ``kite-stack requests``) and read ``status.json``. stack.env (0600) keeps the secrets of the
@@ -101,6 +104,30 @@ def atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
 
 def short(digest: str) -> str:
     return digest.split(":", 1)[-1][:12]
+
+
+COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
+SECRET_KEYS = ("TEMPORAL_POSTGRES_PASSWORD", "TEMPORAL_VISIBILITY_POSTGRES_PASSWORD",
+               "TEMPORAL_SETUP_POSTGRES_PASSWORD", "KITE_WEB_DB_PASSWORD")
+
+
+def find_cosign() -> str | None:
+    """The cosign binary on this machine (a module-level seam: tests replace this)."""
+    return shutil.which("cosign")
+
+
+def signature_identity(image_repo: str) -> str:
+    """The certificate identity CI signs with: this repository's ci.yml workflow on GitHub. The
+    image repo is ghcr.io/<owner>/<repo>; both images are signed by that one workflow."""
+    path = image_repo.split("/", 1)[1] if "/" in image_repo else image_repo
+    return rf"^https://github\.com/{re.escape(path)}/\.github/workflows/ci\.yml@"
+
+
+def generated_secrets(env: dict[str, str]) -> dict[str, str]:
+    """The machine's passwords: the ones it already has are kept word for word, the missing ones
+    are made here. Temporal's side gets one password per consumer (the server itself, its
+    visibility store, the schema setup) plus the web database's, instead of one shared password."""
+    return {key: env.get(key) or secrets.token_urlsafe(32) for key in SECRET_KEYS}
 
 
 class Stack:
@@ -226,6 +253,29 @@ class Stack:
                 "sandbox_ref": sandbox_ref, "sandbox_digest": self.digest_of(sandbox_ref),
                 "revision": (labels.get("org.opencontainers.image.revision") or "")[:12],
                 "created": labels.get("org.opencontainers.image.created") or info.get("Created", "")}
+
+    def verify_signatures(self, new: dict, env: dict[str, str] | None = None) -> tuple[bool, str]:
+        """Both new images must carry this repo's CI signature before either may run. Only when
+        stack.env asks for it (``KITE_VERIFY_IMAGE_SIGNATURES=1``): machines installed before CI
+        signed its images keep updating until the owner turns it on. A failed check — or no cosign
+        on the machine — refuses the images; nothing about the running release changes."""
+        env = self.env() if env is None else env
+        if env.get("KITE_VERIFY_IMAGE_SIGNATURES", "0") != "1":
+            return True, ""
+        cosign = find_cosign()
+        if cosign is None:
+            return False, ("máy chưa cài cosign: cài cosign rồi chạy lại, hoặc tắt "
+                           "KITE_VERIFY_IMAGE_SIGNATURES trong stack.env")
+        kite_repo = new["kite_ref"].rsplit(":", 1)[0]
+        sandbox_repo = new["sandbox_ref"].rsplit(":", 1)[0]
+        for pinned in (f"{kite_repo}@{new['kite_digest']}", f"{sandbox_repo}@{new['sandbox_digest']}"):
+            done = self.run([cosign, "verify", "--certificate-identity-regexp",
+                             signature_identity(kite_repo),
+                             "--certificate-oidc-issuer", COSIGN_ISSUER, pinned], timeout=300)
+            if done.returncode != 0:
+                detail = ((done.stderr or "") + (done.stdout or "")).strip()[-400:]
+                return False, f"{pinned} không đúng chữ ký của CI repo này: {detail}"
+        return True, ""
 
     def prepare(self, new: dict) -> Path:
         """releases/<id>: the deploy/ folder of the new image, images.env with both images pinned."""
@@ -422,6 +472,9 @@ class Stack:
                     f"lần đo {busy['bench'].get('label')}" if busy.get("bench") else "",
                     "chat đang trả lời" if busy.get("chat") else ""]))
                 return self.finish("update", "busy", f"hoãn vì đang chạy: {what}; thử lại lần sau")
+        signed, why = self.verify_signatures(new, env)
+        if not signed:
+            return self.finish("update", "failed", f"bản mới bị từ chối, bản đang chạy giữ nguyên: {why}")
         old = self.release()
         release = self.prepare(new)
         self.set_status(state="updating")
@@ -531,10 +584,10 @@ class Stack:
             "KITE_SANDBOX_REPO": sandbox or env.get("KITE_SANDBOX_REPO") or f"{image or DEFAULT_IMAGE}-sandbox",
             "KITE_CHANNEL": channel or env.get("KITE_CHANNEL", "stable"),
             "KITE_AUTO_UPDATE": {True: "1", False: "0"}.get(auto_update, env.get("KITE_AUTO_UPDATE", "1")),
+            "KITE_VERIFY_IMAGE_SIGNATURES": env.get("KITE_VERIFY_IMAGE_SIGNATURES", "1"),
             "TZ": timezone or env.get("TZ") or self.host_timezone(),
             "DOCKER_GID": str(grp.getgrnam("docker").gr_gid),
-            "TEMPORAL_POSTGRES_PASSWORD": env.get("TEMPORAL_POSTGRES_PASSWORD") or secrets.token_urlsafe(32),
-            "KITE_WEB_DB_PASSWORD": env.get("KITE_WEB_DB_PASSWORD") or secrets.token_urlsafe(32),
+            **generated_secrets(env),
         }
         if values["KITE_ACCESS"] not in ("public", "private"):
             raise StackError("--access là public hoặc private")
@@ -550,6 +603,9 @@ class Stack:
             if self.release() is None:
                 self.set_status(state="updating")
                 new = self.pull()
+                signed, why = self.verify_signatures(new, values)
+                if not signed:
+                    raise StackError(f"image đầu tiên bị từ chối: {why}")
                 release = self.prepare(new)
                 self.activate(release)
             release = self.release()

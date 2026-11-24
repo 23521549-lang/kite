@@ -46,6 +46,10 @@ if not KITE_TOKEN:
         raise RuntimeError("Không đọc được Secret KITE_WORKER_TOKEN: Add-ons -> Secrets, bật nó cho notebook "
                            "này (token in ra từ `kite worker token <worker>` trên máy Kite).") from exc
 KITE_GATEWAY = (_kite_pushed.get("gateway_url") or KITE_GATEWAY).rstrip("/")
+if not KITE_GATEWAY:
+    raise RuntimeError("Chưa có địa chỉ gateway: KITE_LAUNCH không có gateway_url và ô khởi động này "
+                       "không mang địa chỉ nào (gateway.public_url chưa đặt khi Kite tạo ô). Worker dừng "
+                       "tại đây để không gửi token tới một địa chỉ không rõ.")
 _kite_request = urllib.request.Request(KITE_GATEWAY + "/worker/code", headers={{
     "Authorization": "Bearer " + KITE_TOKEN,
     "X-Kite-Run-Type": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "")}})

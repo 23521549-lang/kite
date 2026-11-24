@@ -12,6 +12,16 @@ except ModuleNotFoundError:
     main = None
 
 
+def test_sandbox_build_refuses_an_opencode_binary_that_is_not_the_pinned_one(tmp_path):
+    from poc.kaggle_worker.cli import _check_opencode_binary
+    from poc.kaggle_worker.config import ConfigError
+
+    fake = tmp_path / "opencode"
+    fake.write_bytes(b"not the pinned opencode binary")
+    with pytest.raises(ConfigError, match="OPENCODE_BIN_SHA512"):
+        _check_opencode_binary(fake)
+
+
 def invoke(args, capsys):
     assert main is not None, "CLI module has not been implemented"
     result = main(args)

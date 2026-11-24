@@ -110,7 +110,13 @@ def _safe_path(workspace: Path, path: str) -> Path:
     clean = PurePosixPath(path.replace("\\", "/"))
     if clean.is_absolute() or ".." in clean.parts or not clean.parts or clean.parts[0] == ".git":
         raise EditError(f"{path}: not a path inside the repository")
-    return Path(workspace) / Path(*clean.parts)
+    # Resolve symlinks (a committed symlink, or one the setup step planted, must not let an
+    # edit write outside the workspace through a linked directory or file).
+    root = Path(workspace).resolve()
+    target = (root / Path(*clean.parts)).resolve()
+    if target != root and root not in target.parents:
+        raise EditError(f"{path}: resolves outside the repository (symlink escape)")
+    return target
 
 
 def _indent(line: str) -> str:
