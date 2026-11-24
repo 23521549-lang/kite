@@ -25,6 +25,7 @@ class FakeDocker:
         self.unhealthy: set[str] = set()          # kite digests whose web service never gets healthy
         self.running = None                      # KITE_IMAGE of the last `compose up`
         self.busy = {"busy": False, "tasks": [], "bench": None, "chat": 0}
+        self.cosign_ok = True                    # what `cosign verify` says about the new images
         self.calls: list[list[str]] = []
 
     def done(self, out="", code=0, err=""):
@@ -52,6 +53,8 @@ class FakeDocker:
             return self.done("true 172.30.230.1")
         if cmd[:2] == ["docker", "compose"]:
             return self.compose(cmd)
+        if cmd[0].endswith("cosign"):
+            return self.done(code=0) if self.cosign_ok else self.done(code=1, err="no matching signatures")
         return self.done()                        # create, rm, tag, rmi, image prune
 
     def compose(self, cmd):
@@ -205,3 +208,58 @@ def test_secrets_stay_in_a_root_only_file(tmp_path):
     path = tmp_path / "stack.env"
     ks.write_env(path, {"TEMPORAL_POSTGRES_PASSWORD": "p"}, "x")
     assert path.stat().st_mode & 0o777 == 0o600 and ks.read_env(path) == {"TEMPORAL_POSTGRES_PASSWORD": "p"}
+
+
+def require_signatures(host, monkeypatch, present=True):
+    stack = host["stack"]
+    env = stack.env()
+    env["KITE_VERIFY_IMAGE_SIGNATURES"] = "1"
+    ks.write_env(stack.env_file, env, "test")
+    monkeypatch.setattr(ks, "find_cosign", lambda: "/usr/local/bin/cosign" if present else None)
+
+
+def cosign_calls(docker):
+    return [c for c in docker.calls if c[0].endswith("cosign")]
+
+
+def test_an_update_with_signature_checking_verifies_both_images_by_digest_first(host, monkeypatch):
+    stack, docker = host["stack"], host["docker"]
+    require_signatures(host, monkeypatch)
+    assert stack.update(force=True)["last"]["result"] == "updated"
+    calls = cosign_calls(docker)
+    assert [c[-1] for c in calls] == ["ghcr.io/han/kite@sha256:" + "a" * 64,
+                                      "ghcr.io/han/kite-sandbox@sha256:" + "b" * 64]
+    for call in calls:
+        assert call[1] == "verify"
+        assert call[call.index("--certificate-oidc-issuer") + 1] == "https://token.actions.githubusercontent.com"
+        identity = call[call.index("--certificate-identity-regexp") + 1]
+        assert identity == r"^https://github\.com/han/kite/\.github/workflows/ci\.yml@"
+
+
+def test_an_update_whose_signature_fails_is_refused_and_the_running_release_is_untouched(host, monkeypatch):
+    stack, docker = host["stack"], host["docker"]
+    stack.update(force=True)                                   # release a*12 runs, checking still off
+    require_signatures(host, monkeypatch)
+    docker.registry["kite"] = "sha256:" + "c" * 64
+    docker.cosign_ok = False
+    ups = len(compose_ups(docker))
+    result = stack.update(timer=True)
+    assert result["last"]["result"] == "failed" and "chữ ký" in result["last"]["message"]
+    assert stack.release().name == "a" * 12                    # the old release still runs
+    assert docker.running.endswith("a" * 64) and len(compose_ups(docker)) == ups
+    assert not (stack.releases / ("c" * 12)).exists()          # nothing of the refused one was prepared
+
+
+def test_an_update_is_refused_when_cosign_is_missing(host, monkeypatch):
+    stack, docker = host["stack"], host["docker"]
+    require_signatures(host, monkeypatch, present=False)
+    result = stack.update(force=True)
+    assert result["last"]["result"] == "failed" and "cosign" in result["last"]["message"]
+    assert stack.release() is None and not cosign_calls(docker)
+    assert not any(c[:2] == ["docker", "create"] for c in docker.calls)
+
+
+def test_signature_checking_is_off_until_the_machine_asks_for_it(host):
+    stack, docker = host["stack"], host["docker"]
+    assert stack.update(force=True)["last"]["result"] == "updated"
+    assert not cosign_calls(docker)
