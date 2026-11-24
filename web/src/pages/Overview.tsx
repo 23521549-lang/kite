@@ -94,6 +94,9 @@ export default function Overview() {
   )
   if (!data || !office) return <Loading error={error} />
   const quota = data.gpu_quota ?? {}
+  const brandTotals = new Map<string, number>()
+  for (const w of data.workers) brandTotals.set(w.brand, (brandTotals.get(w.brand) ?? 0) + w.spend.month_usd)
+  const brandSpend = [...brandTotals.entries()].sort((a, b) => b[1] - a[1])
   return (
     <Page title="Tổng quan">
       <SimpleGrid cols={{ base: 2, md: 4 }}>
@@ -102,6 +105,18 @@ export default function Overview() {
         <Stat label="Chi hôm nay" value={usd(data.spend.today_usd)} />
         <Stat label="Chi tháng này" value={usd(data.spend.month_usd)} />
       </SimpleGrid>
+      {brandSpend.length ? (
+        <Card withBorder>
+          <Text fw={600} mb={6}>
+            Chi theo hãng tháng này
+          </Text>
+          {brandSpend.map(([brand, total]) => (
+            <Text key={brand} size="sm">
+              <b>{brand}</b>: {usd(total)}
+            </Text>
+          ))}
+        </Card>
+      ) : null}
       {Object.keys(quota).length ? (
         <Card withBorder>
           <Text fw={600} mb={6}>

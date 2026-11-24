@@ -181,7 +181,14 @@ function WorkerConfigCard({ worker: w, onEdit, onChanged }: { worker: WorkerRow;
   return (
     <Card withBorder>
       <Group justify="space-between">
-        <Text fw={600}>{w.id}</Text>
+        <div>
+          <Text fw={600}>
+            {w.brand} · {w.models[0] ?? w.id}
+          </Text>
+          <Text size="xs" c="dimmed">
+            {w.id} · {w.type}
+          </Text>
+        </div>
         <Badge color={w.enabled ? 'teal' : 'gray'} variant="light">
           {w.enabled ? 'đang dùng' : 'tắt trong cấu hình'}
         </Badge>
