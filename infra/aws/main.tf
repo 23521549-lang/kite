@@ -66,7 +66,10 @@ resource "aws_vpc_security_group_ingress_rule" "https" {
   to_port           = 443
 }
 
+# Public mode only: in private mode nothing is served over HTTP, and Caddy gets its certificate with
+# the TLS-ALPN-01 challenge on port 443 instead of HTTP-01, so port 80 stays closed.
 resource "aws_vpc_security_group_ingress_rule" "http" {
+  count             = var.access == "private" ? 0 : 1
   security_group_id = aws_security_group.kite.id
   description       = "HTTP: certificate challenges and the redirect to HTTPS"
   cidr_ipv4         = "0.0.0.0/0"
