@@ -85,6 +85,9 @@ class SandboxSettings:
     gateway_url: str = "http://172.19.0.1:8787/v1"
     host_gateway_url: str = ""       # the same gateway as Kite itself (on the host) reaches it; "" = gateway_url
     memory: str = "1g"
+    # Host-disk guard: a step that fills the workspace (on the same disk as Kite's state)
+    # aborts the task instead of the whole stack. 0 = no limit.
+    workspace_limit_bytes: int = 10 * 1024 * 1024 * 1024
     cpus: float = 1.0
     pids_limit: int = 512
     agent_timeout_seconds: int = 3600
@@ -231,6 +234,30 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
+def workspace_size(workspace: Path) -> int:
+    """Total size of the files under ``workspace`` (symlinked directories are not followed)."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(workspace):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return total
+
+
+def check_workspace_limit(settings: SandboxSettings, workspace: Path) -> None:
+    """Abort the task when the workspace grew past the configured host-disk guard."""
+    limit = settings.workspace_limit_bytes
+    if limit <= 0:
+        return
+    size = workspace_size(workspace)
+    if size > limit:
+        raise SandboxError(
+            f"workspace is {size} bytes, over the sandbox limit of {limit} bytes "
+            "(sandbox.workspace_limit_bytes); the task was stopped before it could fill the disk")
+
+
 def container_name(kind: str, task_id: str) -> str:
     return f"kite-{kind}-{task_id}"
 
@@ -244,6 +271,7 @@ def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, ne
         "--network", network,
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--pids-limit", str(settings.pids_limit), "--memory", settings.memory,
+        "--memory-swap", settings.memory,     # no swap beyond the memory limit
         "--cpus", str(settings.cpus), "--user", f"{settings.uid}:{settings.uid}",
         "-e", "HOME=/home/kite", "-e", "OPENCODE_DISABLE_AUTOUPDATE=1",
         "-v", f"{Path(workspace).resolve()}:/work", "-w", "/work",
@@ -2250,6 +2278,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         if workspace_state(workspace) == before and store_deps(deps_cache, key, deps):
             log(f"[{task_id}] đã lưu thư viện để task sau dùng lại ({key})")
         run.patch_base = commit_setup_changes(workspace)
+        check_workspace_limit(settings, workspace)
 
     # 2. Agent (internal network, gateway only), then 3. Kite's own tests (no network at all).
     #    When the tests fail, the agent gets the failing output and tries again (settings.fix_rounds).
@@ -2392,6 +2421,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.agent_output_tail = _tail(output)
         agent_log.append(f"===== {kind} exit={run.agent_exit_code} =====\n{output}")
         count_tools(output)
+        check_workspace_limit(settings, workspace)
         if not run.test_command:
             break
         run.test_exit_code, test_output, ran = run_tests(kind, test_output)
@@ -2473,6 +2503,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                 run.review = "reverted"
                 log(f"[{task_id}] rà soát làm hỏng (agent exit {review_code}, test exit {code}, kiểm tra "
                     f"{check_code}): trả lại bản trước")
+    check_workspace_limit(settings, workspace)
     (root / "agent.log").write_text("\n".join(agent_log), encoding="utf-8")
     if test_log:
         (root / "test.log").write_text("\n".join(test_log), encoding="utf-8")

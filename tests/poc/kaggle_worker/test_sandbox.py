@@ -771,6 +771,26 @@ def test_edit_blocks_apply_all_or_nothing_and_stay_inside_the_repo(tmp_path):
 
 
 
+def test_workspace_over_the_limit_aborts_the_task(tmp_path):
+    from dataclasses import replace
+
+    (tmp_path / "big.bin").write_bytes(b"x" * 2048)
+    with pytest.raises(sbx.SandboxError, match="over the sandbox limit"):
+        sbx.check_workspace_limit(replace(SETTINGS, workspace_limit_bytes=1024), tmp_path)
+    sbx.check_workspace_limit(replace(SETTINGS, workspace_limit_bytes=4096), tmp_path)   # under: fine
+    sbx.check_workspace_limit(replace(SETTINGS, workspace_limit_bytes=0), tmp_path)      # 0 = no limit
+    # End to end: the agent step writes into the workspace, then the guard stops the task.
+    fake = FakeDocker()
+    (tmp_path / "r").mkdir()
+    with pytest.raises(sbx.SandboxError, match="over the sandbox limit"):
+        sbx.run_task(replace(SETTINGS, workspace_limit_bytes=10), repo=make_repo(tmp_path / "r"),
+                     goal="Sửa average", model="qwen3.6", models=["qwen3.6"],
+                     state_dir=tmp_path / "state", task_id="big1", runner=fake, log=lambda _m: None)
+    # And every container gets no swap beyond its memory limit.
+    args = sbx.docker_run_args(SETTINGS, name="kite-agent-t1", workspace=tmp_path, network="none")
+    assert value_after(args, "--memory-swap") == value_after(args, "--memory") == SETTINGS.memory
+
+
 def test_setup_network_defaults_to_none_and_an_opt_in_warns_once_per_repo(tmp_path):
     from dataclasses import replace
 
