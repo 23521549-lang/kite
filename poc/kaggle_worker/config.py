@@ -193,6 +193,10 @@ class LaunchConfig:
     # What Kite pushes: "stub" is one small cell that downloads the worker code from Kite when it runs
     # (stub.py), so a run never has old code; "full" is this repository's whole notebook.
     notebook: str = "stub"
+    # SHA-256 of the prebuilt llama-server binary in the owner's kite-llama-bin dataset. The notebook
+    # only runs the prebuilt when the file it finds hashes to this; unset or mismatched means it
+    # builds from source (pinned commit) instead of executing an unverified binary.
+    llama_server_sha256: str | None = None
 
 
 LAUNCH_TOKEN_MODES = ("kaggle-secret", "per-launch")
@@ -205,7 +209,7 @@ _ACCELERATOR = re.compile(r"^[A-Za-z0-9]{2,40}$")
 def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tuple[str, ...]) -> LaunchConfig:
     launch = _mapping(raw, label)
     unknown = set(launch) - {"kernel", "idle_minutes", "token", "accelerator", "max_hours", "model",
-                             "kaggle_username", "via", "notebook"}
+                             "kaggle_username", "via", "notebook", "llama_server_sha256"}
     if unknown:
         raise ConfigError(f"{label} has unsupported fields")
     kernel = launch.get("kernel")
@@ -238,7 +242,13 @@ def _validate_launch(raw: Any, label: str, secrets: dict[str, str], models: tupl
     notebook = launch.get("notebook", "stub")
     if notebook not in LAUNCH_NOTEBOOKS:
         raise ConfigError(f"{label}.notebook must be one of {', '.join(LAUNCH_NOTEBOOKS)}")
-    return LaunchConfig(kernel, idle, token, accelerator, hours, model, username, via, notebook)
+    sha256 = launch.get("llama_server_sha256")
+    if sha256 is not None:
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+            raise ConfigError(f"{label}.llama_server_sha256 must be a 64-character hex SHA-256 digest "
+                              "(sha256sum of the llama-server binary in your kite-llama-bin dataset)")
+        sha256 = sha256.lower()
+    return LaunchConfig(kernel, idle, token, accelerator, hours, model, username, via, notebook, sha256)
 
 
 @dataclass(frozen=True)

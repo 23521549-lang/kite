@@ -29,7 +29,7 @@ from typing import Any, Callable
 # as ``WORKER_VERSION = ""``). The worker reports it in its heartbeat, so EC2 can tell when a notebook
 # started by hand runs older code than the repository (``kite doctor``, ``kite worker status``).
 # tests/poc/kaggle_worker/test_launcher.py checks it and prints the right value when a cell changes.
-WORKER_VERSION = "30762fe8d635"
+WORKER_VERSION = "f649be459ecf"
 
 
 class PullWorker:

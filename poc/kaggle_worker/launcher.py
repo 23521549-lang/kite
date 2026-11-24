@@ -343,6 +343,9 @@ class KaggleLauncher:
                 launch["gateway_url"] = self.config.gateway.public_url
             if spec.token == "per-launch":
                 launch["token"] = self._new_launch_token(worker_id, spec.max_hours)
+            if spec.llama_server_sha256:
+                # The notebook only runs the prebuilt llama-server when the binary hashes to this.
+                launch["llama_server_sha256"] = spec.llama_server_sha256
             # The bootstrap notebook needs the gateway's public address to fetch the worker code.
             base = (stub_notebook(self.config.gateway.public_url)
                     if spec.notebook == "stub" and self.config.gateway.public_url

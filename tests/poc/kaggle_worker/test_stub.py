@@ -99,6 +99,21 @@ def test_a_wrong_token_says_which_secret_to_check(monkeypatch):
         run_stub(stub_source(GATEWAY), monkeypatch, bundle={}, status=401)
 
 
+def test_a_stub_without_any_gateway_address_stops_before_sending_the_token(monkeypatch):
+    with pytest.raises(RuntimeError, match="địa chỉ gateway"):
+        run_stub(stub_source(""), monkeypatch, bundle={"version": "x", "cells": [], "launch": {}})
+
+
+def test_the_notebook_has_no_hard_coded_gateway_and_checks_the_prebuilt_binary():
+    text = NOTEBOOK.read_text(encoding="utf-8")
+    assert "184-72-143-157" not in text                       # the old EC2 address is gone for good
+    worker = next(s for s in notebook_cells() if "WORKER_TOKEN = KITE_LAUNCH.get" in s)
+    assert "if not GATEWAY_URL:" in worker and "raise RuntimeError" in worker
+    build = next(s for s in notebook_cells() if "LLAMA_CPP_REF" in s)
+    assert '"/kaggle/input/**/llama-server"' not in build     # not just any attached dataset
+    assert "kite-llama-bin" in build and "_sha256_of" in build and "llama_server_sha256" in build
+
+
 def test_the_notebook_setup_cell_takes_the_stub_values_for_a_saved_run_only(monkeypatch):
     import os
     import time

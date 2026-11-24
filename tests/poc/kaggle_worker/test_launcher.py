@@ -152,6 +152,25 @@ def test_a_request_with_no_connected_worker_pushes_the_notebook_with_the_request
     assert env["KAGGLE_CONFIG_DIR"] and not Path(env["KAGGLE_CONFIG_DIR"]).exists()   # temporary, removed
 
 
+def test_launch_token_default_is_per_launch_and_the_llama_hash_is_validated(tmp_path):
+    config, *_ = make(tmp_path)
+    assert config.providers[0].launch.token == "per-launch"          # one default, as in config.py
+    assert config.providers[0].launch.llama_server_sha256 is None
+    config, *_ = make(tmp_path, launch={"kernel": "hanle/kite-worker", "llama_server_sha256": "AB" * 32})
+    assert config.providers[0].launch.llama_server_sha256 == "ab" * 32
+    with pytest.raises(ConfigError, match="llama_server_sha256"):
+        make(tmp_path, launch={"kernel": "hanle/kite-worker", "llama_server_sha256": "not-a-hash"})
+
+
+def test_the_pushed_notebook_carries_the_llama_hash(tmp_path):
+    sha = "cd" * 32
+    _config, _gateway, launcher, fake, _clock = make(
+        tmp_path, launch={"kernel": "hanle/kite-worker", "llama_server_sha256": sha})
+    ok, error, _version = launcher._push("kaggle-han", "qwen3.6", "test")
+    assert ok, error
+    assert launch_values(fake.pushed)["llama_server_sha256"] == sha
+
+
 def test_no_push_while_a_worker_is_connected_even_if_it_is_loading_a_model(tmp_path):
     async def scenario():
         _config, gateway, launcher, fake, _clock = make(tmp_path)
