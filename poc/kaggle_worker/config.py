@@ -148,6 +148,11 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
                           "(the API key would travel in clear text)")
     if kind == "anthropic" and not secrets.get("api_key"):
         raise ConfigError(f"{where}: Anthropic needs secrets.api_key")
+    if pod is not None and not secrets.get("api_key"):
+        raise ConfigError(f"{where}: a RunPod pod's model server needs secrets.api_key — the pod's "
+                          "proxy URL follows from its id, so a server without a key is open to anyone "
+                          "who learns the id; start the server on the pod with --api-key "
+                          "(e.g. vLLM --api-key) and store that key as secrets.api_key")
     upstream = _mapping(r.get("upstream", {}), f"{where}.upstream")
     for name, target in upstream.items():
         if name not in models:
