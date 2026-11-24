@@ -17,7 +17,10 @@ or deletes pods; it only switches the existing one on and off through RunPod's R
 * Cost: hours the pod runs times its hourly price (the owner's ``price_hour``, else the price RunPod
   reports), counted in the spend ledger like an API's tokens; caps work the same.
 
-When Kite restarts while the pod runs, it takes the running pod over (its idle clock starts again).
+When Kite restarts while the pod runs, it takes the running pod over (its idle clock starts
+again) and keeps billing from where the previous process stopped: every accrual saves a
+billing cursor in the spend store (spend_ledger.py), and adoption resumes from that cursor,
+so the hours the gateway was down are counted too.
 The RunPod key lives in a 0600 file and only ever goes to api.runpod.io.
 """
 
@@ -98,9 +101,11 @@ class PodController:
     def __init__(self, spec, client: RunPodClient, relay, ledger, *, notify=None,
                  journal: Callable[[str, dict], None] | None = None, clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], Any] = asyncio.sleep, health=None, poll_seconds: float = 10.0,
-                 flush_seconds: float = 600.0) -> None:
+                 flush_seconds: float = 600.0, store=None) -> None:
         self.spec, self.pod = spec, spec.pod
         self.client, self.relay, self.ledger = client, relay, ledger
+        # Durable billing cursor (spend_ledger.SpendStore); default: the ledger's own store.
+        self.store = store if store is not None else getattr(ledger, "store", None)
         self.notify, self.journal, self.clock, self.sleep = notify, journal, clock, sleep
         self.health = health or self._server_answers
         self.poll_seconds, self.flush_seconds = poll_seconds, flush_seconds
@@ -155,6 +160,21 @@ class PodController:
                 " Máy thuê thường lên sau 2–10 phút; khi đó nhắn lại.")
 
     # ------------------------------------------------------------------ money
+    def _save_cursor(self) -> None:
+        """Remember (durably) how far this pod's billing has been counted, for a gateway restart."""
+        if self.store is not None:
+            self.store.set_pod_cursor(self.worker_id, self.s.billed_from or None)
+
+    def _resume_cursor(self) -> float:
+        """Where billing should continue from: the saved cursor if the pod was already billing
+        when this process started (the gateway was down, RunPod was not), else now."""
+        now = self.clock()
+        if self.store is not None:
+            cursor = self.store.pod_cursor(self.worker_id)
+            if cursor is not None and 0 < cursor <= now:
+                return cursor
+        return now
+
     def _accrue(self, *, flush: bool = False) -> None:
         """Count the hourly price from the last accrual until now (while RunPod bills the pod)."""
         now = self.clock()
@@ -166,6 +186,7 @@ class PodController:
                 self.ledger.add(self.worker_id, usd, now)
             self.s.unflushed_usd += usd
             self.s.unflushed_hours += hours
+            self._save_cursor()
         if self.s.unflushed_hours and (flush or now - self.s.last_flush >= self.flush_seconds):
             self._record("spend", {"kind": "pod", "pod": self.pod.pod_id, "hours": round(self.s.unflushed_hours, 4),
                                    "price_hour": self.price, "usd": round(self.s.unflushed_usd, 6)})
@@ -191,7 +212,8 @@ class PodController:
 
     # ------------------------------------------------------------------ start / stop
     async def adopt(self) -> None:
-        """At gateway start: a pod that is already running is taken over (and billed from now)."""
+        """At gateway start: a pod that is already running is taken over; billing resumes from
+        the saved cursor, so the hours this process was down are counted too."""
         try:
             pod = await self.client.get(self.pod.pod_id)
         except PodError as exc:
@@ -200,10 +222,13 @@ class PodController:
         self._price_from(pod)
         self.s.pod_status = pod.get("status")
         if self.s.pod_status == RUNNING or self.s.pod_status in BOOTING:
-            self.s.billed_from = self.clock()
+            self.s.billed_from = self._resume_cursor()     # count the gateway's downtime too
+            self._save_cursor()
             self.s.reason = "adopted"
             self._set("starting", "máy đang chạy từ trước; chờ model server trả lời")
             self._spawn(self._wait_up())
+        elif self.store is not None:
+            self.store.set_pod_cursor(self.worker_id, None)   # not running: the old billing period is over
 
     def on_demand(self) -> None:
         """Gateway hook (through starters.py): a request for one of this pod's models is waiting."""
@@ -238,7 +263,11 @@ class PodController:
                 pod = {}
             self._price_from(pod)
             self.s.pod_status = pod.get("status") or self.s.pod_status
+            # Billing (re)starts now; a saved cursor is only resumed by adopt(), which knows
+            # the pod kept running while this process was down. Here it could be stale (the
+            # pod was stopped while Kite was away) and would bill time the pod was off.
             self.s.billed_from = self.s.billed_from or self.clock()
+            self._save_cursor()
             self._record("launches", {"event": "push", "kind": "pod", "pod": self.pod.pod_id, "reason": reason,
                                       "price_hour": self.price})
             self._spawn(self._wait_up())
@@ -263,6 +292,7 @@ class PodController:
             if self.s.pod_status in STOPPED and self.clock() - started > 3 * self.poll_seconds:
                 self._accrue(flush=True)
                 self.s.billed_from = 0.0
+                self._save_cursor()
                 self._set("error", f"RunPod báo máy {self.s.pod_status} khi đang bật")
                 self._record("launches", {"event": "failed", "error": self.s.detail})
                 return
@@ -295,6 +325,7 @@ class PodController:
                 return self.status()
         self._accrue(flush=True)
         self.s.billed_from = 0.0
+        self._save_cursor()
         self._record("launches", {"event": "stopped", "kind": "pod", "reason": reason})
         self._set("off", detail)
         return self.status()

@@ -597,9 +597,11 @@ def _worker_browser(args: argparse.Namespace) -> int:
 
 def _worker_spend(args: argparse.Namespace) -> int:
     from .relay import SpendLedger
+    from .spend_ledger import SpendStore
 
     config = _load_operator_config(args)
-    ledger = SpendLedger(Journal(args.config.parent / "journal").read("spend"))
+    ledger = SpendLedger(Journal(args.config.parent / "journal").read("spend"),
+                         store=SpendStore(args.config.parent / "spend.sqlite3"))
     rows = []
     for p in config.providers:
         if p.adapter != "relay" or p.relay is None:
@@ -1161,7 +1163,10 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
 
     specs = relay_specs(config)
     gateway.paid = {spec.worker_id for spec in specs if spec.paid}
-    ledger = SpendLedger(journal.read("spend"))
+    from .spend_ledger import SpendStore
+
+    # Settled spend is durable (SQLite in the state dir); the journal's old records import once.
+    ledger = SpendLedger(journal.read("spend"), store=SpendStore(state_dir / "spend.sqlite3"))
     from .starters import Starters, Switches
 
     switches = Switches(state_dir / "switches.json")
@@ -1197,8 +1202,19 @@ async def _serve_gateway(args: argparse.Namespace, config) -> None:
                                    "run_type": str(headers.get("X-Kite-Run-Type", ""))[:20]})
         return worker_bundle(launch)
 
+    sandbox_digest = None
+    if config.sandbox is not None:
+        # One sandbox client token per gateway boot: the plaintext goes to a 0600 file the
+        # sandbox side reads; only its digest stays in this process (gateway.py).
+        from .gateway import issue_sandbox_client_token
+
+        token_file = Path(os.environ.get("KITE_SANDBOX_TOKEN_FILE")
+                          or state_dir / "secrets" / "sandbox_client_token")
+        sandbox_digest = issue_sandbox_client_token(token_file)
     runner = web.AppRunner(create_app(gateway, launcher=launcher, worker_code=worker_code, browser=browser,
-                                      switches=switches, relays=relays))
+                                      switches=switches, relays=relays,
+                                      sandbox_host=config.sandbox.gateway_host if config.sandbox else None,
+                                      sandbox_token_digest=sandbox_digest))
     await runner.setup()
     hosts = [config.gateway.host]
     if config.sandbox is not None:

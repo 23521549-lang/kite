@@ -81,6 +81,7 @@ class RelayConfig:
     # pod: RunPod's proxy closes a request that has sent nothing for 100 seconds.
     stream: bool = False
     pod: PodConfig | None = None
+    max_tokens: int = 8192               # ceiling for one answer; sizes the spend reservation (relay.py)
 
 
 POD_PROVIDERS = ("runpod",)
@@ -123,7 +124,8 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
     from urllib.parse import urlparse
 
     r = _mapping(raw, where)
-    unknown = set(r) - {"kind", "base_url", "upstream", "price", "caps", "timeout_seconds", "stream", "pod"}
+    unknown = set(r) - {"kind", "base_url", "upstream", "price", "caps", "timeout_seconds", "stream", "pod",
+                        "max_tokens"}
     if unknown:
         raise ConfigError(f"{where} has unsupported fields: {', '.join(sorted(unknown))}")
     kind = r.get("kind")
@@ -170,9 +172,12 @@ def _validate_relay(raw: Any, where: str, secrets: dict, models: tuple[str, ...]
         raise ConfigError(f"{where}: price takes input/output, caps take daily_usd/monthly_usd")
     if not numbers["timeout"] or numbers["timeout"] > 3600:
         raise ConfigError(f"{where}.timeout_seconds must be between 1 and 3600")
+    max_tokens = r.get("max_tokens", 8192)
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or not 16 <= max_tokens <= 1_000_000:
+        raise ConfigError(f"{where}.max_tokens must be an integer between 16 and 1000000")
     return RelayConfig(kind, base_url.rstrip("/"), tuple((k, v.strip()) for k, v in upstream.items()),
                        numbers["price_in"], numbers["price_out"], numbers["daily_cap"], numbers["monthly_cap"],
-                       numbers["timeout"], stream or pod is not None, pod)
+                       numbers["timeout"], stream or pod is not None, pod, max_tokens)
 
 
 @dataclass(frozen=True)
