@@ -52,7 +52,7 @@ DEPS_ENV = (
 )
 
 PROBE = r"""
-import json, os, urllib.error, urllib.request
+import json, os, socket, urllib.error, urllib.parse, urllib.request
 def get(url):
     try:
         with urllib.request.urlopen(url, timeout=8) as response:
@@ -61,11 +61,20 @@ def get(url):
         return exc.code
     except Exception as exc:
         return type(exc).__name__
+def tcp(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True
+    except OSError:
+        return False
+gateway_host = urllib.parse.urlsplit(os.environ["KITE_GATEWAY_MODELS"]).hostname
 print(json.dumps({
     "gateway": get(os.environ["KITE_GATEWAY_MODELS"]),
     "internet": get("https://example.com"),
     "host_secrets_visible": os.path.exists("/var/lib/kite"),
     "uid": os.getuid(),
+    "host_ssh_reachable": tcp(gateway_host, 22),
+    "host_https_reachable": tcp(gateway_host, 443),
 }))
 """
 
@@ -2647,6 +2656,17 @@ def doctor(settings: SandboxSettings, runner: Runner = default_runner) -> dict[s
     internet = data.get("internet")
     record("gateway_reachable", data.get("gateway") == 200, data.get("gateway"))
     record("internet_blocked", not (isinstance(internet, int) and 200 <= internet < 400), internet)
+    # The --internal network stops routed Internet, not the host itself: a sandbox container
+    # must not reach the host's own services (SSH, the public HTTPS port) through the gateway
+    # address. Kite cannot install host firewall rules from here, so this probe is the check:
+    # when it fails, the host needs a firewall rule (DOCKER-USER/iptables) that lets the
+    # sandbox subnet reach only the gateway port on the host.
+    ssh_open, https_open = data.get("host_ssh_reachable"), data.get("host_https_reachable")
+    record("host_ports_blocked", ssh_open is False and https_open is False,
+           f"ssh={ssh_open} https={https_open}" if ssh_open is False and https_open is False else
+           f"ssh={ssh_open} https={https_open}: a sandbox container can reach host services "
+           "beyond the gateway — add a host firewall rule (DOCKER-USER/iptables) allowing the "
+           "sandbox subnet to reach only the gateway port on the host")
     record("host_secrets_hidden", data.get("host_secrets_visible") is False, data.get("host_secrets_visible"))
     record("non_root", data.get("uid") not in (0, None), data.get("uid"))
     record("opencode", opencode.returncode == 0, clean_output(opencode.stdout or opencode.stderr).strip())

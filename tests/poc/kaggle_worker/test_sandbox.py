@@ -312,13 +312,37 @@ def test_doctor_reports_every_isolation_check(tmp_path):
             return subprocess.CompletedProcess(cmd, 0, "2.3.0\n", "")
         if "python" in cmd:
             return subprocess.CompletedProcess(cmd, 0, json.dumps({
-                "gateway": 200, "internet": "URLError", "host_secrets_visible": False, "uid": 1000}) + "\n", "")
+                "gateway": 200, "internet": "URLError", "host_secrets_visible": False, "uid": 1000,
+                "host_ssh_reachable": False, "host_https_reachable": False}) + "\n", "")
         raise AssertionError(cmd)
 
     checks = sbx.doctor(SETTINGS, runner=fake)
     assert set(checks) == {"docker", "image", "network_internal", "gateway_reachable",
-                           "internet_blocked", "host_secrets_hidden", "non_root", "opencode"}
+                           "internet_blocked", "host_ports_blocked", "host_secrets_hidden",
+                           "non_root", "opencode"}
     assert all(check["ok"] for check in checks.values())
+
+
+def test_doctor_flags_a_host_port_the_sandbox_can_reach(tmp_path):
+    def fake(cmd, *, timeout=None):
+        cmd = list(cmd)
+        if cmd[1:3] == ["version", "--format"]:
+            return subprocess.CompletedProcess(cmd, 0, "29.0\n", "")
+        if cmd[1:3] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+        if cmd[1:3] == ["network", "inspect"]:
+            return subprocess.CompletedProcess(cmd, 0, "true\n", "")
+        if cmd[-2:] == ["opencode", "--version"]:
+            return subprocess.CompletedProcess(cmd, 0, "2.3.0\n", "")
+        if "python" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({
+                "gateway": 200, "internet": "URLError", "host_secrets_visible": False, "uid": 1000,
+                "host_ssh_reachable": True, "host_https_reachable": False}) + "\n", "")
+        raise AssertionError(cmd)
+
+    checks = sbx.doctor(SETTINGS, runner=fake)
+    assert checks["host_ports_blocked"]["ok"] is False
+    assert "firewall" in checks["host_ports_blocked"]["detail"]
 
 
 def _config(**sandbox):
