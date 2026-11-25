@@ -22,16 +22,17 @@ import { useState } from 'react'
 import { get, post, type TaskRow } from '../api'
 import { ConfirmButton, DiffView, Empty, JsonView, KeyValue, Loading, Page, StateBadge } from '../components/common'
 import { go } from '../router'
-import { TASK_TYPES, attempt, fmtTime, short, useLoad } from '../util'
-
-const FILTERS = [
-  { value: 'all', label: 'Tất cả' },
-  { value: 'active', label: 'Đang chạy' },
-  { value: 'done', label: 'Xong' },
-  { value: 'bad', label: 'Lỗi/hủy' },
-]
+import { attempt, fmtTime, short, useLoad } from '../util'
+import { useT } from '../i18n'
 
 export default function Tasks({ parts }: { parts: string[] }) {
+  const t = useT()
+  const FILTERS = [
+    { value: 'all', label: t('tasks.filter.all') },
+    { value: 'active', label: t('tasks.filter.active') },
+    { value: 'done', label: t('tasks.filter.done') },
+    { value: 'bad', label: t('tasks.filter.bad') },
+  ]
   const taskId = parts[0] ?? null
   const { data, error, reload } = useLoad(() => get<{ tasks: TaskRow[] }>('/api/tasks?limit=50'), [], 8000)
   const [filter, setFilter] = useState('all')
@@ -47,10 +48,10 @@ export default function Tasks({ parts }: { parts: string[] }) {
   )
   return (
     <Page
-      title="Task"
+      title={t('tasks.title')}
       actions={
         <Button leftSection={<IconPlus size={16} />} onClick={() => setCreating(true)}>
-          Task mới
+          {t('tasks.new-task')}
         </Button>
       }
     >
@@ -95,7 +96,7 @@ export default function Tasks({ parts }: { parts: string[] }) {
                 </Table.Tbody>
               </Table>
             ) : (
-              <Empty>Không có task nào.</Empty>
+              <Empty>{t('tasks.no-tasks')}</Empty>
             )}
           </Card>
         </Grid.Col>
@@ -110,6 +111,14 @@ export default function Tasks({ parts }: { parts: string[] }) {
 }
 
 function NewTask({ opened, onClose, onCreated }: { opened: boolean; onClose: () => void; onCreated: (id: string) => void }) {
+  const t = useT()
+  const TASK_TYPE_OPTIONS = [
+    { value: 'coding', label: t('tasks.new.type.coding') },
+    { value: 'analysis', label: t('tasks.new.type.analysis') },
+    { value: 'review', label: t('tasks.new.type.review') },
+    { value: 'docs', label: t('tasks.new.type.docs') },
+    { value: 'vision', label: t('tasks.new.type.vision') },
+  ]
   const repos = useLoad(() => get<{ repos: { id: number; name: string; path: string }[]; allowed_roots: string[] }>('/api/repos'), [opened])
   const [repo, setRepo] = useState<string | null>(null)
   const [goal, setGoal] = useState('')
@@ -120,47 +129,47 @@ function NewTask({ opened, onClose, onCreated }: { opened: boolean; onClose: () 
   const [busy, setBusy] = useState(false)
   const options = (repos.data?.repos ?? []).map((r) => ({ value: r.path, label: `${r.name} · ${r.path}` }))
   return (
-    <Modal opened={opened} onClose={onClose} title="Giao task cho Kite" size="lg">
+    <Modal opened={opened} onClose={onClose} title={t('tasks.new.title')} size="lg">
       <Stack>
         <Select
-          label="Repo"
-          description="Repo đã thêm ở tab Repo, hoặc gõ đường dẫn một repo Git trên máy Kite"
+          label={t('tasks.new.repo')}
+          description={t('tasks.new.repo-desc')}
           data={options}
           value={repo}
           onChange={setRepo}
           searchable
           clearable
-          nothingFoundMessage="Gõ đường dẫn đầy đủ rồi chọn"
+          nothingFoundMessage={t('tasks.new.repo-nothing-found')}
           onSearchChange={(q) => {
             if (q.startsWith('/') && !options.some((o) => o.value === q)) setRepo(q)
           }}
         />
         <Textarea
-          label="Việc cần làm"
-          description="Cụ thể: file nào, hành vi mong muốn, cách kiểm tra"
+          label={t('tasks.new.goal')}
+          description={t('tasks.new.goal-desc')}
           autosize
           minRows={4}
           value={goal}
           onChange={(e) => setGoal(e.currentTarget.value)}
         />
         <Group grow>
-          <Select label="Loại task" data={TASK_TYPES} value={taskType} onChange={(v) => setTaskType(v ?? 'coding')} allowDeselect={false} />
-          <TextInput label="Model (để trống: Kite chọn)" value={model} onChange={(e) => setModel(e.currentTarget.value)} />
+          <Select label={t('tasks.new.type')} data={TASK_TYPE_OPTIONS} value={taskType} onChange={(v) => setTaskType(v ?? 'coding')} allowDeselect={false} />
+          <TextInput label={t('tasks.new.model')} value={model} onChange={(e) => setModel(e.currentTarget.value)} />
         </Group>
         <TextInput
-          label="Sửa tiếp từ task"
-          description="ID một task đã xong: task mới bắt đầu từ kết quả của nó"
+          label={t('tasks.new.continue-from')}
+          description={t('tasks.new.continue-from-desc')}
           value={continueFrom}
           onChange={(e) => setContinueFrom(e.currentTarget.value)}
         />
         <Checkbox
-          label="Bỏ qua thay đổi chưa commit trong repo"
+          label={t('tasks.new.ignore-dirty')}
           checked={ignoreDirty}
           onChange={(e) => setIgnoreDirty(e.currentTarget.checked)}
         />
         <Group justify="flex-end">
           <Button variant="default" onClick={onClose}>
-            Thôi
+            {t('common.cancel')}
           </Button>
           <Button
             loading={busy}
@@ -181,7 +190,7 @@ function NewTask({ opened, onClose, onCreated }: { opened: boolean; onClose: () 
               if (res?.task_id) onCreated(res.task_id)
             }}
           >
-            Giao task
+            {t('tasks.new.assign')}
           </Button>
         </Group>
       </Stack>
@@ -197,6 +206,7 @@ type Detail = {
 }
 
 function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => void }) {
+  const t = useT()
   const { data, error, reload } = useLoad(
     () => get<Detail>(`/api/tasks/${encodeURIComponent(taskId)}`),
     [taskId],
@@ -244,7 +254,7 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
         </Group>
         {s.error ? (
           <Alert color="yellow" mt="sm">
-            Không đọc được trạng thái từ Temporal: {short(s.error, 200)}
+            {t('tasks.detail.temporal-error', { error: short(s.error, 200) })}
           </Alert>
         ) : null}
         <Group gap="xs" mt="md">
@@ -252,52 +262,52 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
             <ConfirmButton
               color="teal"
               size="xs"
-              label="Áp vào repo"
-              title="Áp patch"
-              message={<Text size="sm">Áp patch vào working tree của repo gốc (không commit, không push).</Text>}
-              confirmLabel="Áp"
-              onConfirm={() => act('apply', {}, 'Đã áp patch')}
+              label={t('tasks.detail.apply-patch')}
+              title={t('tasks.detail.apply-title')}
+              message={<Text size="sm">{t('tasks.detail.apply-message')}</Text>}
+              confirmLabel={t('tasks.detail.apply')}
+              onConfirm={() => act('apply', {}, t('tasks.detail.applied'))}
             />
           ) : null}
           {done && patch ? (
             <ConfirmButton
               size="xs"
               variant="light"
-              label="Commit…"
-              title="Commit đúng các file của patch đã áp"
+              label={t('tasks.detail.commit')}
+              title={t('tasks.detail.commit-title')}
               askText
-              textLabel="Commit message"
-              confirmLabel="Commit"
-              onConfirm={(message) => act('commit', { message }, 'Đã commit (chưa push)')}
+              textLabel={t('tasks.detail.commit-label')}
+              confirmLabel={t('tasks.detail.commit-button')}
+              onConfirm={(message) => act('commit', { message }, t('tasks.detail.committed'))}
             />
           ) : null}
           {running ? (
             <>
-              <Button size="xs" variant="light" onClick={() => act('pause', {}, 'Đã gửi lệnh tạm dừng')}>
-                Tạm dừng
+              <Button size="xs" variant="light" onClick={() => act('pause', {}, t('tasks.detail.paused'))}>
+                {t('tasks.detail.pause')}
               </Button>
-              <Button size="xs" variant="light" onClick={() => act('resume', {}, 'Đã gửi lệnh tiếp tục')}>
-                Tiếp tục
+              <Button size="xs" variant="light" onClick={() => act('resume', {}, t('tasks.detail.resumed'))}>
+                {t('tasks.detail.resume')}
               </Button>
               <ConfirmButton
                 size="xs"
                 variant="light"
-                label="Gửi chỉ dẫn…"
-                title="Gửi thêm chỉ dẫn cho task đang chạy"
+                label={t('tasks.detail.instruct')}
+                title={t('tasks.detail.instruct-title')}
                 askText
-                textLabel="Chỉ dẫn"
-                confirmLabel="Gửi"
-                onConfirm={(text) => act('instruct', { text }, 'Đã gửi chỉ dẫn')}
+                textLabel={t('tasks.detail.instruct-label')}
+                confirmLabel={t('tasks.detail.instruct-send')}
+                onConfirm={(text) => act('instruct', { text }, t('tasks.detail.instructed'))}
               />
               <ConfirmButton
                 size="xs"
                 color="red"
                 variant="light"
-                label="Hủy task"
-                title="Hủy task?"
-                message="Các bước đang chạy dừng trong vài giây, worker được trả lại."
-                confirmLabel="Hủy task"
-                onConfirm={() => act('cancel', {}, 'Đã hủy')}
+                label={t('tasks.detail.cancel')}
+                title={t('tasks.detail.cancel-title')}
+                message={t('tasks.detail.cancel-message')}
+                confirmLabel={t('tasks.detail.cancel')}
+                onConfirm={() => act('cancel', {}, t('tasks.detail.cancelled'))}
               />
             </>
           ) : null}
@@ -307,24 +317,24 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
                 size="xs"
                 variant="subtle"
                 color="teal"
-                label="👍 Tốt"
-                title="Ghi nhận: kết quả tốt"
+                label={t('tasks.detail.good')}
+                title={t('tasks.detail.good-title')}
                 askText
-                textLabel="Lý do (không bắt buộc)"
+                textLabel={t('tasks.detail.good-reason')}
                 textDefault="ok"
-                confirmLabel="Ghi"
-                onConfirm={(reason) => act('note', { verdict: 'good', reason }, 'Đã ghi')}
+                confirmLabel={t('tasks.detail.record')}
+                onConfirm={(reason) => act('note', { verdict: 'good', reason }, t('tasks.detail.recorded'))}
               />
               <ConfirmButton
                 size="xs"
                 variant="subtle"
                 color="red"
-                label="👎 Chưa tốt"
-                title="Ghi nhận: kết quả chưa tốt"
+                label={t('tasks.detail.bad')}
+                title={t('tasks.detail.bad-title')}
                 askText
-                textLabel="Sai ở đâu? Kite rút kinh nghiệm cho repo này"
-                confirmLabel="Ghi"
-                onConfirm={(reason) => act('note', { verdict: 'bad', reason }, 'Đã ghi')}
+                textLabel={t('tasks.detail.bad-reason')}
+                confirmLabel={t('tasks.detail.record')}
+                onConfirm={(reason) => act('note', { verdict: 'bad', reason }, t('tasks.detail.recorded'))}
               />
             </>
           ) : null}
@@ -332,19 +342,19 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
       </Card>
       <Tabs defaultValue="progress" keepMounted={false}>
         <Tabs.List>
-          <Tabs.Tab value="progress">Tiến độ</Tabs.Tab>
-          <Tabs.Tab value="result">Kết quả</Tabs.Tab>
-          <Tabs.Tab value="diff">Diff</Tabs.Tab>
-          <Tabs.Tab value="journal">Nhật ký</Tabs.Tab>
+          <Tabs.Tab value="progress">{t('tasks.detail.tab-progress')}</Tabs.Tab>
+          <Tabs.Tab value="result">{t('tasks.detail.tab-result')}</Tabs.Tab>
+          <Tabs.Tab value="diff">{t('tasks.detail.tab-diff')}</Tabs.Tab>
+          <Tabs.Tab value="journal">{t('tasks.detail.tab-journal')}</Tabs.Tab>
         </Tabs.List>
         <Tabs.Panel value="progress" pt="sm">
           <Card withBorder>
             <KeyValue
               rows={[
-                ['Đã chạy', log.elapsed ?? s.elapsed ?? '—'],
-                ['Đang làm', log.now ?? s.now ?? (running ? s.step : '—') ?? '—'],
-                ...(s.waiting_for ? ([['Đang chờ', s.waiting_for]] as [string, string][]) : []),
-                ...(log.fast_path ? ([['Đường nhanh', short(log.fast_path, 200)]] as [string, string][]) : []),
+                [t('tasks.detail.elapsed'), log.elapsed ?? s.elapsed ?? '—'],
+                [t('tasks.detail.doing'), log.now ?? s.now ?? (running ? s.step : '—') ?? '—'],
+                ...(s.waiting_for ? ([[t('tasks.detail.waiting'), s.waiting_for]] as [string, string][]) : []),
+                ...(log.fast_path ? ([[t('tasks.detail.fast-path'), short(log.fast_path, 200)]] as [string, string][]) : []),
               ]}
             />
             {(log.progress ?? []).length ? (
@@ -356,7 +366,7 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
                 ))}
               </Timeline>
             ) : (
-              <Empty>{log.note ?? 'Chưa có bước nào.'}</Empty>
+              <Empty>{log.note ?? t('tasks.detail.no-steps')}</Empty>
             )}
           </Card>
         </Tabs.Panel>
@@ -366,14 +376,14 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
               <Stack>
                 <KeyValue
                   rows={[
-                    ['Trạng thái', result.status ?? '—'],
-                    ['Worker', result.worker ?? '—'],
-                    ['Repo', result.repo_path ?? '—'],
+                    [t('tasks.detail.status'), result.status ?? '—'],
+                    [t('tasks.detail.worker'), result.worker ?? '—'],
+                    [t('tasks.detail.repo'), result.repo_path ?? '—'],
                     ...(log.result
                       ? ([
-                          ['Kite tự test', log.result.verified ? 'qua' : 'chưa qua'],
-                          ['Thời gian', log.result.wall_seconds ? `${Math.round(log.result.wall_seconds)} giây` : '—'],
-                          ['File đổi', (log.result.changed_files ?? []).join(', ') || '—'],
+                          [t('tasks.detail.self-test'), log.result.verified ? t('tasks.detail.self-test-pass') : t('tasks.detail.self-test-fail')],
+                          [t('tasks.detail.duration'), log.result.wall_seconds ? t('tasks.detail.duration-seconds', { seconds: Math.round(log.result.wall_seconds) }) : '—'],
+                          [t('tasks.detail.changed-files'), (log.result.changed_files ?? []).join(', ') || '—'],
                         ] as [string, string][])
                       : []),
                   ]}
@@ -385,13 +395,13 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
                 ) : null}
               </Stack>
             ) : (
-              <Empty>Task chưa xong.</Empty>
+              <Empty>{t('tasks.detail.not-done')}</Empty>
             )}
           </Card>
         </Tabs.Panel>
         <Tabs.Panel value="diff" pt="sm">
           <Card withBorder p={0}>
-            {patch ? <DiffView patch={patch} /> : <Empty>Chưa có patch.</Empty>}
+            {patch ? <DiffView patch={patch} /> : <Empty>{t('tasks.detail.no-patch')}</Empty>}
           </Card>
         </Tabs.Panel>
         <Tabs.Panel value="journal" pt="sm">
@@ -399,17 +409,17 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
             <Card withBorder>
               <KeyValue
                 rows={[
-                  ['Request tới model', String(data.journal.requests?.count ?? 0)],
-                  ['Token vào / ra', `${data.journal.requests?.prompt_tokens ?? 0} / ${data.journal.requests?.completion_tokens ?? 0}`],
-                  ['Thời gian model', `${data.journal.requests?.model_seconds ?? 0} giây`],
-                  ['Lỗi', (data.journal.requests?.errors ?? []).length ? short((data.journal.requests.errors as string[]).join('; '), 300) : 'không'],
+                  [t('tasks.detail.requests'), String(data.journal.requests?.count ?? 0)],
+                  [t('tasks.detail.tokens'), `${data.journal.requests?.prompt_tokens ?? 0} / ${data.journal.requests?.completion_tokens ?? 0}`],
+                  [t('tasks.detail.model-time'), t('tasks.detail.model-seconds', { seconds: data.journal.requests?.model_seconds ?? 0 })],
+                  [t('tasks.detail.errors'), (data.journal.requests?.errors ?? []).length ? short((data.journal.requests.errors as string[]).join('; '), 300) : t('tasks.detail.no-errors')],
                 ]}
               />
             </Card>
             {data.journal.notes.length ? (
               <Card withBorder>
                 <Text fw={600} mb={4}>
-                  Nhận xét
+                  {t('tasks.detail.notes')}
                 </Text>
                 {data.journal.notes.map((n, i) => (
                   <Text key={i} size="sm">
@@ -420,9 +430,9 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
             ) : null}
             <Card withBorder>
               <Text fw={600} mb={4}>
-                Các lần chạy
+                {t('tasks.detail.runs')}
               </Text>
-              {data.journal.runs.length ? <JsonView data={data.journal.runs} /> : <Empty>Chưa có.</Empty>}
+              {data.journal.runs.length ? <JsonView data={data.journal.runs} /> : <Empty>{t('tasks.detail.no-runs')}</Empty>}
             </Card>
           </Stack>
         </Tabs.Panel>

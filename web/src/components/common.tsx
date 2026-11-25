@@ -17,7 +17,8 @@ import {
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { useMemo, useState, type ReactNode } from 'react'
-import { taskState } from '../util'
+import { useT, type DictKey } from '../i18n'
+import { taskState, type WorkerStateKey } from '../util'
 
 export function Page({ title, actions, children }: { title: ReactNode; actions?: ReactNode; children: ReactNode }) {
   return (
@@ -32,11 +33,12 @@ export function Page({ title, actions, children }: { title: ReactNode; actions?:
 }
 
 export function Loading({ error, label }: { error?: string | null; label?: string }) {
-  if (error) return <Alert color="red" title="Không tải được">{error}</Alert>
+  const t = useT()
+  if (error) return <Alert color="red" title={t('common.load-error')}>{error}</Alert>
   return (
     <Group gap="xs" c="dimmed">
       <Loader size="sm" />
-      <Text size="sm">{label ?? 'Đang tải…'}</Text>
+      <Text size="sm">{label ?? t('common.loading')}</Text>
     </Group>
   )
 }
@@ -98,25 +100,54 @@ export function DiffView({ patch, maxHeight = 520 }: { patch: string; maxHeight?
   )
 }
 
+const TASK_STATE_KEYS: Record<string, DictKey> = {
+  QUEUED: 'common.task-state.queued',
+  LEASED: 'common.task-state.leased',
+  COMPLETED: 'common.task-state.completed',
+  FAILED: 'common.task-state.failed',
+  CANCELLED: 'common.task-state.cancelled',
+  RUNNING: 'common.task-state.running',
+  TERMINATED: 'common.task-state.terminated',
+  TIMED_OUT: 'common.task-state.timed-out',
+}
+
 export function StateBadge({ state }: { state: string }) {
+  const t = useT()
   const s = taskState(state)
+  const key = TASK_STATE_KEYS[state]
   return (
     <Badge color={s.color} variant="light" size="sm">
-      {s.label}
+      {key ? t(key) : s.label}
     </Badge>
   )
+}
+
+const WORKER_STATE_KEYS: Record<WorkerStateKey, DictKey> = {
+  disabled: 'workers.state.disabled',
+  'switch-off': 'workers.state.switch-off',
+  stopping: 'workers.state.stopping',
+  busy: 'workers.state.busy',
+  idle: 'workers.state.idle',
+  starting: 'workers.state.starting',
+  offline: 'workers.state.offline',
+}
+
+/** Translate a workerState() key (shared by Overview + Workers). */
+export function useWorkerStateLabel(): (key: WorkerStateKey) => string {
+  const t = useT()
+  return (key) => t(WORKER_STATE_KEYS[key])
 }
 
 export function Dot({ color, title }: { color: string; title?: string }) {
   return <span className="dot" title={title} style={{ background: `var(--mantine-color-${color}-6)` }} />
 }
 
-/** A button that asks before it acts. With `askText`, the dialog also takes a text (a commit message…). */
+/** A button that asks before it acts. With `askText`, the dialog also takes a text (a commit message...). */
 export function ConfirmButton({
   label,
   title,
   message,
-  confirmLabel = 'Đồng ý',
+  confirmLabel,
   onConfirm,
   askText,
   textLabel,
@@ -133,6 +164,7 @@ export function ConfirmButton({
   textLabel?: string
   textDefault?: string
 } & ButtonProps) {
+  const t = useT()
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [text, setText] = useState(textDefault)
@@ -156,7 +188,7 @@ export function ConfirmButton({
           ) : null}
           <Group justify="flex-end">
             <Button variant="default" onClick={() => setOpen(false)}>
-              Thôi
+              {t('common.cancel')}
             </Button>
             <Button
               color={color}
@@ -172,7 +204,7 @@ export function ConfirmButton({
                 }
               }}
             >
-              {confirmLabel}
+              {confirmLabel ?? t('common.confirm')}
             </Button>
           </Group>
         </Stack>
@@ -193,7 +225,8 @@ export function Bars({
   color?: string
   format?: (v: number) => string
 }) {
-  if (!items.length) return <Empty>Chưa có số liệu.</Empty>
+  const t = useT()
+  if (!items.length) return <Empty>{t('common.no-data')}</Empty>
   const max = Math.max(...items.map((i) => i.value), 1)
   const w = 100 / items.length
   return (
@@ -221,7 +254,7 @@ export function Bars({
           {items[0].label}
         </Text>
         <Text size="xs" c="dimmed">
-          cao nhất {format(max)}
+          {t('common.highest', { value: format(max) })}
         </Text>
         <Text size="xs" c="dimmed">
           {items[items.length - 1].label}

@@ -13,15 +13,22 @@
 .md blockquote { margin: 0.4em 0; padding-left: 10px; border-left: 3px solid var(--mantine-color-dark-4); color: var(--mantine-color-dimmed); }
 [data-mantine-color-scheme='light'] .md pre { background: var(--mantine-color-gray-1); }
 [data-mantine-color-scheme='light'] .md code { background: var(--mantine-color-gray-2); }
+[data-mantine-color-scheme='light'] .md th, [data-mantine-color-scheme='light'] .md td { border-color: var(--mantine-color-gray-3); }
+[data-mantine-color-scheme='light'] .md a { color: var(--mantine-color-indigo-8); }
+[data-mantine-color-scheme='light'] .md blockquote { border-left-color: var(--mantine-color-gray-3); }
 .diff { margin: 0; font-family: var(--mantine-font-family-monospace); font-size: 12px; line-height: 1.45; }
 .diff > div { padding: 0 8px; white-space: pre-wrap; word-break: break-all; }
 .diff .d-add { background: rgba(46, 160, 67, 0.18); }
 .diff .d-del { background: rgba(248, 81, 73, 0.18); }
 .diff .d-hunk { color: var(--mantine-color-cyan-4); }
 .diff .d-file, .diff .d-head { color: var(--mantine-color-yellow-4); font-weight: 600; }
+/* cyan-4 / yellow-4 chỉ đọc được trên nền tối: chế độ sáng dùng tông đậm (cyan-9 5.59:1, orange-9 4.30:1 trên nền trắng). */
+[data-mantine-color-scheme='light'] .diff .d-hunk { color: var(--mantine-color-cyan-9); }
+[data-mantine-color-scheme='light'] .diff .d-file, [data-mantine-color-scheme='light'] .diff .d-head { color: var(--mantine-color-orange-9); }
 .bubble-user { background: var(--mantine-color-indigo-9); color: var(--mantine-color-white); border-radius: 14px 14px 4px 14px; padding: 8px 12px; max-width: min(720px, 85%); white-space: pre-wrap; word-break: break-word; }
 [data-mantine-color-scheme='light'] .bubble-user { background: var(--mantine-color-indigo-1); color: var(--mantine-color-black); }
 .chat-scroll { flex: 1; min-height: 0; }
+/* light-ok: .screen — #000 là mặt màn hình của trình duyệt từ xa (KaggleScreen): nội dung là ảnh JPEG từ server, không phải chữ UI — giữ nguyên cả hai chế độ, không cần override sáng. */
 .screen { display: block; width: 100%; height: auto; background: #000; outline: none; border-radius: 6px; cursor: default; }
 .screen:focus { box-shadow: 0 0 0 2px var(--mantine-color-indigo-5); }
 .clickable { cursor: pointer; }

@@ -3,33 +3,17 @@ import { useState } from 'react'
 import { get, qs } from '../api'
 import { Bars, Empty, JsonView, Loading, Page } from '../components/common'
 import { fmtTime, num, short, usd, useLoad } from '../util'
-
-const FILES = [
-  { value: 'gateway', label: 'Request model' },
-  { value: 'tasks', label: 'Task' },
-  { value: 'actions', label: 'Agent trưởng' },
-  { value: 'launches', label: 'Bật worker' },
-  { value: 'spend', label: 'Chi phí' },
-  { value: 'notes', label: 'Nhận xét' },
-]
-
-const METRICS = [
-  { value: 'requests', label: 'Request' },
-  { value: 'completion_tokens', label: 'Token ra' },
-  { value: 'gpu_seconds', label: 'Giây GPU' },
-  { value: 'tasks', label: 'Task' },
-  { value: 'errors', label: 'Lỗi' },
-  { value: 'usd', label: 'USD' },
-]
+import { useT, type DictKey } from '../i18n'
 
 export default function Journal() {
+  const t = useT()
   return (
-    <Page title="Nhật ký">
+    <Page title={t('journal.title')}>
       <Tabs defaultValue="summary" keepMounted={false}>
         <Tabs.List>
-          <Tabs.Tab value="summary">Tổng hợp</Tabs.Tab>
-          <Tabs.Tab value="events">Sự kiện</Tabs.Tab>
-          <Tabs.Tab value="audit">Thao tác của bạn</Tabs.Tab>
+          <Tabs.Tab value="summary">{t('journal.tab.summary')}</Tabs.Tab>
+          <Tabs.Tab value="events">{t('journal.tab.events')}</Tabs.Tab>
+          <Tabs.Tab value="audit">{t('journal.tab.audit')}</Tabs.Tab>
         </Tabs.List>
         <Tabs.Panel value="summary" pt="md">
           <Summary />
@@ -45,7 +29,25 @@ export default function Journal() {
   )
 }
 
+const FILE_KEYS: Record<string, DictKey> = {
+  gateway: 'journal.file.gateway',
+  tasks: 'journal.file.tasks',
+  actions: 'journal.file.actions',
+  launches: 'journal.file.launches',
+  spend: 'journal.file.spend',
+  notes: 'journal.file.notes',
+}
+
 function Summary() {
+  const t = useT()
+  const METRICS = [
+    { value: 'requests', label: t('journal.metric.requests') },
+    { value: 'completion_tokens', label: t('journal.metric.completion-tokens') },
+    { value: 'gpu_seconds', label: t('journal.metric.gpu-seconds') },
+    { value: 'tasks', label: t('journal.metric.tasks') },
+    { value: 'errors', label: t('journal.metric.errors') },
+    { value: 'usd', label: t('journal.metric.usd') },
+  ]
   const [days, setDays] = useState('7')
   const [metric, setMetric] = useState('requests')
   const summary = useLoad(() => get<Record<string, any>>(`/api/journal/summary${qs({ days })}`), [days])
@@ -55,7 +57,7 @@ function Summary() {
     <Stack>
       <Card withBorder>
         <Group justify="space-between" mb="xs">
-          <Text fw={600}>30 ngày qua</Text>
+          <Text fw={600}>{t('journal.summary.last-30')}</Text>
           <SegmentedControl size="xs" data={METRICS} value={metric} onChange={setMetric} />
         </Group>
         {daily.data ? (
@@ -71,10 +73,10 @@ function Summary() {
         <SegmentedControl
           size="xs"
           data={[
-            { value: '1', label: 'Hôm nay' },
-            { value: '7', label: '7 ngày' },
-            { value: '30', label: '30 ngày' },
-            { value: '0', label: 'Tất cả' },
+            { value: '1', label: t('journal.range.today') },
+            { value: '7', label: t('journal.range.7d') },
+            { value: '30', label: t('journal.range.30d') },
+            { value: '0', label: t('journal.range.all') },
           ]}
           value={days}
           onChange={setDays}
@@ -86,10 +88,10 @@ function Summary() {
         <SimpleGrid cols={{ base: 1, lg: 2 }}>
           <Card withBorder>
             <Text fw={600} mb="xs">
-              Task
+              {t('journal.summary.tasks')}
             </Text>
             <Text size="sm">
-              {s.tasks.runs} lần chạy · đã áp {s.tasks.applied} · đã commit {s.tasks.committed}
+              {t('journal.summary.runs', { runs: s.tasks.runs, applied: s.tasks.applied, committed: s.tasks.committed })}
             </Text>
             <Group gap={6} mt="xs">
               {Object.entries(s.tasks.reasons ?? {}).map(([k, v]) => (
@@ -102,10 +104,10 @@ function Summary() {
               <Table mt="sm">
                 <Table.Thead>
                   <Table.Tr>
-                    <Table.Th>Model</Table.Th>
-                    <Table.Th>Chạy</Table.Th>
-                    <Table.Th>Qua test</Table.Th>
-                    <Table.Th>TB giây</Table.Th>
+                    <Table.Th>{t('journal.summary.table.model')}</Table.Th>
+                    <Table.Th>{t('journal.summary.table.runs')}</Table.Th>
+                    <Table.Th>{t('journal.summary.table.verified')}</Table.Th>
+                    <Table.Th>{t('journal.summary.table.avg-seconds')}</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
@@ -123,7 +125,7 @@ function Summary() {
             {(s.tasks.recent_failures ?? []).length ? (
               <Stack gap={2} mt="sm">
                 <Text size="sm" fw={600}>
-                  Lỗi gần đây
+                  {t('journal.summary.recent-failures')}
                 </Text>
                 {(s.tasks.recent_failures as any[]).map((f, i) => (
                   <Text key={i} size="xs">
@@ -135,17 +137,17 @@ function Summary() {
           </Card>
           <Card withBorder>
             <Text fw={600} mb="xs">
-              Request tới model ({s.gateway.requests})
+              {t('journal.summary.gateway-requests', { count: s.gateway.requests })}
             </Text>
             {Object.keys(s.gateway.by_model ?? {}).length ? (
               <Table>
                 <Table.Thead>
                   <Table.Tr>
-                    <Table.Th>Model</Table.Th>
-                    <Table.Th>Request</Table.Th>
-                    <Table.Th>Token vào/ra</Table.Th>
-                    <Table.Th>tok/s ra</Table.Th>
-                    <Table.Th>Chờ (giây)</Table.Th>
+                    <Table.Th>{t('journal.summary.table.model')}</Table.Th>
+                    <Table.Th>{t('journal.metric.requests')}</Table.Th>
+                    <Table.Th>{t('journal.summary.table.tokens')}</Table.Th>
+                    <Table.Th>{t('journal.summary.table.tps')}</Table.Th>
+                    <Table.Th>{t('journal.summary.table.queue')}</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
@@ -163,12 +165,12 @@ function Summary() {
                 </Table.Tbody>
               </Table>
             ) : (
-              <Empty>Chưa có request.</Empty>
+              <Empty>{t('journal.summary.no-requests')}</Empty>
             )}
             {Object.keys(s.gateway.errors ?? {}).length ? (
               <Stack gap={2} mt="sm">
                 <Text size="sm" fw={600}>
-                  Lỗi
+                  {t('journal.summary.errors')}
                 </Text>
                 {Object.entries(s.gateway.errors as Record<string, number>).map(([k, v]) => (
                   <Text key={k} size="xs">
@@ -180,13 +182,13 @@ function Summary() {
           </Card>
           <Card withBorder>
             <Text fw={600} mb="xs">
-              Bật worker
+              {t('journal.summary.launches')}
             </Text>
             <JsonView data={s.autostart} maxHeight={220} />
           </Card>
           <Card withBorder>
             <Text fw={600} mb="xs">
-              Chi phí
+              {t('journal.summary.spend')}
             </Text>
             <JsonView data={s.spend} maxHeight={220} />
           </Card>
@@ -197,6 +199,8 @@ function Summary() {
 }
 
 function Events() {
+  const t = useT()
+  const FILES = Object.entries(FILE_KEYS).map(([value, key]) => ({ value, label: t(key) }))
   const [file, setFile] = useState('gateway')
   const [extra, setExtra] = useState<Record<string, any>[]>([])
   const { data, error } = useLoad(async () => {
@@ -221,7 +225,7 @@ function Events() {
           </Table>
         </Card>
       ) : (
-        <Empty>Chưa có sự kiện.</Empty>
+        <Empty>{t('journal.events.no-events')}</Empty>
       )}
       {records.length >= 100 && last?.ts ? (
         <Group>
@@ -233,7 +237,7 @@ function Events() {
               setExtra((x) => [...x, ...more.records])
             }}
           >
-            Xem cũ hơn
+            {t('journal.events.older')}
           </Button>
         </Group>
       ) : null}
@@ -242,6 +246,7 @@ function Events() {
 }
 
 function EventRow({ record: r }: { record: Record<string, any> }) {
+  const t = useT()
   const [open, setOpen] = useState(false)
   const main = [r.tool, r.event, r.model, r.worker, r.tag ?? r.task_id, r.outcome, r.verdict, r.usd !== undefined ? usd(r.usd) : null]
     .filter((x) => x !== undefined && x !== null && x !== '')
@@ -259,7 +264,7 @@ function EventRow({ record: r }: { record: Record<string, any> }) {
             {main || short(r, 140)}
           </Text>
         </Table.Td>
-        <Table.Td w={60}>{r.ok === false || r.outcome === 'error' ? <Badge color="red" size="xs">lỗi</Badge> : null}</Table.Td>
+        <Table.Td w={60}>{r.ok === false || r.outcome === 'error' ? <Badge color="red" size="xs">{t('journal.events.error')}</Badge> : null}</Table.Td>
       </Table.Tr>
       {open ? (
         <Table.Tr>
@@ -273,18 +278,19 @@ function EventRow({ record: r }: { record: Record<string, any> }) {
 }
 
 function Audit() {
+  const t = useT()
   const { data, error } = useLoad(() => get<{ rows: Record<string, any>[] }>('/api/audit?limit=200'), [])
   if (!data) return <Loading error={error} />
-  if (!data.rows.length) return <Empty>Chưa có thao tác nào.</Empty>
+  if (!data.rows.length) return <Empty>{t('journal.audit.no-rows')}</Empty>
   return (
     <Card withBorder p={0}>
       <Table striped>
         <Table.Thead>
           <Table.Tr>
-            <Table.Th>Lúc</Table.Th>
-            <Table.Th>Thao tác</Table.Th>
-            <Table.Th>Đối tượng</Table.Th>
-            <Table.Th>Địa chỉ</Table.Th>
+            <Table.Th>{t('journal.audit.time')}</Table.Th>
+            <Table.Th>{t('journal.audit.action')}</Table.Th>
+            <Table.Th>{t('journal.audit.target')}</Table.Th>
+            <Table.Th>{t('journal.audit.address')}</Table.Th>
             <Table.Th />
           </Table.Tr>
         </Table.Thead>
@@ -307,7 +313,7 @@ function Audit() {
                   {r.ip}
                 </Text>
               </Table.Td>
-              <Table.Td>{r.ok ? <Badge color="teal" size="xs">ok</Badge> : <Badge color="red" size="xs">lỗi</Badge>}</Table.Td>
+              <Table.Td>{r.ok ? <Badge color="teal" size="xs">{t('journal.audit.ok')}</Badge> : <Badge color="red" size="xs">{t('journal.audit.error')}</Badge>}</Table.Td>
             </Table.Tr>
           ))}
         </Table.Tbody>

@@ -1,9 +1,15 @@
 import { notifications } from '@mantine/notifications'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { getLanguage } from './i18n'
 
-export function notifyError(error: unknown, title = 'Không làm được') {
+export function notifyError(error: unknown, title?: string) {
   const message = error instanceof Error ? error.message : String(error)
-  notifications.show({ color: 'red', title, message, autoClose: 8000 })
+  notifications.show({
+    color: 'red',
+    title: title ?? (getLanguage() === 'en' ? 'Something went wrong' : 'Không làm được'),
+    message,
+    autoClose: 8000,
+  })
 }
 
 export function notifyOk(message: string, title?: string) {
@@ -95,28 +101,24 @@ export function num(value: number | null | undefined): string {
   return value.toLocaleString('vi-VN')
 }
 
-export const TASK_STATES: Record<string, { label: string; color: string }> = {
-  QUEUED: { label: 'đang chờ', color: 'yellow' },
-  LEASED: { label: 'đang chạy', color: 'blue' },
-  COMPLETED: { label: 'xong', color: 'teal' },
-  FAILED: { label: 'lỗi', color: 'red' },
-  CANCELLED: { label: 'đã hủy', color: 'gray' },
-  RUNNING: { label: 'đang chạy', color: 'blue' },
-  TERMINATED: { label: 'đã dừng', color: 'gray' },
-  TIMED_OUT: { label: 'quá giờ', color: 'orange' },
+export type TaskStateKey = 'queued' | 'leased' | 'completed' | 'failed' | 'cancelled' | 'running' | 'terminated' | 'timed-out'
+
+export const TASK_STATES: Record<string, { label: string; color: string; key: TaskStateKey }> = {
+  QUEUED: { label: 'đang chờ', color: 'yellow', key: 'queued' },
+  LEASED: { label: 'đang chạy', color: 'blue', key: 'leased' },
+  COMPLETED: { label: 'xong', color: 'teal', key: 'completed' },
+  FAILED: { label: 'lỗi', color: 'red', key: 'failed' },
+  CANCELLED: { label: 'đã hủy', color: 'gray', key: 'cancelled' },
+  RUNNING: { label: 'đang chạy', color: 'blue', key: 'running' },
+  TERMINATED: { label: 'đã dừng', color: 'gray', key: 'terminated' },
+  TIMED_OUT: { label: 'quá giờ', color: 'orange', key: 'timed-out' },
 }
 
 export function taskState(state: string | undefined | null) {
-  return TASK_STATES[state ?? ''] ?? { label: state ?? '?', color: 'gray' }
+  return TASK_STATES[state ?? ''] ?? { label: state ?? '?', color: 'gray', key: null as TaskStateKey | null }
 }
 
-export const TASK_TYPES = [
-  { value: 'coding', label: 'Sửa code (coding)' },
-  { value: 'analysis', label: 'Phân tích (analysis)' },
-  { value: 'review', label: 'Review' },
-  { value: 'docs', label: 'Tài liệu (docs)' },
-  { value: 'vision', label: 'Ảnh/giao diện (vision)' },
-]
+export type WorkerStateKey = 'disabled' | 'switch-off' | 'stopping' | 'busy' | 'idle' | 'starting' | 'offline'
 
 export function workerState(w: {
   enabled: boolean
@@ -125,16 +127,16 @@ export function workerState(w: {
   draining?: boolean
   switch?: { on: boolean }
   start?: Record<string, any> | null
-}): { label: string; color: string } {
-  if (!w.enabled) return { label: 'tắt trong cấu hình', color: 'gray' }
-  if (w.switch && !w.switch.on) return { label: 'công tắc tắt', color: 'gray' }
-  if (w.draining) return { label: 'đang dừng', color: 'orange' }
-  if (w.alive && w.busy) return { label: 'bận', color: 'blue' }
-  if (w.alive) return { label: 'rảnh', color: 'teal' }
+}): { label: string; color: string; key: WorkerStateKey } {
+  if (!w.enabled) return { label: 'tắt trong cấu hình', color: 'gray', key: 'disabled' }
+  if (w.switch && !w.switch.on) return { label: 'công tắc tắt', color: 'gray', key: 'switch-off' }
+  if (w.draining) return { label: 'đang dừng', color: 'orange', key: 'stopping' }
+  if (w.alive && w.busy) return { label: 'bận', color: 'blue', key: 'busy' }
+  if (w.alive) return { label: 'rảnh', color: 'teal', key: 'idle' }
   const start = w.start ?? {}
   const phase = String(start.state ?? start.status ?? start.phase ?? '')
-  if (/start|queue|wait|boot|launch|running/i.test(phase)) return { label: 'đang khởi động', color: 'yellow' }
-  return { label: 'chưa kết nối', color: 'gray' }
+  if (/start|queue|wait|boot|launch|running/i.test(phase)) return { label: 'đang khởi động', color: 'yellow', key: 'starting' }
+  return { label: 'chưa kết nối', color: 'gray', key: 'offline' }
 }
 
 export function short(text: unknown, n = 120): string {

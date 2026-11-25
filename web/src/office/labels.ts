@@ -3,7 +3,8 @@
 import * as THREE from 'three'
 
 export type Line = { text: string; color?: string; bold?: boolean; size?: number }
-export type LabelStyle = { bg?: string; border?: string; pad?: number; maxWidth?: number; radius?: number }
+/** `dark`: chế độ của nền nhãn — quyết định màu chữ mặc định của dòng không ghi `color` (sáng: chữ đậm, tối: chữ sáng). */
+export type LabelStyle = { bg?: string; border?: string; pad?: number; maxWidth?: number; radius?: number; dark?: boolean }
 
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 
@@ -61,7 +62,8 @@ export function makeLabel(lines: Line[], style: LabelStyle = {}): THREE.Sprite {
   let y = pad * 0.8
   lines.forEach((l, i) => {
     ctx.font = fonts[i]
-    ctx.fillStyle = l.color ?? '#e9ecef'
+    // Mặc định cũ '#e9ecef' chỉ đọc được trên nền tối; nhãn nền sáng (chế độ sáng, thẻ task vàng) phải dùng chữ đậm.
+    ctx.fillStyle = l.color ?? (style.dark === false ? '#212529' : '#e9ecef')
     ctx.textBaseline = 'top'
     ctx.fillText(texts[i], (canvas.width - widths[i]) / 2, y + (heights[i] - (l.size ?? 15) * scale) / 2.4)
     y += heights[i]

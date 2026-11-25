@@ -23,29 +23,30 @@ import { IconPlus } from '@tabler/icons-react'
 import { useState, type ReactNode } from 'react'
 import { del, get, patch, post, type ProviderType, type WorkerRow } from '../api'
 import { ConfirmButton, Empty, Loading, Page } from '../components/common'
+import { useT, type DictKey } from '../i18n'
 import { attempt, notifyError, usd, useLoad } from '../util'
 
-type FieldDef = { label: string; kind: 'text' | 'secret' | 'number' | 'models' | 'via'; placeholder?: string; description?: string; required?: boolean }
+type FieldDef = { kind: 'text' | 'secret' | 'number' | 'models' | 'via'; labelKey: DictKey | null; descKey?: DictKey; placeholder?: string; required?: boolean }
 
 const FIELDS: Record<string, FieldDef> = {
-  id: { label: 'ID worker', kind: 'text', required: true, placeholder: 'kaggle-han, openrouter…', description: 'chữ thường, số, dấu -' },
-  owner: { label: 'Chủ notebook', kind: 'text', placeholder: 'self' },
-  models: { label: 'Model', kind: 'models', required: true, description: 'Tên model; dạng ten=model-that-cua-api nếu muốn đổi tên. Enter để thêm.' },
-  kernel: { label: 'Notebook Kaggle', kind: 'text', placeholder: '<user>/<slug>', description: 'Để trống nếu không cho Kite tự bật notebook' },
-  kaggle_api_token: { label: 'Kaggle API token', kind: 'secret', description: 'kaggle.com/settings → API → Create New Token' },
-  via: { label: 'Cách bật notebook', kind: 'via' },
-  idle_minutes: { label: 'Rảnh bao nhiêu phút thì tắt', kind: 'number', placeholder: '30' },
-  base_url: { label: 'Base URL', kind: 'text', placeholder: 'https://openrouter.ai/api/v1', required: true },
-  api_key: { label: 'API key', kind: 'secret' },
-  runpod_api_key: { label: 'RunPod API key', kind: 'secret', required: true, description: 'quyền pods:write' },
-  pod_id: { label: 'Pod ID', kind: 'text', required: true },
-  port: { label: 'Cổng HTTP của pod', kind: 'number', placeholder: '8000' },
-  price_in: { label: 'Giá token vào (USD/1 triệu)', kind: 'number', placeholder: '0' },
-  price_out: { label: 'Giá token ra (USD/1 triệu)', kind: 'number', placeholder: '0' },
-  price_hour: { label: 'Giá theo giờ (USD)', kind: 'number', description: 'để trống: lấy giá RunPod báo' },
-  daily_cap: { label: 'Hạn mức chi/ngày (USD)', kind: 'number' },
-  monthly_cap: { label: 'Hạn mức chi/tháng (USD)', kind: 'number' },
-  concurrency: { label: 'Số việc chạy cùng lúc', kind: 'number', placeholder: '2' },
+  id: { labelKey: 'providers.field.id', kind: 'text', required: true, placeholder: 'kaggle-han, openrouter…', descKey: 'providers.field.id-desc' },
+  owner: { labelKey: 'providers.field.owner', kind: 'text', placeholder: 'self' },
+  models: { labelKey: 'providers.field.models', kind: 'models', required: true, descKey: 'providers.field.models-desc' },
+  kernel: { labelKey: 'providers.field.kernel', kind: 'text', placeholder: '<user>/<slug>', descKey: 'providers.field.kernel-desc' },
+  kaggle_api_token: { labelKey: 'providers.field.kaggle-api-token', kind: 'secret', descKey: 'providers.field.kaggle-api-token-desc' },
+  via: { labelKey: 'providers.field.via', kind: 'via' },
+  idle_minutes: { labelKey: 'providers.field.idle-minutes', kind: 'number', placeholder: '30' },
+  base_url: { labelKey: 'providers.field.base-url', kind: 'text', placeholder: 'https://openrouter.ai/api/v1', required: true },
+  api_key: { labelKey: 'providers.field.api-key', kind: 'secret' },
+  runpod_api_key: { labelKey: 'providers.field.runpod-api-key', kind: 'secret', required: true, descKey: 'providers.field.runpod-api-key-desc' },
+  pod_id: { labelKey: 'providers.field.pod-id', kind: 'text', required: true },
+  port: { labelKey: 'providers.field.port', kind: 'number', placeholder: '8000' },
+  price_in: { labelKey: 'providers.field.price-in', kind: 'number', placeholder: '0' },
+  price_out: { labelKey: 'providers.field.price-out', kind: 'number', placeholder: '0' },
+  price_hour: { labelKey: 'providers.field.price-hour', kind: 'number', descKey: 'providers.field.price-hour-desc' },
+  daily_cap: { labelKey: 'providers.field.daily-cap', kind: 'number' },
+  monthly_cap: { labelKey: 'providers.field.monthly-cap', kind: 'number' },
+  concurrency: { labelKey: 'providers.field.concurrency', kind: 'number', placeholder: '2' },
 }
 
 type Values = Record<string, any>
@@ -61,14 +62,15 @@ type ProviderPreset = {
 }
 
 function FieldInput({ name, value, onChange, editing }: { name: string; value: any; onChange: (v: any) => void; editing?: boolean }) {
-  const f = FIELDS[name] ?? { label: name, kind: 'text' }
-  const common = { label: f.label, description: f.description, placeholder: f.placeholder, required: f.required && !editing }
+  const t = useT()
+  const f: FieldDef = FIELDS[name] ?? { labelKey: null, kind: 'text' }
+  const common = { label: f.labelKey ? t(f.labelKey) : name, description: f.descKey ? t(f.descKey) : undefined, placeholder: f.placeholder, required: f.required && !editing }
   switch (f.kind) {
     case 'secret':
       return (
         <PasswordInput
           {...common}
-          placeholder={editing ? 'để trống: giữ key cũ' : f.placeholder}
+          placeholder={editing ? t('providers.field.keep-key') : f.placeholder}
           value={value ?? ''}
           onChange={(e) => onChange(e.currentTarget.value)}
           autoComplete="off"
@@ -83,8 +85,8 @@ function FieldInput({ name, value, onChange, editing }: { name: string; value: a
         <Select
           {...common}
           data={[
-            { value: 'api', label: 'Kaggle API (kaggle kernels push)' },
-            { value: 'browser', label: 'Trình duyệt Kite (Save Version)' },
+            { value: 'api', label: t('providers.field.via-api') },
+            { value: 'browser', label: t('providers.field.via-browser') },
           ]}
           value={value ?? 'api'}
           onChange={onChange}
@@ -97,6 +99,7 @@ function FieldInput({ name, value, onChange, editing }: { name: string; value: a
 }
 
 export default function Providers() {
+  const t = useT()
   const types = useLoad(() => get<{ types: ProviderType[] }>('/api/provider-types'), [])
   const workers = useLoad(() => get<{ workers: WorkerRow[] }>('/api/workers'), [])
   const [adding, setAdding] = useState<ProviderType | null>(null)
@@ -109,37 +112,37 @@ export default function Providers() {
     setRestartNote(true)
   }
   return (
-    <Page title="Provider">
+    <Page title={t('providers.title')}>
       {restartNote ? <RestartNote onDone={() => setRestartNote(false)} /> : null}
       <SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }}>
-        {types.data.types.map((t) => (
-          <Card key={t.type} withBorder>
-            <Text fw={600}>{t.label}</Text>
+        {types.data.types.map((pt) => (
+          <Card key={pt.type} withBorder>
+            <Text fw={600}>{pt.label}</Text>
             <Text size="sm" c="dimmed">
-              {t.cost}
+              {pt.cost}
             </Text>
-            {t.note ? (
+            {pt.note ? (
               <Text size="xs" c="dimmed" mt={4}>
-                {t.note}
+                {pt.note}
               </Text>
             ) : null}
-            <Button mt="sm" size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={() => setAdding(t)}>
-              Thêm worker
+            <Button mt="sm" size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={() => setAdding(pt)}>
+              {t('providers.add-worker')}
             </Button>
           </Card>
         ))}
       </SimpleGrid>
-      {types.data.types.map((t) => (
-        <Stack key={t.type} gap="xs">
-          <Title order={4}>{t.label}</Title>
-          {byType(t.type).length ? (
+      {types.data.types.map((pt) => (
+        <Stack key={pt.type} gap="xs">
+          <Title order={4}>{pt.label}</Title>
+          {byType(pt.type).length ? (
             <SimpleGrid cols={{ base: 1, md: 2 }}>
-              {byType(t.type).map((w) => (
+              {byType(pt.type).map((w) => (
                 <WorkerConfigCard key={w.id} worker={w} onEdit={() => setEditing(w)} onChanged={changed} />
               ))}
             </SimpleGrid>
           ) : (
-            <Empty>Chưa có.</Empty>
+            <Empty>{t('providers.no-workers')}</Empty>
           )}
         </Stack>
       ))}
@@ -157,22 +160,23 @@ export default function Providers() {
 }
 
 function RestartNote({ onDone }: { onDone: () => void }) {
+  const t = useT()
   const [busy, setBusy] = useState(false)
   return (
-    <Alert color="blue" title="Cần khởi động lại gateway để áp thay đổi">
+    <Alert color="blue" title={t('providers.restart-title')}>
       <Group>
-        <Text size="sm">Cấu hình đã lưu (có bản sao lưu). Gateway đọc lại khi khởi động lại; không làm được khi có task đang chạy.</Text>
+        <Text size="sm">{t('providers.restart-message')}</Text>
         <Button
           size="xs"
           loading={busy}
           onClick={async () => {
             setBusy(true)
-            const res = await attempt(() => post('/api/system/restart', { services: ['kite-gateway'] }), 'Đã khởi động lại gateway')
+            const res = await attempt(() => post('/api/system/restart', { services: ['kite-gateway'] }), t('providers.restarted'))
             setBusy(false)
             if (res) onDone()
           }}
         >
-          Khởi động lại gateway
+          {t('providers.restart-button')}
         </Button>
       </Group>
     </Alert>
@@ -180,14 +184,15 @@ function RestartNote({ onDone }: { onDone: () => void }) {
 }
 
 function WorkerConfigCard({ worker: w, onEdit, onChanged }: { worker: WorkerRow; onEdit: () => void; onChanged: () => void }) {
-  const rows: [string, ReactNode][] = [['Model', w.models.join(', ')]]
-  if (w.kaggle) rows.push(['Notebook', `${w.kaggle.kernel} (bật qua ${w.kaggle.via === 'browser' ? 'trình duyệt Kite' : 'Kaggle API'})`])
-  if (w.api?.base_url) rows.push(['Base URL', w.api.base_url])
-  if (w.api && !w.pod) rows.push(['Giá', `${w.api.price.input} / ${w.api.price.output} USD mỗi triệu token vào/ra`])
-  if (w.pod) rows.push(['Pod', `${w.pod.id}:${w.pod.port}${w.pod.price_hour ? ` · ${w.pod.price_hour} USD/giờ` : ''} · tắt sau ${w.pod.idle_minutes} phút rảnh`])
+  const t = useT()
+  const rows: [string, ReactNode][] = [[t('providers.card.model'), w.models.join(', ')]]
+  if (w.kaggle) rows.push([t('providers.card.notebook'), `${w.kaggle.kernel} (${t('providers.card.via', { via: w.kaggle.via === 'browser' ? t('providers.card.via-browser') : t('providers.card.via-api') })})`])
+  if (w.api?.base_url) rows.push([t('providers.card.base-url'), w.api.base_url])
+  if (w.api && !w.pod) rows.push([t('providers.card.price'), `${w.api.price.input} / ${w.api.price.output} ${t('providers.card.price-unit')}`])
+  if (w.pod) rows.push([t('providers.card.pod'), `${w.pod.id}:${w.pod.port}${w.pod.price_hour ? ` · ${t('providers.card.pod-price', { price: w.pod.price_hour })}` : ''} · ${t('providers.card.pod-idle', { minutes: w.pod.idle_minutes })}`])
   if (w.api?.caps && (w.api.caps.daily_usd || w.api.caps.monthly_usd))
-    rows.push(['Hạn mức', `${w.api.caps.daily_usd ?? '—'}/ngày · ${w.api.caps.monthly_usd ?? '—'}/tháng`])
-  rows.push(['Đã chi', `${usd(w.spend.today_usd)} hôm nay · ${usd(w.spend.month_usd)} tháng này`])
+    rows.push([t('providers.card.caps'), t('providers.card.caps-value', { daily: w.api.caps.daily_usd ?? '—', monthly: w.api.caps.monthly_usd ?? '—' })])
+  rows.push([t('providers.card.spent'), t('providers.card.spent-value', { today: usd(w.spend.today_usd), month: usd(w.spend.month_usd) })])
   return (
     <Card withBorder>
       <Group justify="space-between">
@@ -200,7 +205,7 @@ function WorkerConfigCard({ worker: w, onEdit, onChanged }: { worker: WorkerRow;
           </Text>
         </div>
         <Badge color={w.enabled ? 'teal' : 'gray'} variant="light">
-          {w.enabled ? 'đang dùng' : 'tắt trong cấu hình'}
+          {w.enabled ? t('providers.card.enabled') : t('providers.card.disabled')}
         </Badge>
       </Group>
       <Stack gap={2} mt="xs">
@@ -215,28 +220,28 @@ function WorkerConfigCard({ worker: w, onEdit, onChanged }: { worker: WorkerRow;
       </Stack>
       <Group gap="xs" mt="sm">
         <Button size="xs" variant="light" onClick={onEdit}>
-          Sửa
+          {t('providers.card.edit')}
         </Button>
         <Button
           size="xs"
           variant="subtle"
           onClick={async () => {
-            await attempt(() => patch(`/api/workers/${w.id}`, { enabled: !w.enabled }), w.enabled ? 'Đã tắt trong cấu hình' : 'Đã bật trong cấu hình')
+            await attempt(() => patch(`/api/workers/${w.id}`, { enabled: !w.enabled }), w.enabled ? t('providers.card.disabled-msg') : t('providers.card.enabled-msg'))
             onChanged()
           }}
         >
-          {w.enabled ? 'Tắt trong cấu hình' : 'Bật trong cấu hình'}
+          {w.enabled ? t('providers.card.disable') : t('providers.card.enable')}
         </Button>
         <ConfirmButton
           size="xs"
           variant="subtle"
           color="red"
-          label="Xóa"
-          title={`Xóa worker ${w.id}?`}
-          message="Xóa khỏi config.yaml (có bản sao lưu) và xóa các file key riêng của worker này."
-          confirmLabel="Xóa"
+          label={t('providers.card.delete')}
+          title={t('providers.card.delete-title', { id: w.id })}
+          message={t('providers.card.delete-message')}
+          confirmLabel={t('providers.card.delete')}
           onConfirm={async () => {
-            await attempt(() => del(`/api/workers/${w.id}`), 'Đã xóa')
+            await attempt(() => del(`/api/workers/${w.id}`), t('providers.card.deleted'))
             onChanged()
           }}
         />
@@ -246,6 +251,7 @@ function WorkerConfigCard({ worker: w, onEdit, onChanged }: { worker: WorkerRow;
 }
 
 function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: () => void; onAdded: () => void }) {
+  const t = useT()
   const [values, setValues] = useState<Values>(type.type === 'kaggle' ? { via: 'browser', owner: 'self' } : {})
   const [test, setTest] = useState<Record<string, any> | null>(null)
   const [busy, setBusy] = useState(false)
@@ -273,16 +279,16 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
     })
   }
   return (
-    <Modal opened onClose={onClose} title={`Thêm worker: ${type.label}`} size="lg">
+    <Modal opened onClose={onClose} title={t('providers.add.title', { label: type.label })} size="lg">
       {added ? (
         <Stack>
-          <Alert color="teal" title={`Đã thêm ${added.added}`}>
-            {added.next ?? 'Khởi động lại gateway để dùng worker mới.'}
+          <Alert color="teal" title={t('providers.add.added-title', { added: added.added })}>
+            {added.next ?? t('providers.add.added-next')}
           </Alert>
           {added.worker_token ? (
             <Stack gap={4}>
               <Text size="sm" fw={600}>
-                Worker token (chỉ hiện một lần): dán vào Kaggle → Add-ons → Secrets, tên KITE_WORKER_TOKEN
+                {t('providers.add.worker-token')}
               </Text>
               <Code block>{added.worker_token}</Code>
             </Stack>
@@ -295,7 +301,7 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
                 onClose()
               }}
             >
-              Xong
+              {t('providers.add.done')}
             </Button>
           </Group>
         </Stack>
@@ -304,9 +310,9 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
           {isRelay && brandOptions.length ? (
             <Stack gap={4}>
               <Select
-                label="Hãng"
-                description="Chọn hãng để điền sẵn Base URL, model gợi ý và giá tham chiếu; mọi ô vẫn sửa tay được."
-                data={[{ value: 'custom', label: 'Tùy chỉnh (tự nhập)' }, ...brandOptions.map((p) => ({ value: p.brand, label: p.label }))]}
+                label={t('providers.add.brand')}
+                description={t('providers.add.brand-desc')}
+                data={[{ value: 'custom', label: t('providers.add.brand-custom') }, ...brandOptions.map((p) => ({ value: p.brand, label: p.label }))]}
                 value={brand}
                 onChange={applyBrand}
                 allowDeselect={false}
@@ -322,19 +328,19 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
             <FieldInput key={f} name={f} value={values[f]} onChange={set(f)} />
           ))}
           {test ? (
-            <Alert color={test.ok ? 'teal' : 'red'} title={test.ok ? 'Kết nối được' : 'Chưa kết nối được'}>
+            <Alert color={test.ok ? 'teal' : 'red'} title={test.ok ? t('providers.add.test-ok') : t('providers.add.test-fail')}>
               {test.detail}
-              {test.models?.length ? <Text size="xs" mt={4}>Model: {test.models.slice(0, 20).join(', ')}</Text> : null}
+              {test.models?.length ? <Text size="xs" mt={4}>{t('providers.add.test-models', { models: test.models.slice(0, 20).join(', ') })}</Text> : null}
               {test.model_tested ? (
                 <Text size="xs" mt={4}>
-                  Model đã thử: {test.model_tested} — {test.model_ok ? 'gọi được' : 'chưa gọi được'}
-                  {typeof test.latency_ms === 'number' ? ` · độ trễ ${test.latency_ms} ms` : ''}
+                  {t('providers.add.test-model-tried', { model: test.model_tested, ok: test.model_ok ? t('providers.add.test-model-ok') : t('providers.add.test-model-fail') })}
+                  {typeof test.latency_ms === 'number' ? t('providers.add.test-latency', { ms: test.latency_ms }) : ''}
                   {test.chat_detail ? ` · ${test.chat_detail}` : ''}
                 </Text>
               ) : null}
               {test.usage_reported === false ? (
                 <Text size="xs" mt={4} c="orange.7">
-                  API không trả usage — chi phí sẽ tính theo ước lượng
+                  {t('providers.add.test-no-usage')}
                 </Text>
               ) : null}
             </Alert>
@@ -354,11 +360,11 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
                 }
               }}
             >
-              Thử kết nối
+              {t('providers.add.test')}
             </Button>
             <Group gap="xs">
               <Button variant="default" onClick={onClose}>
-                Thôi
+                {t('common.cancel')}
               </Button>
               <Button
                 onClick={async () => {
@@ -366,7 +372,7 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
                   if (res) setAdded(res)
                 }}
               >
-                Thêm
+                {t('providers.add.add')}
               </Button>
             </Group>
           </Group>
@@ -379,6 +385,7 @@ function AddWorker({ type, onClose, onAdded }: { type: ProviderType; onClose: ()
 const EDITABLE = ['models', 'base_url', 'api_key', 'runpod_api_key', 'kaggle_api_token', 'kernel', 'via', 'idle_minutes', 'price_in', 'price_out', 'price_hour', 'daily_cap', 'monthly_cap', 'concurrency']
 
 function EditWorker({ worker: w, type, onClose, onSaved }: { worker: WorkerRow; type?: ProviderType; onClose: () => void; onSaved: () => void }) {
+  const t = useT()
   const initial: Values = {
     models: w.models.map((m) => (w.api?.upstream?.[m] ? `${m}=${w.api.upstream[m]}` : m)),
     base_url: w.api?.base_url ?? undefined,
@@ -395,14 +402,14 @@ function EditWorker({ worker: w, type, onClose, onSaved }: { worker: WorkerRow; 
   const [values, setValues] = useState<Values>(initial)
   const fields = (type?.fields ?? []).filter((f) => EDITABLE.includes(f) && !(w.type === 'kaggle' && !w.kaggle && ['via', 'idle_minutes', 'kaggle_api_token'].includes(f)))
   return (
-    <Modal opened onClose={onClose} title={`Sửa ${w.id}`} size="lg">
+    <Modal opened onClose={onClose} title={t('providers.edit.title', { id: w.id })} size="lg">
       <Stack>
         {fields.map((f) => (
           <FieldInput key={f} name={f} value={values[f]} onChange={(v) => setValues((s) => ({ ...s, [f]: v }))} editing />
         ))}
         <Group justify="flex-end">
           <Button variant="default" onClick={onClose}>
-            Thôi
+            {t('common.cancel')}
           </Button>
           <Button
             onClick={async () => {
@@ -415,18 +422,18 @@ function EditWorker({ worker: w, type, onClose, onSaved }: { worker: WorkerRow; 
                 } else if (a !== b) changes[f] = values[f] ?? null
               }
               if (!Object.keys(changes).length) return onClose()
-              const res = await attempt(() => patch(`/api/workers/${w.id}`, changes), 'Đã lưu')
+              const res = await attempt(() => patch(`/api/workers/${w.id}`, changes), t('providers.edit.saved'))
               if (res) {
                 onSaved()
                 onClose()
               }
             }}
           >
-            Lưu
+            {t('providers.edit.save')}
           </Button>
         </Group>
         <Text size="xs" c="dimmed">
-          Trường không sửa ở đây được (ID, loại, chủ): xóa rồi thêm lại.
+          {t('providers.edit.note')}
         </Text>
       </Stack>
     </Modal>

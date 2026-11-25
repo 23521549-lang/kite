@@ -20,12 +20,14 @@ import { get, post, qs } from '../api'
 import { ConfirmButton, Empty, JsonView, KeyValue, Loading, Page } from '../components/common'
 import { loadMe, useKite } from '../store'
 import { ago, attempt, fmtTime, notifyOk, useLoad } from '../util'
+import { useT, type DictKey } from '../i18n'
 
 export default function Settings() {
+  const t = useT()
   const settings = useLoad(() => get<Record<string, any>>('/api/settings'), [])
   const s = settings.data
   return (
-    <Page title="Cài đặt">
+    <Page title={t('settings.title')}>
       <SimpleGrid cols={{ base: 1, lg: 2 }}>
         <Stack>
           <Account />
@@ -35,31 +37,31 @@ export default function Settings() {
         <Stack>
           <Card withBorder>
             <Title order={5} mb="xs">
-              Kite trên máy này
+              {t('settings.machine')}
             </Title>
             {!s ? (
               <Loading error={settings.error} />
             ) : (
               <KeyValue
                 rows={[
-                  ['Phiên bản', [s.version?.commit || '?', s.version?.subject].filter(Boolean).join(' · ')],
-                  ['Ngày', fmtTime(s.version?.date)],
-                  ['Gateway', `${s.gateway.host}:${s.gateway.port}`],
-                  ['Địa chỉ cho worker', s.gateway.public_url ?? 'chưa đặt'],
-                  ['Thư mục dữ liệu', <Code key="d">{s.state_dir}</Code>],
+                  [t('settings.machine.version'), [s.version?.commit || '?', s.version?.subject].filter(Boolean).join(' · ')],
+                  [t('settings.machine.date'), fmtTime(s.version?.date)],
+                  [t('settings.machine.gateway'), `${s.gateway.host}:${s.gateway.port}`],
+                  [t('settings.machine.worker-address'), s.gateway.public_url ?? t('settings.machine.worker-address-unset')],
+                  [t('settings.machine.state-dir'), <Code key="d">{s.state_dir}</Code>],
                   [
-                    'Thông báo ntfy',
+                    t('settings.machine.ntfy'),
                     s.ntfy ? (
                       <Group key="n" gap="xs">
                         <Badge color="teal" variant="light">
-                          đã cài
+                          {t('settings.machine.ntfy-on')}
                         </Badge>
-                        <Button size="compact-xs" variant="light" onClick={() => attempt(() => post('/api/settings/ntfy/test'), 'Đã gửi thông báo thử')}>
-                          Gửi thử
+                        <Button size="compact-xs" variant="light" onClick={() => attempt(() => post('/api/settings/ntfy/test'), t('settings.machine.ntfy-sent'))}>
+                          {t('settings.machine.ntfy-test')}
                         </Button>
                       </Group>
                     ) : (
-                      'chưa cài (kite notify setup)'
+                      t('settings.machine.ntfy-off')
                     ),
                   ],
                 ]}
@@ -77,6 +79,7 @@ export default function Settings() {
 }
 
 function Account() {
+  const t = useT()
   const [current, setCurrent] = useState('')
   const [next, setNext] = useState('')
   const [again, setAgain] = useState('')
@@ -84,26 +87,26 @@ function Account() {
   const me = useKite((s) => s.me)
   return (
     <Card withBorder>
-      <Title order={5}>Tài khoản {me?.username}</Title>
+      <Title order={5}>{t('settings.account.title', { username: me?.username ?? '' })}</Title>
       <Text size="sm" c="dimmed" mb="xs">
-        Đổi mật khẩu (ít nhất 12 ký tự). Các trình duyệt khác bị đăng xuất.
+        {t('settings.account.note')}
       </Text>
       <Stack gap="xs">
-        <PasswordInput label="Mật khẩu hiện tại" value={current} onChange={(e) => setCurrent(e.currentTarget.value)} autoComplete="current-password" />
-        <PasswordInput label="Mật khẩu mới" value={next} onChange={(e) => setNext(e.currentTarget.value)} autoComplete="new-password" />
+        <PasswordInput label={t('settings.account.current')} value={current} onChange={(e) => setCurrent(e.currentTarget.value)} autoComplete="current-password" />
+        <PasswordInput label={t('settings.account.new')} value={next} onChange={(e) => setNext(e.currentTarget.value)} autoComplete="new-password" />
         <PasswordInput
-          label="Nhập lại mật khẩu mới"
+          label={t('settings.account.again')}
           value={again}
           onChange={(e) => setAgain(e.currentTarget.value)}
-          error={again && again !== next ? 'không khớp' : undefined}
+          error={again && again !== next ? t('settings.account.mismatch') : undefined}
           autoComplete="new-password"
         />
-        <TextInput label="Mã 2FA" value={code} onChange={(e) => setCode(e.currentTarget.value)} inputMode="numeric" maxLength={6} />
+        <TextInput label={t('settings.account.code')} value={code} onChange={(e) => setCode(e.currentTarget.value)} inputMode="numeric" maxLength={6} />
         <Group>
           <Button
             disabled={!current || next.length < 12 || next !== again || code.length !== 6}
             onClick={async () => {
-              const res = await attempt(() => post('/api/auth/password', { current, new: next, code }), 'Đã đổi mật khẩu')
+              const res = await attempt(() => post('/api/auth/password', { current, new: next, code }), t('settings.account.changed'))
               if (res) {
                 setCurrent('')
                 setNext('')
@@ -112,7 +115,7 @@ function Account() {
               }
             }}
           >
-            Đổi mật khẩu
+            {t('settings.account.change')}
           </Button>
         </Group>
       </Stack>
@@ -121,20 +124,21 @@ function Account() {
 }
 
 function TwoFactor() {
+  const t = useT()
   const [password, setPassword] = useState('')
   const [code, setCode] = useState('')
   const [pending, setPending] = useState<{ secret: string; uri: string } | null>(null)
   const [confirmCode, setConfirmCode] = useState('')
   return (
     <Card withBorder>
-      <Title order={5}>Đổi app 2FA</Title>
+      <Title order={5}>{t('settings.totp.title')}</Title>
       <Text size="sm" c="dimmed" mb="xs">
-        Dùng khi đổi điện thoại. Mất điện thoại thì trên máy Kite chạy <Code>kite web admin --reset</Code>.
+        {t('settings.totp.note-prefix')} <Code>kite web admin --reset</Code>.
       </Text>
       {!pending ? (
         <Stack gap="xs">
-          <PasswordInput label="Mật khẩu" value={password} onChange={(e) => setPassword(e.currentTarget.value)} />
-          <TextInput label="Mã 2FA hiện tại" value={code} onChange={(e) => setCode(e.currentTarget.value)} maxLength={6} inputMode="numeric" />
+          <PasswordInput label={t('settings.totp.password')} value={password} onChange={(e) => setPassword(e.currentTarget.value)} />
+          <TextInput label={t('settings.totp.current-code')} value={code} onChange={(e) => setCode(e.currentTarget.value)} maxLength={6} inputMode="numeric" />
           <Group>
             <Button
               variant="light"
@@ -148,39 +152,39 @@ function TwoFactor() {
                 }
               }}
             >
-              Tạo khóa mới
+              {t('settings.totp.create')}
             </Button>
           </Group>
         </Stack>
       ) : (
         <Stack gap="xs">
-          <Text size="sm">Thêm khóa này vào app xác thực (chọn "Nhập khóa thiết lập"), rồi gõ mã 6 số app hiện:</Text>
+          <Text size="sm">{t('settings.totp.add')}</Text>
           <Group gap="xs">
             <Code style={{ fontSize: 14 }}>{pending.secret}</Code>
             <CopyButton value={pending.secret}>
               {({ copied, copy }) => (
                 <Button size="compact-xs" variant="light" onClick={copy}>
-                  {copied ? 'Đã chép' : 'Chép'}
+                  {copied ? t('settings.totp.copied') : t('settings.totp.copy')}
                 </Button>
               )}
             </CopyButton>
           </Group>
-          <TextInput label="Mã từ app mới" value={confirmCode} onChange={(e) => setConfirmCode(e.currentTarget.value)} maxLength={6} inputMode="numeric" />
+          <TextInput label={t('settings.totp.new-code')} value={confirmCode} onChange={(e) => setConfirmCode(e.currentTarget.value)} maxLength={6} inputMode="numeric" />
           <Group>
             <Button
               disabled={confirmCode.length !== 6}
               onClick={async () => {
-                const res = await attempt(() => post('/api/auth/totp/confirm', { code: confirmCode }), 'Đã đổi app 2FA')
+                const res = await attempt(() => post('/api/auth/totp/confirm', { code: confirmCode }), t('settings.totp.confirmed'))
                 if (res) {
                   setPending(null)
                   setConfirmCode('')
                 }
               }}
             >
-              Xác nhận
+              {t('settings.totp.confirm')}
             </Button>
             <Button variant="default" onClick={() => setPending(null)}>
-              Thôi
+              {t('common.cancel')}
             </Button>
           </Group>
         </Stack>
@@ -190,21 +194,22 @@ function TwoFactor() {
 }
 
 function Sessions() {
+  const t = useT()
   const me = useKite((s) => s.me)
   const sessions = (me?.sessions ?? []) as Record<string, any>[]
   return (
     <Card withBorder>
       <Group justify="space-between" mb="xs">
-        <Title order={5}>Các nơi đang đăng nhập</Title>
+        <Title order={5}>{t('settings.sessions.title')}</Title>
         <ConfirmButton
           size="xs"
           variant="light"
           color="red"
-          label="Đăng xuất nơi khác"
-          title="Đăng xuất mọi trình duyệt khác?"
-          confirmLabel="Đăng xuất"
+          label={t('settings.sessions.logout-others')}
+          title={t('settings.sessions.logout-others-title')}
+          confirmLabel={t('settings.sessions.logout')}
           onConfirm={async () => {
-            await attempt(() => post('/api/auth/logout-others'), 'Đã đăng xuất các nơi khác')
+            await attempt(() => post('/api/auth/logout-others'), t('settings.sessions.logged-out'))
             loadMe()
           }}
         />
@@ -230,23 +235,23 @@ function Sessions() {
           </Table.Tbody>
         </Table>
       ) : (
-        <Empty>Không có.</Empty>
+        <Empty>{t('settings.sessions.empty')}</Empty>
       )}
     </Card>
   )
 }
 
 function Update() {
+  const t = useT()
   const plan = useLoad(() => get<Record<string, any>>('/api/system/update'), [])
   const [result, setResult] = useState<Record<string, any> | null>(null)
   const p = plan.data
   return (
     <Card withBorder>
       <Group justify="space-between" mb="xs">
-        <Title order={5}>Cập nhật Kite</Title>
+        <Title order={5}>{t('settings.update.title')}</Title>
         <Button size="xs" variant="subtle" onClick={plan.reload}>
-          Kiểm tra
-        </Button>
+          {t('settings.update.check')}        </Button>
       </Group>
       {!p ? (
         <Loading error={plan.error} />
@@ -256,15 +261,15 @@ function Update() {
         <Alert color="red">{p.error}</Alert>
       ) : p.behind ? (
         <Stack gap="xs">
-          <Text size="sm">{p.behind} commit mới:</Text>
+          <Text size="sm">{t('settings.update.behind', { count: p.behind })}</Text>
           <Code block>{(p.commits ?? []).join('\n')}</Code>
-          {p.dirty?.length ? <Alert color="yellow">Repo Kite trên máy có file đang sửa: {p.dirty.join(', ')}</Alert> : null}
+          {p.dirty?.length ? <Alert color="yellow">{t('settings.update.dirty', { files: p.dirty.join(', ') })}</Alert> : null}
           <Group>
             <ConfirmButton
-              label="Cập nhật"
-              title="Cập nhật Kite?"
-              message="Kite kéo bản mới, cài thư viện mới nếu có, chạy test (khoảng 1 phút), build lại giao diện, rồi khởi động lại dịch vụ. Test lỗi thì quay lại bản cũ. Không làm khi có task đang chạy."
-              confirmLabel="Cập nhật"
+              label={t('settings.update.button')}
+              title={t('settings.update.title-confirm')}
+              message={t('settings.update.message')}
+              confirmLabel={t('settings.update.button')}
               onConfirm={async () => {
                 const res = await attempt(() => post('/api/system/update'))
                 if (res) {
@@ -277,20 +282,19 @@ function Update() {
         </Stack>
       ) : (
         <Text size="sm" c="dimmed">
-          Đang là bản mới nhất ({p.head}).
+          {t('settings.update.up-to-date', { head: p.head })}
         </Text>
       )}
       {result?.queued ? (
         <Alert color="blue" mt="sm">
-          Đã gửi yêu cầu. kite-stack trên máy tải image mới, kiểm tra rồi chạy (vài phút); image lỗi thì tự quay về
-          bản cũ. Xong thì tải lại trang.
+          {t('settings.update.queued')}
         </Alert>
       ) : result ? (
         <Stack gap="xs" mt="sm">
           <Alert color={result.updated ? 'teal' : 'red'}>
-            {result.updated ? `Đã cập nhật; test: ${result.tests}` : result.error ?? result.note}
-            {result.ui_error ? <Text size="sm" c="red">Giao diện: {result.ui_error}</Text> : null}
-            {result.updated ? <Text size="sm">Tải lại trang để dùng giao diện mới.</Text> : null}
+            {result.updated ? t('settings.update.updated', { tests: result.tests }) : result.error ?? result.note}
+            {result.ui_error ? <Text size="sm" c="red">{t('settings.update.ui-error', { error: result.ui_error })}</Text> : null}
+            {result.updated ? <Text size="sm">{t('settings.update.reload')}</Text> : null}
           </Alert>
           <JsonView data={result} maxHeight={200} />
         </Stack>
@@ -299,20 +303,20 @@ function Update() {
   )
 }
 
-const STACK_STATE: Record<string, string> = {
-  idle: 'chờ',
-  checking: 'đang kiểm tra bản mới',
-  updating: 'đang cập nhật',
-  rolling_back: 'đang quay về bản cũ',
-  restarting: 'đang khởi động lại',
+const STACK_STATE: Record<string, DictKey> = {
+  idle: 'settings.update.state.idle',
+  checking: 'settings.update.state.checking',
+  updating: 'settings.update.state.updating',
+  rolling_back: 'settings.update.state.rolling-back',
+  restarting: 'settings.update.state.restarting',
 }
-const STACK_RESULT: Record<string, string> = {
-  updated: 'đã cập nhật',
-  up_to_date: 'đang là bản mới nhất',
-  busy: 'hoãn: có task hoặc lần đo đang chạy',
-  rolled_back: 'bản mới lỗi, đã quay về bản cũ',
-  failed: 'lỗi',
-  restarted: 'đã khởi động lại',
+const STACK_RESULT: Record<string, DictKey> = {
+  updated: 'settings.update.result.updated',
+  up_to_date: 'settings.update.result.up-to-date',
+  busy: 'settings.update.result.busy',
+  rolled_back: 'settings.update.result.rolled-back',
+  failed: 'settings.update.result.failed',
+  restarted: 'settings.update.result.restarted',
 }
 
 /** The Compose deployment: kite-stack on the host pulls the image, checks it and keeps the old one on failure. */
@@ -325,6 +329,7 @@ function StackUpdate({
   reload: () => void
   onResult: (r: Record<string, any>) => void
 }) {
+  const t = useT()
   const st = plan.stack ?? {}
   const last = st.last ?? {}
   const working = st.state && st.state !== 'idle' && st.state !== 'unknown'
@@ -337,31 +342,31 @@ function StackUpdate({
     <Stack gap="xs">
       {plan.error ? <Alert color="yellow">{plan.error}</Alert> : null}
       <Text size="sm">
-        Đang chạy <Code>{plan.head || '?'}</Code>
+        {t('settings.update.running')} <Code>{plan.head || '?'}</Code>
         {st.current?.created ? ` (build ${fmtTime(st.current.created)})` : ''}
         {plan.behind ? (
           <>
             {' '}
-            · có bản mới <Code>{plan.target}</Code>
+            · {t('settings.update.has-new')} <Code>{plan.target}</Code>
           </>
         ) : null}
       </Text>
       <Text size="sm" c="dimmed">
-        Tự cập nhật: {st.auto === false ? 'tắt' : 'bật'} (kite-stack kiểm tra nhãn stable mỗi 10 phút)
-        {st.state ? ` · ${STACK_STATE[st.state] ?? st.state}` : ''}
+        {t('settings.update.auto-note', { state: st.auto === false ? t('settings.update.auto-off') : t('settings.update.auto-on') })}
+        {st.state ? ` · ${STACK_STATE[st.state] ? t(STACK_STATE[st.state]) : st.state}` : ''}
       </Text>
       {last.result ? (
         <Alert color={last.result === 'rolled_back' || last.result === 'failed' ? 'red' : 'gray'}>
-          Lần cuối ({fmtTime(last.at)}): {STACK_RESULT[last.result] ?? last.result}
+          {t('settings.update.last', { time: fmtTime(last.at), result: STACK_RESULT[last.result] ? t(STACK_RESULT[last.result]) : last.result })}
           {last.message ? ` — ${last.message}` : ''}
         </Alert>
       ) : null}
       <Group>
         <ConfirmButton
-          label="Cập nhật ngay"
-          title="Cập nhật Kite?"
-          message="kite-stack tải image mới nhất đã qua CI, chạy nó rồi kiểm tra từng dịch vụ. Dịch vụ nào không khỏe thì quay về image cũ. Không làm khi có task hoặc lần đo đang chạy."
-          confirmLabel="Cập nhật"
+          label={t('settings.update.update-now')}
+          title={t('settings.update.title-confirm')}
+          message={t('settings.update.stack-message')}
+          confirmLabel={t('settings.update.button')}
           onConfirm={async () => {
             const res = await attempt(() => post('/api/system/update'))
             if (res) {
@@ -376,36 +381,37 @@ function StackUpdate({
 }
 
 function Doctor() {
+  const t = useT()
   const doctor = useLoad(() => get<Record<string, any>>('/api/system/doctor'), [])
   const d = doctor.data
   return (
     <Card withBorder>
       <Group justify="space-between" mb="xs">
-        <Title order={5}>Sức khỏe</Title>
+        <Title order={5}>{t('settings.doctor.title')}</Title>
         <Button size="xs" variant="subtle" onClick={doctor.reload}>
-          Kiểm tra lại
+          {t('settings.doctor.check-again')}
         </Button>
       </Group>
       {!d ? (
-        <Loading error={doctor.error} label="Đang kiểm tra…" />
+        <Loading error={doctor.error} label={t('settings.doctor.checking')} />
       ) : (
         <Stack gap="xs">
           <Badge color={d.fail ? 'red' : d.warn ? 'yellow' : 'teal'} variant="light">
-            {d.fail ? `${d.fail} lỗi` : d.warn ? `${d.warn} cảnh báo` : 'ổn'}
+            {d.fail ? t('settings.doctor.fail', { count: d.fail }) : d.warn ? t('settings.doctor.warn', { count: d.warn }) : t('settings.doctor.ok')}
           </Badge>
           {(d.problems ?? []).map((p: any, i: number) => (
-            <Alert key={i} color={p.status === 'lỗi' ? 'red' : 'yellow'} title={p.check} py={6}>
+            <Alert key={i} color={p.status === 'lỗi' ? 'red' : 'yellow'} title={p.check} py={6}> {/* i18n-ignore: p.status là giá trị trạng thái do backend /api/doctor trả về, không phải chuỗi UI — giữ nguyên phép so sánh. */}
               <Text size="sm">{p.detail}</Text>
               {p.fix ? (
                 <Text size="xs" mt={4}>
-                  Cách sửa: <Code>{p.fix}</Code>
+                  {t('settings.doctor.fix')} <Code>{p.fix}</Code>
                 </Text>
               ) : null}
             </Alert>
           ))}
-          {d.gpu_quota ? <Text size="sm">Quota GPU: {typeof d.gpu_quota === 'string' ? d.gpu_quota : JSON.stringify(d.gpu_quota)}</Text> : null}
+          {d.gpu_quota ? <Text size="sm">{t('settings.doctor.gpu-quota', { quota: typeof d.gpu_quota === 'string' ? d.gpu_quota : JSON.stringify(d.gpu_quota) })}</Text> : null}
           <Text size="xs" c="dimmed">
-            Ổn: {(d.ok ?? []).join(', ')}
+            {t('settings.doctor.ok-list', { list: (d.ok ?? []).join(', ') })}
           </Text>
         </Stack>
       )}
@@ -414,24 +420,25 @@ function Doctor() {
 }
 
 function Cleanup() {
+  const t = useT()
   const [days, setDays] = useState<number>(7)
   const plan = useLoad(() => get<Record<string, any>>(`/api/system/cleanup${qs({ days })}`), [days])
   return (
     <Card withBorder>
       <Title order={5} mb="xs">
-        Dọn ổ đĩa
+        {t('settings.cleanup.title')}
       </Title>
       <Group align="flex-end" gap="xs">
-        <NumberInput label="Cũ hơn (ngày)" value={days} onChange={(v) => setDays(Number(v) || 7)} min={1} max={365} w={140} />
+        <NumberInput label={t('settings.cleanup.older')} value={days} onChange={(v) => setDays(Number(v) || 7)} min={1} max={365} w={140} />
         <ConfirmButton
           variant="light"
           color="red"
-          label="Dọn"
-          title="Xóa các bản sao repo, thư viện, bản đồ code và lần đo cũ?"
-          message="Kết quả và nhật ký giữ lại."
-          confirmLabel="Dọn"
+          label={t('settings.cleanup.button')}
+          title={t('settings.cleanup.title-confirm')}
+          message={t('settings.cleanup.message')}
+          confirmLabel={t('settings.cleanup.button')}
           onConfirm={async () => {
-            await attempt(() => post('/api/system/cleanup', { days }), 'Đã dọn')
+            await attempt(() => post('/api/system/cleanup', { days }), t('settings.cleanup.done'))
             plan.reload()
           }}
         />
@@ -442,17 +449,18 @@ function Cleanup() {
 }
 
 function Restart() {
+  const t = useT()
   const restart = async (services: string[], force = false) => {
     const res = await attempt(() => post<Record<string, any>>('/api/system/restart', { services, force }))
-    if (res) notifyOk(res.queued ? 'Đã gửi yêu cầu khởi động lại' : 'Đã khởi động lại')
+    if (res) notifyOk(res.queued ? t('settings.restart.requested') : t('settings.restart.done'))
   }
   return (
     <Card withBorder>
       <Title order={5} mb="xs">
-        Khởi động lại dịch vụ
+        {t('settings.restart.title')}
       </Title>
       <Text size="sm" c="dimmed" mb="xs">
-        Cần sau khi sửa worker. Không làm được khi có task đang chạy.
+        {t('settings.restart.note')}
       </Text>
       <Group gap="xs">
         <Button size="xs" variant="light" onClick={() => restart(['kite-gateway'])}>

@@ -5,6 +5,7 @@
 // desk for the chat) to the worker that answered it.
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { getLanguage, translate } from '../i18n'
 import { disposeSprite, labelSize, makeLabel, sizeLabel, type Line } from './labels'
 
 export type WorkerState = 'idle' | 'busy' | 'starting' | 'off' | 'error'
@@ -202,6 +203,7 @@ class Station {
       bg: dark ? 'rgba(24,26,32,0.86)' : 'rgba(255,255,255,0.9)',
       border: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)',
       maxWidth: 180,
+      dark,
     })
     this.label.position.set(0, LABEL_Y, -0.4)
     this.label.center.set(0.5, 0)
@@ -233,11 +235,12 @@ class Station {
       const lines: Line[] = [{ text: task.goal || task.id, color: '#212529', bold: true, size: 13 }]
       if (task.step) lines.push({ text: task.step, color: '#495057', size: 12 })
       if (i === shown.length - 1 && tasks.length > shown.length)
-        lines.push({ text: `+${tasks.length - shown.length} task nữa`, color: '#868e96', size: 12 })
-      const card = makeLabel(lines, { bg: '#fff3bf', border: '#fab005', maxWidth: 180, radius: 6, pad: 7 })
+        lines.push({ text: translate('overview.office.more-tasks', { count: tasks.length - shown.length }), color: '#868e96', size: 12 })
+      // Thẻ task nền vàng cố định ở cả hai chế độ → luôn dùng chữ đậm (dark: false), không theo theme.
+      const card = makeLabel(lines, { bg: '#fff3bf', border: '#fab005', maxWidth: 180, radius: 6, pad: 7, dark: false })
       card.position.set(0, LABEL_Y, -0.4)
       card.userData.pick = { kind: 'task', id: task.id } satisfies Pick
-      card.userData.tip = `${task.goal}${task.step ? ` — ${task.step}` : ''} (bấm để mở task)`
+      card.userData.tip = `${task.goal}${task.step ? ` — ${task.step}` : ''} ${translate('overview.office.task-tip-suffix')}`
       this.group.add(card)
       pickables.push(card)
       return card
@@ -288,15 +291,24 @@ class Station {
     return this.state === 'busy' || this.state === 'starting' || this.state === 'error'
   }
 
-  setSleeping(on: boolean) {
-    if (on && !this.zzz) {
-      this.zzz = makeLabel([{ text: 'z z z', color: '#adb5bd', bold: true, size: 16 }], { pad: 2 })
+  private zzzDark: boolean | null = null
+
+  setSleeping(on: boolean, dark: boolean) {
+    // 'z z z' không có nền: màu xám nhạt cũ (#adb5bd) chìm trên nền sáng → chế độ sáng dùng xám đậm; đổi theme lúc đang ngủ thì vẽ lại.
+    if (on && (!this.zzz || this.zzzDark !== dark)) {
+      if (this.zzz) {
+        this.group.remove(this.zzz)
+        disposeSprite(this.zzz)
+      }
+      this.zzz = makeLabel([{ text: 'z z z', color: dark ? '#adb5bd' : '#495057', bold: true, size: 16 }], { pad: 2, dark })
       this.zzz.position.set(0.55, 1.95, -0.95)
       this.group.add(this.zzz)
+      this.zzzDark = dark
     } else if (!on && this.zzz) {
       this.group.remove(this.zzz)
       disposeSprite(this.zzz)
       this.zzz = null
+      this.zzzDark = null
     }
   }
 }
@@ -326,9 +338,11 @@ export class OfficeScene {
   private rackLeds: THREE.MeshStandardMaterial[] = []
   private rackPos = new THREE.Vector3(-8, 0, -1.2)
   private rack = new THREE.Group()
+  private rackHit!: THREE.Mesh
   private rackLabel: THREE.Sprite | null = null
   private rackKey = ''
   private queuePos = new THREE.Vector3(6.6, 0, 4.2)
+  private queueHit!: THREE.Mesh
   private queueLabel: THREE.Sprite | null = null
   private queue = new THREE.Group()
   private queueKey = ''
@@ -369,7 +383,6 @@ export class OfficeScene {
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
     this.renderer.domElement.style.display = 'block'
     this.renderer.domElement.style.touchAction = 'none'
-    this.renderer.domElement.setAttribute('aria-label', 'Văn phòng Kite 3D: worker, task và agent trưởng')
     container.appendChild(this.renderer.domElement)
 
     this.shared = {
@@ -417,11 +430,10 @@ export class OfficeScene {
     rug.rotation.x = -Math.PI / 2
     rug.position.y = 0.01
     this.queue.add(rug)
-    const queueHit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
+    const queueHit = this.queueHit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
     queueHit.scale.set(2.6, 2.5, 2.6)
     queueHit.position.y = 1.2
     queueHit.userData.pick = { kind: 'queue', id: 'queue' } satisfies Pick
-    queueHit.userData.tip = 'Hàng chờ: task chưa có worker (bấm để xem tab Task)'
     this.queue.add(queueHit)
     this.pickables.push(queueHit)
 
@@ -463,20 +475,21 @@ export class OfficeScene {
         this.rackLeds.push(led)
       }
     }
-    const hit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
+    const hit = this.rackHit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
     hit.scale.set(1.8, 3.2, 1.8)
     hit.position.y = 1.5
     hit.userData.pick = { kind: 'gateway', id: 'gateway' } satisfies Pick
-    hit.userData.tip = 'Gateway: chuyển request tới worker (bấm để xem nhật ký)'
     group.add(hit)
     this.pickables.push(hit)
     this.scene.add(group)
   }
 
   private updateRackLabel(up: boolean, dark: boolean) {
-    const key = JSON.stringify([up, dark])
+    const key = JSON.stringify([up, dark, getLanguage()])
     if (key === this.rackKey) return
     this.rackKey = key
+    // Tooltip dịch theo ngôn ngữ hiện tại (đổi ngôn ngữ làm mới qua memo key).
+    this.rackHit.userData.tip = translate('overview.office.gateway-tip')
     if (this.rackLabel) {
       this.rack.remove(this.rackLabel)
       disposeSprite(this.rackLabel)
@@ -484,9 +497,9 @@ export class OfficeScene {
     this.rackLabel = makeLabel(
       [
         { text: 'Gateway', bold: true, color: dark ? '#f1f3f5' : '#212529' },
-        { text: up ? 'đang chạy' : 'không phản hồi', color: up ? '#20c997' : '#fa5252', size: 13 },
+        { text: up ? translate('overview.gateway-running') : translate('overview.office.rack-offline'), color: up ? '#20c997' : '#fa5252', size: 13 },
       ],
-      { bg: dark ? 'rgba(24,26,32,0.86)' : 'rgba(255,255,255,0.9)', border: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)' },
+      { bg: dark ? 'rgba(24,26,32,0.86)' : 'rgba(255,255,255,0.9)', border: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)', dark },
     )
     this.rackLabel.position.set(0, 2.75, 0)
     this.rackLabel.center.set(0.5, 0)
@@ -517,7 +530,14 @@ export class OfficeScene {
     this.scene.fog = new THREE.Fog(background, 34, 75)
     this.floorMat.color.setHex(dark ? 0x262a33 : 0xdde2e8)
     ;(this.grid.material as THREE.LineBasicMaterial).color.setHex(dark ? 0x30353f : 0xcfd5dc)
+    // Đường nối + hạt bay màu xanh nhạt chỉ nổi trên nền tối: chế độ sáng dùng tông đậm.
+    this.beamMat.color.setHex(dark ? 0x748ffc : 0x4263eb)
+    this.tokenMat.color.setHex(dark ? 0xbac8ff : 0x5c7cfa)
+    this.packetOk.color.setHex(dark ? 0x63e6be : 0x099268)
     this.gatewayUp = state.gatewayUp
+    // Nhãn truy cập + tooltip dịch theo ngôn ngữ hiện tại; update() chạy lại
+    // mỗi khi Overview tính lại state (kể cả khi đổi ngôn ngữ) nên luôn mới.
+    this.renderer.domElement.setAttribute('aria-label', translate('overview.office.aria-label'))
 
     // Desks: add, move or remove when the worker list changes.
     const ids = state.workers.map((w) => w.id)
@@ -564,12 +584,12 @@ export class OfficeScene {
       const station = this.stations.get(w.id)!
       const tasks = byWorker.get(w.id) ?? []
       const state2: WorkerState = w.state === 'idle' && tasks.length ? 'busy' : w.state
-      station.setState(state2, `${w.id} · ${w.stateLabel}${w.model ? ` · ${w.model}` : ''} (bấm để xem tab Worker)`)
-      station.setSleeping(state2 === 'off')
+      station.setState(state2, `${w.id} · ${w.stateLabel}${w.model ? ` · ${w.model}` : ''} ${translate('overview.office.station-hint')}`)
+      station.setSleeping(state2 === 'off', dark)
       const lines: Line[] = [
         { text: w.id, bold: true, color: dark ? '#f1f3f5' : '#212529' },
         {
-          text: `${w.stateLabel}${w.running ? ` · ${w.running}/${w.slots} việc` : ''}`,
+          text: `${w.stateLabel}${w.running ? ` · ${translate('overview.office.running', { running: w.running, slots: w.slots })}` : ''}`,
           color: hex((dark ? STATE_COLOR : STATE_TEXT_LIGHT)[state2]),
           size: 13,
         },
@@ -579,11 +599,11 @@ export class OfficeScene {
       station.setCards(compact ? [] : tasks, dark, this.pickables)
     }
 
-    this.lead.setState(state.chatBusy ? 'busy' : 'idle', 'Agent trưởng: chat với bạn và giao task (bấm để mở Chat)')
+    this.lead.setState(state.chatBusy ? 'busy' : 'idle', translate('overview.office.lead-tooltip'))
     this.lead.setLabel(
       [
-        { text: 'Agent trưởng', bold: true, color: dark ? '#f1f3f5' : '#212529' },
-        { text: state.chatBusy ? 'đang trả lời' : 'chờ bạn nhắn', color: hex((dark ? STATE_COLOR : STATE_TEXT_LIGHT)[state.chatBusy ? 'busy' : 'idle']), size: 13 },
+        { text: translate('overview.office.lead-title'), bold: true, color: dark ? '#f1f3f5' : '#212529' },
+        { text: state.chatBusy ? translate('overview.office.lead-busy') : translate('overview.office.lead-idle'), color: hex((dark ? STATE_COLOR : STATE_TEXT_LIGHT)[state.chatBusy ? 'busy' : 'idle']), size: 13 },
       ],
       dark,
     )
@@ -595,9 +615,11 @@ export class OfficeScene {
   }
 
   private updateQueue(waiting: TaskView[], dark: boolean) {
-    const key = JSON.stringify([waiting.map((t) => t.id), dark])
+    const key = JSON.stringify([waiting.map((t) => t.id), dark, getLanguage()])
     if (key === this.queueKey) return
     this.queueKey = key
+    // Tooltip dịch theo ngôn ngữ hiện tại (đổi ngôn ngữ làm mới qua memo key).
+    this.queueHit.userData.tip = translate('overview.office.queue-tip')
     for (const child of [...this.queue.children]) {
       if (child.userData.queueItem) {
         this.queue.remove(child)
@@ -615,10 +637,10 @@ export class OfficeScene {
     })
     const label = makeLabel(
       [
-        { text: 'Hàng chờ', bold: true, color: dark ? '#f1f3f5' : '#212529' },
-        { text: waiting.length ? `${waiting.length} task chờ worker` : 'trống', color: dark ? '#adb5bd' : '#495057', size: 13 },
+        { text: translate('overview.office.queue-title'), bold: true, color: dark ? '#f1f3f5' : '#212529' },
+        { text: waiting.length ? translate('overview.office.queue-waiting', { count: waiting.length }) : translate('overview.office.queue-empty'), color: dark ? '#adb5bd' : '#495057', size: 13 },
       ],
-      { bg: dark ? 'rgba(24,26,32,0.86)' : 'rgba(255,255,255,0.9)', border: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)' },
+      { bg: dark ? 'rgba(24,26,32,0.86)' : 'rgba(255,255,255,0.9)', border: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)', dark },
     )
     this.queueLabel = label
     label.position.set(0, 0.25 + Math.min(waiting.length, 10) * 0.11, 0)

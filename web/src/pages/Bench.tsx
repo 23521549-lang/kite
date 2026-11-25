@@ -2,15 +2,16 @@ import { Alert, Button, Card, Checkbox, Code, Group, ScrollArea, Select, Stack, 
 import { useState } from 'react'
 import { get, post, type WorkerRow } from '../api'
 import { Empty, Loading, Page } from '../components/common'
+import { useT } from '../i18n'
 import { attempt, useLoad } from '../util'
 
-const SUITES = [
-  { value: 'code', label: 'code: sửa code thật, Kite tự test' },
-  { value: 'lead', label: 'lead: agent trưởng chọn tool đúng' },
-  { value: 'speed', label: 'speed: tốc độ model' },
-]
-
 export default function Bench() {
+  const t = useT()
+  const SUITES = [
+    { value: 'code', label: t('bench.suite.code') },
+    { value: 'lead', label: t('bench.suite.lead') },
+    { value: 'speed', label: t('bench.suite.speed') },
+  ]
   const history = useLoad(() => get<{ runs: Record<string, any>[]; table: string }>('/api/bench/history'), [], 30000)
   const workers = useLoad(() => get<{ workers: WorkerRow[] }>('/api/workers'), [])
   const [label, setLabel] = useState('')
@@ -21,24 +22,24 @@ export default function Bench() {
   const runs = history.data?.runs ?? []
   const columns = runs.length ? Object.keys(runs[0]).filter((k) => typeof runs[0][k] !== 'object').slice(0, 9) : []
   return (
-    <Page title="Bench">
+    <Page title={t('bench.title')}>
       <Card withBorder>
         <Text fw={600} mb="xs">
-          Chạy đo mới
+          {t('bench.new-run')}
         </Text>
         <Stack gap="xs">
           <Group grow align="flex-start">
-            <TextInput label="Tên lần đo" placeholder="v8" value={label} onChange={(e) => setLabel(e.currentTarget.value)} />
-            <TextInput label="Model (để trống: tất cả)" placeholder="qwen3.6-fast,devstral" value={models} onChange={(e) => setModels(e.currentTarget.value)} />
+            <TextInput label={t('bench.new.label')} placeholder="v8" value={label} onChange={(e) => setLabel(e.currentTarget.value)} />
+            <TextInput label={t('bench.new.models')} placeholder="qwen3.6-fast,devstral" value={models} onChange={(e) => setModels(e.currentTarget.value)} />
             <Select
-              label="Worker (để trống: worker rảnh)"
+              label={t('bench.new.worker')}
               data={(workers.data?.workers ?? []).map((w) => w.id)}
               value={worker}
               onChange={setWorker}
               clearable
             />
           </Group>
-          <Checkbox.Group label="Bộ đo" value={suites} onChange={setSuites}>
+          <Checkbox.Group label={t('bench.new.suites')} value={suites} onChange={setSuites}>
             <Group mt={4}>
               {SUITES.map((s) => (
                 <Checkbox key={s.value} value={s.value} label={s.label} />
@@ -49,14 +50,14 @@ export default function Bench() {
             <Button
               disabled={!label.trim() || !suites.length}
               onClick={async () => {
-                const res = await attempt(() => post('/api/bench/run', { label, suites: suites.join(','), models, worker: worker ?? '' }), 'Đã bắt đầu đo ở nền')
+                const res = await attempt(() => post('/api/bench/run', { label, suites: suites.join(','), models, worker: worker ?? '' }), t('bench.new.started'))
                 if (res) setStarted(res)
               }}
             >
-              Chạy ở nền
+              {t('bench.new.run-bg')}
             </Button>
             <Text size="xs" c="dimmed">
-              Đo dùng GPU của worker; task của bạn sẽ phải chờ.
+              {t('bench.new.note')}
             </Text>
           </Group>
           {started ? (
@@ -68,9 +69,9 @@ export default function Bench() {
       </Card>
       <Card withBorder>
         <Group justify="space-between" mb="xs">
-          <Text fw={600}>Các lần đo</Text>
+          <Text fw={600}>{t('bench.history')}</Text>
           <Button size="xs" variant="subtle" onClick={history.reload}>
-            Làm mới
+            {t('bench.history.refresh')}
           </Button>
         </Group>
         {!history.data ? (
@@ -99,13 +100,13 @@ export default function Bench() {
             </Table>
           </ScrollArea>
         ) : (
-          <Empty>Chưa có lần đo nào.</Empty>
+          <Empty>{t('bench.history.empty')}</Empty>
         )}
         {history.data?.table ? (
           <details>
             <summary>
               <Text span size="sm" c="dimmed">
-                Bảng như kite bench history
+                {t('bench.history.table-note')}
               </Text>
             </summary>
             <Code block>{history.data.table}</Code>

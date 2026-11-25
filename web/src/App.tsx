@@ -1,4 +1,4 @@
-import { ActionIcon, AppShell, Burger, Center, Group, Loader, Menu, NavLink, Text, Tooltip, useMantineColorScheme } from '@mantine/core'
+import { ActionIcon, AppShell, Burger, Center, Group, Loader, Menu, NavLink, SegmentedControl, Text, Tooltip, useMantineColorScheme } from '@mantine/core'
 import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
@@ -19,6 +19,7 @@ import {
 import { useEffect, type ComponentType } from 'react'
 import { post, setUnauthorizedHandler } from './api'
 import { Dot } from './components/common'
+import { useLanguage, useT } from './i18n'
 import Bench from './pages/Bench'
 import Chat from './pages/Chat'
 import Journal from './pages/Journal'
@@ -33,18 +34,6 @@ import { segments, useRoute } from './router'
 import { loadMe, startLive, stopLive, useKite } from './store'
 
 type Tab = { path: string; label: string; icon: ComponentType<{ size?: number; stroke?: number }>; page: ComponentType<{ parts: string[] }> }
-
-const TABS: Tab[] = [
-  { path: '', label: 'Tổng quan', icon: IconLayoutDashboard, page: Overview },
-  { path: 'chat', label: 'Chat', icon: IconMessages, page: Chat },
-  { path: 'tasks', label: 'Task', icon: IconListCheck, page: Tasks },
-  { path: 'repos', label: 'Repo', icon: IconFolders, page: Repos },
-  { path: 'providers', label: 'Provider', icon: IconPlugConnected, page: Providers },
-  { path: 'workers', label: 'Worker', icon: IconCpu, page: Workers },
-  { path: 'journal', label: 'Nhật ký', icon: IconBook2, page: Journal },
-  { path: 'bench', label: 'Bench', icon: IconChartBar, page: Bench },
-  { path: 'settings', label: 'Cài đặt', icon: IconSettings, page: Settings },
-]
 
 export default function App() {
   const me = useKite((s) => s.me)
@@ -67,6 +56,19 @@ export default function App() {
 }
 
 function Shell() {
+  const t = useT()
+  const { language, setLanguage } = useLanguage()
+  const TABS: Tab[] = [
+    { path: '', label: t('nav.overview'), icon: IconLayoutDashboard, page: Overview },
+    { path: 'chat', label: t('nav.chat'), icon: IconMessages, page: Chat },
+    { path: 'tasks', label: t('nav.tasks'), icon: IconListCheck, page: Tasks },
+    { path: 'repos', label: t('nav.repos'), icon: IconFolders, page: Repos },
+    { path: 'providers', label: t('nav.providers'), icon: IconPlugConnected, page: Providers },
+    { path: 'workers', label: t('nav.workers'), icon: IconCpu, page: Workers },
+    { path: 'journal', label: t('nav.journal'), icon: IconBook2, page: Journal },
+    { path: 'bench', label: t('nav.bench'), icon: IconChartBar, page: Bench },
+    { path: 'settings', label: t('nav.settings'), icon: IconSettings, page: Settings },
+  ]
   const [opened, { toggle, close }] = useDisclosure()
   const path = useRoute((s) => s.path)
   const go = useRoute((s) => s.go)
@@ -95,22 +97,32 @@ function Shell() {
             <Tooltip
               label={
                 !connected
-                  ? 'Mất kết nối trực tiếp với Kite (đang thử lại)'
+                  ? t('header.connection-lost')
                   : gatewayUp
-                    ? 'Đang nối với Kite; gateway chạy'
-                    : 'Đang nối với Kite; gateway không trả lời'
+                    ? t('header.gateway-running')
+                    : t('header.gateway-down')
               }
             >
               <Group gap={6}>
                 <Dot color={!connected ? 'gray' : gatewayUp ? 'teal' : 'red'} />
                 <Text size="xs" c="dimmed" visibleFrom="xs">
-                  {!connected ? 'mất kết nối' : gatewayUp ? 'gateway chạy' : 'gateway tắt'}
+                  {!connected ? t('header.status-offline') : gatewayUp ? t('header.status-gateway-running') : t('header.status-gateway-down')}
                 </Text>
               </Group>
             </Tooltip>
           </Group>
           <Group gap="xs">
-            <ActionIcon variant="subtle" onClick={toggleColorScheme} title="Đổi sáng/tối">
+            <SegmentedControl
+              size="xs"
+              data={[
+                { value: 'vi', label: 'VI' },
+                { value: 'en', label: 'EN' },
+              ]}
+              value={language}
+              onChange={(v) => setLanguage(v === 'en' ? 'en' : 'vi')}
+              aria-label={t('header.language')}
+            />
+            <ActionIcon variant="subtle" onClick={toggleColorScheme} title={t('header.toggle-theme')}>
               {colorScheme === 'dark' ? <IconSun size={18} /> : <IconMoon size={18} />}
             </ActionIcon>
             <Menu position="bottom-end">
@@ -122,7 +134,7 @@ function Shell() {
               <Menu.Dropdown>
                 <Menu.Label>{me?.username}</Menu.Label>
                 <Menu.Item leftSection={<IconSettings size={14} />} onClick={() => go('/settings')}>
-                  Tài khoản và cài đặt
+                  {t('header.account-settings')}
                 </Menu.Item>
                 <Menu.Item
                   color="red"
@@ -135,7 +147,7 @@ function Shell() {
                     }
                   }}
                 >
-                  Đăng xuất
+                  {t('header.logout')}
                 </Menu.Item>
               </Menu.Dropdown>
             </Menu>
@@ -160,7 +172,7 @@ function Shell() {
         <Group mt="auto" gap={6} px="xs" pb={4}>
           <IconActivity size={14} color="var(--mantine-color-dimmed)" />
           <Text size="xs" c="dimmed">
-            Kite không bao giờ push
+            {t('header.never-push')}
           </Text>
         </Group>
       </AppShell.Navbar>
