@@ -813,6 +813,110 @@ class KiteOps:
             raise KiteToolError(f"không có dòng số {number}; xem lại bằng memory_show")
         return {"removed": removed}
 
+    # ------------------------------------------------------- experience documents (Gói 10)
+    async def experience_distill(self, repo: str) -> dict:
+        """Distill the repo's raw lessons/notes/task runs into a proposed experience document.
+
+        The proposal waits in the queue: nothing takes effect until the owner approves it
+        (``experience_approve`` / ``kite experience approve``).
+        """
+        from . import experience_store
+        from .journal import read_jsonl
+
+        try:
+            from . import experience
+        except ImportError:
+            raise KiteToolError("chưng cất tài liệu kinh nghiệm chưa sẵn sàng "
+                                "(module experience của Gói 10 chưa giao)") from None
+        path, _head = self._repo(repo)
+        lessons = experience_store.lesson_dicts(self.state_dir, path)
+        runs = [r for r in read_jsonl(self.state_dir / "journal" / "tasks.jsonl")
+                if r.get("repo") == str(path)]
+        task_ids = {r.get("task_id") for r in runs}
+        notes = [{"task_id": n.get("task_id"), "verdict": n.get("verdict"), "text": n.get("text", "")}
+                 for n in read_jsonl(self.state_dir / "journal" / "notes.jsonl")
+                 if n.get("task_id") in task_ids]
+        rules = experience.distill(lessons, notes, runs, clock=self.clock)
+        try:
+            result = experience_store.propose(self.state_dir, path, rules, clock=self.clock)
+        except ValueError as exc:
+            raise KiteToolError(str(exc)) from exc
+        entry = result["entry"]
+        return {"proposal_id": entry["id"], "version": entry["version"], "diff": result["diff"],
+                "rules_added": entry["rules_added"], "rules_removed": entry["rules_removed"],
+                "rules_changed": entry["rules_changed"],
+                "note": "bản đề xuất đang CHỜ người dùng duyệt; chưa có hiệu lực với các task sau"}
+
+    async def experience_show(self, repo: str) -> dict:
+        """The approved experience document for a repo, plus its pending proposal, if any."""
+        from . import experience_store
+
+        path, _head = self._repo(repo)
+        return experience_store.show(self.state_dir, path)
+
+    async def experience_approve(self, proposal_id: str) -> dict:
+        """Approve a proposed experience document: it becomes official, the old one is archived."""
+        from . import experience_store
+
+        try:
+            return experience_store.approve(self.state_dir, proposal_id, clock=self.clock)
+        except ValueError as exc:
+            raise KiteToolError(str(exc)) from exc
+
+    async def experience_reject(self, proposal_id: str) -> dict:
+        """Reject a proposed experience document (dropped; the approved one is untouched)."""
+        from . import experience_store
+
+        try:
+            return experience_store.reject(self.state_dir, proposal_id)
+        except ValueError as exc:
+            raise KiteToolError(str(exc)) from exc
+
+    async def experience_diff(self, proposal_id: str) -> dict:
+        """Unified diff between a proposed experience document and the approved one."""
+        from . import experience_store
+
+        try:
+            return {"proposal_id": proposal_id, "diff": experience_store.diff_text(self.state_dir, proposal_id)}
+        except ValueError as exc:
+            raise KiteToolError(str(exc)) from exc
+
+    def _improve_module(self):
+        try:
+            from . import improve
+        except ImportError:
+            raise KiteToolError("vòng tự cải tiến chưa sẵn sàng (module improve của Gói 10 chưa giao)") from None
+        return improve
+
+    async def improve_list(self) -> dict:
+        """Improvement proposals waiting for the owner (weakest bench axis + experience doc)."""
+        return {"proposals": self._improve_module().list_proposals(self.state_dir)}
+
+    async def improve_approve(self, proposal_id: str) -> dict:
+        """Approve an improvement proposal: Kite creates a task for it on the Kite repo.
+
+        ``improve.approve_proposal`` is synchronous but the task goes through the normal
+        async ``start_task`` (enqueue + Temporal workflow start). The proposal runs in a
+        worker thread and the task creation is marshalled back onto this loop — the same
+        ``run_coroutine_threadsafe`` bridge ``backend.py`` uses for sync code that needs
+        this loop. If task creation fails the entry stays "pending" (nothing is faked).
+        """
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+
+        def create_task(repo: str, goal: str) -> dict:
+            future = asyncio.run_coroutine_threadsafe(self.start_task(repo, goal), loop)
+            return future.result()
+
+        return await asyncio.to_thread(
+            self._improve_module().approve_proposal, self.state_dir, proposal_id,
+            ops={"create_task": create_task})
+
+    async def improve_reject(self, proposal_id: str) -> dict:
+        """Reject an improvement proposal (dropped; no task is created)."""
+        return self._improve_module().reject_proposal(self.state_dir, proposal_id)
+
     async def repo_config(self, repo: str, config: str = "") -> dict:
         """How Kite installs and tests a repository. Without ``config``: show it (the repository's
         committed .kite.yml, or the one Kite keeps for it). With ``config``: check and save it as the one
@@ -1077,6 +1181,38 @@ def build_server(ops: KiteOps):
     async def memory_forget(number: int, repo: str = "") -> dict:
         return await ops.logged("memory_forget", ops.memory_forget, number, repo)
 
+    @server.tool(description="Chưng cất các lưu ý/nhận xét/lần chạy trước trên một repo thành bản đề xuất tài liệu "
+                             "kinh nghiệm (quy tắc nên/không nên làm). Bản đề xuất CHƯA có hiệu lực: người dùng "
+                             "phải duyệt (`experience_approve` / `kite experience approve`).")
+    async def experience_distill(repo: str) -> dict:
+        return await ops.logged("experience_distill", ops.experience_distill, repo)
+
+    @server.tool(description="Xem tài liệu kinh nghiệm đã duyệt của một repo (kèm bản đề xuất đang chờ, nếu có).")
+    async def experience_show(repo: str) -> dict:
+        return await ops.logged("experience_show", ops.experience_show, repo)
+
+    @server.tool(description="Duyệt một bản đề xuất tài liệu kinh nghiệm (id từ experience_show/experience_distill): "
+                             "bản đó thành chính thức, bản cũ được lưu trữ theo phiên bản.")
+    async def experience_approve(id: str) -> dict:
+        return await ops.logged("experience_approve", ops.experience_approve, id)
+
+    @server.tool(description="Từ chối một bản đề xuất tài liệu kinh nghiệm (bỏ đi; tài liệu đã duyệt không đổi).")
+    async def experience_reject(id: str) -> dict:
+        return await ops.logged("experience_reject", ops.experience_reject, id)
+
+    @server.tool(description="Xem các đề xuất tự cải tiến đang chờ (trục bench yếu nhất + tài liệu kinh nghiệm).")
+    async def improve_list() -> dict:
+        return await ops.logged("improve_list", ops.improve_list)
+
+    @server.tool(description="Duyệt một đề xuất tự cải tiến (id từ improve_list): Kite tạo task cho nó trên repo "
+                             "Kite qua đường start_task thường (sandbox, patch chờ duyệt như mọi task).")
+    async def improve_approve(id: str) -> dict:
+        return await ops.logged("improve_approve", ops.improve_approve, id)
+
+    @server.tool(description="Từ chối một đề xuất tự cải tiến (bỏ đi; không tạo task).")
+    async def improve_reject(id: str) -> dict:
+        return await ops.logged("improve_reject", ops.improve_reject, id)
+
     @server.tool(description="Cách Kite cài thư viện và chạy test cho một repo. config trống: xem. config là YAML "
                              "(setup, test, quick_test chứa {tests}, check, setup_timeout, test_timeout): kiểm tra rồi "
                              "lưu trong Kite (không ghi vào repo). Dùng khi task cài hay chạy test sai cách.")
@@ -1124,7 +1260,7 @@ Bạn là agent trưởng của Kite. Luôn trả lời người dùng bằng **
 
 ## Tool
 
-Trong OpenCode, tool của Kite có tiền tố `kite_`: `start_task`, `task_status`, `wait_task`, `task_log`, `task_result`, `apply_result`, `commit_result`, `repo_status`, `run_command`, `send_instruction`, `pause_task`, `resume_task`, `cancel_task`, `list_tasks`, `worker_status`, `note_task`, `remember`, `memory_show`, `memory_forget`, `repo_config`, `doctor`, `cleanup`, `worker_restart`, `update_kite`, `bench_start`, `bench_history`.
+Trong OpenCode, tool của Kite có tiền tố `kite_`: `start_task`, `task_status`, `wait_task`, `task_log`, `task_result`, `apply_result`, `commit_result`, `repo_status`, `run_command`, `send_instruction`, `pause_task`, `resume_task`, `cancel_task`, `list_tasks`, `worker_status`, `note_task`, `remember`, `memory_show`, `memory_forget`, `experience_distill`, `experience_show`, `experience_approve`, `experience_reject`, `improve_list`, `improve_approve`, `improve_reject`, `repo_config`, `doctor`, `cleanup`, `worker_restart`, `update_kite`, `bench_start`, `bench_history`.
 
 - Tool báo lỗi thì đọc kỹ lỗi, báo đúng lỗi cho người dùng và làm theo hướng dẫn trong lỗi. KHÔNG BAO GIỜ nói đã làm xong một việc khi tool của việc đó báo lỗi (ví dụ đã hủy, đã áp, đã commit).
 - `task_id`: dùng đúng `task_id` mà tool trả về; ghi 4 ký tự cuối (`short_id`) cũng được; để trống là task mới nhất. Không tự đặt hay đoán ID. Lỗi "không có task" kèm danh sách task gần đây: chọn đúng ID trong đó.
