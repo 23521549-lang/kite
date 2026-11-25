@@ -19,8 +19,9 @@ import {
 } from '@mantine/core'
 import { IconPlus } from '@tabler/icons-react'
 import { useState } from 'react'
-import { get, post, type TaskRow } from '../api'
+import { dismissApplyError, envDisplayName, get, listEnvironments, post, rerunTask, type ApplyError, type TaskRow } from '../api'
 import { ConfirmButton, DiffView, Empty, JsonView, KeyValue, Loading, Page, StateBadge } from '../components/common'
+import { useEnvStrings } from '../i18n/env'
 import { go } from '../router'
 import { TASK_TYPES, attempt, fmtTime, short, useLoad } from '../util'
 
@@ -194,14 +195,28 @@ type Detail = {
   status: Record<string, any>
   result?: Record<string, any>
   journal: { runs: any[]; trace: any[]; requests: Record<string, any>; actions: any[]; notes: any[] }
+  // Gói 2 (origin stamp) + Gói 3 (durable apply error). The back end may
+  // carry them at the top level or inside `status`; read both.
+  chat_session_id?: string | null
+  environment_id?: string | null
+  main_repo?: string | null
+  last_apply_error?: ApplyError | null
 }
 
 function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => void }) {
+  const t = useEnvStrings()
+  const [rerunning, setRerunning] = useState(false)
   const { data, error, reload } = useLoad(
     () => get<Detail>(`/api/tasks/${encodeURIComponent(taskId)}`),
     [taskId],
     6000,
   )
+  const envs = useLoad(() => listEnvironments().catch(() => []), [taskId])
+  // GET /api/tasks/{id} does not carry the origin stamp or the durable
+  // apply error (worker (a)/(b) + Gói 3 own that endpoint); the list rows
+  // do, so read them from there as well.
+  const listRow = useLoad(() => get<{ tasks: TaskRow[] }>('/api/tasks?limit=50').catch(() => ({ tasks: [] as TaskRow[] })), [taskId])
+  const row = (listRow.data?.tasks ?? []).find((tk) => tk.task_id === taskId)
   const patchText = useLoad(async () => {
     try {
       const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/patch`, { credentials: 'same-origin' })
@@ -223,6 +238,13 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
     onChanged()
   }
   const patch = patchText.data ?? ''
+  // Gói 2 origin stamp: stamped at creation, never inferred from the
+  // session's current environment (the session may have moved since).
+  const originSession: string | null = row?.chat_session_id ?? data.chat_session_id ?? (s.chat_session_id as string | null) ?? (log.chat_session_id as string | null) ?? null
+  const originEnv: string | null = row?.environment_id ?? data.environment_id ?? (s.environment_id as string | null) ?? (log.environment_id as string | null) ?? null
+  const originEnvRow = (envs.data ?? []).find((e) => e.id === originEnv)
+  const applyError: ApplyError | null = row?.last_apply_error ?? data.last_apply_error ?? (s.last_apply_error as ApplyError | null) ?? null
+  const isApplyConflict = applyError?.code === 'apply_conflict'
   return (
     <Stack>
       <Card withBorder>
@@ -242,6 +264,78 @@ function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => vo
             ) : null}
           </Group>
         </Group>
+        <Group gap={4} mt="sm" wrap="wrap">
+          <Text size="sm" c="dimmed">
+            {t['env.origin-session']}:
+          </Text>
+          {originSession ? (
+            <Button size="compact-xs" variant="subtle" onClick={() => go(`/chat/${encodeURIComponent(originSession)}`)}>
+              {originSession}
+            </Button>
+          ) : (
+            <Text size="sm">{t['env.origin-unknown']}</Text>
+          )}
+          <Text size="sm" c="dimmed">
+            · {t['env.origin-environment']}:
+          </Text>
+          {originEnv ? (
+            <Button size="compact-xs" variant="subtle" onClick={() => go(`/environments/${encodeURIComponent(originEnv)}/sessions`)}>
+              {originEnvRow ? envDisplayName(originEnvRow) : originEnv}
+            </Button>
+          ) : (
+            <Text size="sm">{t['env.origin-unknown']}</Text>
+          )}
+          {originEnv ? (
+            <Button size="compact-xs" variant="subtle" onClick={() => go(`/environments/${encodeURIComponent(originEnv)}/sessions`)}>
+              {t['env.origin-timeline']}
+            </Button>
+          ) : null}
+        </Group>
+        {isApplyConflict ? (
+          <Alert color="red" mt="sm" title={t['env.apply-error-title']}>
+            <Stack gap="xs">
+              <Text size="sm">
+                {taskId} · {t['env.head']}: {applyError.head ?? '—'}
+              </Text>
+              {(applyError.failed_files ?? []).length ? (
+                <Text size="sm">
+                  {t['env.apply-error-files']}: {(applyError.failed_files ?? []).join(', ')}
+                </Text>
+              ) : null}
+              <Text size="xs" c="dimmed">
+                {t['env.apply-error-note']}
+              </Text>
+              <Group gap="xs">
+                <Button
+                  size="xs"
+                  color="red"
+                  loading={rerunning}
+                  onClick={async () => {
+                    setRerunning(true)
+                    const res = await attempt(() => rerunTask(taskId), t['env.apply-error-rerun-done'])
+                    setRerunning(false)
+                    if (res?.task_id) go(`/tasks/${encodeURIComponent(res.task_id)}`)
+                  }}
+                >
+                  {t['env.apply-error-rerun']}
+                </Button>
+                <Button
+                  size="xs"
+                  variant="light"
+                  onClick={async () => {
+                    const res = await attempt(() => dismissApplyError(taskId), t['env.apply-error-dismissed'])
+                    if (res !== undefined) reload()
+                  }}
+                >
+                  {t['env.apply-error-dismiss']}
+                </Button>
+                <Text size="sm">
+                  {t['env.apply-error-manual']}: {t['env.apply-error-manual-help']}
+                </Text>
+              </Group>
+            </Stack>
+          </Alert>
+        ) : null}
         {s.error ? (
           <Alert color="yellow" mt="sm">
             Không đọc được trạng thái từ Temporal: {short(s.error, 200)}

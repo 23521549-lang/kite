@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ from typing import Any, Awaitable, Callable
 from .config import KiteConfig, gateway_models, model_contexts, model_policy_from_config, split_context
 from .journal import Journal, read_jsonl, short
 from .protocol import ScheduledTask
+from .session_copies import copy_identity_from_path, copy_path, delete_copy, ensure_copy
 from .store import SQLiteSchedulerStore, StoreError
 
 PATCH_PREVIEW_CHARS = 6000
@@ -101,6 +103,42 @@ class KiteToolError(RuntimeError):
     """A tool call that cannot be done; the message is shown to the chat agent."""
 
 
+class ApplyConflictError(KiteToolError):
+    """A patch that no longer applies to the main repository's HEAD.
+
+    Carries the structured fields the web maps to HTTP 400
+    (``code: apply_conflict`` + ``head`` + ``failed_files``) so the owner can
+    decide (rerun on the new HEAD / drop the patch / fix by hand) instead of
+    reading a bare stderr tail. The confirmation code is NOT consumed when
+    this is raised, so the patch stays available for the other choices.
+    """
+
+    code = "apply_conflict"
+
+    def __init__(self, task_id: str, head: str, failed_files: list[str], message: str) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+        self.head = head
+        self.failed_files = list(failed_files)
+
+
+# Sentinel for start_task(..., session_id=...): "use this process's session".
+_USE_OPS_SESSION = object()
+
+
+def _parse_failed_files(stderr: str) -> list[str]:
+    """Files from ``git apply`` stderr, in order of first appearance:
+    ``error: patch failed: <file>:<line>`` and ``error: <file>: patch does
+    not apply``."""
+    files: list[str] = []
+    for line in stderr.splitlines():
+        match = (re.match(r"error: patch failed: ([^:]+):", line)
+                 or re.match(r"error: ([^:]+): patch does not apply", line))
+        if match and match.group(1) not in files:
+            files.append(match.group(1))
+    return files
+
+
 def _goal_of(task: dict) -> str:
     try:
         return str(json.loads(task.get("payload_json") or "{}").get("goal", ""))
@@ -117,11 +155,18 @@ class KiteOps:
                  clock: Callable[[], float] = time.time, runner: Callable[..., Any] | None = None,
                  sandbox_settings: Any = None, chat_dir: Path | None = None,
                  spawn: Callable[[list[str], Path], Any] | None = None, kite_command: list[str] | None = None,
-                 config_path: Path | None = None, sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep) -> None:
+                 config_path: Path | None = None, sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+                 session_id: str | None = None) -> None:
         self.config = config
         self.db_path = Path(db_path)
         self.state_dir = Path(state_dir)
         self.allowed_roots = [Path(root).expanduser().resolve() for root in allowed_roots]
+        # The chat session this process serves (``kite mcp serve --session-id``).
+        # Only the session id is pinned in the process: the environment is
+        # looked up from the registry at task time, because a session can move
+        # Default -> repo between tasks and stamping the old environment would
+        # be wrong. None = the legacy single-chat process (no session).
+        self.session_id = (session_id or "").strip() or None
         self._connect = connect
         self._client = None
         self._gateway_status = gateway_status
@@ -191,6 +236,411 @@ class KiteOps:
             raise KiteToolError(f"{path} không phải repo Git có ít nhất một commit")
         return path, head.stdout.strip()
 
+    def _repo_unchecked(self, repo: str | Path) -> tuple[Path, str]:
+        """A Git repository with a HEAD, without the ``allowed_roots`` gate.
+
+        Only for repositories Kite itself resolved (a task's recorded
+        ``main_repo``, a session copy's origin) — never for a path the chat
+        typed in. ``apply_result``/``commit_result`` target the main
+        repository by design, and the main repository is by definition not
+        inside the session's allowed roots ([chat dir, session copy]); gating
+        it there would make every apply fail. Those tools are gated instead by
+        the owner's one-time confirmation code.
+        """
+        path = Path(repo).expanduser().resolve()
+        head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True)
+        if head.returncode != 0:
+            raise KiteToolError(f"{path} không phải repo Git có ít nhất một commit")
+        return path, head.stdout.strip()
+
+    # ------------------------------------------------------- session registry
+    # The chat_sessions / chat_session_moves / session_copies tables and the
+    # task columns (chat_session_id, environment_id, main_repo,
+    # last_apply_error) belong to worker (a) (store.py) and Gói 3. Everything
+    # here goes through the store's registry methods first
+    # (``get_chat_session``, ``record_session_move``, ``get_task``) and only
+    # falls back to raw SQLite when a method or a table/column does not exist
+    # yet (a store created before the migration): the lookup then returns
+    # "unknown" instead of failing, and the task still runs — the legacy path.
+    # The environment registry itself lives in the web store
+    # (``<state_dir>/web.sqlite3``, table ``repos``): an environment IS a repo
+    # row there, matched by local path or remote URL.
+    def _registry_db(self) -> sqlite3.Connection | None:
+        """A read-only connection to the scheduler DB, or None when there is none."""
+        if not self.db_path.is_file():
+            return None
+        try:
+            return sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0)
+        except sqlite3.Error:
+            return None
+
+    def _session_row(self, session_id: str) -> dict | None:
+        try:
+            with self._store() as store:
+                getter = getattr(store, "get_chat_session", None)
+                if callable(getter):
+                    row = getter(session_id)
+                    return dict(row) if row is not None else None
+        except Exception:
+            pass
+        db = self._registry_db()
+        if db is None:
+            return None
+        try:
+            db.row_factory = sqlite3.Row
+            tables = {r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "chat_sessions" not in tables:
+                return None
+            row = db.execute("SELECT * FROM chat_sessions WHERE kite_session_id=?",
+                             (session_id,)).fetchone()
+            return dict(row) if row is not None else None
+        except sqlite3.Error:
+            return None
+        finally:
+            db.close()
+
+    def _task_trace(self, task_id: str) -> dict:
+        """A task's Gói 2 trace (chat_session_id, environment_id, main_repo):
+        the store's ``get_task`` first, the raw columns as fallback."""
+        trace: dict = {"chat_session_id": None, "environment_id": None, "main_repo": None}
+        try:
+            with self._store() as store:
+                row = store.get_task(task_id)
+            for key in trace:
+                if row.get(key):
+                    trace[key] = row[key]
+        except Exception:
+            pass
+        extra = self._task_row_extra(task_id)
+        for key in trace:
+            if trace[key] is None and extra.get(key):
+                trace[key] = extra[key]
+        return trace
+
+    def _session_environment_id(self, session_id: str) -> str | None:
+        """The session's current environment, or None when the registry has no row."""
+        row = self._session_row(session_id)
+        if row is None:
+            return None
+        env = (row.get("environment_id") or "").strip()
+        return env or None
+
+    def _lookup_env_id_for_repo(self, repo: Path) -> str | None:
+        """The environment id a repository belongs to, or None when unknown.
+
+        Prefers worker (a)'s registry when it can answer: the web store's
+        ``repos`` table (``<state_dir>/web.sqlite3`` — an environment IS a
+        repo row there, matched by local path, or by remote URL for a GitHub
+        repo); then an ``environments`` table when one exists; last, a
+        deterministic slug from the repository's remote (``owner-repo``) or
+        folder name. The slug is only a fallback for a store with no
+        environment registry at all — it never overrides a registry answer.
+        """
+        try:
+            with self._store() as store:
+                lookup = getattr(store, "environment_for_repo", None)
+                if callable(lookup):
+                    found = lookup(str(repo))
+                    if found:
+                        return str(found)
+        except Exception:
+            pass
+        web_db = self.state_dir / "web.sqlite3"
+        if web_db.is_file():
+            try:
+                db = sqlite3.connect(f"file:{web_db}?mode=ro", uri=True, timeout=5.0)
+                try:
+                    db.row_factory = sqlite3.Row
+                    tables = {r[0] for r in db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                    if "repos" in tables:
+                        remote = subprocess.run(
+                            ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+                            capture_output=True, text=True)
+                        origin_url = (remote.stdout.strip() if remote.returncode == 0 else "")
+
+                        def _norm_url(value: str) -> str:
+                            value = value.strip().rstrip("/")
+                            return value[:-4] if value.endswith(".git") else value
+
+                        for row in db.execute("SELECT id, path, url FROM repos").fetchall():
+                            if row["path"] and Path(row["path"]).expanduser().resolve() == repo:
+                                return str(row["id"])
+                            if (origin_url and row["url"]
+                                    and _norm_url(row["url"]) == _norm_url(origin_url)):
+                                return str(row["id"])
+                finally:
+                    db.close()
+            except sqlite3.Error:
+                pass
+        db = self._registry_db()
+        if db is not None:
+            try:
+                db.row_factory = sqlite3.Row
+                tables = {r[0] for r in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "environments" in tables:
+                    cols = {r[1] for r in db.execute("PRAGMA table_info(environments)").fetchall()}
+                    id_col = next((c for c in ("id", "env_id", "environment_id") if c in cols), None)
+                    path_cols = [c for c in ("repo_path", "path", "local_path", "url", "remote_url")
+                                 if c in cols]
+                    if id_col and path_cols:
+                        for row in db.execute("SELECT * FROM environments").fetchall():
+                            for col in path_cols:
+                                value = (row[col] or "").strip()
+                                if not value:
+                                    continue
+                                if Path(value).expanduser().resolve() == repo or value.rstrip("/") == str(repo):
+                                    return str(row[id_col])
+            except sqlite3.Error:
+                pass
+            finally:
+                db.close()
+        remote = subprocess.run(["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+                                capture_output=True, text=True)
+        slug_source = ""
+        if remote.returncode == 0 and remote.stdout.strip():
+            url = remote.stdout.strip().rstrip("/")
+            if url.endswith(".git"):
+                url = url[:-4]
+            parts = [p for p in url.split("/") if p]
+            slug_source = "-".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "")
+        if not slug_source:
+            slug_source = repo.name
+        slug = re.sub(r"[^a-z0-9]+", "-", slug_source.lower()).strip("-")
+        return slug or None
+
+    def _ensure_environment_for_repo(self, repo: Path) -> str | None:
+        """Register a local repo that has no environment yet (Default sessions
+        only) and return its new env id (a digit string), or None when the web
+        store cannot be written. The row lands in the same ``repos`` table the
+        web reads, so the environment shows up in the Environments page. A
+        repo already registered under its path is reused; a name collision
+        with a different repo gets a ``-2``/``-3`` suffix. Never raises."""
+        web_db = self.state_dir / "web.sqlite3"
+        try:
+            remote = subprocess.run(["git", "-C", str(repo), "config", "--get",
+                                     "remote.origin.url"], capture_output=True, text=True,
+                                    timeout=10)
+            origin_url = remote.stdout.strip() if remote.returncode == 0 else ""
+            name_source = ""
+            if origin_url:
+                parts = [p for p in origin_url.rstrip("/").removesuffix(".git").split("/") if p]
+                name_source = "-".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else "")
+            if not name_source:
+                name_source = repo.name
+            name = re.sub(r"[^A-Za-z0-9._-]+", "-", name_source).strip("-") or "repo"
+            db = sqlite3.connect(web_db, timeout=5.0)
+            try:
+                db.execute("CREATE TABLE IF NOT EXISTS repos (id INTEGER PRIMARY KEY, "
+                           "name VARCHAR(100) UNIQUE NOT NULL, path TEXT NOT NULL, "
+                           "url TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)")
+                existing = db.execute("SELECT id FROM repos WHERE path = ?",
+                                      (str(repo),)).fetchone()
+                if existing:
+                    return str(existing[0])
+                for attempt in range(1, 21):
+                    candidate = name if attempt == 1 else f"{name}-{attempt}"
+                    try:
+                        cur = db.execute("INSERT INTO repos (name, path, url, created_at) "
+                                         "VALUES (?, ?, ?, ?)",
+                                         (candidate, str(repo), origin_url, time.time()))
+                        db.commit()
+                        return str(cur.lastrowid)
+                    except sqlite3.IntegrityError:
+                        db.rollback()
+                        row = db.execute("SELECT id, path FROM repos WHERE name = ?",
+                                         (candidate,)).fetchone()
+                        if row and row[1] == str(repo):
+                            return str(row[0])
+                        continue
+                return None
+            finally:
+                db.close()
+        except Exception:
+            return None
+
+    def _record_session_move(self, session_id: str, from_env: str, to_env: str,
+                             trigger: str, note: str) -> None:
+        """Append a ``chat_session_moves`` row and move the session's registry
+        row. Best-effort: a registry that cannot be written must not block the
+        task — the move is journaled instead."""
+        try:
+            with self._store() as store:
+                record = getattr(store, "record_session_move", None)
+                if callable(record):
+                    record(session_id, from_env, to_env, trigger=trigger, note=note)
+                    return
+        except Exception:
+            pass
+        try:
+            db = sqlite3.connect(self.db_path, timeout=10.0) if self.db_path.is_file() else None
+            if db is None:
+                raise sqlite3.Error("no scheduler database yet")
+            try:
+                tables = {r[0] for r in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "chat_session_moves" in tables:
+                    db.execute("INSERT INTO chat_session_moves "
+                               "(session_id, from_env, to_env, moved_at, trigger, note) "
+                               "VALUES (?, ?, ?, ?, ?, ?)",
+                               (session_id, from_env, to_env, int(self.clock()), trigger, note))
+                if "chat_sessions" in tables:
+                    db.execute("UPDATE chat_sessions SET environment_id=?, updated_at=? "
+                               "WHERE kite_session_id=?", (to_env, int(self.clock()), session_id))
+                db.commit()
+            finally:
+                db.close()
+        except sqlite3.Error:
+            pass
+        try:
+            self.journal.write("actions", {"tool": "session_move", "session_id": session_id,
+                                            "from_env": from_env, "to_env": to_env,
+                                            "trigger": trigger, "note": note})
+        except Exception:
+            pass
+
+    def _task_row_extra(self, task_id: str) -> dict:
+        """The Gói 2/Gói 3 task columns when they exist, else {}."""
+        db = self._registry_db()
+        if db is None:
+            return {}
+        try:
+            db.row_factory = sqlite3.Row
+            cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)").fetchall()}
+            wanted = [c for c in ("chat_session_id", "environment_id", "main_repo",
+                                  "last_apply_error") if c in cols]
+            if not wanted:
+                return {}
+            row = db.execute(f"SELECT {', '.join(wanted)} FROM tasks WHERE task_id=?",
+                             (task_id,)).fetchone()
+            return dict(row) if row is not None else {}
+        except sqlite3.Error:
+            return {}
+        finally:
+            db.close()
+
+    def _update_task_row(self, task_id: str, **values: Any) -> None:
+        """Write Gói 2/Gói 3 task columns when they exist. Best-effort."""
+        if not values or not self.db_path.is_file():
+            return
+        try:
+            db = sqlite3.connect(self.db_path, timeout=10.0)
+            try:
+                cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)").fetchall()}
+                present = {k: v for k, v in values.items() if k in cols}
+                if not present:
+                    return
+                db.execute(f"UPDATE tasks SET {', '.join(f'{k}=?' for k in present)} "
+                           "WHERE task_id=?", (*present.values(), task_id))
+                db.commit()
+            finally:
+                db.close()
+        except sqlite3.Error:
+            pass
+
+    def _resolve_task_repo(self, repo: str, *, task_id: str,
+                           session_id: str | None) -> tuple[Path, str, Path, str | None]:
+        """(run_repo, head, main_repo, environment_id) for a task.
+
+        No session: the task runs on the repo itself (legacy behaviour, with
+        the ``allowed_roots`` gate). With a session: the task runs on the
+        session's lazy copy (``ensure_copy``), the dirty-check then sees the
+        copy — never the main repository — so session B is not blocked by a
+        patch of A that is still uncommitted on the main repository.
+        A Default session that touches a code repository moves to that
+        repository's environment first (one-way, recorded with trigger
+        ``task``), and only then is the task enqueued.
+        """
+        main_path, main_head = self._repo_unchecked(repo)
+        if session_id is None:
+            path, head = self._repo(repo)
+            return path, head, path, None
+        if self.chat_dir is not None:
+            chat_dir = self.chat_dir.expanduser().resolve()
+            if main_path == chat_dir or chat_dir in main_path.parents:
+                return main_path, main_head, main_path, "default"
+        env_id = self._session_environment_id(session_id) or "default"
+        if env_id == "default":
+            target = self._lookup_env_id_for_repo(main_path)
+            if not target or (target != "default" and not target.isdigit()):
+                # No registered environment for this repo yet (a slug fallback
+                # proves nothing). Register it now: the task needs a real
+                # environment to be stamped with, and the owner can rename it
+                # or add a PAT later in the Environments page. Refusing here
+                # would block tasks on repos the owner simply has not
+                # registered yet — the lenient behaviour that predates Gói 2.
+                target = self._ensure_environment_for_repo(main_path)
+            if target and target.isdigit():
+                self._record_session_move(session_id, "default", target,
+                                          trigger="task", note=task_id)
+                env_id = target
+            elif target != "default":
+                # The web store is not a writable SQLite DB, so the repo
+                # cannot be auto-registered: tell the owner to register it.
+                raise KiteToolError(
+                    f"repo {main_path} chưa đăng ký thành môi trường — đăng ký ở trang "
+                    "Môi trường trước rồi giao task lại")
+        else:
+            # A session already on a repository is locked to it: its copy's
+            # origin must be that repository, or the lead is aiming at a
+            # different repo than the session's environment.
+            existing = copy_path(self.state_dir, env_id, session_id)
+            if existing.exists():
+                origin = subprocess.run(
+                    ["git", "-C", str(existing), "config", "--get", "remote.origin.url"],
+                    capture_output=True, text=True)
+                if origin.returncode == 0 and origin.stdout.strip():
+                    origin_path = Path(origin.stdout.strip()).expanduser()
+                    if origin_path.resolve() != main_path:
+                        raise KiteToolError(
+                            f"session đang ở môi trường {env_id} (repo {origin_path}), "
+                            f"không phải {main_path}: session đã ở repo thì khóa, không đổi repo")
+            else:
+                # First task on this environment: no copy exists yet to compare
+                # against, so ask the registry which environment this repo
+                # belongs to. A registry answer that is not this environment
+                # refuses; no answer (or a slug fallback, which proves nothing)
+                # also refuses: the task must run on the session's environment,
+                # and an unregistered repo has no environment to run in.
+                target = self._lookup_env_id_for_repo(main_path)
+                if target and target.isdigit() and target != env_id:
+                    raise KiteToolError(
+                        f"session đang ở môi trường {env_id}, không phải repo {main_path} "
+                        f"(môi trường {target}): session đã ở repo thì khóa, không đổi repo")
+                if not target or not target.isdigit():
+                    raise KiteToolError(
+                        f"repo {main_path} chưa đăng ký thành môi trường — đăng ký ở trang "
+                        "Môi trường trước rồi giao task lại")
+        copy = ensure_copy(env_id, session_id, main_path, state_dir=self.state_dir,
+                           db_path=self.db_path, clock=self.clock())
+        _copy, head = self._repo_unchecked(copy)
+        return copy, head, main_path, env_id
+
+    def _task_main_repo(self, task_id: str, repo_path: str | None) -> Path:
+        """The main repository a finished task's patch belongs to.
+
+        The task row's ``main_repo`` wins; otherwise the copy's ``origin``
+        (the copy was cloned from the main repository); otherwise the
+        checkpoint's repo path (legacy tasks, which ran on the main repo).
+        """
+        extra = self._task_trace(task_id)
+        if extra.get("main_repo"):
+            return Path(str(extra["main_repo"])).expanduser().resolve()
+        if repo_path:
+            candidate = Path(repo_path).expanduser().resolve()
+            if copy_identity_from_path(self.state_dir, candidate) is not None:
+                origin = subprocess.run(
+                    ["git", "-C", str(candidate), "config", "--get", "remote.origin.url"],
+                    capture_output=True, text=True)
+                if origin.returncode == 0 and origin.stdout.strip():
+                    origin_path = Path(origin.stdout.strip()).expanduser()
+                    if origin_path.is_dir():
+                        return origin_path.resolve()
+            return candidate
+        raise KiteToolError(f"task {task_id} không rõ repo gốc")
+
     def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess:
         # core.fsmonitor could name a program from the repository's config: never run it.
         return subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(repo), *args],
@@ -207,7 +657,15 @@ class KiteOps:
         return self._sandbox_settings
 
     async def _finished_patch(self, task_id: str) -> tuple[Path, Path, list[str]]:
-        """Repository, patch file and changed files of a task that finished READY_FOR_REVIEW."""
+        """Main repository, patch file and changed files of a task that finished
+        READY_FOR_REVIEW.
+
+        The repository returned here is ALWAYS the main repository, never the
+        session copy the task ran on: the checkpoint's ``repo_path`` is the
+        copy, and applying to the copy would leave the main repository
+        unchanged while the owner believes the patch was applied. This is the
+        easiest place in Gói 2 to get wrong, so it has its own test.
+        """
         result = await self.task_result(task_id)
         if not result.get("ready"):
             raise KiteToolError("task chưa xong nên chưa có patch")
@@ -216,7 +674,7 @@ class KiteOps:
         patch = Path(result["patch_path"])
         if not result.get("repo_path") or not patch.is_file() or patch.stat().st_size == 0:
             raise KiteToolError("không tìm thấy patch hoặc repo gốc của task")
-        repo, _head = self._repo(result["repo_path"])
+        repo, _head = self._repo_unchecked(self._task_main_repo(task_id, result["repo_path"]))
         files = [line.split("\t", 2)[2] for line in self._git(repo, "apply", "--numstat", str(patch)).stdout.splitlines()
                  if line.count("\t") >= 2]
         return repo, patch, files
@@ -263,7 +721,8 @@ class KiteOps:
 
     # ------------------------------------------------------------------ tools
     async def start_task(self, repo: str, goal: str, task_type: str = "coding", model: str | None = None,
-                         continue_from: str = "", ignore_uncommitted: bool = False) -> dict:
+                         continue_from: str = "", ignore_uncommitted: bool = False,
+                         session_id: Any = _USE_OPS_SESSION) -> dict:
         from .temporal_workflow import CodingTaskInput, CodingTaskWorkflow
 
         if not goal.strip():
@@ -272,7 +731,15 @@ class KiteOps:
             raise KiteToolError(f"task_type phải là một trong: {', '.join(TASK_TYPES)}")
         if model is not None and model not in self.base_models():
             raise KiteToolError(f"model phải là một trong: {', '.join(self.base_models())} (để trống cho Kite tự chọn)")
-        path, head = self._repo(repo)
+        if session_id is _USE_OPS_SESSION:
+            session_id = self.session_id
+        task_id = f"chat-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
+        # With a session the task runs on the session's lazy copy (never on the
+        # main repository): the dirty-check below then sees the copy, so
+        # session B is not blocked by A's still-uncommitted patch on the main
+        # repository. Without a session this is the legacy path (repo itself).
+        path, head, main_repo, env_id = self._resolve_task_repo(
+            repo, task_id=task_id, session_id=session_id)
         base_patch, base_task, notes = "", "", []
         if continue_from.strip():
             base_task = self.resolve(continue_from)
@@ -292,12 +759,17 @@ class KiteOps:
         if new_files and not base_task:
             notes.append(f"repo có file mới chưa commit ({', '.join(new_files[:5])}): task KHÔNG thấy chúng; "
                          "nói người dùng nếu đó là code cần dùng")
-        task_id = f"chat-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
         branch = f"agent/{task_id}"
         with self._store() as store:
+            # The trace goes in through the constructor (ScheduledTask carries
+            # the three Gói 2 fields since worker (a) landed them); the store
+            # persists them on the task row at creation — never re-derived
+            # from the session afterwards.
             store.enqueue(ScheduledTask(task_id, "coder", model, head, branch,
                                         json.dumps({"goal": goal}, ensure_ascii=False, sort_keys=True),
-                                        900, 0, self.clock(), task_type=task_type))
+                                        900, 0, self.clock(), task_type=task_type,
+                                        chat_session_id=session_id, environment_id=env_id,
+                                        main_repo=str(main_repo)))
         client = await self.client()
         try:
             await client.start_workflow(
@@ -309,7 +781,12 @@ class KiteOps:
             raise KiteToolError(f"không khởi động được workflow: {exc}") from exc
         self.wake_soon(model=model, reason="task")
         result = {"task_id": task_id, "short_id": task_id[-4:], "repo": str(path), "commit": head,
-                  "task_type": task_type, "model": model or "Kite tự chọn", "status": "started"}
+                  "task_type": task_type, "model": model or "Kite tự chọn", "status": "started",
+                  "main_repo": str(main_repo)}
+        if session_id is not None:
+            result.update(chat_session_id=session_id, environment_id=env_id)
+            if path != main_repo:
+                result["copy"] = str(path)
         if base_task:
             result["continue_from"] = base_task
             from .backend import task_slug
@@ -317,7 +794,7 @@ class KiteOps:
             marker = self.state_dir / "tasks" / task_slug(task_id) / "continue.json"
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(json.dumps({"from": base_task}), encoding="utf-8")
-        config = self._repo_config_note(path)
+        config = self._repo_config_note(main_repo)
         if config:
             result["repo_config"] = config
         if notes:
@@ -533,9 +1010,50 @@ class KiteOps:
 
         consume_code(self.state_dir, action, task_id, digest, code or "")
 
+    def _record_apply_error(self, task_id: str, code: str, head: str, failed_files: list[str]) -> None:
+        """Persist an apply error on the task row (Gói 3's ``last_apply_error``)
+        so the detail page can show it inline instead of a toast. Best-effort:
+        a store without the column simply keeps nothing."""
+        self._update_task_row(
+            task_id, last_apply_error=json.dumps(
+                {"code": code, "head": head, "failed_files": list(failed_files),
+                 "at": int(self.clock()), "task_id": task_id},
+                ensure_ascii=False, sort_keys=True))
+
+    def _delete_task_copy(self, task_id: str) -> bool | None:
+        """Delete the session copy a task ran on. True/False when the task had
+        one, None when it did not. Best-effort: never raises, and a failure
+        never fails the apply — the copy is journaled for the sweeper."""
+        try:
+            extra = self._task_trace(task_id)
+            session_id, env_id = extra.get("chat_session_id"), extra.get("environment_id")
+            if session_id and env_id:
+                return delete_copy(str(env_id), str(session_id), state_dir=self.state_dir,
+                                   db_path=self.db_path, clock=self.clock())
+            from .backend import task_slug
+
+            try:
+                checkpoint = json.loads(
+                    (self.state_dir / "tasks" / task_slug(task_id) / "checkpoint.json")
+                    .read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            identity = copy_identity_from_path(self.state_dir, checkpoint.get("repo_path") or "")
+            if identity is None:
+                return None
+            env_id, session_id = identity
+            return delete_copy(env_id, session_id, state_dir=self.state_dir,
+                               db_path=self.db_path, clock=self.clock())
+        except Exception:
+            return False
+
     async def apply_result(self, task_id: str = "", confirmation_code: str = "") -> dict:
         """Apply a finished task's patch to the working tree of its own repository (never commits).
-        Requires the owner's one-time confirmation code for this patch (see `kite tasks confirm`)."""
+        Requires the owner's one-time confirmation code for this patch (see `kite tasks confirm`).
+        The patch is applied to the MAIN repository (see ``_finished_patch``); after a successful
+        apply the session's copy is deleted (best-effort). A patch that no longer applies raises
+        ``ApplyConflictError`` (structured: head + failed files) and the confirmation code is NOT
+        consumed, so the owner can still rerun, drop, or fix the patch by hand."""
         task_id = self._require_explicit_task(task_id)
         repo, patch, files = await self._finished_patch(task_id)
         digest = self._check_confirmation("apply", task_id, patch, confirmation_code)
@@ -554,14 +1072,30 @@ class KiteOps:
         if check.returncode != 0:
             if replaced:                                  # put the previous result back as it was
                 self._git(repo, "apply", str(self._task_patch(replaced)[0]))
-            raise KiteToolError("patch không áp được (repo đã đổi so với lúc chạy task?): " + check.stderr.strip()[-500:])
+            head = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+            failed_files = _parse_failed_files(check.stderr)
+            self._record_apply_error(task_id, "apply_conflict", head, failed_files)
+            raise ApplyConflictError(
+                task_id, head, failed_files,
+                "patch không áp được lên HEAD hiện tại " + head[:8]
+                + (f" (file lỗi: {', '.join(failed_files)})" if failed_files else "")
+                + ": " + check.stderr.strip()[-500:])
         applied = self._git(repo, "apply", str(patch))
         if applied.returncode != 0:
             raise KiteToolError("git apply lỗi: " + applied.stderr.strip()[-500:])
         self._consume_confirmation("apply", task_id, digest, confirmation_code)
-        return {"task_id": task_id, "applied": True, "repo": str(repo), "files": files, "committed": False,
-                "undo_with": f"git -C {repo} apply -R {patch}",
-                **({"replaced": f"patch của task {replaced} (đã nằm trong patch này)"} if replaced else {})}
+        self._update_task_row(task_id, last_apply_error=None)
+        copy_deleted = self._delete_task_copy(task_id)
+        if copy_deleted is False:
+            self.journal.write("actions", {"tool": "apply_result", "task_id": task_id,
+                                            "copy_deleted": False,
+                                            "note": "áp xong nhưng không xóa được bản sao session"})
+        result = {"task_id": task_id, "applied": True, "repo": str(repo), "files": files, "committed": False,
+                  "undo_with": f"git -C {repo} apply -R {patch}",
+                  **({"replaced": f"patch của task {replaced} (đã nằm trong patch này)"} if replaced else {})}
+        if copy_deleted is not None:
+            result["copy_deleted"] = copy_deleted
+        return result
 
     async def commit_result(self, task_id: str, message: str, confirmation_code: str = "") -> dict:
         """Commit exactly the files of an applied task patch (nothing else that is staged or changed).
@@ -588,6 +1122,67 @@ class KiteOps:
         head = self._git(repo, "log", "-1", "--oneline").stdout.strip()
         return {"task_id": task_id, "committed": True, "repo": str(repo), "files": files, "commit": head,
                 "pushed": False, "undo_with": f"git -C {repo} reset --soft HEAD~1"}
+
+    async def rerun_task(self, task_id: str) -> dict:
+        """Run a task again on the main repository's newest HEAD.
+
+        Reads the goal, repository, session and environment from the store
+        (the web never re-assembles them: ``list_tasks`` truncates the goal).
+        The session copy is fast-forwarded first, then the rerun continues
+        from the old task's patch (``continue_from``). When the old patch no
+        longer merges onto the new HEAD (``_continue_patch`` fails), the rerun
+        falls back to a fresh task with the same goal and a clear note — the
+        new task still goes through the full pipeline and still waits for the
+        owner's review, so nothing is decided on the owner's behalf.
+        """
+        from .backend import task_slug
+
+        task_id = self.resolve(task_id)
+        with self._store() as store:
+            row = store.get_task(task_id)
+        goal = _goal_of(row)
+        if not goal.strip():
+            raise KiteToolError(f"task {task_id} không còn goal để chạy lại")
+        extra = self._task_trace(task_id)
+        main_repo = (extra.get("main_repo") or "").strip() or None
+        if main_repo is None:
+            try:
+                checkpoint = json.loads(
+                    (self.state_dir / "tasks" / task_slug(task_id) / "checkpoint.json")
+                    .read_text(encoding="utf-8"))
+                main_repo = self._task_main_repo(task_id, checkpoint.get("repo_path"))
+            except (OSError, ValueError, KiteToolError):
+                raise KiteToolError(f"task {task_id} không rõ repo gốc để chạy lại") from None
+        main_repo = Path(str(main_repo)).expanduser().resolve()
+        session_id = extra.get("chat_session_id") or None
+        task_type = str(row.get("task_type") or "coding")
+        model = row.get("model_id")
+        if task_type not in TASK_TYPES:
+            task_type = "coding"
+        # Fast-forward the copy (or resolve the repo) before deciding whether
+        # the old patch still continues: the check must run on the newest HEAD.
+        new_task_id = f"chat-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
+        try:
+            run_path, head, _main, _env = self._resolve_task_repo(
+                str(main_repo), task_id=new_task_id, session_id=session_id)
+            self._continue_patch(task_id, run_path, head)
+        except KiteToolError:
+            fell_back = True
+        else:
+            fell_back = False
+        if fell_back:
+            fresh_goal = (goal.strip() + "\n\nLưu ý: patch cũ không gộp được lên HEAD mới "
+                          "nên chạy lại từ đầu.")
+            started = await self.start_task(str(main_repo), fresh_goal, task_type=task_type,
+                                            model=model, session_id=session_id)
+        else:
+            started = await self.start_task(str(main_repo), goal, task_type=task_type,
+                                            model=model, continue_from=task_id,
+                                            session_id=session_id)
+        return {"task_id": started["task_id"], "rerun_of": task_id, "fell_back": fell_back,
+                "main_repo": str(main_repo),
+                "note": ("chạy lại từ đầu vì patch cũ không gộp được lên HEAD mới"
+                         if fell_back else f"sửa tiếp kết quả của task {task_id}")}
 
     async def repo_status(self, repo: str) -> dict:
         """Read-only look at a repository: branch, changes, recent commits."""
@@ -676,6 +1271,10 @@ class KiteOps:
                 goal = ""
             listed.append({"task_id": task["task_id"], "state": task["state"], "task_type": task["task_type"],
                            "goal": goal[:200],
+                           "chat_session_id": task.get("chat_session_id"),
+                           "environment_id": task.get("environment_id"),
+                           "main_repo": task.get("main_repo"),
+                           "last_apply_error": task.get("last_apply_error"),
                            "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(task["created_at"]))})
         return listed
 
@@ -1277,14 +1876,111 @@ def stale_chat_processes(config_path, *, proc: Path = Path("/proc"), uid: int | 
     return found
 
 
+def _argv_session_id(argv: list[str]) -> str | None:
+    """The ``--session-id <id>`` in a ``kite mcp serve`` argv, or None."""
+    if "--session-id" in argv:
+        at = argv.index("--session-id")
+        if at + 1 < len(argv):
+            return argv[at + 1]
+    return None
+
+
+def _command_session_id(command: str) -> str | None:
+    """The ``--session-id <id>`` in a space-joined command line, or None."""
+    match = re.search(r"--session-id\s+(\S+)", command)
+    return match.group(1) if match else None
+
+
 def stop_stale_chat_processes(config_path, *, proc: Path = Path("/proc"), uid: int | None = None,
-                              kill: Callable[[int, int], None] = os.kill) -> list[dict]:
-    """SIGTERM the processes found by ``stale_chat_processes``; OpenCode restarts them on next launch."""
+                              kill: Callable[[int, int], None] = os.kill,
+                              session_id: str | None = None) -> list[dict]:
+    """SIGTERM the processes found by ``stale_chat_processes``; OpenCode restarts them on next launch.
+
+    With ``session_id`` only that session's ``kite mcp serve`` processes are
+    stopped (matched on ``--session-id <id>`` in the argv) — a ``chat
+    reload`` for one session must not kill the MCP servers of the other
+    sessions. Without it the old behaviour stays: everything stale for this
+    config is stopped.
+    """
     stopped = []
     for pid, command in stale_chat_processes(config_path, proc=proc, uid=uid):
+        if session_id is not None and _command_session_id(command) != session_id:
+            continue
         try:
             kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             continue
         stopped.append({"pid": pid, "command": command[:200]})
     return stopped
+
+
+def sweep_stale_mcp_processes(state_dir: Path, config_path, *, proc: Path = Path("/proc"),
+                              uid: int | None = None,
+                              kill: Callable[[int, int], None] = os.kill) -> list[dict]:
+    """SIGTERM orphaned ``kite mcp serve`` processes: their session is gone.
+
+    This is mandatory, not optional. Live evidence (OpenCode 1.19.6, this VM,
+    25/11/2026): a dummy MCP server (Python stdio, PID 9397) was still alive
+    and still answering ``/mcp`` ("connected") 5 seconds after its session was
+    deleted through the API (``GET /session`` back to ``[]``). OpenCode ties
+    an MCP server to the project directory, not to the session — deleting the
+    last session in a directory does NOT kill the server. Without this
+    sweeper every archived or deleted session would leak one process
+    (~61 MB RSS measured on this VM) forever.
+
+    A process is stale when it carries ``--session-id <id>`` and either the
+    ``chat_sessions`` registry has no ``active`` row for ``<id>`` or the
+    session's chat directory (``<state_dir>/chat-sessions/<id>/``) no longer
+    exists. Processes without ``--session-id`` (the legacy single-chat
+    server) are left alone: they belong to no session and cannot be
+    attributed. Returns what was killed, with the reason.
+    """
+    state_dir = Path(state_dir)
+    uid = os.getuid() if uid is None else uid
+    stale: list[dict] = []
+    for pid, command in stale_chat_processes(config_path, proc=proc, uid=uid):
+        if "mcp" not in command.split() or "serve" not in command.split():
+            continue
+        session_id = _command_session_id(command)
+        if session_id is None:
+            continue
+        chat_dir = state_dir / "chat-sessions" / session_id
+        if not chat_dir.is_dir():
+            reason = "chat_dir_missing"
+        else:
+            reason = None
+            try:
+                db_path = None
+                # The scheduler DB lives next to the state dir in the usual
+                # layout (<state>/scheduler.sqlite3); only consult it when
+                # it is really there.
+                for candidate in (state_dir / "scheduler.sqlite3",
+                                  state_dir.parent / "scheduler.sqlite3"):
+                    if candidate.is_file():
+                        db_path = candidate
+                        break
+                if db_path is not None:
+                    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+                    try:
+                        db.row_factory = sqlite3.Row
+                        tables = {r[0] for r in db.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                        if "chat_sessions" in tables:
+                            row = db.execute(
+                                "SELECT status FROM chat_sessions WHERE kite_session_id=?",
+                                (session_id,)).fetchone()
+                            if row is None or (row["status"] or "") != "active":
+                                reason = "session_archived_or_deleted"
+                    finally:
+                        db.close()
+            except sqlite3.Error:
+                reason = None
+        if reason is None:
+            continue
+        try:
+            kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            continue
+        stale.append({"pid": pid, "session_id": session_id, "reason": reason,
+                      "command": command[:200]})
+    return stale

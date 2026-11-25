@@ -20,7 +20,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import sys
 import time
+import uuid
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
@@ -47,16 +51,20 @@ CSP = ("default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe
        "object-src 'none'")
 GatewayCall = Callable[[str, str, dict | None], Awaitable[dict]]
 OPENCODE_TESTED = "2.4.0"            # the OpenCode version the Chat tab was built and tested against
+# Gói 2: soft warning when this many chat sessions are open at once (measured RSS of one
+# `kite mcp serve` is ~62 MB; the limit is a warning, never a block).
+MAX_OPEN_SESSIONS_SOFT = 10
 _SID = r"[A-Za-z0-9_-]{1,80}"
 # The OpenCode routes the Chat tab needs, and the body fields it may send: nothing else of the OpenCode
 # server (its shell, terminal, file and credential routes) is reachable from the web. A new session is
-# always made in the chat folder (Kite sets its location), and a prompt carries text only.
+# always made in the chat folder of its Kite session (Kite sets its location), and a prompt carries
+# text only. Without a kite_session_id the new session falls back to the legacy single chat folder.
 OPENCODE_ROUTES: tuple[tuple[frozenset, re.Pattern, frozenset | None], ...] = tuple(
     (frozenset(methods.split()), re.compile(pattern.replace("{S}", _SID)), None if keys is None else frozenset(keys))
     for methods, pattern, keys in (
         ("GET", r"api/(info|agent|model|event|permission/request)", None),
         ("GET", r"api/session", None),
-        ("POST", r"api/session", ("agent",)),
+        ("POST", r"api/session", ("agent", "kite_session_id")),
         ("GET DELETE", r"api/session/{S}", None),
         ("PATCH", r"api/session/{S}", ("title", "archived")),
         ("GET", r"api/session/{S}/(message|permission|form)", None),
@@ -152,6 +160,35 @@ def _session_busy(item: Any) -> bool:
         return False
     busy, idle = times.get("busy"), times.get("idle")
     return isinstance(busy, (int, float)) and (not isinstance(idle, (int, float)) or busy > idle)
+
+
+def env_cost_usd(journal: Any, tasks: list[dict[str, Any]], env_id: str) -> float | None:
+    """USD spent on tasks of one environment (a lower bound, never fabricated).
+
+    Journal spend records carry ``tag=<task_id>`` (relay.py records
+    ``"tag": job.tag``); a task's environment comes from the scheduler store.
+    Chat (``"chat"``), bench (``"bench-*"``), pod (``kind="pod"``, no tag) and
+    pre-Gói-2 spend have no task link and are excluded. Branch retries tag
+    ``"<task_id>-b<N>"``: the suffix is stripped. Unreadable journal: None
+    (unknown, not zero).
+    """
+    task_env = {t.get("task_id"): t.get("environment_id") for t in tasks}
+    try:
+        records = journal.read("spend")
+    except Exception:
+        return None
+    total = 0.0
+    for record in records:
+        tag = record.get("tag")
+        if not isinstance(tag, str) or not tag:
+            continue
+        base = re.sub(r"-b\d+$", "", tag)
+        if task_env.get(base) != env_id:
+            continue
+        usd = record.get("usd")
+        if isinstance(usd, (int, float)):
+            total += float(usd)
+    return round(total, 6)
 
 
 def find_opencode(home: Path, fallback_url: str, fallback_password: str | None) -> tuple[str, str | None]:
@@ -262,6 +299,28 @@ class CleanupIn(BaseModel):
     days: float = 7
 
 
+class ChatSessionIn(BaseModel):
+    environment_id: str | None = None
+    title: str | None = Field(default=None, max_length=200)
+    kind: str = "chat"
+
+
+class ChatMoveIn(BaseModel):
+    to_env: str
+
+
+class EnvIn(BaseModel):
+    name: str = Field(max_length=100)
+    path: str = Field(default="", max_length=500)
+    url: str = Field(default="", max_length=500)
+    branch: str | None = Field(default=None, max_length=200)
+    pat: str | None = Field(default=None, max_length=500)
+
+
+class PatIn(BaseModel):
+    pat: str = Field(max_length=500)
+
+
 # ---------------------------------------------------------------- the app
 def client_ip(request) -> str:
     """The caller's address; behind Caddy on this machine, the one Caddy saw (last X-Forwarded-For entry)."""
@@ -310,7 +369,22 @@ def create_app(ctx: WebContext) -> FastAPI:
 
     @app.exception_handler(KiteToolError)
     async def tool_error(_request, exc):
-        return JSONResponse({"error": str(exc)}, status_code=400)
+        # Gói 2/Gói 3: an apply error carries structured fields (ApplyConflictError, defined by
+        # worker (b) in mcp_server.py); an ordinary tool error stays {"error": str} as before.
+        body: dict[str, Any] = {"error": str(exc)}
+        code = getattr(exc, "code", None)
+        if code is not None:
+            body["code"] = code
+        task_id = getattr(exc, "task_id", None)
+        if task_id is not None:
+            body["task_id"] = task_id
+        head = getattr(exc, "head", None)
+        if head is not None:
+            body["head"] = head
+        failed_files = getattr(exc, "failed_files", None)
+        if failed_files is not None:
+            body["failed_files"] = list(failed_files)
+        return JSONResponse(body, status_code=400)
 
     @app.exception_handler(ValueError)
     async def value_error(_request, exc):
@@ -726,6 +800,17 @@ def create_app(ctx: WebContext) -> FastAPI:
         resolved = report["log"].get("task_id", task_id)
         report["journal"] = show_task(ctx.journal(), resolved,
                                       ctx.state_dir / "tasks" / task_slug(resolved) / "trace.jsonl")
+        # Gói 2/Gói 3: stamp the origin on the detail, the same fields the list carries.
+        # Absent while the scheduler store has no such task: the trace above still stands.
+        for key in ("chat_session_id", "environment_id", "main_repo", "last_apply_error"):
+            report.setdefault(key, None)
+        try:
+            with scheduler_store() as store:
+                row = store.get_task(resolved)
+            for key in ("chat_session_id", "environment_id", "main_repo", "last_apply_error"):
+                report[key] = row.get(key)
+        except Exception:
+            pass
         return report
 
     @app.get("/api/tasks/{task_id}/patch")
@@ -789,6 +874,18 @@ def create_app(ctx: WebContext) -> FastAPI:
     async def task_note(task_id: str, body: NoteIn, request: Request):
         return await task_action(request, task_id, "note_task", body.verdict, body.reason)
 
+    @app.post("/api/tasks/{task_id}/rerun")
+    async def task_rerun(task_id: str, request: Request):
+        session = auth(request)
+        ops = ctx.ops()
+        rerun = getattr(ops, "rerun_task", None)
+        if rerun is None:
+            raise HTTPException(501, "chạy lại task chưa sẵn sàng (KiteOps.rerun_task của worker (b))")
+        report = await ops.logged("rerun_task", rerun, task_id)
+        audit(session, "task_rerun", task_id, True,
+              {"task_id": report.get("task_id", task_id) if isinstance(report, dict) else task_id})
+        return report
+
     # ------------------------------------------------------------------ repositories
     @app.get("/api/repos")
     async def repos(request: Request):
@@ -850,6 +947,331 @@ def create_app(ctx: WebContext) -> FastAPI:
         report = await ctx.ops().repo_config(body.repo, body.config)
         audit(session, "repo_config", body.repo)
         return report
+
+    # ------------------------------------------------------------------ chat sessions + environments (Gói 2)
+    def scheduler_store():
+        """The scheduler SQLite store: the chat_sessions registry lives there. KiteOps owns the
+        database path; a caller without _store cannot serve these routes."""
+        ops = ctx.ops()
+        factory = getattr(ops, "_store", None)
+        if factory is None:
+            raise HTTPException(501, "scheduler store chưa sẵn sàng cho session chat")
+        return factory()
+
+    def session_dir(kite_session_id: str) -> Path:
+        return ctx.state_dir / "chat-sessions" / kite_session_id
+
+    def check_session_id(kite_session_id: str) -> str:
+        if not re.fullmatch(_SID, kite_session_id or ""):
+            raise HTTPException(400, "id session không hợp lệ")
+        return kite_session_id
+
+    def session_out(row: dict[str, Any], *, warning: str | None = None) -> dict[str, Any]:
+        out = {**row, "directory": str(session_dir(str(row["kite_session_id"])))}
+        if warning is not None:
+            out["warning"] = warning
+        return out
+
+    def env_rows() -> list[dict[str, Any]]:
+        rows = [{"id": "default", "name": "Default", "path": "", "url": "", "kind": "default"}]
+        for repo in ctx.store.repo_rows():
+            rows.append({"id": str(repo["id"]), "name": repo["name"], "path": repo["path"],
+                         "url": repo["url"], "kind": "github" if repo["url"] else "local"})
+        return rows
+
+    def require_env(env_id: str) -> dict[str, Any]:
+        for row in env_rows():
+            if row["id"] == env_id:
+                return row
+        raise HTTPException(404, "không có môi trường này")
+
+    @app.get("/api/chat/sessions")
+    async def chat_sessions(request: Request):
+        auth(request)
+        with scheduler_store() as store:
+            return {"sessions": [session_out(row) for row in store.list_chat_sessions()]}
+
+    @app.post("/api/chat/sessions")
+    async def create_chat_session(body: ChatSessionIn, request: Request):
+        session = auth(request)
+        kind = (body.kind or "chat").strip()
+        if kind not in ("chat", "review", "secretary"):
+            raise HTTPException(400, "kind phải là chat, review hoặc secretary")
+        environment_id = (body.environment_id or "default").strip() or "default"
+        if environment_id != "default":
+            require_env(environment_id)
+        kite_session_id = uuid.uuid4().hex
+        directory = session_dir(kite_session_id)
+        try:
+            _write_session_files(ctx, kite_session_id, directory)
+            with scheduler_store() as store:
+                open_count = len(store.list_chat_sessions(status="active"))
+                row = store.create_chat_session(kite_session_id, None, environment_id,
+                                                body.title, kind=kind)
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        warning = "many_sessions" if open_count + 1 >= MAX_OPEN_SESSIONS_SOFT else None
+        audit(session, "chat_session_create", kite_session_id, True,
+              {"environment_id": environment_id, "kind": kind})
+        return session_out(row, warning=warning)
+
+    @app.post("/api/chat/sessions/{kite_session_id}/move")
+    async def move_chat_session(kite_session_id: str, body: ChatMoveIn, request: Request):
+        session = auth(request)
+        check_session_id(kite_session_id)
+        to_env = (body.to_env or "").strip()
+        require_env(to_env)
+        with scheduler_store() as store:
+            row = store.get_chat_session(kite_session_id)
+            if row is None:
+                raise HTTPException(404, "không có session này")
+            if row["status"] != "active":
+                raise HTTPException(409, "session đã lưu trữ hoặc đã xóa")
+            from_env = str(row["environment_id"])
+            if from_env != "default":
+                raise HTTPException(409, "session đã ở một repo thì không đổi môi trường nữa")
+            if to_env == "default":
+                raise HTTPException(409, "session đã ở Default")
+            store.record_session_move(kite_session_id, from_env, to_env, "picker")
+            updated = store.get_chat_session(kite_session_id)
+        audit(session, "chat_session_move", kite_session_id, True, {"from": from_env, "to": to_env})
+        assert updated is not None
+        return session_out(updated)
+
+    @app.post("/api/chat/sessions/{kite_session_id}/archive")
+    async def archive_chat_session(kite_session_id: str, request: Request):
+        session = auth(request)
+        check_session_id(kite_session_id)
+        with scheduler_store() as store:
+            if store.get_chat_session(kite_session_id) is None:
+                raise HTTPException(404, "không có session này")
+            updated = store.set_chat_session_status(kite_session_id, "archived")
+        audit(session, "chat_session_archive", kite_session_id)
+        return session_out(updated)
+
+    @app.delete("/api/chat/sessions/{kite_session_id}")
+    async def delete_chat_session(kite_session_id: str, request: Request):
+        session = auth(request)
+        check_session_id(kite_session_id)
+        with scheduler_store() as store:
+            if store.get_chat_session(kite_session_id) is None:
+                raise HTTPException(404, "không có session này")
+            # Only the status changes: the registry row stays, so the trace survives.
+            updated = store.set_chat_session_status(kite_session_id, "deleted")
+        audit(session, "chat_session_delete", kite_session_id)
+        return session_out(updated)
+
+    @app.get("/api/chat/sessions/{kite_session_id}/moves")
+    async def chat_session_moves(kite_session_id: str, request: Request):
+        auth(request)
+        check_session_id(kite_session_id)
+        with scheduler_store() as store:
+            if store.get_chat_session(kite_session_id) is None:
+                raise HTTPException(404, "không có session này")
+            return {"moves": store.list_session_moves(kite_session_id)}
+
+    async def env_card(env: dict[str, Any]) -> dict[str, Any]:
+        """One environment's card: identity + live repo state + counts. Every source is
+        best-effort (a missing repo, a store without the registry, or a lesson lookup that
+        fails leaves that field null instead of failing the whole list). Cost counts only
+        task-attributed spend (see env_cost_usd); chat/pod/bench spend is excluded, so the
+        number is a lower bound, never a fabrication."""
+        card: dict[str, Any] = {**env, "branch": None, "head": None, "clean": None,
+                                "last_sync": None, "session_count": None, "task_count": None,
+                                "cost_usd": None, "lesson_count": None, "recent_commits": []}
+        if env["path"]:
+            try:
+                status = await ctx.ops().repo_status(env["path"])
+                card["branch"] = status.get("branch")
+                card["head"] = status.get("head")
+                changes = status.get("changes") or ""
+                card["clean"] = changes == "(không có thay đổi)"
+                card["recent_commits"] = [line for line in (status.get("recent_commits") or "").splitlines()
+                                          if line.strip()]
+                fetch_head = Path(env["path"]) / ".git" / "FETCH_HEAD"
+                if fetch_head.is_file():
+                    card["last_sync"] = fetch_head.stat().st_mtime
+            except Exception:
+                pass
+            try:
+                lessons = (await ctx.ops().memory_show(env["path"])).get("lessons")
+                card["lesson_count"] = len(lessons) if isinstance(lessons, list) else None
+            except Exception:
+                pass
+        try:
+            with scheduler_store() as store:
+                card["session_count"] = len(store.list_chat_sessions(status="active",
+                                                                     environment_id=env["id"]))
+                tasks = store.list_tasks()
+                card["task_count"] = len([t for t in tasks
+                                          if t.get("environment_id") == env["id"]])
+                card["cost_usd"] = env_cost_usd(ctx.journal(), tasks, str(env["id"]))
+        except Exception:
+            pass
+        return card
+
+    @app.get("/api/environments")
+    async def environments(request: Request):
+        auth(request)
+        return {"environments": [await env_card(env) for env in env_rows()]}
+
+    @app.get("/api/environments/{env_id}")
+    async def environment(env_id: str, request: Request):
+        auth(request)
+        return await env_card(require_env(env_id))
+
+    @app.post("/api/environments")
+    async def add_environment(body: EnvIn, request: Request):
+        session = auth(request)
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", body.name):
+            raise HTTPException(400, "tên môi trường chỉ gồm chữ, số, '.', '_', '-'")
+        name, url = body.name.strip(), (body.url or "").strip()
+        path = (body.path or "").strip()
+        branch = (body.branch or "").strip() or None
+        pat = (body.pat or "").strip() or None
+        if branch is not None and not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch):
+            raise HTTPException(400, "tên branch không hợp lệ")
+        if branch is not None and not url:
+            raise HTTPException(400, "branch chỉ dùng khi clone từ URL")
+        if pat is not None and not url:
+            raise HTTPException(400, "PAT chỉ dùng khi clone từ URL")
+        if url and not path:
+            report = await clone_environment(name, url, branch, pat)
+            audit(session, "env_add", name, True, {"path": report["path"], "cloned": True})
+            return report
+        if not path:
+            raise HTTPException(400, "cần path của repo đã có hoặc URL để clone")
+        await ctx.ops().repo_status(path)          # inside the allowed folders, a Git repo with a commit
+        resolved = str(Path(path).expanduser().resolve())
+        repo_id = ctx.store.add_repo(name, resolved, url)
+        audit(session, "env_add", name, True, {"path": path})
+        return {"id": str(repo_id), "path": resolved, "cloned": False}
+
+    async def clone_environment(name: str, url: str, branch: str | None,
+                                pat: str | None) -> dict[str, Any]:
+        """Clone a repo URL into a Kite-managed folder and register it as an environment.
+
+        With a PAT the credentialed helper clones (PAT sealed at rest, never in the URL);
+        without one the repo must be public and plain ``git clone`` runs. Either way the
+        row, the folder and the PAT file are all removed again when the clone fails, so a
+        failed clone leaves no half-registered environment behind."""
+        try:
+            from ..github_env import GitHubEnvError, clone_with_pat
+        except ImportError:
+            raise HTTPException(501, "clone từ URL chưa sẵn sàng (module github_env của worker (b))") from None
+        dest = ctx.state_dir / "envs" / f"clone-{uuid.uuid4().hex[:12]}" / "repo"
+        if dest.exists():
+            raise HTTPException(409, "thư mục đích đã tồn tại; thử lại")
+        repo_id = ctx.store.add_repo(name, str(dest), url)
+        pat_path = ctx.state_dir / "secrets" / f"github_pat_{repo_id}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if pat is not None:
+                wk.write_secret(pat_path, pat, sealer=ctx.sealer)
+                await asyncio.to_thread(clone_with_pat, url, str(dest), pat_path, sealer=ctx.sealer)
+            else:
+                _plain_clone(url, dest)
+        except Exception as exc:
+            ctx.store.drop_repo(repo_id)
+            shutil.rmtree(dest.parent, ignore_errors=True)
+            try:
+                pat_path.unlink()
+            except OSError:
+                pass
+            if isinstance(exc, GitHubEnvError):
+                raise HTTPException(400, str(exc)) from exc
+            raise
+        if branch is not None:
+            done = subprocess.run(["git", "-C", str(dest), "checkout", branch],
+                                  capture_output=True, text=True)
+            if done.returncode != 0:
+                ctx.store.drop_repo(repo_id)
+                shutil.rmtree(dest.parent, ignore_errors=True)
+                try:
+                    pat_path.unlink()
+                except OSError:
+                    pass
+                raise HTTPException(400, f"không checkout được branch {branch}: "
+                                         + (done.stderr or done.stdout).strip()[-200:])
+        return {"id": str(repo_id), "path": str(dest), "cloned": True}
+
+    @app.post("/api/environments/{env_id}/sync")
+    async def sync_environment(env_id: str, request: Request):
+        session = auth(request)
+        env = require_env(env_id)
+        if env_id == "default":
+            raise HTTPException(409, "môi trường Default không có repo để đồng bộ")
+        if not env["url"]:
+            return await ctx.ops().repo_status(env["path"])
+        try:
+            from ..github_env import GitHubEnvError, clone_with_pat, pull_with_pat
+        except ImportError:
+            raise HTTPException(501, "đồng bộ GitHub chưa sẵn sàng (module github_env của worker (b))") from None
+        pat_path = ctx.state_dir / "secrets" / f"github_pat_{env_id}"
+        path = Path(env["path"])
+        try:
+            # The PAT file is sealed with the web key: the helper needs the sealer to read it.
+            if path.is_dir():
+                result = pull_with_pat(str(path), pat_path, sealer=ctx.sealer)
+            else:
+                result = clone_with_pat(env["url"], str(path), pat_path, sealer=ctx.sealer)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except GitHubEnvError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        audit(session, "env_sync", env_id, True)
+        return result if isinstance(result, dict) else {"ok": True, "result": str(result)}
+
+    @app.delete("/api/environments/{env_id}")
+    async def remove_environment(env_id: str, request: Request):
+        session = auth(request)
+        require_env(env_id)
+        if env_id == "default":
+            raise HTTPException(409, "không xóa được môi trường Default")
+        with scheduler_store() as store:
+            active = store.list_chat_sessions(status="active", environment_id=env_id)
+            if active:
+                raise HTTPException(409, f"còn {len(active)} session đang mở trong môi trường này")
+            busy = [t for t in store.list_tasks()
+                    if t.get("environment_id") == env_id and t.get("state") in ("QUEUED", "LEASED")]
+            if busy:
+                raise HTTPException(409, f"còn {len(busy)} task đang chạy trong môi trường này")
+        if not ctx.store.drop_repo(int(env_id)):
+            raise HTTPException(404, "không có môi trường này")
+        pat_path = ctx.state_dir / "secrets" / f"github_pat_{env_id}"
+        try:
+            pat_path.unlink()
+        except OSError:
+            pass
+        audit(session, "env_remove", env_id)
+        return {"ok": True}
+
+    @app.post("/api/environments/{env_id}/pat")
+    async def set_env_pat(env_id: str, body: PatIn, request: Request):
+        session = auth(request)
+        env = require_env(env_id)
+        if env_id == "default" or not env["url"]:
+            raise HTTPException(409, "chỉ repo GitHub mới dùng PAT")
+        pat = (body.pat or "").strip()
+        if not pat:
+            raise HTTPException(400, "PAT trống")
+        # Sealed at rest with the web key; never returned to the browser.
+        wk.write_secret(ctx.state_dir / "secrets" / f"github_pat_{env_id}", pat, sealer=ctx.sealer)
+        audit(session, "env_pat_set", env_id)
+        return {"ok": True}
+
+    @app.delete("/api/environments/{env_id}/pat")
+    async def delete_env_pat(env_id: str, request: Request):
+        session = auth(request)
+        require_env(env_id)
+        pat_path = ctx.state_dir / "secrets" / f"github_pat_{env_id}"
+        try:
+            pat_path.unlink()
+        except FileNotFoundError:
+            raise HTTPException(404, "môi trường này chưa có PAT") from None
+        audit(session, "env_pat_delete", env_id)
+        return {"ok": True}
 
     # ------------------------------------------------------------------ journal
     @app.get("/api/journal/summary")
@@ -1048,9 +1470,22 @@ def create_app(ctx: WebContext) -> FastAPI:
             if extra:
                 raise HTTPException(400, f"OpenCode: không gửi được {', '.join(sorted(extra))} từ web")
             if path == "api/session":
-                if ctx.chat_dir is None or not (ctx.chat_dir / "opencode.json").is_file():
+                # Gói 2: route the new OpenCode session into its Kite session's folder, not the
+                # single legacy chat folder. kite_session_id is Kite's own field: it is consumed
+                # here and never forwarded to OpenCode.
+                kite_sid = data.pop("kite_session_id", None)
+                if kite_sid is not None:
+                    check_session_id(kite_sid)
+                    with scheduler_store() as store:
+                        row = store.get_chat_session(kite_sid)
+                    if row is None:
+                        raise HTTPException(404, "không có session chat này")
+                    chat_dir = session_dir(kite_sid)
+                else:
+                    chat_dir = ctx.chat_dir
+                if chat_dir is None or not (chat_dir / "opencode.json").is_file():
                     raise HTTPException(409, "chưa có thư mục chat của Kite: chạy kite chat setup")
-                data["location"] = {"directory": str(ctx.chat_dir)}
+                data["location"] = {"directory": str(chat_dir)}
             if path.endswith("/reply") and "decision" in data and data["decision"] not in ("once", "reject"):
                 # "Always allow" outlives the chat folder's opencode.json (it is saved for every project).
                 raise HTTPException(400, "từ web chỉ cho phép một lần hoặc từ chối")
@@ -1187,6 +1622,50 @@ def create_app(ctx: WebContext) -> FastAPI:
 
 
 # ---------------------------------------------------------------- helpers
+def _plain_clone(url: str, dest: Path) -> None:
+    """``git clone`` a public repository: https, or a local file:// URL (a sample repo on this
+    machine). No credentials of any kind: a URL carrying userinfo is refused, and the PAT path
+    is for private repos only (see ``clone_with_pat``)."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https", "file"):
+        raise HTTPException(400, "chỉ nhận URL https (repo công khai) hoặc file:// (repo mẫu trên máy)")
+    if parsed.username or parsed.password or "@" in parsed.netloc:
+        raise HTTPException(400, "URL không được nhúng credential (dùng PAT riêng)")
+    if parsed.scheme == "https" and (not parsed.netloc or not parsed.path.strip("/")):
+        raise HTTPException(400, f"URL không hợp lệ: {url}")
+    done = subprocess.run(["git", "clone", "--quiet", url, str(dest)], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise HTTPException(400, "git clone lỗi: " + (done.stderr or done.stdout).strip()[-300:])
+
+
+def _write_session_files(ctx: WebContext, kite_session_id: str, directory: Path) -> None:
+    """opencode.json + AGENTS.md for one chat session, then `git init` (OpenCode only reads a
+    project's opencode.json inside a Git repository). The MCP command carries --session-id so
+    tasks started here are stamped with this session; the only allowed root at creation is the
+    session folder itself — the repo copy's root is added by worker (b)'s reload path when the
+    session first runs a task on a repo."""
+    from ..config import gateway_models
+    from ..mcp_server import chat_files
+
+    config = ctx.config()
+    models = gateway_models(config)
+    if not models:
+        raise HTTPException(409, "chưa có worker nào phục vụ model: thêm worker rồi tạo session")
+    lead = "qwen3.6-fast" if "qwen3.6-fast" in models else models[0]
+    command = [sys.executable, "-m", "poc.kaggle_worker.cli", "--config", str(ctx.config_path.resolve()),
+               "mcp", "serve", "--session-id", kite_session_id, "--chat-dir", str(directory),
+               "--allow-root", str(directory)]
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, content in chat_files(config, lead_model=lead, kite_command=command,
+                                    allowed_roots=[directory], state_dir=ctx.state_dir).items():
+        (directory / name).write_text(content, encoding="utf-8")
+    done = subprocess.run(["git", "init", "-q", str(directory)], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise HTTPException(500, "không tạo được thư mục chat của session")
+
+
 async def _json(request: Request) -> dict:
     try:
         body = await request.json()

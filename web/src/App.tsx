@@ -21,6 +21,7 @@ import { post, setUnauthorizedHandler } from './api'
 import { Dot } from './components/common'
 import Bench from './pages/Bench'
 import Chat from './pages/Chat'
+import Environments from './pages/Environments'
 import Journal from './pages/Journal'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
@@ -32,13 +33,14 @@ import Workers from './pages/Workers'
 import { segments, useRoute } from './router'
 import { loadMe, startLive, stopLive, useKite } from './store'
 
-type Tab = { path: string; label: string; icon: ComponentType<{ size?: number; stroke?: number }>; page: ComponentType<{ parts: string[] }> }
+type Tab = { path: string; label: string; icon: ComponentType<{ size?: number; stroke?: number }>; page: ComponentType<{ parts: string[] }>; hidden?: boolean }
 
 const TABS: Tab[] = [
   { path: '', label: 'Tổng quan', icon: IconLayoutDashboard, page: Overview },
   { path: 'chat', label: 'Chat', icon: IconMessages, page: Chat },
   { path: 'tasks', label: 'Task', icon: IconListCheck, page: Tasks },
-  { path: 'repos', label: 'Repo', icon: IconFolders, page: Repos },
+  { path: 'environments', label: 'Môi trường', icon: IconFolders, page: Environments },
+  { path: 'repos', label: 'Repo', icon: IconFolders, page: Repos, hidden: true },
   { path: 'providers', label: 'Provider', icon: IconPlugConnected, page: Providers },
   { path: 'workers', label: 'Worker', icon: IconCpu, page: Workers },
   { path: 'journal', label: 'Nhật ký', icon: IconBook2, page: Journal },
@@ -143,7 +145,7 @@ function Shell() {
         </Group>
       </AppShell.Header>
       <AppShell.Navbar p="xs">
-        {TABS.map((t) => (
+        {TABS.filter((t) => !t.hidden).map((t) => (
           <NavLink
             key={t.path}
             href={`/${t.path}`}
