@@ -152,12 +152,19 @@ class ScheduledTask:
     created_at: float
     task_type: str = "coding"
     required_capabilities: tuple[str, ...] = ()
+    # Gói 3: origin stamp, set once at creation; None = unknown origin (old rows).
+    chat_session_id: str | None = None
+    environment_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_text("task_id", self.task_id)
         _require_text("role", self.role)
         _require_text("task_type", self.task_type)
         _require_optional_names("required_capabilities", self.required_capabilities)
+        if self.chat_session_id is not None:
+            _require_text("chat_session_id", self.chat_session_id)
+        if self.environment_id is not None:
+            _require_text("environment_id", self.environment_id)
         if self.model_id is not None:
             _require_text("model_id", self.model_id)
         _require_text("repo_head", self.repo_head)

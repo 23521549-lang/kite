@@ -101,6 +101,40 @@ class KiteToolError(RuntimeError):
     """A tool call that cannot be done; the message is shown to the chat agent."""
 
 
+class ApplyConflictError(KiteToolError):
+    """`git apply --check` failed: the patch conflicts with the current HEAD.
+
+    Carries the structured fields the web UI needs (and the plain message stays the
+    same shape as before, so chat callers see no change). Any other apply failure
+    (dirty repo, missing confirmation code) is still a plain KiteToolError.
+    """
+
+    code = "apply_conflict"
+
+    def __init__(self, message: str, *, head: str, failed_files: list[str]) -> None:
+        super().__init__(message)
+        self.head = head
+        self.failed_files = list(failed_files)
+
+
+def _parse_failed_files(stderr: str) -> list[str]:
+    """Files from `error: patch failed: <file>:<line>` lines, in order of appearance."""
+    seen: list[str] = []
+    for line in stderr.splitlines():
+        match = re.match(r"error: patch failed: (.+):\d+\s*$", line)
+        if match and match.group(1) not in seen:
+            seen.append(match.group(1))
+    return seen
+
+
+class _ContinuePatchError(KiteToolError):
+    """`_continue_patch` failed: the old patch cannot start from this commit.
+
+    A subclass of KiteToolError, so existing callers see the same error type;
+    `rerun_task` catches exactly this to fall back to a fresh task.
+    """
+
+
 def _goal_of(task: dict) -> str:
     try:
         return str(json.loads(task.get("payload_json") or "{}").get("goal", ""))
@@ -263,11 +297,20 @@ class KiteOps:
 
     # ------------------------------------------------------------------ tools
     async def start_task(self, repo: str, goal: str, task_type: str = "coding", model: str | None = None,
-                         continue_from: str = "", ignore_uncommitted: bool = False) -> dict:
+                         continue_from: str = "", ignore_uncommitted: bool = False,
+                         chat_session_id: str | None = None,
+                         environment_id: str | None = None) -> dict:
         from .temporal_workflow import CodingTaskInput, CodingTaskWorkflow
 
         if not goal.strip():
             raise KiteToolError("goal đang trống")
+        if chat_session_id is not None and (not isinstance(chat_session_id, str) or not chat_session_id.strip()):
+            raise KiteToolError("chat_session_id phải là chuỗi không rỗng")
+        if environment_id is not None and (not isinstance(environment_id, str) or not environment_id.strip()):
+            raise KiteToolError("environment_id phải là chuỗi không rỗng")
+        # Origin stamp, set once at creation; never inferred from the session afterwards.
+        chat_session_id = (chat_session_id or "").strip() or None
+        environment_id = (environment_id or "").strip() or None
         if task_type not in TASK_TYPES:
             raise KiteToolError(f"task_type phải là một trong: {', '.join(TASK_TYPES)}")
         if model is not None and model not in self.base_models():
@@ -297,7 +340,8 @@ class KiteOps:
         with self._store() as store:
             store.enqueue(ScheduledTask(task_id, "coder", model, head, branch,
                                         json.dumps({"goal": goal}, ensure_ascii=False, sort_keys=True),
-                                        900, 0, self.clock(), task_type=task_type))
+                                        900, 0, self.clock(), task_type=task_type,
+                                        chat_session_id=chat_session_id, environment_id=environment_id))
         client = await self.client()
         try:
             await client.start_workflow(
@@ -309,7 +353,8 @@ class KiteOps:
             raise KiteToolError(f"không khởi động được workflow: {exc}") from exc
         self.wake_soon(model=model, reason="task")
         result = {"task_id": task_id, "short_id": task_id[-4:], "repo": str(path), "commit": head,
-                  "task_type": task_type, "model": model or "Kite tự chọn", "status": "started"}
+                  "task_type": task_type, "model": model or "Kite tự chọn", "status": "started",
+                  "chat_session_id": chat_session_id, "environment_id": environment_id}
         if base_task:
             result["continue_from"] = base_task
             from .backend import task_slug
@@ -351,9 +396,9 @@ class KiteOps:
         already holds it (the person applied and committed it)."""
         patch, checkpoint = self._task_patch(task_id)
         if Path(checkpoint.get("repo_path") or "").resolve() != path:
-            raise KiteToolError(f"task {task_id} chạy trên repo {checkpoint.get('repo_path')}, không phải {path}")
+            raise _ContinuePatchError(f"task {task_id} chạy trên repo {checkpoint.get('repo_path')}, không phải {path}")
         if not patch.is_file() or not patch.read_text(encoding="utf-8").strip().startswith("diff"):
-            raise KiteToolError(f"task {task_id} không có patch để sửa tiếp")
+            raise _ContinuePatchError(f"task {task_id} không có patch để sửa tiếp")
         with tempfile.TemporaryDirectory() as scratch:
             # Checked against the commit in a throw-away index: the working tree (which may hold the
             # applied patch) and the repository's own index are never touched.
@@ -367,8 +412,66 @@ class KiteOps:
                     return str(patch)
                 if git("apply", "--cached", "-R", "--check", str(patch)) == 0:
                     return ""
-        raise KiteToolError(f"kết quả task {task_id} không áp được lên commit {head[:8]} (code đã đổi nhiều); "
-                            "giao task mới thay vì sửa tiếp")
+        raise _ContinuePatchError(f"kết quả task {task_id} không áp được lên commit {head[:8]} (code đã đổi nhiều); "
+                                  "giao task mới thay vì sửa tiếp")
+
+    async def rerun_task(self, task_id: str) -> dict:
+        """Run a task again on the newest HEAD: continue from its patch when that still applies,
+        otherwise start a fresh task with the same goal (and a note saying so).
+
+        Reads goal / repo / session / environment from the store; the new task keeps the origin
+        stamp and the original task_type/model. `repo` is the task's `main_repo` (Gói 2's column,
+        read defensively) falling back to the repo path saved in the task checkpoint. Resolving
+        the session copy is `start_task`'s job (Gói 2), not this method's.
+        Returns `{"task_id": <new id>}`; on the fresh-task fallback also `"fallback": True`
+        and the note that was appended to the new task's goal (the web endpoint only reads
+        `task_id`, but the shape is kept explicit here).
+        """
+        task_id = self.resolve(task_id)
+        with self._store() as store:
+            row = store.get_task(task_id)
+        goal = _goal_of(row)
+        if not goal.strip():
+            raise KiteToolError(f"task {task_id} không có goal để chạy lại")
+        repo = (row.get("main_repo") or "").strip() or None
+        if repo is None:
+            try:
+                repo = (self._task_patch(task_id)[1].get("repo_path") or "").strip() or None
+            except KiteToolError:
+                repo = None
+        if repo is None:
+            raise KiteToolError(f"không biết repo của task {task_id} nên không chạy lại được")
+        task_type = row.get("task_type") if row.get("task_type") in TASK_TYPES else "coding"
+        model = row.get("model_id") or None
+        if model is not None and model not in self.base_models():
+            model = None              # config changed since the task was created: let Kite pick again
+        stamp = {"chat_session_id": row.get("chat_session_id"),
+                 "environment_id": row.get("environment_id")}
+        try:
+            continued = await self.start_task(repo, goal, task_type=task_type, model=model,
+                                              continue_from=task_id, **stamp)
+            return {"task_id": continued["task_id"]}
+        except _ContinuePatchError:
+            pass                      # the old patch does not merge onto the new HEAD: fresh task
+        note = "Lưu ý: patch cũ không gộp được lên HEAD mới nên chạy lại từ đầu."
+        fresh = await self.start_task(repo, goal + "\n\n" + note, task_type=task_type,
+                                      model=model, **stamp)
+        return {"task_id": fresh["task_id"], "fallback": True, "note": note}
+
+    async def dismiss_apply_error(self, task_id: str) -> dict:
+        """Drop a task's persisted apply error (the "Bỏ patch" choice in the task detail):
+        clear `last_apply_error` in the store and leave a journal note saying the patch
+        was dropped. The patch itself is untouched (its confirmation code was never
+        consumed by the failed apply, so the other two choices stay available)."""
+        task_id = self.resolve(task_id)
+        try:
+            with self._store() as store:
+                store.set_last_apply_error(task_id, None)
+        except StoreError as exc:
+            raise KiteToolError(f"không có task '{task_id}'") from exc
+        self.journal.write("notes", {"task_id": task_id, "verdict": "dismissed",
+                                     "text": "patch đã bỏ", "source": "web"})
+        return {"ok": True, "task_id": task_id}
 
     def _repo_config_note(self, path: Path) -> dict | None:
         """How the task will install and test the repository when it has no .kite.yml: the config Kite
@@ -440,7 +543,14 @@ class KiteOps:
                 result["step"] = "UNKNOWN"
         with self._store() as store:
             try:
-                result["queue_state"] = store.get_task(task_id)["state"]
+                row = store.get_task(task_id)
+                result["queue_state"] = row["state"]
+                # Origin stamp + persisted apply error: this is the seam through which
+                # GET /api/tasks/{id} (web/app.py, another worker's file) exposes them,
+                # under report["status"]; no change to app.py is needed for that.
+                result["chat_session_id"] = row.get("chat_session_id")
+                result["environment_id"] = row.get("environment_id")
+                result["last_apply_error"] = self._last_apply_error(row)
             except StoreError:
                 pass
         # What it has done so far, step by step (written by the sandbox backend as it goes).
@@ -533,6 +643,26 @@ class KiteOps:
 
         consume_code(self.state_dir, action, task_id, digest, code or "")
 
+    def _record_apply_error(self, task_id: str, head: str, failed_files: list[str]) -> None:
+        """Persist a structured apply conflict on the task row (best-effort: a store failure
+        must not hide the conflict itself, which is raised right after)."""
+        try:
+            with self._store() as store:
+                store.set_last_apply_error(task_id, {
+                    "code": ApplyConflictError.code, "head": head,
+                    "failed_files": list(failed_files), "at": self.clock(), "task_id": task_id,
+                })
+        except StoreError:
+            pass
+
+    def _clear_apply_error(self, task_id: str) -> None:
+        """Clear the persisted apply error after a successful apply (best-effort, as above)."""
+        try:
+            with self._store() as store:
+                store.set_last_apply_error(task_id, None)
+        except StoreError:
+            pass
+
     async def apply_result(self, task_id: str = "", confirmation_code: str = "") -> dict:
         """Apply a finished task's patch to the working tree of its own repository (never commits).
         Requires the owner's one-time confirmation code for this patch (see `kite tasks confirm`)."""
@@ -554,10 +684,16 @@ class KiteOps:
         if check.returncode != 0:
             if replaced:                                  # put the previous result back as it was
                 self._git(repo, "apply", str(self._task_patch(replaced)[0]))
-            raise KiteToolError("patch không áp được (repo đã đổi so với lúc chạy task?): " + check.stderr.strip()[-500:])
+            head = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+            failed_files = _parse_failed_files(check.stderr)
+            self._record_apply_error(task_id, head, failed_files)
+            raise ApplyConflictError(
+                "patch không áp được (repo đã đổi so với lúc chạy task?): " + check.stderr.strip()[-500:],
+                head=head, failed_files=failed_files)
         applied = self._git(repo, "apply", str(patch))
         if applied.returncode != 0:
             raise KiteToolError("git apply lỗi: " + applied.stderr.strip()[-500:])
+        self._clear_apply_error(task_id)
         self._consume_confirmation("apply", task_id, digest, confirmation_code)
         return {"task_id": task_id, "applied": True, "repo": str(repo), "files": files, "committed": False,
                 "undo_with": f"git -C {repo} apply -R {patch}",
@@ -664,6 +800,18 @@ class KiteOps:
         return {**sent, "cancelled": True,
                 "note": "Kite dừng các bước đang chạy trong vài giây; task chuyển sang CANCELLED khi đã dừng hẳn."}
 
+    @staticmethod
+    def _last_apply_error(task: dict) -> dict | None:
+        """The persisted structured apply error, or None (never stored / cleared / corrupt)."""
+        raw = task.get("last_apply_error")
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     async def list_tasks(self, limit: int = 10) -> list[dict]:
         with self._store() as store:
             tasks = store.list_tasks()
@@ -676,6 +824,9 @@ class KiteOps:
                 goal = ""
             listed.append({"task_id": task["task_id"], "state": task["state"], "task_type": task["task_type"],
                            "goal": goal[:200],
+                           "chat_session_id": task.get("chat_session_id"),
+                           "environment_id": task.get("environment_id"),
+                           "last_apply_error": self._last_apply_error(task),
                            "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(task["created_at"]))})
         return listed
 
@@ -977,11 +1128,14 @@ def build_server(ops: KiteOps):
                              "Task chạy trên BẢN COPY trong sandbox, KHÔNG BAO GIỜ đổi repo thật. continue_from: "
                              "task_id của task trước khi người dùng muốn SỬA TIẾP kết quả của nó (bắt đầu từ bản sửa "
                              "đó, không làm lại từ đầu). ignore_uncommitted=true: chỉ khi người dùng đồng ý chạy trên "
-                             "commit cũ dù repo có thay đổi chưa commit.")
+                             "commit cũ dù repo có thay đổi chưa commit. chat_session_id / environment_id: chỉ khi "
+                             "gọi từ một phiên chat / môi trường cụ thể (đóng dấu nguồn gốc task lúc tạo).")
     async def start_task(repo: str, goal: str, task_type: str = "coding", model: str | None = None,
-                         continue_from: str = "", ignore_uncommitted: bool = False) -> dict:
+                         continue_from: str = "", ignore_uncommitted: bool = False,
+                         chat_session_id: str | None = None,
+                         environment_id: str | None = None) -> dict:
         return await ops.logged("start_task", ops.start_task, repo, goal, task_type, model, continue_from,
-                                ignore_uncommitted)
+                                ignore_uncommitted, chat_session_id, environment_id)
 
     @server.tool(description="Tiến độ một task: workflow, bước hiện tại (now), đã chạy bao lâu (elapsed), các bước "
                              "đã xong (progress), đang chờ gì (waiting_for)." + task_note)
