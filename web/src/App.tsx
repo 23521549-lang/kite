@@ -3,6 +3,7 @@ import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
   IconBook2,
+  IconBriefcase,
   IconChartBar,
   IconCpu,
   IconFolders,
@@ -29,6 +30,7 @@ import Repos from './pages/Repos'
 import Settings from './pages/Settings'
 import Tasks from './pages/Tasks'
 import Workers from './pages/Workers'
+import Workspace from './pages/Workspace'
 import { segments, useRoute } from './router'
 import { loadMe, startLive, stopLive, useKite } from './store'
 
@@ -36,6 +38,7 @@ type Tab = { path: string; label: string; icon: ComponentType<{ size?: number; s
 
 const TABS: Tab[] = [
   { path: '', label: 'Tổng quan', icon: IconLayoutDashboard, page: Overview },
+  { path: 'workspace', label: 'Không gian làm việc', icon: IconBriefcase, page: Workspace },
   { path: 'chat', label: 'Chat', icon: IconMessages, page: Chat },
   { path: 'tasks', label: 'Task', icon: IconListCheck, page: Tasks },
   { path: 'repos', label: 'Repo', icon: IconFolders, page: Repos },

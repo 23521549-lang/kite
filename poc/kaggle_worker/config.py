@@ -336,8 +336,11 @@ class SandboxConfig:
 @dataclass(frozen=True)
 class NotifyConfig:
     """Push notifications when a task finishes (``kite notify setup``); ``ntfy`` is a secret reference
-    (file:PATH or env:NAME) holding the topic URL, e.g. https://ntfy.sh/kite-<random>."""
+    (file:PATH or env:NAME) holding the topic URL, e.g. https://ntfy.sh/kite-<random>. ``near_cap_pct``
+    is the spend level (percent of a worker's daily/monthly cap) at which "Cần bạn quyết" starts
+    warning that the cap is near."""
     ntfy: str | None = None
+    near_cap_pct: float = 80
 
 
 @dataclass(frozen=True)
@@ -513,13 +516,16 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
 
 def _validate_notify(raw: Any) -> NotifyConfig:
     notify = _mapping(raw, "notify")
-    if set(notify) - {"ntfy"}:
-        raise ConfigError("notify accepts only ntfy")
+    if set(notify) - {"ntfy", "near_cap_pct"}:
+        raise ConfigError("notify accepts only ntfy and near_cap_pct")
     ref = notify.get("ntfy")
     if ref is not None and (not isinstance(ref, str)
                             or not (_ENV_REF.fullmatch(ref) or (ref.startswith("file:") and len(ref) > 5))):
         raise ConfigError("notify.ntfy must be an env:NAME or file:PATH reference to the topic URL")
-    return NotifyConfig(ntfy=ref)
+    pct = _number(notify.get("near_cap_pct", 80), "notify.near_cap_pct")
+    if not 0 < pct <= 100:
+        raise ConfigError("notify.near_cap_pct must be between 0 and 100")
+    return NotifyConfig(ntfy=ref, near_cap_pct=pct)
 
 
 def _number(value: Any, label: str, *, minimum: float | None = None) -> float:

@@ -1177,7 +1177,7 @@ def _web_serve(args: argparse.Namespace, store, sealer) -> int:
     _emit({"web": f"http://{args.host}:{args.port}", "db": str(store.engine.url.render_as_string(hide_password=True)),
            "page": str(dist) if (dist / "index.html").is_file() else "chưa build giao diện: kite web build"})
     sys.stdout.flush()
-    uvicorn.Server(uvicorn.Config(create_app(ctx), host=args.host, port=args.port, proxy_headers=False,
+    uvicorn.Server(uvicorn.Config(create_app(ctx, start_scheduler=True), host=args.host, port=args.port, proxy_headers=False,
                                   server_header=False, date_header=False, log_level="warning",
                                   ws_max_size=1 << 20)).run()
     return 0
