@@ -34,6 +34,8 @@ from ..journal import FILES, Journal, read_jsonl, summarize
 from ..mcp_server import KiteToolError
 from . import security as sec
 from . import workers as wk
+from .monitor import register_monitor_routes
+from .monitor_alerts import register_monitor_alert_routes
 from .presets import PROVIDER_PRESETS
 from .db import Store, User
 
@@ -558,6 +560,10 @@ def create_app(ctx: WebContext) -> FastAPI:
             return None
 
     # ------------------------------------------------------------------ overview
+    # Gói 8 — Giám sát: GET /api/monitor (worker (a)) + route cảnh báo (worker (c)).
+    register_monitor_routes(app, ctx, auth)
+    register_monitor_alert_routes(app, ctx, auth)
+
     @app.get("/api/overview")
     async def overview(request: Request):
         auth(request)

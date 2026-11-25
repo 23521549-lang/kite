@@ -67,7 +67,6 @@ export default function Settings() {
             )}
           </Card>
           <Update />
-          <Doctor />
           <Cleanup />
           <Restart />
         </Stack>
@@ -372,44 +371,6 @@ function StackUpdate({
         />
       </Group>
     </Stack>
-  )
-}
-
-function Doctor() {
-  const doctor = useLoad(() => get<Record<string, any>>('/api/system/doctor'), [])
-  const d = doctor.data
-  return (
-    <Card withBorder>
-      <Group justify="space-between" mb="xs">
-        <Title order={5}>Sức khỏe</Title>
-        <Button size="xs" variant="subtle" onClick={doctor.reload}>
-          Kiểm tra lại
-        </Button>
-      </Group>
-      {!d ? (
-        <Loading error={doctor.error} label="Đang kiểm tra…" />
-      ) : (
-        <Stack gap="xs">
-          <Badge color={d.fail ? 'red' : d.warn ? 'yellow' : 'teal'} variant="light">
-            {d.fail ? `${d.fail} lỗi` : d.warn ? `${d.warn} cảnh báo` : 'ổn'}
-          </Badge>
-          {(d.problems ?? []).map((p: any, i: number) => (
-            <Alert key={i} color={p.status === 'lỗi' ? 'red' : 'yellow'} title={p.check} py={6}>
-              <Text size="sm">{p.detail}</Text>
-              {p.fix ? (
-                <Text size="xs" mt={4}>
-                  Cách sửa: <Code>{p.fix}</Code>
-                </Text>
-              ) : null}
-            </Alert>
-          ))}
-          {d.gpu_quota ? <Text size="sm">Quota GPU: {typeof d.gpu_quota === 'string' ? d.gpu_quota : JSON.stringify(d.gpu_quota)}</Text> : null}
-          <Text size="xs" c="dimmed">
-            Ổn: {(d.ok ?? []).join(', ')}
-          </Text>
-        </Stack>
-      )}
-    </Card>
   )
 }
 

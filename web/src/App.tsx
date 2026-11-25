@@ -23,6 +23,7 @@ import Bench from './pages/Bench'
 import Chat from './pages/Chat'
 import Journal from './pages/Journal'
 import Login from './pages/Login'
+import Monitor from './pages/Monitor'
 import Overview from './pages/Overview'
 import Providers from './pages/Providers'
 import Repos from './pages/Repos'
@@ -43,6 +44,7 @@ const TABS: Tab[] = [
   { path: 'workers', label: 'Worker', icon: IconCpu, page: Workers },
   { path: 'journal', label: 'Nhật ký', icon: IconBook2, page: Journal },
   { path: 'bench', label: 'Bench', icon: IconChartBar, page: Bench },
+  { path: 'giam-sat', label: 'Giám sát', icon: IconActivity, page: Monitor },
   { path: 'settings', label: 'Cài đặt', icon: IconSettings, page: Settings },
 ]
 
