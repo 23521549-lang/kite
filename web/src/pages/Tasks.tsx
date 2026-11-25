@@ -1,4 +1,5 @@
 import {
+  Badge,
   Button,
   Card,
   Checkbox,
@@ -9,17 +10,19 @@ import {
   Select,
   Stack,
   Table,
+  Tabs,
   Text,
   TextInput,
   Textarea,
 } from '@mantine/core'
 import { IconPlus } from '@tabler/icons-react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { get, post, type TaskRow } from '../api'
 import { Empty, Loading, Page, StateBadge } from '../components/common'
 import { go } from '../router'
-import { TASK_TYPES, attempt, useLoad } from '../util'
+import { TASK_TYPES, attempt, short, useLoad } from '../util'
 import TaskDetail from './TaskDetail'
+import TaskJournal from './TaskJournal'
 
 const FILTERS = [
   { value: 'all', label: 'Tất cả' },
@@ -28,19 +31,60 @@ const FILTERS = [
   { value: 'bad', label: 'Lỗi/hủy' },
 ]
 
+// Giá trị lọc "không rõ nguồn gốc": task cũ chưa được đóng dấu session/môi trường.
+const UNKNOWN = '__unknown__'
+const UNKNOWN_LABEL = 'Không rõ nguồn gốc'
+
+function distinct(values: (string | null | undefined)[]): string[] {
+  return [...new Set(values.filter((v): v is string => !!v))]
+}
+
+function matchOrigin(value: string | null | undefined, filter: string | null): boolean {
+  if (filter === null) return true
+  if (filter === UNKNOWN) return !value
+  return value === filter
+}
+
+function originOptions(values: (string | null | undefined)[]): { value: string; label: string }[] {
+  return [
+    { value: UNKNOWN, label: UNKNOWN_LABEL },
+    ...distinct(values).map((v) => ({ value: v, label: short(v, 24) })),
+  ]
+}
+
 export default function Tasks({ parts }: { parts: string[] }) {
   const taskId = parts[0] ?? null
   const { data, error, reload } = useLoad(() => get<{ tasks: TaskRow[] }>('/api/tasks?limit=50'), [], 8000)
   const [filter, setFilter] = useState('all')
+  const [tab, setTab] = useState('tasks')
+  // Khởi tạo từ query (?session=…&env=…) để link từ chi tiết task lọc được danh sách.
+  const [sessionFilter, setSessionFilter] = useState<string | null>(() => new URLSearchParams(location.search).get('session'))
+  const [envFilter, setEnvFilter] = useState<string | null>(() => new URLSearchParams(location.search).get('env'))
+  // Đồng bộ lại khi route đổi trong SPA: component không remount khi đi từ
+  // /tasks/<id> sang /tasks?session=… nên initializer ở trên không chạy lại.
+  // Chỉ đồng bộ khi query thật sự đổi — chọn tay trong Select không đổi URL nên không bị reset.
+  const lastQuery = useRef(location.search)
+  useEffect(() => {
+    if (location.search !== lastQuery.current) {
+      lastQuery.current = location.search
+      const q = new URLSearchParams(location.search)
+      setSessionFilter(q.get('session'))
+      setEnvFilter(q.get('env'))
+    }
+  })
   const [creating, setCreating] = useState(false)
-  const tasks = (data?.tasks ?? []).filter((t) =>
-    filter === 'all'
-      ? true
-      : filter === 'active'
-        ? ['QUEUED', 'LEASED'].includes(t.state)
-        : filter === 'done'
-          ? t.state === 'COMPLETED'
-          : ['FAILED', 'CANCELLED'].includes(t.state),
+  const allTasks = data?.tasks ?? []
+  const tasks = allTasks.filter(
+    (t) =>
+      (filter === 'all'
+        ? true
+        : filter === 'active'
+          ? ['QUEUED', 'LEASED'].includes(t.state)
+          : filter === 'done'
+            ? t.state === 'COMPLETED'
+            : ['FAILED', 'CANCELLED'].includes(t.state)) &&
+      matchOrigin(t.chat_session_id, sessionFilter) &&
+      matchOrigin(t.environment_id, envFilter),
   )
   return (
     <Page
@@ -60,48 +104,112 @@ export default function Tasks({ parts }: { parts: string[] }) {
           go(`/tasks/${encodeURIComponent(id)}`)
         }}
       />
-      <Grid>
-        <Grid.Col span={{ base: 12, md: taskId ? 4 : 12 }}>
-          <Card withBorder p="xs">
-            <SegmentedControl fullWidth size="xs" data={FILTERS} value={filter} onChange={setFilter} mb="xs" />
-            {!data ? (
-              <Loading error={error} />
-            ) : tasks.length ? (
-              <Table highlightOnHover>
-                <Table.Tbody>
-                  {tasks.map((t) => (
-                    <Table.Tr
-                      key={t.task_id}
-                      className="clickable"
-                      onClick={() => go(`/tasks/${encodeURIComponent(t.task_id)}`)}
-                      style={t.task_id === taskId ? { background: 'var(--mantine-color-default-hover)' } : undefined}
-                    >
-                      <Table.Td>
-                        <Text size="sm" lineClamp={2}>
-                          {t.goal || t.task_id}
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          {t.task_id} · {t.task_type} · {t.created}
-                        </Text>
-                      </Table.Td>
-                      <Table.Td w={90}>
-                        <StateBadge state={t.state} />
-                      </Table.Td>
-                    </Table.Tr>
-                  ))}
-                </Table.Tbody>
-              </Table>
-            ) : (
-              <Empty>Không có task nào.</Empty>
-            )}
-          </Card>
-        </Grid.Col>
-        {taskId ? (
-          <Grid.Col span={{ base: 12, md: 8 }}>
-            <TaskDetail key={taskId} taskId={taskId} onChanged={reload} />
+      <Tabs value={tab} onChange={(v) => setTab(v ?? 'tasks')}>
+        <Tabs.List>
+          <Tabs.Tab value="tasks">Task</Tabs.Tab>
+          <Tabs.Tab value="journal">Nhật ký</Tabs.Tab>
+        </Tabs.List>
+        <Tabs.Panel value="tasks" pt="md">
+        <Grid>
+          <Grid.Col span={{ base: 12, md: taskId ? 4 : 12 }}>
+            <Card withBorder p="xs">
+              <SegmentedControl fullWidth size="xs" data={FILTERS} value={filter} onChange={setFilter} mb="xs" />
+              <Group grow mb="xs">
+                <Select
+                  size="xs"
+                  placeholder="Môi trường: tất cả"
+                  data={originOptions(allTasks.map((t) => t.environment_id))}
+                  value={envFilter}
+                  onChange={setEnvFilter}
+                  clearable
+                />
+                <Select
+                  size="xs"
+                  placeholder="Session: tất cả"
+                  data={originOptions(allTasks.map((t) => t.chat_session_id))}
+                  value={sessionFilter}
+                  onChange={setSessionFilter}
+                  clearable
+                />
+              </Group>
+              {!data ? (
+                <Loading error={error} />
+              ) : tasks.length ? (
+                <Table highlightOnHover>
+                  <Table.Tbody>
+                    {tasks.map((t) => (
+                      <Table.Tr
+                        key={t.task_id}
+                        className="clickable"
+                        onClick={() => go(`/tasks/${encodeURIComponent(t.task_id)}`)}
+                        style={t.task_id === taskId ? { background: 'var(--mantine-color-default-hover)' } : undefined}
+                      >
+                        <Table.Td>
+                          <Text size="sm" lineClamp={2}>
+                            {t.goal || t.task_id}
+                          </Text>
+                          <Text size="xs" c="dimmed">
+                            {t.task_id} · {t.task_type} · {t.created}
+                          </Text>
+                          <Group gap={4} mt={2}>
+                            <Text size="xs" c="dimmed">
+                              Môi trường
+                            </Text>
+                            <Badge
+                              size="xs"
+                              variant="light"
+                              style={{ cursor: 'pointer' }}
+                              title="Lọc theo môi trường này"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setEnvFilter(t.environment_id ?? UNKNOWN)
+                              }}
+                            >
+                              {t.environment_id ? short(t.environment_id, 20) : UNKNOWN_LABEL}
+                            </Badge>
+                            <Text size="xs" c="dimmed">
+                              →
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              Session
+                            </Text>
+                            <Badge
+                              size="xs"
+                              variant="light"
+                              style={{ cursor: 'pointer' }}
+                              title="Lọc theo session này"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setSessionFilter(t.chat_session_id ?? UNKNOWN)
+                              }}
+                            >
+                              {t.chat_session_id ? short(t.chat_session_id, 20) : UNKNOWN_LABEL}
+                            </Badge>
+                          </Group>
+                        </Table.Td>
+                        <Table.Td w={90}>
+                          <StateBadge state={t.state} />
+                        </Table.Td>
+                      </Table.Tr>
+                    ))}
+                  </Table.Tbody>
+                </Table>
+              ) : (
+                <Empty>Không có task nào.</Empty>
+              )}
+            </Card>
           </Grid.Col>
-        ) : null}
-      </Grid>
+          {taskId ? (
+            <Grid.Col span={{ base: 12, md: 8 }}>
+              <TaskDetail key={taskId} taskId={taskId} onChanged={reload} />
+            </Grid.Col>
+          ) : null}
+        </Grid>
+        </Tabs.Panel>
+        <Tabs.Panel value="journal" pt="md">
+          <TaskJournal tasks={allTasks} />
+        </Tabs.Panel>
+      </Tabs>
     </Page>
   )
 }

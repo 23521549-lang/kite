@@ -111,7 +111,7 @@ export type WorkerRow = {
   pod?: { provider: string; id: string; port: number; price_hour?: number | null; idle_minutes: number }
 }
 
-export type TaskRow = { task_id: string; state: string; task_type: string; goal: string; created: string }
+export type TaskRow = { task_id: string; state: string; task_type: string; goal: string; created: string; chat_session_id?: string | null; environment_id?: string | null }
 
 export type Activity = {
   task_id: string

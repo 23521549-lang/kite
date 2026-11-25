@@ -1,7 +1,11 @@
-import { Badge, Button, Card, Group, SegmentedControl, SimpleGrid, Stack, Table, Tabs, Text } from '@mantine/core'
+// Nội dung tab "Nhật ký" gộp vào trang Task (chuyển từ Journal.tsx đã xóa).
+// Dữ liệu và endpoint journal KHÔNG đổi — chỉ đổi cách hiển thị.
+// Bộ lọc client-side theo session/môi trường/task chỉ áp dụng cho tab Sự kiện,
+// nơi bản ghi có trường đó; Tổng hợp và Thao tác hiện toàn bộ.
+import { Badge, Button, Card, Group, SegmentedControl, Select, SimpleGrid, Stack, Table, Tabs, Text } from '@mantine/core'
 import { useState } from 'react'
-import { get, qs } from '../api'
-import { Bars, Empty, JsonView, Loading, Page } from '../components/common'
+import { get, qs, type TaskRow } from '../api'
+import { Bars, Empty, JsonView, Loading } from '../components/common'
 import { fmtTime, num, short, usd, useLoad } from '../util'
 
 const FILES = [
@@ -22,9 +26,79 @@ const METRICS = [
   { value: 'usd', label: 'USD' },
 ]
 
-export default function Journal() {
+// Giá trị lọc "không rõ nguồn gốc": bản ghi chưa mang session/môi trường.
+const UNKNOWN = '__unknown__'
+const UNKNOWN_LABEL = 'Không rõ nguồn gốc'
+
+function distinct(values: (string | null | undefined)[]): string[] {
+  return [...new Set(values.filter((v): v is string => !!v))]
+}
+
+function originOptions(values: (string | null | undefined)[]): { value: string; label: string }[] {
+  return [
+    { value: UNKNOWN, label: UNKNOWN_LABEL },
+    ...distinct(values).map((v) => ({ value: v, label: short(v, 24) })),
+  ]
+}
+
+// Giá trị của một bản ghi journal ở các trường có thể mang session/môi trường/task.
+// Bản ghi không có trường nào trong danh sách được coi là "không rõ nguồn gốc".
+function recordValue(r: Record<string, any>, fields: string[]): string | null {
+  for (const f of fields) {
+    const v = r[f]
+    if (typeof v === 'string' && v) return v
+    if (typeof v === 'number') return String(v)
+  }
+  return null
+}
+
+function recordMatches(r: Record<string, any>, fields: string[], filter: string | null): boolean {
+  if (filter === null) return true
+  const value = recordValue(r, fields)
+  if (filter === UNKNOWN) return value === null
+  return value === filter
+}
+
+export type JournalFilters = { session: string | null; env: string | null; task: string | null }
+
+export default function TaskJournal({ tasks }: { tasks: TaskRow[] }) {
+  const [sessionFilter, setSessionFilter] = useState<string | null>(null)
+  const [envFilter, setEnvFilter] = useState<string | null>(null)
+  const [taskFilter, setTaskFilter] = useState<string | null>(null)
+  const anyFilter = sessionFilter !== null || envFilter !== null || taskFilter !== null
   return (
-    <Page title="Nhật ký">
+    <Stack>
+      <Group grow>
+        <Select
+          size="xs"
+          placeholder="Môi trường: tất cả"
+          data={originOptions(tasks.map((t) => t.environment_id))}
+          value={envFilter}
+          onChange={setEnvFilter}
+          clearable
+        />
+        <Select
+          size="xs"
+          placeholder="Session: tất cả"
+          data={originOptions(tasks.map((t) => t.chat_session_id))}
+          value={sessionFilter}
+          onChange={setSessionFilter}
+          clearable
+        />
+        <Select
+          size="xs"
+          placeholder="Task: tất cả"
+          data={tasks.map((t) => ({ value: t.task_id, label: short(t.goal || t.task_id, 30) }))}
+          value={taskFilter}
+          onChange={setTaskFilter}
+          clearable
+        />
+      </Group>
+      {anyFilter ? (
+        <Text size="xs" c="dimmed">
+          Bộ lọc chỉ áp dụng cho tab Sự kiện — Tổng hợp và Thao tác hiện toàn bộ vì bản ghi không mang session/môi trường/task.
+        </Text>
+      ) : null}
       <Tabs defaultValue="summary" keepMounted={false}>
         <Tabs.List>
           <Tabs.Tab value="summary">Tổng hợp</Tabs.Tab>
@@ -35,13 +109,13 @@ export default function Journal() {
           <Summary />
         </Tabs.Panel>
         <Tabs.Panel value="events" pt="md">
-          <Events />
+          <Events filters={{ session: sessionFilter, env: envFilter, task: taskFilter }} />
         </Tabs.Panel>
         <Tabs.Panel value="audit" pt="md">
           <Audit />
         </Tabs.Panel>
       </Tabs>
-    </Page>
+    </Stack>
   )
 }
 
@@ -196,15 +270,21 @@ function Summary() {
   )
 }
 
-function Events() {
+function Events({ filters }: { filters: JournalFilters }) {
   const [file, setFile] = useState('gateway')
   const [extra, setExtra] = useState<Record<string, any>[]>([])
   const { data, error } = useLoad(async () => {
     setExtra([])
     return get<{ records: Record<string, any>[] }>(`/api/journal/events${qs({ file, limit: 100 })}`)
   }, [file])
-  const records = [...(data?.records ?? []), ...extra]
-  const last = records[records.length - 1]
+  const allRecords = [...(data?.records ?? []), ...extra]
+  const records = allRecords.filter(
+    (r) =>
+      recordMatches(r, ['task_id', 'tag'], filters.task) &&
+      recordMatches(r, ['chat_session_id', 'session_id'], filters.session) &&
+      recordMatches(r, ['environment_id', 'env_id'], filters.env),
+  )
+  const last = allRecords[allRecords.length - 1]
   return (
     <Stack>
       <SegmentedControl data={FILES} value={file} onChange={setFile} />
@@ -223,7 +303,7 @@ function Events() {
       ) : (
         <Empty>Chưa có sự kiện.</Empty>
       )}
-      {records.length >= 100 && last?.ts ? (
+      {allRecords.length >= 100 && last?.ts ? (
         <Group>
           <Button
             variant="light"

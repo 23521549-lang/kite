@@ -2,7 +2,6 @@ import { ActionIcon, AppShell, Burger, Center, Group, Loader, Menu, NavLink, Tex
 import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
-  IconBook2,
   IconChartBar,
   IconCpu,
   IconFolders,
@@ -21,7 +20,6 @@ import { post, setUnauthorizedHandler } from './api'
 import { Dot } from './components/common'
 import Bench from './pages/Bench'
 import Chat from './pages/Chat'
-import Journal from './pages/Journal'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
 import Providers from './pages/Providers'
@@ -41,7 +39,6 @@ const TABS: Tab[] = [
   { path: 'repos', label: 'Repo', icon: IconFolders, page: Repos },
   { path: 'providers', label: 'Provider', icon: IconPlugConnected, page: Providers },
   { path: 'workers', label: 'Worker', icon: IconCpu, page: Workers },
-  { path: 'journal', label: 'Nhật ký', icon: IconBook2, page: Journal },
   { path: 'bench', label: 'Bench', icon: IconChartBar, page: Bench },
   { path: 'settings', label: 'Cài đặt', icon: IconSettings, page: Settings },
 ]
