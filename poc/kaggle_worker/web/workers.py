@@ -96,6 +96,7 @@ def worker_rows(config, status: dict | None, ledger, auto_click: Callable[[str],
         day, month = ledger.spent(wid) if ledger is not None else (0.0, 0.0)
         row: dict[str, Any] = {
             "id": wid, "type": kind, "brand": brand_for(p, PROVIDER_PRESETS),
+            "label": p.label,
             "enabled": p.enabled, "owner": p.owner, "models": list(p.model_ids),
             "concurrency": p.concurrency, "alive": bool(seen.get("alive")), "busy": bool(seen.get("busy")),
             "running": seen.get("running", 0), "slots": seen.get("slots"), "loaded_model": seen.get("loaded_model"),
@@ -199,6 +200,16 @@ def _caps(body: dict) -> dict:
             if body.get(f) is not None}
 
 
+def _display_label(body: dict) -> str | None:
+    """The display name to store, if the owner typed one; None means 'show the id'."""
+    label = body.get("label")
+    if label is None:
+        return None
+    if not isinstance(label, str):
+        raise ConfigError("label phải là chuỗi")
+    return label.strip() or None
+
+
 def build_provider(body: dict, raw: dict, secrets_dir: Path) -> tuple[dict, dict[Path, str], dict]:
     """The config entry for a new worker, the key files to write, and what to tell the owner."""
     kind, wid = body.get("type"), str(body.get("id") or "")
@@ -229,6 +240,9 @@ def build_provider(body: dict, raw: dict, secrets_dir: Path) -> tuple[dict, dict
             "secrets": {"worker_token": f"file:{secrets_dir / f'worker_token_{wid}'}"}}
         if template and template.get("roles"):
             provider["roles"] = template["roles"]
+        label = _display_label(body)
+        if label is not None:
+            provider["label"] = label
         if body.get("kernel"):
             if not body.get("kaggle_api_token"):
                 raise ConfigError("tự bật notebook cần Kaggle API token (kaggle.com/settings → API)")
@@ -269,6 +283,9 @@ def build_provider(body: dict, raw: dict, secrets_dir: Path) -> tuple[dict, dict
     provider = {"id": wid, "adapter": "relay", "enabled": True, "owner": "self", "model": names[0],
                 "models": names[1:], "capabilities": ["coding"],
                 "quota": {"gpu_seconds": 0, "concurrency": concurrency}, "secrets": secrets, "relay": relay}
+    label = _display_label(body)
+    if label is not None:
+        provider["label"] = label
     return provider, files, report
 
 
@@ -286,7 +303,7 @@ def add_worker(config_path: Path, body: dict, sealer=None) -> dict:
 
 
 EDITABLE = {"enabled", "price_in", "price_out", "price_hour", "daily_cap", "monthly_cap", "idle_minutes",
-            "concurrency", "via", "kernel", "base_url", "models", *SECRET_FIELDS}
+            "concurrency", "via", "kernel", "base_url", "models", "label", *SECRET_FIELDS}
 
 
 def update_worker(config_path: Path, worker_id: str, changes: dict, sealer=None) -> dict:
@@ -331,6 +348,13 @@ def update_worker(config_path: Path, worker_id: str, changes: dict, sealer=None)
             launch[key] = value
         elif key == "base_url" and relay:
             relay["base_url"] = str(value).strip()
+        elif key == "label":
+            if not isinstance(value, str):
+                raise ConfigError("label phải là chuỗi")
+            if value.strip():
+                provider["label"] = value.strip()
+            else:
+                provider.pop("label", None)
         elif key in SECRET_FIELDS and value:
             name = {"api_key": "api_key", "runpod_api_key": "runpod_api_key",
                     "kaggle_api_token": "kaggle_api_token"}[key]

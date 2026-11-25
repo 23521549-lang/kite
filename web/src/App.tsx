@@ -11,7 +11,6 @@ import {
   IconLogout,
   IconMessages,
   IconMoon,
-  IconPlugConnected,
   IconSettings,
   IconSun,
   IconUser,
@@ -24,7 +23,6 @@ import Chat from './pages/Chat'
 import Journal from './pages/Journal'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
-import Providers from './pages/Providers'
 import Repos from './pages/Repos'
 import Settings from './pages/Settings'
 import Tasks from './pages/Tasks'
@@ -39,7 +37,6 @@ const TABS: Tab[] = [
   { path: 'chat', label: 'Chat', icon: IconMessages, page: Chat },
   { path: 'tasks', label: 'Task', icon: IconListCheck, page: Tasks },
   { path: 'repos', label: 'Repo', icon: IconFolders, page: Repos },
-  { path: 'providers', label: 'Provider', icon: IconPlugConnected, page: Providers },
   { path: 'workers', label: 'Worker', icon: IconCpu, page: Workers },
   { path: 'journal', label: 'Nhật ký', icon: IconBook2, page: Journal },
   { path: 'bench', label: 'Bench', icon: IconChartBar, page: Bench },
@@ -75,6 +72,10 @@ function Shell() {
   const gatewayUp = useKite((s) => s.gatewayUp)
   const { colorScheme, toggleColorScheme } = useMantineColorScheme()
   const parts = segments(path)
+  const isProvidersRedirect = parts[0] === 'providers'
+  useEffect(() => {
+    if (isProvidersRedirect) go('/workers', true)
+  }, [isProvidersRedirect, go])
   const tab = TABS.find((t) => t.path === (parts[0] ?? '')) ?? TABS[0]
   const PageComponent = tab.page
   const isChat = tab.path === 'chat'

@@ -3,15 +3,20 @@ import { useState } from 'react'
 import { get, post, type WorkerRow } from '../api'
 import { Bars, Dot, Empty, KeyValue, Loading, Page } from '../components/common'
 import KaggleScreen from '../components/KaggleScreen'
+import { go } from '../router'
 import { attempt, duration, notifyError, notifyOk, short, usd, useLoad, workerState } from '../util'
+import WorkerForm from './WorkerForm'
 
-export default function Workers() {
+export default function Workers({ parts }: { parts: string[] }) {
   const { data, error, reload } = useLoad(() => get<{ gateway_up: boolean; workers: WorkerRow[] }>('/api/workers'), [], 5000)
   const spend = useLoad(() => get<{ days: { day: string; usd: number; workers: Record<string, number> }[] }>('/api/spend?days=31'), [], 60000)
   const [screen, setScreen] = useState<string | null>(null)
   if (!data) return <Loading error={error} />
+  if (parts[0] === 'new') return <WorkerForm key="new" mode="new" />
+  const editing = parts[0] ? data.workers.find((w) => w.id === parts[0]) : undefined
+  if (editing) return <WorkerForm key={editing.id} mode="edit" workerId={editing.id} />
   return (
-    <Page title="Worker">
+    <Page title="Worker" actions={<Button onClick={() => go('/workers/new')}>Tạo worker</Button>}>
       {!data.gateway_up ? <Alert color="red">Gateway không trả lời: tình trạng worker có thể chưa đúng.</Alert> : null}
       {data.workers.length ? (
         <SimpleGrid cols={{ base: 1, lg: 2 }}>
@@ -20,7 +25,7 @@ export default function Workers() {
           ))}
         </SimpleGrid>
       ) : (
-        <Empty>Chưa có worker: thêm ở tab Provider.</Empty>
+        <Empty>Chưa có worker: bấm Tạo worker.</Empty>
       )}
       <Card withBorder>
         <Title order={5} mb="xs">
@@ -58,7 +63,7 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
       <Group justify="space-between" wrap="nowrap">
         <Group gap={8} wrap="nowrap">
           <Dot color={st.color} />
-          <Text fw={600}>{w.id}</Text>
+          <Text fw={600}>{w.label || w.id}</Text>
           <Badge variant="outline" size="sm">
             {w.type}
           </Badge>
@@ -67,6 +72,9 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
           {st.label}
         </Badge>
       </Group>
+      <Text size="sm" c="dimmed">
+        {w.brand} · {w.models[0] ?? ''}
+      </Text>
       <Stack gap="xs" mt="sm">
         <KeyValue
           rows={[
@@ -122,6 +130,9 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
           ) : null}
         </Group>
         <Group gap="xs">
+          <Button size="xs" variant="light" onClick={() => go(`/workers/${w.id}`)}>
+            Cấu hình
+          </Button>
           {!api && !w.alive ? (
             <Button size="xs" loading={starting} onClick={turnOn}>
               Bật ngay
