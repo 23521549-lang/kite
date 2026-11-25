@@ -1,6 +1,7 @@
 import { Alert, Badge, Button, Card, Group, Stack, Tabs, Text, Timeline } from '@mantine/core'
 import { get, post } from '../api'
 import { ConfirmButton, DiffView, Empty, JsonView, KeyValue, Loading, StateBadge } from '../components/common'
+import { go } from '../router'
 import { attempt, fmtTime, short, useLoad } from '../util'
 
 export type Detail = {
@@ -8,6 +9,9 @@ export type Detail = {
   status: Record<string, any>
   result?: Record<string, any>
   journal: { runs: any[]; trace: any[]; requests: Record<string, any>; actions: any[]; notes: any[] }
+  environment_id?: string | null
+  chat_session_id?: string | null
+  last_apply_error?: { code: string; head: string; failed_files: string[]; at: number; task_id: string } | null
 }
 
 export default function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => void }) {
@@ -36,6 +40,16 @@ export default function TaskDetail({ taskId, onChanged }: { taskId: string; onCh
     reload()
     onChanged()
   }
+  // Chạy lại chỉ có khi áp lỗi xung đột: tạo task mới rồi chuyển tới nó (không reload chi tiết cũ).
+  const rerun = async () => {
+    const res = await attempt(() => post<{ task_id: string }>(`/api/tasks/${id}/rerun`, {}), 'Đã tạo task mới')
+    if (res?.task_id) {
+      onChanged()
+      go(`/tasks/${encodeURIComponent(res.task_id)}`)
+    }
+  }
+  const applyError = data.last_apply_error
+  const showApplyError = applyError?.code === 'apply_conflict'
   const patch = patchText.data ?? ''
   return (
     <Stack>
@@ -43,6 +57,53 @@ export default function TaskDetail({ taskId, onChanged }: { taskId: string; onCh
         <Group justify="space-between" align="flex-start">
           <div style={{ minWidth: 0, flex: 1 }}>
             <Text fw={600}>{taskId}</Text>
+            <Group gap={4} mt={4}>
+              <Text size="xs" c="dimmed">
+                Môi trường
+              </Text>
+              {data.environment_id ? (
+                <Badge
+                  size="xs"
+                  variant="light"
+                  style={{ cursor: 'pointer' }}
+                  title="Lọc task theo môi trường này"
+                  onClick={() => go(`/tasks?env=${encodeURIComponent(data.environment_id as string)}`)}
+                >
+                  {short(data.environment_id, 20)}
+                </Badge>
+              ) : (
+                <Text size="xs" c="dimmed">
+                  Không rõ nguồn gốc
+                </Text>
+              )}
+              <Text size="xs" c="dimmed">
+                →
+              </Text>
+              <Text size="xs" c="dimmed">
+                Session
+              </Text>
+              {data.chat_session_id ? (
+                <Badge
+                  size="xs"
+                  variant="light"
+                  style={{ cursor: 'pointer' }}
+                  title="Lọc task theo session này"
+                  onClick={() => go(`/tasks?session=${encodeURIComponent(data.chat_session_id as string)}`)}
+                >
+                  {short(data.chat_session_id, 20)}
+                </Badge>
+              ) : (
+                <Text size="xs" c="dimmed">
+                  Không rõ nguồn gốc
+                </Text>
+              )}
+              <Text size="xs" c="dimmed">
+                →
+              </Text>
+              <Text size="xs" c="dimmed">
+                Task
+              </Text>
+            </Group>
             <Text size="sm" c="dimmed">
               {s.now ?? s.step ?? s.waiting_for ?? ''}
             </Text>
@@ -144,6 +205,34 @@ export default function TaskDetail({ taskId, onChanged }: { taskId: string; onCh
           ) : null}
         </Group>
       </Card>
+      {showApplyError && applyError ? (
+        <Alert color="red" title="Patch không áp được lên HEAD mới">
+          <Stack gap="xs">
+            <Text size="sm">HEAD hiện tại: {short(applyError.head, 80)}</Text>
+            <Text size="sm">File lỗi:</Text>
+            <Stack gap={0}>
+              {applyError.failed_files.map((f) => (
+                <Text key={f} size="sm" ff="monospace">
+                  {f}
+                </Text>
+              ))}
+            </Stack>
+            <Text size="sm">Chọn một cách xử lý:</Text>
+            <Group gap="xs">
+              <Button size="xs" onClick={rerun}>
+                Chạy lại task trên HEAD mới
+              </Button>
+              <Button size="xs" variant="light" onClick={() => act('apply-error/dismiss', {}, 'Đã bỏ patch')}>
+                Bỏ patch
+              </Button>
+            </Group>
+            <Text size="sm">
+              Sửa tay: tự sửa các file xung đột trong repo rồi áp lại patch bằng tay — Kite không tự làm bước
+              này.
+            </Text>
+          </Stack>
+        </Alert>
+      ) : null}
       <Tabs defaultValue="progress" keepMounted={false}>
         <Tabs.List>
           <Tabs.Tab value="progress">Tiến độ</Tabs.Tab>

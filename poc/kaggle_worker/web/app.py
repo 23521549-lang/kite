@@ -310,7 +310,13 @@ def create_app(ctx: WebContext) -> FastAPI:
 
     @app.exception_handler(KiteToolError)
     async def tool_error(_request, exc):
-        return JSONResponse({"error": str(exc)}, status_code=400)
+        # Lỗi thường giữ nguyên {"error": str}; lỗi có cấu trúc (vd ApplyConflictError của
+        # worker (a): code/head/failed_files) thì kèm thêm các trường đó để FE hiện bền vững.
+        body: dict[str, Any] = {"error": str(exc)}
+        for key in ("code", "head", "failed_files"):
+            if hasattr(exc, key):
+                body[key] = getattr(exc, key)
+        return JSONResponse(body, status_code=400)
 
     @app.exception_handler(ValueError)
     async def value_error(_request, exc):
@@ -720,6 +726,12 @@ def create_app(ctx: WebContext) -> FastAPI:
             report["status"] = {"error": str(exc)[:300]}
         if report["status"].get("workflow") == "COMPLETED":
             report["result"] = await ops.task_result(task_id)
+        # Trace + lỗi áp bền vững: worker (a) (Gói 3) đọc 3 cột này từ hàng task trong store
+        # và trả trong task_status (nơi đã đọc hàng task cho queue_state); app.py chỉ chuyền qua,
+        # null khi task cũ chưa đóng dấu / chưa từng áp lỗi. Không đoán ngược từ nguồn khác.
+        report["environment_id"] = report["status"].get("environment_id")
+        report["chat_session_id"] = report["status"].get("chat_session_id")
+        report["last_apply_error"] = report["status"].get("last_apply_error")
         from ..journal import show_task
         from ..backend import task_slug
 
@@ -764,6 +776,19 @@ def create_app(ctx: WebContext) -> FastAPI:
     @app.post("/api/tasks/{task_id}/apply")
     async def task_apply(task_id: str, request: Request):
         return await task_action(request, task_id, "apply_result", audited=True)
+
+    @app.post("/api/tasks/{task_id}/rerun")
+    async def task_rerun(task_id: str, request: Request):
+        # rerun_task (worker (a), mcp_server.py): tạo task mới với continue_from=task_id,
+        # tự rơi về task mới từ đầu khi patch cũ không gộp được; trả về task_id mới.
+        report = await task_action(request, task_id, "rerun_task", audited=True)
+        return {"task_id": report["task_id"]}
+
+    @app.post("/api/tasks/{task_id}/apply-error/dismiss")
+    async def task_dismiss_apply_error(task_id: str, request: Request):
+        # dismiss_apply_error (worker (a), mcp_server.py): xóa last_apply_error của task
+        # trong store + ghi journal note "patch đã bỏ". Chỉ KiteOps chạm được store task.
+        return await task_action(request, task_id, "dismiss_apply_error", audited=True)
 
     @app.post("/api/tasks/{task_id}/commit")
     async def task_commit(task_id: str, body: CommitIn, request: Request):
