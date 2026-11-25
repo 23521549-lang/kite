@@ -251,6 +251,11 @@ class BenchIn(BaseModel):
     suites: str = "code"
     models: str = ""
     worker: str = ""
+    # Network approval (Gói 7, bench-standard §5): the hosts the owner confirmed for this
+    # run, after seeing them. The server re-validates them (format + declared in task.yaml)
+    # in bench_start; a run without network_ack never gets the network.
+    network_ack: bool = False
+    network_hosts: list[str] = []
 
 
 class RestartIn(BaseModel):
@@ -884,15 +889,24 @@ def create_app(ctx: WebContext) -> FastAPI:
         from .. import bench
 
         text, rows = await asyncio.to_thread(bench.history, [ctx.state_dir / "bench", Path.home()])
-        return {"runs": rows, "table": text}
+        extra, official, declared_hosts = await asyncio.to_thread(_bench_history_extra, ctx.state_dir)
+        for row in rows:
+            fields = extra.get((row.get("folder"), row.get("model")))
+            if fields is not None:
+                row.update(fields)
+        return {"runs": rows, "table": text, "official": official,
+                "declared_network_hosts": declared_hosts}
 
     @app.post("/api/bench/run")
     async def bench_run(body: BenchIn, request: Request):
         session = auth(request)
         ops = ctx.ops()
         report = await ops.logged("bench_start", ops.bench_start, True, body.label, body.suites, body.models,
-                                  "", "", 0, body.worker)
-        audit(session, "bench_start", body.label, True, {"suites": body.suites, "models": body.models})
+                                  "", "", 0, body.worker, network_hosts=body.network_hosts,
+                                  network_ack=body.network_ack)
+        audit(session, "bench_start", body.label, True, {"suites": body.suites, "models": body.models,
+                                                         "network_hosts": body.network_hosts,
+                                                         "network_ack": body.network_ack})
         return report
 
     # ------------------------------------------------------------------ settings and system
@@ -1208,6 +1222,48 @@ def _auto_click(ctx: WebContext) -> Callable[[str], bool]:
     from ..browser import auto_click_on
 
     return lambda worker: auto_click_on(ctx.state_dir, worker)
+
+
+def _bench_history_extra(state_dir: Path) -> tuple[dict, dict, list[str]]:
+    """Criteria fields for the bench history (§9.2), read from the runs' ``results.json``.
+
+    Returns ``(by_row, official, declared_hosts)``: ``by_row`` maps ``(folder, model)``
+    to the run record's criteria fields (``criteria_version``, ``gate_set``,
+    ``overall``, ``level``, ``level_unstable``, ``network``, ``axes``, ``radar``);
+    ``official`` is the official summary over every run under ``<state>/bench``;
+    ``declared_hosts`` is the union of the network hosts declared in ``task.yaml``
+    (what the Bench page shows for the owner to confirm). Runs from before v1 have
+    no criteria block, so they simply get no extra fields -- the old shape is kept.
+    """
+    from .. import bench_criteria
+    from ..mcp_server import declared_network_hosts
+
+    by_row: dict[tuple[str, str | None], dict] = {}
+    records: list[dict] = []
+    bench_dir = Path(state_dir) / "bench"
+    if bench_dir.is_dir():
+        for path in sorted(bench_dir.glob("*/results.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            for record in (data.get("criteria") or {}).get("runs") or []:
+                records.append(record)
+                model = (record.get("system_config") or {}).get("model")
+                by_row[(path.parent.name, model)] = {
+                    "criteria_version": record.get("criteria_version"),
+                    "gate_set": record.get("gate_set"),
+                    "overall": record.get("overall"),
+                    "level": record.get("level"),
+                    "level_unstable": record.get("level_unstable"),
+                    "network": record.get("network"),
+                    "axes": record.get("axes"),
+                    "radar": bench_criteria.radar_data(record.get("axes") or {}),
+                }
+    _annotated, official = bench_criteria.annotate_runs(records, gate_set="gate-v1")
+    declared = declared_network_hosts(state_dir)
+    hosts = sorted({h for hs in declared.values() for h in hs})
+    return by_row, official, hosts
 
 
 def _git_head(repo: Path) -> dict:

@@ -16,6 +16,7 @@ Each task gets its own clone of the repository, mounted into throw-away containe
 from __future__ import annotations
 
 from collections import deque
+import dataclasses
 from dataclasses import asdict, dataclass, field
 import errno
 import hashlib
@@ -92,6 +93,14 @@ class SandboxSettings:
     image: str = "kite-sandbox:latest"
     network: str = "kite-sandbox-net"
     gateway_url: str = "http://172.19.0.1:8787/v1"
+    # Egress proxy for a bench run that declared network hosts (Gói 7, bench-standard §5):
+    # the URL of the run's proxy container on the internal network, e.g.
+    # ``http://egress-proxy:3128``. "" = no proxy (every ordinary task). This is a per-task
+    # override, set with ``dataclasses.replace`` by the bench driver -- never from config,
+    # and never by reusing ``network`` to carry "bridge" (validation forbids that, and
+    # ``ensure_network`` refuses a non-internal network). The agent container stays on the
+    # internal network; only its ``HTTP_PROXY``/``HTTPS_PROXY`` point at the proxy.
+    egress_proxy_url: str = ""
     host_gateway_url: str = ""       # the same gateway as Kite itself (on the host) reaches it; "" = gateway_url
     memory: str = "1g"
     # Host-disk guard: a step that fills the workspace (on the same disk as Kite's state)
@@ -269,6 +278,23 @@ def check_workspace_limit(settings: SandboxSettings, workspace: Path) -> None:
 
 def container_name(kind: str, task_id: str) -> str:
     return f"kite-{kind}-{task_id}"
+
+
+def proxy_env(proxy_url: str, gateway_url: str) -> list[tuple[str, str]]:
+    """Proxy variables for an agent container that runs behind an egress proxy.
+
+    Gateway traffic must *not* go through the proxy (the gateway is on the internal network,
+    and the proxy would refuse its address as not allowlisted), so its host joins
+    ``NO_PROXY`` together with loopback. Everything else the agent reaches goes through
+    the proxy, which only forwards the run's allowlisted hosts.
+    """
+    from urllib.parse import urlsplit
+
+    gateway_host = urlsplit(gateway_url).hostname or ""
+    no_proxy = ",".join(h for h in (gateway_host, "localhost", "127.0.0.1") if h)
+    return [("HTTP_PROXY", proxy_url), ("HTTPS_PROXY", proxy_url),
+            ("http_proxy", proxy_url), ("https_proxy", proxy_url),
+            ("NO_PROXY", no_proxy), ("no_proxy", no_proxy)]
 
 
 def docker_run_args(settings: SandboxSettings, *, name: str, workspace: Path, network: str,
@@ -2242,7 +2268,8 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
              test_command: str | None = None, setup_command: str | None = None, task_type: str = "coding",
              with_context: bool = True, runner: Runner = default_runner, log: Callable[[str], None] = print,
              worker_pin: str | None = None, deps_cache: Path | None = None,
-             asker: Callable[[str], str] | None = None) -> SandboxRun:
+             asker: Callable[[str], str] | None = None,
+             egress_proxy_url: str = "") -> SandboxRun:
     task_id = task_id or f"sbx-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     if not TASK_ID.fullmatch(task_id):
         raise SandboxError("task id must use lowercase letters, digits and dashes")
@@ -2254,6 +2281,13 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
     workspace = root / "work"
     base_head = prepare_clone(Path(repo), workspace)
     settings = repo_settings(settings, workspace)
+    if egress_proxy_url:
+        # Per-task override (Gói 7): a copy for this task only -- the shared settings object
+        # the caller passed in is never mutated, so the next ordinary task stays offline.
+        settings = dataclasses.replace(settings, egress_proxy_url=egress_proxy_url)
+    # Only the agent phase (and its review pass) runs behind the proxy; setup keeps the
+    # operator's setup network, tests/checks keep network="none" (see below).
+    proxy_extra = proxy_env(settings.egress_proxy_url, settings.gateway_url) if settings.egress_proxy_url else ()
     deps = root / "deps"
     (deps / "cache").mkdir(parents=True, exist_ok=True)
     run = SandboxRun(
@@ -2428,7 +2462,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
         run.agent_exit_code, output = _run_step(
             settings, runner, name=name, timeout=settings.agent_timeout_seconds, watch=watch,
             args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
-                                 config_file=config_file, deps=deps)
+                                 config_file=config_file, deps=deps, extra_env=proxy_extra)
             + ["opencode", "run", "-m", f"kite/{model}", prompt])
         run.agent_status = AGENT_STATUS.get(run.agent_exit_code, "failed")
         if run.agent_status == "stuck":
@@ -2497,7 +2531,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
             review_code, output = _run_step(
                 settings, runner, name=name, timeout=settings.agent_timeout_seconds, watch=StuckWatch(),
                 args=docker_run_args(settings, name=name, workspace=workspace, network=settings.network,
-                                     config_file=config_file, deps=deps)
+                                     config_file=config_file, deps=deps, extra_env=proxy_extra)
                 + ["opencode", "run", "-m", f"kite/{model}",
                    review_prompt(goal, run.test_command,
                                  codemap.impact(graph, workspace, run.patch_base) if graph is not None else "",

@@ -142,3 +142,46 @@ export type ProviderType = {
   secrets: string[]
   note: string
 }
+
+/** Bench — mở rộng theo schema §9 của docs/bench-standard-v1.md. */
+export type BenchLevel = {
+  level: number
+  name_en: string
+  name_vi: string
+  name_i18n_key: string
+  desc_i18n_key: string
+  range: [number, number]
+}
+
+export type BenchNetwork = { mode: 'offline' | 'allowlist'; hosts: string[] }
+
+export type BenchRadarPoint = { axis: string; key: string; score: number | null }
+
+export type BenchRunRow = Record<string, unknown> & {
+  criteria_version?: string
+  gate_set?: string | null
+  overall?: number | null
+  level?: BenchLevel | null
+  level_unstable?: boolean | null
+  network?: BenchNetwork
+  axes?: Record<string, number | null>
+  radar?: BenchRadarPoint[]
+}
+
+export type BenchOfficial = {
+  criteria_version: string
+  gate_set: string | null
+  overall: number | null
+  official: boolean
+  runs: number
+  excluded_runs: number
+  level: BenchLevel | null
+  level_unstable: boolean
+}
+
+export type BenchHistory = {
+  runs: BenchRunRow[]
+  table: string
+  official?: BenchOfficial
+  declared_network_hosts?: string[]
+}

@@ -1,0 +1,26 @@
+id: sample__calc-1
+goal: >-
+  Add a median(numbers) function to calc.py: the middle value for an odd-length
+  list, the mean of the two middle values for an even-length list. The existing
+  mean() function already works and must keep working.
+kind: repo
+language: en
+axes:
+- Coding
+- Đúng việc
+difficulty: chưa xếp hạng
+timeouts:
+  setup: 600
+  test: 300
+environment: {}
+repo: sample/calc
+base_commit: abc1234
+expected_files:
+- calc.py
+swe_bench:
+  instance_id: sample__calc-1
+  repo: sample/calc
+  FAIL_TO_PASS:
+  - tests/test_median.py::test_median
+  PASS_TO_PASS:
+  - tests/test_calc.py::test_mean

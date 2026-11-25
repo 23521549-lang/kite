@@ -108,6 +108,91 @@ def _goal_of(task: dict) -> str:
         return ""
 
 
+def leased_tasks(store) -> list[dict]:
+    """Tasks currently holding the worker (state ``LEASED``), with the title and link the UI shows.
+
+    The exclusivity gate reads the store, never the gateway's ``running_jobs``: the store is
+    the only place that knows a task has actually been leased to a worker.
+    """
+    out = []
+    for task in store.list_tasks():
+        if task.get("state") != "LEASED":
+            continue
+        task_id = str(task["task_id"])
+        out.append({"task_id": task_id, "title": _goal_of(task)[:60], "link": f"/tasks/{task_id}"})
+    return out
+
+
+def leased_tasks_text(tasks: list[dict]) -> str:
+    """One line per leased task: ``<id> (<title>) — /tasks/<id>``."""
+    return "; ".join(f"{t['task_id']} ({t['title'] or 'không có tiêu đề'}) — {t['link']}" for t in tasks)
+
+
+def declared_network_hosts(state_dir, bench_root=None) -> dict[str, list[str]]:
+    """``task_id -> hosts`` declared in ``<bench_root>/*/task.yaml`` (bench-standard §5).
+
+    The bench task root defaults to ``<state_dir>/bench-tasks``. An absent root (or no
+    task declaring network) means no declaration exists yet to check against -- the
+    loader (worker (b)) has not landed its tasks -- so the caller treats the owner's
+    explicit ack as the declaration and records that in the run. Invalid task files
+    are skipped here (the loader is what rejects them); only valid declarations count.
+    """
+    from pathlib import Path
+
+    from . import bench_standard
+
+    root = Path(bench_root) if bench_root else Path(state_dir) / "bench-tasks"
+    declared: dict[str, list[str]] = {}
+    if not root.is_dir():
+        return declared
+    for path in sorted(root.glob("*/task.yaml")):
+        task, _errors = bench_standard.load_task_file(path)
+        if task is None:
+            continue
+        environment = task.environment if isinstance(task.environment, dict) else {}
+        network = environment.get("network") if isinstance(environment, dict) else None
+        hosts = network.get("hosts") if isinstance(network, dict) else None
+        if hosts:
+            declared[task.id] = [str(h) for h in hosts]
+    return declared
+
+
+def check_network_request(*, state_dir, hosts, ack: bool, bench_root=None,
+                          declared: dict[str, list[str]] | None = None) -> dict:
+    """Validate one bench run's network request; return its network stamp (§9.1).
+
+    * No hosts -> the run is offline (``{"mode": "offline", "hosts": []}``).
+    * Hosts without the owner's ack -> refused: a networked bench only runs after the
+      owner has seen the hosts and confirmed them.
+    * Hosts are validated by ``bench_standard.validate_network_hosts`` (bare hostname,
+      no wildcard, no bare IP, at most 10) and must be a subset of the hosts declared
+      in ``task.yaml`` when a declaration exists; an extra host is refused.
+    Raises ``ValueError`` with a Vietnamese message when the run must not start.
+    """
+    from . import bench_standard
+
+    hosts = [str(h).strip() for h in (hosts or []) if str(h).strip()]
+    if not hosts:
+        return {"mode": "offline", "hosts": []}
+    if not ack:
+        raise ValueError(
+            f"bench này xin mạng tới {', '.join(hosts)}: chủ phải xác nhận các host được phép rồi mới chạy "
+            "(gửi network_ack=true cùng danh sách hosts).")
+    errors = bench_standard.validate_network_hosts(hosts)
+    if errors:
+        raise ValueError("; ".join(e.message for e in errors))
+    if declared is None:
+        declared = declared_network_hosts(state_dir, bench_root)
+    if declared:
+        known = sorted({h for hs in declared.values() for h in hs})
+        unknown = [h for h in hosts if h not in known]
+        if unknown:
+            raise ValueError(
+                f"hosts chưa được khai báo trong task.yaml: {', '.join(unknown)} "
+                f"(đã khai báo: {', '.join(known)})")
+    return {"mode": "allowlist", "hosts": hosts}
+
+
 class KiteOps:
     """What the MCP tools do. Temporal connection and gateway status are injectable for tests."""
 
@@ -272,6 +357,16 @@ class KiteOps:
             raise KiteToolError(f"task_type phải là một trong: {', '.join(TASK_TYPES)}")
         if model is not None and model not in self.base_models():
             raise KiteToolError(f"model phải là một trong: {', '.join(self.base_models())} (để trống cho Kite tự chọn)")
+        # Reverse exclusivity (Gói 7): while a bench run holds the GPU, a new task is refused
+        # instead of queueing behind it -- the bench and the task would fight over the worker.
+        # The web route reaches this same method, so chat and web share the gate.
+        from . import bench
+
+        running = bench.running_bench(self.state_dir)
+        if running is not None:
+            raise KiteToolError(
+                f"đang có một lần đo chạy ({running.get('label')}, từ {running.get('started')}): task mới "
+                "bị từ chối trong lúc đo. Đo xong thì giao lại — task không tự xếp hàng sau bench.")
         path, head = self._repo(repo)
         base_patch, base_task, notes = "", "", []
         if continue_from.strip():
@@ -922,7 +1017,9 @@ class KiteOps:
                         "opencode, chạy `kite chat reload` và mở lại để có tool mới"}
 
     async def bench_start(self, confirm: bool = False, label: str = "", suites: str = "code", models: str = "",
-                          repo_source: str = "", polyglot: str = "", polyglot_count: int = 0, worker: str = "") -> dict:
+                          repo_source: str = "", polyglot: str = "", polyglot_count: int = 0, worker: str = "",
+                          network_hosts: list[str] | None = None, network_ack: bool = False,
+                          bench_root: str = "") -> dict:
         """Start a measurement run (kite bench run) in the background; results go to <state>/bench/<label>."""
         label = re.sub(r"[^A-Za-z0-9._-]+", "-", label.strip())[:40] or time.strftime("bench-%Y%m%d-%H%M")
         out = self.state_dir / "bench" / label
@@ -940,17 +1037,43 @@ class KiteOps:
             args += ["--polyglot-count", str(int(polyglot_count))]
         from . import bench
 
+        with self._store() as store:
+            leased = leased_tasks(store)
+        if leased:
+            raise KiteToolError(
+                f"đang có task chạy ({leased_tasks_text(leased)}): bench giữ GPU nên không đo cùng lúc được. "
+                "Chờ task xong (wait_task) hoặc hủy rồi đo tiếp.")
         running = bench.running_bench(self.state_dir)
         if running is not None:
             raise KiteToolError(f"đang có một lần đo chạy ({running.get('label')}, từ {running.get('started')}): "
                                 "chờ nó xong rồi đo tiếp")
+        # Network approval (Gói 7, bench-standard §5): a run that asks for the network only
+        # starts after the owner confirmed the hosts, and only for hosts declared in task.yaml.
+        # The approval itself is journaled by the logged() wrapper (args carry network_hosts +
+        # network_ack); the egress log path is journaled by the bench child when it starts the
+        # proxy. A networked run never joins the gate set (its outside service makes it
+        # unreproducible), so its gate_set is None and official_overall excludes it.
+        declared = declared_network_hosts(self.state_dir, bench_root or None)
+        try:
+            network_stamp = check_network_request(state_dir=self.state_dir, hosts=network_hosts,
+                                                  ack=network_ack, bench_root=bench_root or None,
+                                                  declared=declared)
+        except ValueError as exc:
+            raise KiteToolError(str(exc)) from exc
+        gate_set = None if network_stamp["mode"] == "allowlist" else "gate-v1"
+        if network_stamp["mode"] == "allowlist":
+            args += ["--network-hosts", ",".join(network_stamp["hosts"]), "--network-ack"]
+            if bench_root.strip():
+                args += ["--bench-root", str(Path(bench_root).expanduser())]
         if not confirm:
             return {"confirm_needed": True, "command": "kite " + " ".join(args), "out": str(out),
+                    "network": network_stamp, "gate_set": gate_set,
                     "will": "đo chạy nền, dùng GPU Kaggle (R1-R4 khoảng 1 giờ); trong lúc đo đừng cập nhật Kite"}
         if out.exists():
             raise KiteToolError(f"{out} đã có; đặt label khác")
         log = self._spawn_detached(args, f"bench-{label}")
-        return {"started": True, "out": str(out), "log": str(log)}
+        return {"started": True, "out": str(out), "log": str(log),
+                "network": network_stamp, "gate_set": gate_set}
 
     async def bench_history(self) -> dict:
         """Every measurement run so far (Kite's evidence, run by run)."""
@@ -1105,11 +1228,15 @@ def build_server(ops: KiteOps):
 
     @server.tool(description="Chạy đo (kite bench run) ở nền. label: tên lần đo (vd v6). suites: code | lead | speed. "
                              "repo_source: clone aiops-traffic-shaper (bài R1-R4); polyglot: clone polyglot-benchmark; "
-                             "worker: ép một worker. confirm=true sau khi người dùng đồng ý.")
+                             "worker: ép một worker. confirm=true sau khi người dùng đồng ý. network_hosts: các host "
+                             "bench được phép chạm tới (chỉ khi bài khai network:); network_ack=true sau khi người dùng "
+                             "đã thấy và xác nhận đúng danh sách đó.")
     async def bench_start(confirm: bool = False, label: str = "", suites: str = "code", models: str = "",
-                          repo_source: str = "", polyglot: str = "", polyglot_count: int = 0, worker: str = "") -> dict:
+                          repo_source: str = "", polyglot: str = "", polyglot_count: int = 0, worker: str = "",
+                          network_hosts: list[str] | None = None, network_ack: bool = False,
+                          bench_root: str = "") -> dict:
         return await ops.logged("bench_start", ops.bench_start, confirm, label, suites, models, repo_source,
-                                polyglot, polyglot_count, worker)
+                                polyglot, polyglot_count, worker, network_hosts, network_ack, bench_root)
 
     @server.tool(description="Bảng các lần đo đã chạy (v1, v2...): đạt bao nhiêu, mất bao lâu, chi phí GPU.")
     async def bench_history() -> dict:

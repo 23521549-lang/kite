@@ -120,7 +120,8 @@ class FakeOps:
         return {"removed": confirm, "freed": "1 GB" if confirm else None}
 
     async def bench_start(self, confirm=False, label="", suites="code", models="", repo_source="", polyglot="",
-                          polyglot_count=0, worker=""):
+                          polyglot_count=0, worker="", network_hosts=None, network_ack=False,
+                          bench_root=""):
         return {"started": confirm, "out": f"/bench/{label}"}
 
 

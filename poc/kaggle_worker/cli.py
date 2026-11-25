@@ -363,6 +363,19 @@ def _parser() -> argparse.ArgumentParser:
     bench_run.add_argument("--worker", default="",
                            help="send every request to this worker (e.g. kaggle-han): comparable timings, and "
                                 "the other worker stays free for real tasks")
+    bench_run.add_argument("--network-hosts", default="",
+                           help="comma-separated hosts this run may reach (bench-standard §5): the agent stays "
+                                "on the internal network and only these hosts are forwarded through the egress "
+                                "proxy. Requires --network-ack and must match the hosts declared in task.yaml.")
+    bench_run.add_argument("--network-ack", action="store_true",
+                           help="the owner has seen the --network-hosts list and approved it for this run")
+    bench_run.add_argument("--bench-root", type=Path,
+                           help="folder of bench tasks (task.yaml each; default: <state>/bench-tasks): the "
+                                "source of the declared network hosts and the per-task axes for the criteria "
+                                "stamp. Without it, only the owner's acked hosts are checked.")
+    bench_run.add_argument("--gate-set", default="gate-v1",
+                           help="name of the fixed gate task set this run belongs to (default: gate-v1); "
+                                "a networked run never joins it, whatever this says")
     bench_history = bench_commands.add_parser(
         "history", help="every bench run so far as one table (markdown): what each change did")
     bench_history.add_argument("--root", type=Path, help="folder of bench runs (default: <state>/bench and the "
@@ -1690,6 +1703,174 @@ def _chat_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def v1_hidden_test_files(task, v1_tasks: dict) -> dict[str, str] | None:
+    """Hidden tests of a v1 repo task, read from its task folder -- or ``None``.
+
+    The contents are the same ones worker (b)'s dispatch exposes as
+    ``outcome["hidden_files"]``: the task folder's ``tests/``. They must be injected
+    from there, NOT through ``bench.hidden_files(task, source)``: that helper runs
+    ``git show <fix>:<path>``, and a v1 RepoTask's ``fix`` is only a placeholder equal
+    to ``base_commit`` (see the dispatch caveat in ``bench.py``), so any test file the
+    real fix added does not exist at that commit and ``git show`` fails. A v1 code /
+    terminal task needs no special case (its hidden tests already ride in
+    ``CodeTask.hidden``), and every non-v1 task keeps the old ``bench.hidden_files``
+    path -- hence ``None`` here means "not a v1 repo task, use the old path".
+    """
+    from . import bench
+    from .bench_loader import read_dir_files, task_dir_of
+
+    if not isinstance(task, bench.RepoTask):
+        return None
+    bench_task = v1_tasks.get(task.id)
+    if bench_task is None or bench_task.kind != "repo":
+        return None
+    task_dir = task_dir_of(bench_task)
+    if task_dir is None:
+        return None
+    return read_dir_files(task_dir / "tests")
+
+
+def write_bench_criteria(results: dict, out: Path, *, state_dir: Path, network: dict,
+                         gate_set: str | None, bench_root=None, worker: str = "",
+                         v1_tasks: dict | None = None) -> dict:
+    """Stamp the v1 criteria block (bench-standard §9.2) into this run's ``results.json``.
+
+    One record per model: per-task scores -> per-axis means -> overall + Dreyfus level,
+    all through ``bench_criteria`` (never recomputed by hand). Old-suite outcomes carry
+    no declared axes, so they contribute nothing to the axes (an all-``None`` record is
+    still stamped: the run happened, it just predates the criteria). The two run-level
+    axes: Chi phí compares this run's median GPU minutes per task with the latest
+    previous run of the same gate set + version (no baseline yet -> ``None`` -- the
+    run *becomes* the baseline); Ổn định is 100 per task unless the gateway journal
+    shows that task hit an infrastructure error (a fault task scores by pass/fail).
+    A networked run is stamped with ``gate_set=None``, so the official summary never
+    mixes it into the gate set. The official summary spans every run under
+    ``<state>/bench``, not just this file. Returns the ``criteria`` dict.
+    """
+    from . import bench, bench_criteria as bc
+
+    v1_tasks = v1_tasks or {}
+    previous: list[dict] = []
+    bench_dir = Path(state_dir) / "bench"
+    if bench_dir.is_dir():
+        for path in sorted(bench_dir.glob("*/results.json")):
+            if path.parent.resolve() == Path(out).resolve():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            previous.extend((data.get("criteria") or {}).get("runs") or [])
+    journal = Journal(Path(state_dir) / "journal")
+
+    def infra_hit(task_run_id):
+        if not task_run_id:
+            return False
+        records = [r for r in journal.read("gateway")
+                   if r.get("tag") == task_run_id or r.get("tag") == f"{task_run_id}-r"]
+        return bool(bench.infra_errors(records))
+
+    def median(values):
+        values = sorted(values)
+        if not values:
+            return None
+        middle = len(values) // 2
+        return round(values[middle] if len(values) % 2
+                     else (values[middle - 1] + values[middle]) / 2, 1)
+
+    records = []
+    for model, entry in (results.get("models") or {}).items():
+        task_records = []
+        per_axis: dict[str, list] = {axis: [] for axis in bc.AXES}
+        gpu_minutes: list[float] = []
+        stability: list[float] = []
+        for outcome in (entry.get("code") or []) + (entry.get("v1") or []):
+            task_id = outcome.get("id")
+            bench_task = v1_tasks.get(task_id)
+            axes = list(outcome.get("axes") or (list(bench_task.axes) if bench_task else []))
+            if not axes:
+                continue
+            passed = bool(outcome.get("passed"))
+            common = float(outcome["score_100"]) if "score_100" in outcome else (100.0 if passed else 0.0)
+            scores_by_axis: dict[str, float] = {}
+            if ("Tốc độ" in axes and bench_task is not None and bench_task.par_seconds
+                    and outcome.get("wall_seconds")):
+                scores_by_axis["Tốc độ"] = bc.round_score(
+                    100 * min(1, bench_task.par_seconds / outcome["wall_seconds"]))
+            for axis in axes:
+                if axis in ("Chi phí", "Ổn định"):
+                    continue            # run-level axes, scored below
+                per_axis[axis].append(scores_by_axis.get(axis, common))
+            # Ổn định (spec §4): every task in the run contributes, whether or not it
+            # declares the axis -- a fault task scores by pass/fail, any other task by
+            # whether it had to be rerun after an infrastructure error. Scenario outcomes
+            # never ran in the sandbox, so they do not contribute here.
+            if outcome.get("kind") in ("code", "repo", "terminal", None):
+                if bench_task is not None and bench_task.fault:
+                    stability.append(100.0 if passed else 0.0)
+                else:
+                    stability.append(0.0 if infra_hit(outcome.get("task_id")) else 100.0)
+            if outcome.get("gpu_seconds"):
+                gpu_minutes.append(round(outcome["gpu_seconds"] / 60, 1))
+            task_record = {"task_id": task_id, "axes": axes, "score": common}
+            if scores_by_axis:
+                task_record["scores_by_axis"] = scores_by_axis
+            task_records.append(task_record)
+        axis_scores = {axis: bc.axis_score(per_axis[axis]) for axis in bc.AXES}
+        cost_basis = median(gpu_minutes)
+        if gate_set is not None and cost_basis:
+            same = [r for r in previous
+                    if r.get("gate_set") == gate_set
+                    and r.get("criteria_version") == bc.CRITERIA_VERSION
+                    and r.get("cost_basis_gpu_minutes_median")]
+            if same:
+                axis_scores["Chi phí"] = bc.round_score(
+                    100 * min(1, same[-1]["cost_basis_gpu_minutes_median"] / cost_basis))
+        if stability:
+            axis_scores["Ổn định"] = bc.axis_score(stability)
+        record = bc.build_run_result(
+            axis_scores=axis_scores,
+            system_config={"worker": worker, "model": model,
+                           "harness": "poc/kaggle_worker/bench.py",
+                           "harness2": "poc/kaggle_worker/harness2.py"},
+            network=network, gate_set=gate_set)
+        record["run_id"] = f"{Path(out).name}-{re.sub(r'[^a-z0-9]+', '-', model.lower()).strip('-')}"
+        record["started"] = results.get("started")
+        record["tasks"] = task_records
+        record["cost_basis_gpu_minutes_median"] = cost_basis
+        records.append(record)
+    annotated, official = bc.annotate_runs(previous + records, gate_set="gate-v1")
+    new_ids = {r["run_id"] for r in records}
+    criteria = {"criteria_version": bc.CRITERIA_VERSION, "gate_set": gate_set,
+                "runs": [r for r in annotated if r["run_id"] in new_ids],
+                "official": official}
+    results["criteria"] = criteria
+    (Path(out) / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2),
+                                            encoding="utf-8")
+    return criteria
+
+
+def check_no_leased_tasks(db_path: Path) -> list[dict]:
+    """The direct ``kite bench run`` path's forward gate: refuse while a task holds the worker.
+
+    ``bench_start`` (chat/web) checks the same condition through ``leased_tasks``; the CLI
+    never goes through ``bench_start``, so it checks here, before taking the bench lock.
+    Returns the (empty) leased list when the run may start. A missing store file means no
+    task ever ran, so there is nothing leased.
+    """
+    from .mcp_server import leased_tasks, leased_tasks_text
+
+    if not Path(db_path).exists():
+        return []
+    with SQLiteSchedulerStore(Path(db_path)) as store:
+        leased = leased_tasks(store)
+    if leased:
+        raise ConfigError(
+            f"đang có task chạy ({leased_tasks_text(leased)}): bench giữ GPU nên không đo cùng lúc được. "
+            "Chờ task xong hoặc hủy rồi chạy `kite bench run` lại.")
+    return leased
+
+
 def _bench_command(args: argparse.Namespace) -> int:
     from . import bench
     from . import sandbox as sbx
@@ -1750,6 +1931,25 @@ def _bench_command(args: argparse.Namespace) -> int:
     code_tasks = [t for t in pool if not only or t.id in only]
     if polyglot is not None and args.polyglot_count:
         code_tasks = code_tasks[:args.polyglot_count]
+    # Validated v1 tasks (worker (b)'s loader): the run's own suite, next to the old
+    # speed/lead/code suites. The bench root defaults to <state>/bench-tasks; an invalid
+    # task folder is warned about and skipped (the loader reports it per file instead of
+    # crashing the list); a missing root simply means no v1 tasks yet.
+    bench_root = args.bench_root.expanduser() if args.bench_root else args.config.parent / "bench-tasks"
+    v1_by_id: dict[str, Any] = {}
+    if bench_root.is_dir():
+        from . import bench_loader
+
+        for loaded in bench_loader.discover_tasks(bench_root):
+            if loaded.task is not None:
+                v1_by_id[loaded.task.id] = loaded.task
+            else:
+                print(f"cảnh báo: bỏ bài bench ở {loaded.task_dir}: "
+                      f"{'; '.join(e.message for e in loaded.errors)}", file=sys.stderr)
+        if v1_by_id:
+            print(f"v1: {len(v1_by_id)} bài từ {bench_root}", file=sys.stderr)
+    # The egress proxy (if any) lives for the whole run; kite_run_once reads its URL here.
+    proxy_holder: dict[str, str] = {}
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = (args.out or args.config.parent / "bench" / stamp).expanduser().resolve()
     post = bench.gateway_post(f"http://{config.gateway.host}:{config.gateway.port}/v1/chat/completions",
@@ -1758,7 +1958,7 @@ def _bench_command(args: argparse.Namespace) -> int:
     tools = bench.lead_tools(asyncio.run(build_server(ops).list_tools()))
     system = chat_files(config, lead_model=models[0], kite_command=["kite"], allowed_roots=[Path.home()])["AGENTS.md"]
     run_code = None
-    if "code" in suites:
+    if "code" in suites or v1_by_id:
         settings = sandbox_settings_from_config(config)
         if args.no_harness:
             settings = dataclasses.replace(settings, fix_rounds=0, self_review=False, code_map=False,
@@ -1796,7 +1996,8 @@ def _bench_command(args: argparse.Namespace) -> int:
             run = sbx.run_task(settings, repo=repo, goal=goal, model=model, models=served,
                                state_dir=out_dir / "runs", task_id=task_id, with_context=not args.no_harness,
                                log=lambda line: print(line, file=sys.stderr), worker_pin=args.worker or None,
-                               deps_cache=args.config.parent / "deps-cache" if settings.deps_cache else None)
+                               deps_cache=args.config.parent / "deps-cache" if settings.deps_cache else None,
+                               egress_proxy_url=proxy_holder.get("url", ""))
             result = run.to_dict()
             result["wall_seconds"] = round(time.monotonic() - started, 1)
             # Model time and tokens of this run, from the gateway's journal on this machine.
@@ -1807,7 +2008,16 @@ def _bench_command(args: argparse.Namespace) -> int:
             # polyglot exercises are scored like Aider: their tests run whatever state Kite ended in.
             polyglot_task = isinstance(task, bench.PolyglotTask)
             ran = run.agent_status == "ok" or (polyglot_task and run.agent_status != "skipped")
-            files = bench.hidden_files(task, source) if ran else {}
+            if ran:
+                # A v1 repo task's hidden tests come from its task folder (the same contents
+                # dispatch exposes as outcome["hidden_files"]) -- see v1_hidden_test_files:
+                # bench.hidden_files(task, source) would run `git show <fix>:<path>` with
+                # fix == base_commit (placeholder) and fail on test files the fix added.
+                files = v1_hidden_test_files(task, v1_by_id)
+                if files is None:
+                    files = bench.hidden_files(task, source)
+            else:
+                files = {}
             if files:
                 workspace = Path(run.workspace)
                 for rel, content in files.items():
@@ -1851,18 +2061,63 @@ def _bench_command(args: argparse.Namespace) -> int:
         (f"bật ({harness_settings.fix_rounds} vòng sửa, rà soát {'bật' if harness_settings.self_review else 'tắt'}, "
          f"có ngữ cảnh repo, bản đồ code graphify {'bật' if map_on else 'tắt'}, đường nhanh "
          f"{'bật' if harness_settings.fast_path and not args.no_fast_path else 'tắt'})")
+    # Network approval for the direct path (same rule as bench_start): hosts only with
+    # the owner's ack, and only hosts declared in task.yaml when a declaration exists.
+    from .mcp_server import check_network_request, declared_network_hosts
+
+    declared = declared_network_hosts(args.config.parent, args.bench_root)
+    try:
+        network_stamp = check_network_request(
+            state_dir=args.config.parent,
+            hosts=[h.strip() for h in args.network_hosts.split(",") if h.strip()],
+            ack=args.network_ack, bench_root=args.bench_root, declared=declared)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    gate_set = None if network_stamp["mode"] == "allowlist" else args.gate_set
+    # Forward gate, same rule as bench_start: no bench while a task holds the worker. The child
+    # run re-checks nothing else -- this is the check, before the lock is taken.
+    check_no_leased_tasks(_db_path(args))
     try:
         lock = bench.acquire_lock(args.config.parent, label=args.label or out.name, out=out)
     except bench.BenchBusy as exc:
         raise ConfigError(str(exc)) from exc
     log(f"bench -> {out} | models {models} | suites {suites} | {len(scenarios)} kịch bản, {len(code_tasks)} task code"
         f" | harness {harness}")
+    proxy = None
+    if network_stamp["mode"] == "allowlist":
+        from . import egress_proxy
+
+        try:
+            proxy = egress_proxy.start_egress_proxy(
+                state_dir=args.config.parent, settings=harness_settings,
+                hosts=network_stamp["hosts"], run_id=stamp, runner=sbx.default_runner)
+        except egress_proxy.EgressProxyError as exc:
+            bench.release_lock(lock)
+            raise ConfigError(str(exc)) from exc
+        proxy_holder["url"] = proxy.proxy_url
+        Journal(args.config.parent / "journal").write("actions", {
+            "tool": "bench_egress_start", "label": args.label or out.name,
+            "hosts": list(network_stamp["hosts"]), "declared": declared,
+            "proxy": proxy.name, "log": str(proxy.log_path)})
+        log(f"egress proxy {proxy.name} cho phép: {', '.join(network_stamp['hosts'])} (log: {proxy.log_path})")
     try:
         _bench_wait_for_workers(config, models, log)
         results = bench.run_bench(models=models, suites=suites, post=post, out=out, system=system, tools=tools,
                                   run_code=run_code, scenarios=scenarios, code_tasks=code_tasks, log=log,
-                                  meta={"harness": harness, **({"label": args.label} if args.label else {})})
+                                  meta={"harness": harness, **({"label": args.label} if args.label else {})},
+                                  v1_tasks=sorted(v1_by_id.values(), key=lambda t: t.id))
+        try:
+            write_bench_criteria(results, out, state_dir=args.config.parent, network=network_stamp,
+                                 gate_set=gate_set, bench_root=bench_root, worker=args.worker or "",
+                                 v1_tasks=v1_by_id)
+        except Exception as exc:      # the run itself is done; a missing criteria stamp must not
+            log(f"cảnh báo: không đóng dấu criteria cho {out}: {exc}")  # lose its results.json
     finally:
+        if proxy is not None:
+            proxy.stop()
+            Journal(args.config.parent / "journal").write("actions", {
+                "tool": "bench_egress_stop", "label": args.label or out.name,
+                "hosts": list(network_stamp["hosts"]), "proxy": proxy.name, "log": str(proxy.log_path)})
         bench.release_lock(lock)
     _emit({"out": str(out), "report": str(out / "README.md"),
            "summary": {m: bench.summarize(entry) for m, entry in results["models"].items()}})
