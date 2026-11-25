@@ -2,10 +2,22 @@
 // gateway events into dots flying to the worker that answered.
 import { Box, Paper, Text } from '@mantine/core'
 import { useEffect, useRef, useState } from 'react'
+import { fmt, useOverviewStrings } from '../i18n/overview'
 import { useKite } from '../store'
-import { OfficeScene, type OfficeState, type Pick } from './scene'
+import { OfficeScene, type OfficeLabels, type OfficeState, type Pick } from './scene'
 
-export default function Office3D({ state, onPick, height }: { state: OfficeState; onPick: (pick: Pick) => void; height: number }) {
+export default function Office3D({
+  state,
+  labels,
+  onPick,
+  height,
+}: {
+  state: OfficeState
+  labels: OfficeLabels
+  onPick: (pick: Pick) => void
+  height: number
+}) {
+  const s = useOverviewStrings()
   const holder = useRef<HTMLDivElement>(null)
   const scene = useRef<OfficeScene | null>(null)
   const pick = useRef(onPick)
@@ -24,6 +36,7 @@ export default function Office3D({ state, onPick, height }: { state: OfficeState
           const rect = el.getBoundingClientRect()
           setTip({ text, x: x - rect.left, y: y - rect.top })
         },
+        labels,
       })
     } catch (e) {
       setFailed(e instanceof Error ? e.message : String(e))
@@ -32,11 +45,13 @@ export default function Office3D({ state, onPick, height }: { state: OfficeState
       scene.current?.dispose()
       scene.current = null
     }
+    // Labels lúc khởi tạo là đủ — đổi ngôn ngữ sau đó đi qua `update(state, labels)` bên dưới.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
-    scene.current?.update(state)
-  }, [state])
+    scene.current?.update(state, labels)
+  }, [state, labels])
 
   // Gateway requests from the live events: newest first in the store, so walk the new ones oldest first.
   const seen = useRef(Date.now())
@@ -57,7 +72,7 @@ export default function Office3D({ state, onPick, height }: { state: OfficeState
   if (failed)
     return (
       <Text c="dimmed" size="sm">
-        Không vẽ được 3D trên trình duyệt này ({failed}). Chọn 2D.
+        {fmt(s['overview.office.failed'], { error: failed })}
       </Text>
     )
   return (
@@ -83,7 +98,7 @@ export default function Office3D({ state, onPick, height }: { state: OfficeState
         </Paper>
       ) : null}
       <Text size="xs" c="dimmed" style={{ position: 'absolute', left: 10, bottom: 6, pointerEvents: 'none' }}>
-        Kéo để xoay · cuộn để phóng to · bấm vào bàn để mở
+        {s['overview.office.hint']}
       </Text>
     </Box>
   )

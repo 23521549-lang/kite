@@ -1,17 +1,15 @@
-import { Badge, Card, Group, SegmentedControl, SimpleGrid, Stack, Table, Text, Title, useComputedColorScheme } from '@mantine/core'
+import { Group, SimpleGrid, Stack, Table, Text, Title, useComputedColorScheme } from '@mantine/core'
 import { useMediaQuery } from '@mantine/hooks'
-import { Suspense, lazy, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { get, type Activity, type Overview as OverviewData, type WorkerRow } from '../api'
-import { Dot, Empty, Loading, Page, StateBadge } from '../components/common'
+import { Empty, Loading, Page, StateBadge } from '../components/common'
+import { fmt, useOverviewStrings, type OverviewKey } from '../i18n/overview'
 import type { OfficeState, Pick, WorkerState } from '../office/scene'
 import { go } from '../router'
 import { useKite } from '../store'
 import { ago, short, usd, useLoad, workerState } from '../util'
-
-// three.js is only downloaded when the 3D office is shown.
-const Office3D = lazy(() => import('../office/Office3D'))
-const MODE_KEY = 'kite.overview.mode'
-const PHASES: Record<string, string> = { fast_path: 'đường nhanh', review: 'rà soát' }
+import HubBlock from './overview/HubBlock'
+import OfficePanel from './overview/OfficePanel'
 
 function hasWebGL(): boolean {
   try {
@@ -22,19 +20,12 @@ function hasWebGL(): boolean {
   }
 }
 
-function savedMode(): '3d' | '2d' {
-  try {
-    const value = localStorage.getItem(MODE_KEY)
-    if (value === '2d' || value === '3d') return value
-  } catch {
-    /* no storage: the default */
-  }
-  // Phones start with the cards: five desks on a small screen are hard to read.
-  return window.matchMedia?.('(max-width: 640px)').matches ? '2d' : '3d'
-}
-
 function officeWorker(w: WorkerRow): OfficeState['workers'][number] {
   const st = workerState(w)
+  // So theo trường trạng thái thô, không so nhãn hiển thị: nhãn `workerState()`
+  // sẽ đổi ngôn ngữ khi Gói 0(b) di trú (so nhãn thì sai ở chế độ EN).
+  // Điều kiện regex này đúng y điều kiện `workerState()` dùng cho 'đang khởi động'.
+  const startPhase = String(w.start?.state ?? w.start?.status ?? w.start?.phase ?? '')
   const state: WorkerState =
     w.start?.state === 'error'
       ? 'error'
@@ -42,7 +33,7 @@ function officeWorker(w: WorkerRow): OfficeState['workers'][number] {
         ? 'busy'
         : w.alive && !w.draining
           ? 'idle'
-          : st.label === 'đang khởi động' || w.draining
+          : /start|queue|wait|boot|launch|running/i.test(startPhase) || w.draining
             ? 'starting'
             : 'off'
   return {
@@ -56,8 +47,10 @@ function officeWorker(w: WorkerRow): OfficeState['workers'][number] {
   }
 }
 
-function officeTask(a: Activity): OfficeState['tasks'][number] {
-  const step = [a.step ? `bước ${a.step}` : null, a.action ? `vừa ${a.action}` : null].filter(Boolean).join(' · ')
+function officeTask(a: Activity, s: Record<OverviewKey, string>): OfficeState['tasks'][number] {
+  const step = [a.step ? fmt(s['overview.task.step'], { step: a.step }) : null, a.action ? fmt(s['overview.task.action'], { action: a.action }) : null]
+    .filter(Boolean)
+    .join(' · ')
   return { id: a.task_id, goal: short(a.goal || a.task_id, 70), worker: a.worker, step: step || null }
 }
 
@@ -65,11 +58,12 @@ function onPick(pick: Pick) {
   if (pick.kind === 'worker') go('/workers')
   else if (pick.kind === 'task') go(`/tasks/${encodeURIComponent(pick.id)}`)
   else if (pick.kind === 'lead') go('/chat')
-  else if (pick.kind === 'gateway') go('/journal')
+  else if (pick.kind === 'gateway') go('/tasks')
   else go('/tasks')
 }
 
 export default function Overview() {
+  const s = useOverviewStrings()
   const { data, error } = useLoad(() => get<OverviewData>('/api/overview'), [], 10000)
   const activity = useKite((s) => s.activity)
   const events = useKite((s) => s.events)
@@ -78,19 +72,18 @@ export default function Overview() {
   const dark = useComputedColorScheme('dark') === 'dark'
   const small = useMediaQuery('(max-width: 48em)')
   const [webgl] = useState(hasWebGL)
-  const [mode, setMode] = useState<'3d' | '2d'>(() => (hasWebGL() ? savedMode() : '2d'))
   const office = useMemo<OfficeState | null>(
     () =>
       data
         ? {
             workers: data.workers.map(officeWorker),
-            tasks: activity.map(officeTask),
+            tasks: activity.map((a) => officeTask(a, s)),
             chatBusy: (chat.data?.busy ?? 0) > 0,
             gatewayUp: gatewayUp ?? data.gateway_up,
             dark,
           }
         : null,
-    [data, activity, chat.data?.busy, gatewayUp, dark],
+    [data, activity, chat.data?.busy, gatewayUp, dark, s],
   )
   if (!data || !office) return <Loading error={error} />
   const quota = data.gpu_quota ?? {}
@@ -98,104 +91,65 @@ export default function Overview() {
   for (const w of data.workers) brandTotals.set(w.brand, (brandTotals.get(w.brand) ?? 0) + w.spend.month_usd)
   const brandSpend = [...brandTotals.entries()].sort((a, b) => b[1] - a[1])
   return (
-    <Page title="Tổng quan">
+    <Page title={s['overview.title']}>
       <SimpleGrid cols={{ base: 2, md: 4 }}>
-        <Stat label="Gateway" value={data.gateway_up ? 'đang chạy' : 'tắt'} color={data.gateway_up ? 'teal' : 'red'} />
-        <Stat label="Việc đang chờ / đang chạy" value={`${data.queued_jobs} / ${data.running_jobs}`} />
-        <Stat label="Chi hôm nay" value={usd(data.spend.today_usd)} />
-        <Stat label="Chi tháng này" value={usd(data.spend.month_usd)} />
+        <Stat label={s['overview.stat.gateway']} value={data.gateway_up ? s['overview.stat.gateway-on'] : s['overview.stat.gateway-off']} color={data.gateway_up ? 'teal' : 'red'} />
+        <Stat label={s['overview.stat.jobs']} value={`${data.queued_jobs} / ${data.running_jobs}`} onClick={() => go('/tasks')} />
+        <Stat label={s['overview.stat.spend-today']} value={usd(data.spend.today_usd)} onClick={() => go('/workers')} />
+        <Stat label={s['overview.stat.spend-month']} value={usd(data.spend.month_usd)} onClick={() => go('/workers')} />
       </SimpleGrid>
       {brandSpend.length ? (
-        <Card withBorder>
-          <Text fw={600} mb={6}>
-            Chi theo hãng tháng này
-          </Text>
+        <HubBlock title={s['overview.brand-spend.title']} onClick={() => go('/workers')}>
           {brandSpend.map(([brand, total]) => (
             <Text key={brand} size="sm">
               <b>{brand}</b>: {usd(total)}
             </Text>
           ))}
-        </Card>
+        </HubBlock>
       ) : null}
       {Object.keys(quota).length ? (
-        <Card withBorder>
-          <Text fw={600} mb={6}>
-            Quota GPU Kaggle
-          </Text>
+        <HubBlock title={s['overview.quota.title']} onClick={() => go('/workers')}>
           {Object.entries(quota).map(([worker, q]) => (
             <Text key={worker} size="sm">
               <b>{worker}</b>: {q.detail}
             </Text>
           ))}
-        </Card>
+        </HubBlock>
       ) : null}
-      <Card withBorder p="xs">
-        <Group justify="space-between" px={6} pb={6}>
-          <Text fw={600}>Văn phòng Kite</Text>
-          <SegmentedControl
-            size="xs"
-            data={[
-              { value: '3d', label: '3D', disabled: !webgl },
-              { value: '2d', label: '2D' },
-            ]}
-            value={mode}
-            onChange={(v) => {
-              const next = v === '3d' ? '3d' : '2d'
-              setMode(next)
-              try {
-                localStorage.setItem(MODE_KEY, next)
-              } catch {
-                /* the choice lasts for this visit only */
-              }
-            }}
-          />
-        </Group>
-        {mode === '3d' ? (
-          <Suspense fallback={<Loading label="Đang tải văn phòng 3D…" />}>
-            <Office3D state={office} onPick={onPick} height={small ? 360 : 500} />
-          </Suspense>
-        ) : (
-          <WorkerCards workers={data.workers} />
-        )}
-        {!webgl ? (
-          <Text size="xs" c="dimmed" px={6} pt={6}>
-            Trình duyệt này không có WebGL nên chỉ xem được 2D.
-          </Text>
-        ) : null}
-      </Card>
-      <Title order={4}>Đang làm</Title>
+      <OfficePanel office={office} workers={data.workers} webgl={webgl} small={small} onPick={onPick} />
+      <Title order={4}>{s['overview.running.title']}</Title>
       {activity.length ? (
         <Stack gap="xs">
           {activity.map((a) => (
-            <Card key={a.task_id} withBorder p="sm" className="clickable" onClick={() => go(`/tasks/${encodeURIComponent(a.task_id)}`)}>
-              <Group justify="space-between" wrap="nowrap">
-                <Text fw={600} truncate>
-                  {a.goal || a.task_id}
+            <HubBlock key={a.task_id} title={a.goal || a.task_id} onClick={() => go(`/tasks/${encodeURIComponent(a.task_id)}`)}>
+              <Group justify="space-between" wrap="nowrap" align="flex-start">
+                <Text size="sm" c="dimmed" style={{ flex: 1, minWidth: 0 }}>
+                  {[
+                    a.worker ? fmt(s['overview.task.worker'], { worker: a.worker }) : null,
+                    a.phase
+                      ? a.phase === 'fast_path'
+                        ? s['overview.phase.fast-path']
+                        : a.phase === 'review'
+                          ? s['overview.phase.review']
+                          : a.phase
+                      : null,
+                    a.step ? fmt(s['overview.task.step'], { step: a.step }) : null,
+                    a.action ? fmt(s['overview.task.action'], { action: a.action }) : null,
+                    a.since ? fmt(s['overview.task.since'], { time: ago(a.since) }) : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ') || (a.state === 'QUEUED' ? s['overview.running.queued'] : s['overview.running.preparing'])}
                 </Text>
                 <StateBadge state={a.state} />
               </Group>
-              <Text size="sm" c="dimmed">
-                {[
-                  a.worker ? `worker ${a.worker}` : null,
-                  a.phase ? PHASES[a.phase] ?? a.phase : null,
-                  a.step ? `bước ${a.step}` : null,
-                  a.action ? `vừa ${a.action}` : null,
-                  a.since ? `từ ${ago(a.since)}` : null,
-                ]
-                  .filter(Boolean)
-                  .join(' · ') || (a.state === 'QUEUED' ? 'đang chờ worker' : 'đang chuẩn bị')}
-              </Text>
-            </Card>
+            </HubBlock>
           ))}
         </Stack>
       ) : (
-        <Empty>Không có task nào đang chạy.</Empty>
+        <Empty>{s['overview.running.empty']}</Empty>
       )}
       <SimpleGrid cols={{ base: 1, lg: 2 }}>
-        <Card withBorder>
-          <Text fw={600} mb="xs">
-            Task gần đây
-          </Text>
+        <HubBlock title={s['overview.recent-tasks.title']}>
           {data.tasks.recent.length ? (
             <Table highlightOnHover>
               <Table.Tbody>
@@ -219,67 +173,36 @@ export default function Overview() {
               </Table.Tbody>
             </Table>
           ) : (
-            <Empty>Chưa có task.</Empty>
+            <Empty>{s['overview.recent-tasks.empty']}</Empty>
           )}
-        </Card>
-        <Card withBorder>
-          <Text fw={600} mb="xs">
-            Sự kiện mới
-          </Text>
+        </HubBlock>
+        <HubBlock title={s['overview.recent-events.title']}>
           {events.length ? (
             <Stack gap={4}>
-              {events.slice(0, 14).map((e, i) => (
-                <Text key={i} size="xs" className="mono" lineClamp={1}>
-                  <Text span c="dimmed">
-                    {new Date(e.at).toLocaleTimeString('vi-VN', { hour12: false })} {e.file}
-                  </Text>{' '}
-                  {short(describe(e.record), 160)}
-                </Text>
-              ))}
+              {events.slice(0, 14).map((e, i) => {
+                const taskId = typeof e.record.task_id === 'string' && e.record.task_id ? e.record.task_id : null
+                return (
+                  <Text
+                    key={i}
+                    size="xs"
+                    className="mono clickable"
+                    lineClamp={1}
+                    onClick={() => go(taskId ? `/tasks/${encodeURIComponent(taskId)}` : '/tasks')}
+                  >
+                    <Text span c="dimmed">
+                      {new Date(e.at).toLocaleTimeString('vi-VN', { hour12: false })} {e.file}
+                    </Text>{' '}
+                    {short(describe(e.record), 160)}
+                  </Text>
+                )
+              })}
             </Stack>
           ) : (
-            <Empty>Sự kiện mới sẽ hiện ở đây khi Kite làm việc.</Empty>
+            <Empty>{s['overview.recent-events.empty']}</Empty>
           )}
-        </Card>
+        </HubBlock>
       </SimpleGrid>
     </Page>
-  )
-}
-
-function WorkerCards({ workers }: { workers: WorkerRow[] }) {
-  if (!workers.length) return <Empty>Chưa có worker nào: thêm ở tab Provider.</Empty>
-  return (
-    <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} p={6}>
-      {workers.map((w) => {
-        const st = workerState(w)
-        return (
-          <Card key={w.id} withBorder className="clickable" onClick={() => go('/workers')}>
-            <Group justify="space-between">
-              <Group gap={8}>
-                <Dot color={st.color} />
-                <Text fw={600}>{w.id}</Text>
-              </Group>
-              <Badge variant="light" color={st.color}>
-                {st.label}
-              </Badge>
-            </Group>
-            <Text size="sm" c="dimmed" mt={4}>
-              {w.type} · {w.loaded_model ? `đang nạp ${w.loaded_model}` : w.models.slice(0, 3).join(', ')}
-            </Text>
-            {w.alive && w.busy ? (
-              <Text size="sm" mt={4}>
-                {w.running}/{w.slots ?? w.concurrency} việc đang chạy
-              </Text>
-            ) : null}
-            {w.start?.detail ? (
-              <Text size="xs" c="yellow" mt={4}>
-                {short(w.start.detail, 140)}
-              </Text>
-            ) : null}
-          </Card>
-        )
-      })}
-    </SimpleGrid>
   )
 }
 
@@ -289,15 +212,12 @@ function describe(record: Record<string, any>): string {
   return text || JSON.stringify(record)
 }
 
-function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
+function Stat({ label, value, color, onClick }: { label: string; value: string; color?: string; onClick?: () => void }) {
   return (
-    <Card withBorder p="md">
-      <Text size="xs" c="dimmed">
-        {label}
-      </Text>
+    <HubBlock title={label} onClick={onClick}>
       <Text fw={700} size="lg" c={color}>
         {value}
       </Text>
-    </Card>
+    </HubBlock>
   )
 }
