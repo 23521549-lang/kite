@@ -3,6 +3,7 @@ import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
   IconBook2,
+  IconBooks,
   IconChartBar,
   IconCpu,
   IconFolders,
@@ -22,6 +23,7 @@ import { Dot } from './components/common'
 import Bench from './pages/Bench'
 import Chat from './pages/Chat'
 import Journal from './pages/Journal'
+import Knowledge from './pages/Knowledge'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
 import Providers from './pages/Providers'
@@ -42,6 +44,7 @@ const TABS: Tab[] = [
   { path: 'providers', label: 'Provider', icon: IconPlugConnected, page: Providers },
   { path: 'workers', label: 'Worker', icon: IconCpu, page: Workers },
   { path: 'journal', label: 'Nhật ký', icon: IconBook2, page: Journal },
+  { path: 'knowledge', label: 'Kiến thức', icon: IconBooks, page: Knowledge },
   { path: 'bench', label: 'Bench', icon: IconChartBar, page: Bench },
   { path: 'settings', label: 'Cài đặt', icon: IconSettings, page: Settings },
 ]

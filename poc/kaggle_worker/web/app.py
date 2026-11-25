@@ -17,14 +17,16 @@ import asyncio
 from dataclasses import dataclass
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -32,6 +34,7 @@ from pydantic import BaseModel, Field
 from ..config import ConfigError, load_config
 from ..journal import FILES, Journal, read_jsonl, summarize
 from ..mcp_server import KiteToolError
+from . import knowledge as know
 from . import security as sec
 from . import workers as wk
 from .presets import PROVIDER_PRESETS
@@ -895,6 +898,118 @@ def create_app(ctx: WebContext) -> FastAPI:
         audit(session, "bench_start", body.label, True, {"suites": body.suites, "models": body.models})
         return report
 
+    # ------------------------------------------------------------------ knowledge
+    @app.post("/api/knowledge", status_code=201)
+    async def knowledge_upload(request: Request, file: UploadFile = File(...), scope: str = Form("global"),
+                               environment_id: str | None = Form(None), tags: str = Form("")):
+        session = auth(request)
+        if scope not in ("global", "environment"):
+            raise HTTPException(400, "scope phải là 'global' hoặc 'environment'")
+        if scope == "environment" and not (environment_id or "").strip():
+            raise HTTPException(400, "scope 'environment' cần có environment_id")
+        # Read at most one byte over the limit: a bigger file is refused without loading it all.
+        data = await file.read(know.MAX_FILE_BYTES + 1)
+        if len(data) > know.MAX_FILE_BYTES:
+            raise HTTPException(413, "file quá lớn; tối đa 20 MB")
+        tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+        root = ctx.state_dir / "knowledge"
+        before = {path.name for path in root.iterdir()} if root.is_dir() else set()
+        try:
+            # Conversion runs off the event loop and must finish within 120 seconds; a
+            # timeout leaves no half-saved document behind (see _drop_orphan_knowledge_dirs).
+            meta = await asyncio.wait_for(
+                asyncio.to_thread(know.ingest_document, ctx.state_dir, file.filename or "", data, scope,
+                                  environment_id, tag_list),
+                timeout=120)
+        except asyncio.TimeoutError:
+            _drop_orphan_knowledge_dirs(ctx.state_dir, before)
+            audit(session, "knowledge_upload", "", False, {"error": "timeout 120s",
+                                                           "filename": file.filename or ""})
+            raise HTTPException(504, "chuyển đổi quá lâu (quá 120 giây); thử lại sau")
+        except ValueError as exc:
+            audit(session, "knowledge_upload", "", False, {"error": str(exc)[:300]})
+            raise
+        audit(session, "knowledge_upload", meta["doc_id"], True,
+              {"filename": meta["filename"], "scope": scope, "status": meta["status"]})
+        if meta["status"] == "converting":
+            # MarkItDown found (near-)no text: a scan. Start the Docling job
+            # in the background; a failure to start it only logs — the doc
+            # stays "converting" and the owner can press reconvert by hand.
+            try:
+                from . import docling_job
+            except ImportError:
+                log.warning("knowledge upload: chưa có docling_job nên không chạy job Docling cho %s",
+                            meta["doc_id"])
+            else:
+                try:
+                    await asyncio.to_thread(docling_job.request_reconvert, ctx.state_dir,
+                                            meta["doc_id"], reason="auto-scan")
+                except ValueError as exc:
+                    log.warning("knowledge upload: không khởi động được job Docling cho %s: %s",
+                                meta["doc_id"], exc)
+        return meta
+
+    @app.get("/api/knowledge")
+    async def knowledge_list(request: Request, scope: str | None = None, environment_id: str | None = None,
+                             tag: str | None = None):
+        auth(request)
+        return {"documents": await asyncio.to_thread(know.list_documents, ctx.state_dir, scope,
+                                                     environment_id, tag)}
+
+    @app.get("/api/knowledge/{doc_id}")
+    async def knowledge_get(doc_id: str, request: Request):
+        auth(request)
+        try:
+            return await asyncio.to_thread(know.get_document, ctx.state_dir, doc_id)
+        except FileNotFoundError:
+            raise HTTPException(404, "không có tài liệu này")
+
+    @app.get("/api/knowledge/{doc_id}/markdown")
+    async def knowledge_markdown(doc_id: str, request: Request):
+        auth(request)
+        try:
+            text = await asyncio.to_thread(know.read_markdown, ctx.state_dir, doc_id)
+        except FileNotFoundError:
+            raise HTTPException(404, "không có tài liệu này")
+        return PlainTextResponse(text)
+
+    @app.delete("/api/knowledge/{doc_id}")
+    async def knowledge_delete(doc_id: str, request: Request):
+        session = auth(request)
+        try:
+            await asyncio.to_thread(know.delete_document, ctx.state_dir, doc_id)
+        except FileNotFoundError:
+            raise HTTPException(404, "không có tài liệu này")
+        audit(session, "knowledge_delete", doc_id)
+        return {"ok": True, "doc_id": doc_id}
+
+    @app.post("/api/knowledge/{doc_id}/reconvert")
+    async def knowledge_reconvert(doc_id: str, request: Request):
+        session = auth(request)
+        try:
+            meta = await asyncio.to_thread(know.get_document, ctx.state_dir, doc_id)
+        except FileNotFoundError:
+            raise HTTPException(404, "không có tài liệu này")
+        try:
+            # docling_job may not exist yet in a partial tree: the route must
+            # still import and answer. Without it, no job is started and the stored
+            # document is left exactly as it was.
+            from . import docling_job
+        except ImportError:
+            log.warning("knowledge reconvert: chưa có docling_job nên không chạy job Docling cho %s", doc_id)
+            return {"doc_id": doc_id, "status": "converting"}
+        # A live job is the only thing that blocks a reconvert: the meta status
+        # alone can be "converting" with no job running (ingest found a scan
+        # and the auto-trigger has not spawned yet, or a spawn failed).
+        if await asyncio.to_thread(docling_job.is_converting, ctx.state_dir, doc_id):
+            raise HTTPException(409, "tài liệu đang chuyển đổi; thử lại sau")
+        try:
+            report = await asyncio.to_thread(docling_job.request_reconvert, ctx.state_dir, doc_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        audit(session, "knowledge_reconvert", doc_id, True, {"status": report.get("status")})
+        return report
+
     # ------------------------------------------------------------------ settings and system
     @app.get("/api/settings")
     async def settings(request: Request):
@@ -1187,6 +1302,24 @@ def create_app(ctx: WebContext) -> FastAPI:
 
 
 # ---------------------------------------------------------------- helpers
+log = logging.getLogger(__name__)
+
+
+def _drop_orphan_knowledge_dirs(state_dir: Path, before: set[str]) -> None:
+    """Remove knowledge directories created by a timed-out upload that never wrote meta.json.
+
+    Best effort only: the conversion thread may still be running after the 120 s timeout
+    (``asyncio.wait_for`` cannot stop it), so a directory it finishes later would keep its
+    own meta.json and stay visible — it is a complete document then, not a half-saved one.
+    """
+    root = Path(state_dir) / "knowledge"
+    if not root.is_dir():
+        return
+    for path in root.iterdir():
+        if path.name not in before and path.is_dir() and not (path / "meta.json").is_file():
+            shutil.rmtree(path, ignore_errors=True)
+
+
 async def _json(request: Request) -> dict:
     try:
         body = await request.json()
