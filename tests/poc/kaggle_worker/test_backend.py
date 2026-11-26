@@ -11,6 +11,7 @@ import time
 import pytest
 from temporalio.exceptions import ApplicationError
 
+from loopback_port import free_loopback_port
 from poc.kaggle_worker import sandbox as sbx
 from poc.kaggle_worker.backend import SandboxActivityBackend, task_slug
 from poc.kaggle_worker.protocol import OwnerPolicy, ScheduledTask, WorkerProfile
@@ -210,7 +211,7 @@ def test_temporal_workflow_runs_a_task_end_to_end_in_the_sandbox(tmp_path):
                    activities.prepare_opencode_session, activities.run_opencode,
                    activities.interrupt_opencode, activities.checkpoint_and_stop,
                    activities.build_review_bundle, activities.release_route]
-        async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with await WorkflowEnvironment.start_time_skipping(port=free_loopback_port()) as env:
             async with Worker(env.client, task_queue="kite-sandbox-e2e",
                               workflows=[CodingTaskWorkflow], activities=methods):
                 outcome = await env.client.execute_workflow(
