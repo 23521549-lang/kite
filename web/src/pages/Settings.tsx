@@ -257,7 +257,7 @@ function Update() {
       ) : p.deploy === 'compose' ? (
         <StackUpdate plan={p} reload={plan.reload} onResult={setResult} />
       ) : p.error ? (
-        <Alert color="red">{p.error}</Alert>
+        <Alert color="red">{p.error_code === 'no_upstream' ? t('settings.update.no-upstream') : p.error}</Alert>
       ) : p.behind ? (
         <Stack gap="xs">
           <Text size="sm">{t('settings.update.behind', { count: p.behind })}</Text>
@@ -291,7 +291,11 @@ function Update() {
       ) : result ? (
         <Stack gap="xs" mt="sm">
           <Alert color={result.updated ? 'teal' : 'red'}>
-            {result.updated ? t('settings.update.updated', { tests: result.tests }) : result.error ?? result.note}
+            {result.updated
+              ? t('settings.update.updated', { tests: result.tests })
+              : result.error_code === 'no_upstream'
+                ? t('settings.update.no-upstream')
+                : (result.error ?? result.note)}
             {result.ui_error ? <Text size="sm" c="red">{t('settings.update.ui-error', { error: result.ui_error })}</Text> : null}
             {result.updated ? <Text size="sm">{t('settings.update.reload')}</Text> : null}
           </Alert>
@@ -403,7 +407,26 @@ function Cleanup() {
           }}
         />
       </Group>
-      {plan.data ? <JsonView data={plan.data} maxHeight={180} /> : <Loading error={plan.error} />}
+      {plan.data ? (
+        <Stack gap={4} mt="sm">
+          {plan.data.folders ? (
+            <>
+              <Text size="sm">{t('settings.cleanup.preview', { folders: plan.data.folders, size: plan.data.size })}</Text>
+              {(plan.data.biggest ?? []).map((b: string) => (
+                <Text key={b} size="xs" c="dimmed">
+                  <Code>{b}</Code>
+                </Text>
+              ))}
+            </>
+          ) : (
+            <Text size="sm" c="dimmed">
+              {t('settings.cleanup.empty')}
+            </Text>
+          )}
+        </Stack>
+      ) : (
+        <Loading error={plan.error} />
+      )}
     </Card>
   )
 }

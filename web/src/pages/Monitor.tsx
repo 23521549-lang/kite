@@ -37,6 +37,30 @@ type MonitorData = {
   alerts_active: number
 }
 
+/** This worker's quota detail, or null when the payload has none for it.
+ *  The payload has two shapes: /api/system/doctor maps worker → detail string,
+ *  while /api/monitor (ctx.quota) maps worker → {status, detail}. */
+function quotaDetailFor(quota: unknown, workerId: string): string | null {
+  if (quota == null || typeof quota !== 'object') return null
+  const v = (quota as Record<string, unknown>)[workerId]
+  if (typeof v === 'string') return v || null
+  if (v != null && typeof v === 'object') {
+    const detail = (v as Record<string, unknown>).detail
+    return typeof detail === 'string' && detail ? detail : null
+  }
+  return null
+}
+
+/** One readable "worker: detail" line per quota entry; [] when nothing is
+ *  readable — never raw JSON. */
+function quotaLines(quota: unknown): string[] {
+  if (quota == null || typeof quota !== 'object') return []
+  return Object.keys(quota as Record<string, unknown>).flatMap((id) => {
+    const detail = quotaDetailFor(quota, id)
+    return detail ? [`${id}: ${detail}`] : []
+  })
+}
+
 export default function Monitor() {
   const t = useT()
   const monitor = useLoad(() => get<MonitorData>('/api/monitor'), [], 30000)
@@ -82,6 +106,7 @@ function Doctor() {
   const t = useT()
   const doctor = useLoad(() => get<Record<string, any>>('/api/system/doctor'), [])
   const d = doctor.data
+  const quota = d ? quotaLines(d.gpu_quota) : []
   return (
     <Card withBorder>
       <Group justify="space-between" mb="xs">
@@ -107,9 +132,17 @@ function Doctor() {
               ) : null}
             </Alert>
           ))}
-          {d.gpu_quota ? (
-            <Text size="sm">{t('monitor.health.quota-gpu', { value: typeof d.gpu_quota === 'string' ? d.gpu_quota : JSON.stringify(d.gpu_quota) })}</Text>
-          ) : null}
+          {quota.length ? (
+            quota.map((line) => (
+              <Text key={line} size="sm">
+                {t('monitor.health.quota-gpu', { value: line })}
+              </Text>
+            ))
+          ) : (
+            <Text size="sm" c="dimmed">
+              {t('monitor.health.quota-gpu-unavailable')}
+            </Text>
+          )}
           <Text size="xs" c="dimmed">
             {t('monitor.health.ok-list', { list: (d.ok ?? []).join(', ') })}
           </Text>
@@ -122,7 +155,10 @@ function Doctor() {
 function WorkerCostCard({ worker: w, gpuQuota }: { worker: MonitorWorker; gpuQuota: unknown }) {
   const t = useT()
   const name = w.label || w.id
-  const quotaText = typeof gpuQuota === 'string' ? gpuQuota : gpuQuota == null ? null : JSON.stringify(gpuQuota)
+  // The quota payload is keyed by worker id; this card shows only its own
+  // worker's detail. No entry for this worker → no row (was: the whole dict
+  // JSON-stringified into every Kaggle card).
+  const quotaText = quotaDetailFor(gpuQuota, w.id)
   return (
     <Card withBorder>
       <Group justify="space-between" wrap="nowrap">

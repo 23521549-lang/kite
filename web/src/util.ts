@@ -1,6 +1,6 @@
 import { notifications } from '@mantine/notifications'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getLanguage } from './i18n'
+import { getLanguage, translate } from './i18n'
 
 export function notifyError(error: unknown, title?: string) {
   const message = error instanceof Error ? error.message : String(error)
@@ -77,10 +77,10 @@ export function ago(value: unknown): string {
   const d = toDate(value)
   if (!d) return '—'
   const s = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000))
-  if (s < 60) return `${s} giây trước`
-  if (s < 3600) return `${Math.round(s / 60)} phút trước`
-  if (s < 86400) return `${Math.round(s / 3600)} giờ trước`
-  return `${Math.round(s / 86400)} ngày trước`
+  if (s < 60) return translate('util.ago.seconds', { n: s })
+  if (s < 3600) return translate('util.ago.minutes', { n: Math.round(s / 60) })
+  if (s < 86400) return translate('util.ago.hours', { n: Math.round(s / 3600) })
+  return translate('util.ago.days', { n: Math.round(s / 86400) })
 }
 
 export function duration(seconds: number | null | undefined): string {

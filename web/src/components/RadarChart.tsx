@@ -75,8 +75,15 @@ export default function RadarChart({ axes, series, size = 320 }: RadarChartProps
         })}
         {axes.map((axis, i) => {
           const [x, y] = point(i, R + 26)
+          // A label centred on its axis point overflows the viewBox at the
+          // left/right edge (e.g. "Ổn định" on the left); clamp the centre so
+          // the whole label stays inside. Half-width is estimated from the
+          // label length at fontSize 12.
+          const halfW = Math.min(64, axis.length * 3.5 + 4)
+          const lx = Math.max(halfW + 2, Math.min(size - halfW - 2, x))
+          const ly = Math.max(8, Math.min(size - 8, y))
           return (
-            <text key={i} x={x} y={y} textAnchor="middle" dominantBaseline="middle" fontSize={12} fill="currentColor">
+            <text key={i} x={lx} y={ly} textAnchor="middle" dominantBaseline="middle" fontSize={12} fill="currentColor">
               {axis}
             </text>
           )

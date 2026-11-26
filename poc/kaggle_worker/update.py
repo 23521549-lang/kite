@@ -56,7 +56,8 @@ def plan(repo: Path = REPO, runner: Runner = subprocess.run) -> dict:
     head = git("rev-parse", "HEAD").stdout.strip()
     upstream = git("rev-parse", "@{u}")
     if upstream.returncode != 0:
-        return {"error": "nhánh hiện tại không theo dõi nhánh nào trên GitHub"}
+        return {"error": "nhánh hiện tại không theo dõi nhánh nào trên GitHub",
+                "error_code": "no_upstream"}
     target = upstream.stdout.strip()
     commits = [line for line in git("log", "--oneline", f"{head}..{target}").stdout.splitlines() if line]
     dirty = [line[3:] for line in git("status", "--porcelain", "--untracked-files=no").stdout.splitlines() if line]

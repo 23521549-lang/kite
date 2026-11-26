@@ -92,7 +92,11 @@ export default function Bench() {
                 {t('bench.new.network-note')}
               </Text>
             </Stack>
-          ) : null}
+          ) : (
+            <Text size="sm" c="dimmed">
+              {t('bench.new.network-empty')}
+            </Text>
+          )}
           <Group>
             <Button
               disabled={!label.trim() || !suites.length}

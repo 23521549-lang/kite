@@ -195,3 +195,13 @@ def test_autostart_checks_the_token_mode_and_reads_the_gpu_quota(tmp_path):
     assert named["token kaggle-han"].status == "warn" and "rotate-token" in named["token kaggle-han"].fix
     quota = named["quota GPU kaggle-han"]
     assert quota.status == "warn" and quota.detail == "còn 2.50h / 30.00h, làm mới 2026-11-28T00:00"
+
+
+def test_opencode_missing_names_the_command_instead_of_echoing_it(tmp_path):
+    raw, path = config_for(tmp_path)
+    fake, _ = probes(gateway={"workers": []})
+    fake.which = lambda name: None          # nothing on PATH: opencode is not installed
+    named = by_name(run_checks(validate_config(raw), path, fake))
+    assert named["opencode"].status == "fail"
+    assert named["opencode"].detail == "không tìm thấy lệnh opencode"
+    assert "cài OpenCode" in named["opencode"].fix
