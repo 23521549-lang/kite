@@ -52,7 +52,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     OPENCODE_DISABLE_AUTOUPDATE=1 \
-    PATH=/opt/kite/.venv/bin:$PATH \
+    PATH=/opt/kite/.venv/bin:/opt/node/bin:/opt/mcpiranha/bin:$PATH \
     KITE_DEPLOY=compose \
     KITE_CONFIG=/var/lib/kite/kite/config.yaml \
     HOME=/var/lib/kite/home
@@ -82,6 +82,19 @@ for extra in ("codemap", "kaggle", "browser", "web"):
 print("\n".join(wanted))
 PY
 RUN .venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+# Gói 5 (Connect) — scan-gate binaries, so the gate does not fail closed in
+# production for a missing binary:
+#  - Argus 0.2.1 (skill scanner companion + tools/list description scan) via
+#    node from the same nodejs-wheel pin as the ui stage; global install into
+#    /opt/node so its bin lands on PATH. npx is the fallback at runtime.
+#  - MCPiranha 0.4.1 in its OWN venv: it requires mcp>=2.3, which conflicts
+#    with Kite's mcp<2 pin, so it must never enter .venv (see connect.py).
+# skillshield comes from the `web` extra (zero runtime deps) — no extra step.
+RUN python3 -m venv /opt/node \
+ && /opt/node/bin/pip install --no-cache-dir "nodejs-wheel>=24,<25" \
+ && /opt/node/bin/npm install -g --prefix /opt/node "@kurtfrancisco/argus@0.2.1" \
+ && python3 -m venv /opt/mcpiranha \
+ && /opt/mcpiranha/bin/pip install --no-cache-dir "mcpiranha==0.4.1"
 # Harness² (evaluations) at the revision the bootstrap pins (HARNESS2_REVISION in bootstrap.py; a test keeps
 # the two equal), installed like on the development machine.
 ARG HARNESS2=1

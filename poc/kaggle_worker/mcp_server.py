@@ -1210,6 +1210,12 @@ def chat_files(config: KiteConfig, *, lead_model: str, kite_command: list[str], 
     opencode["model"] = f"kite/{lead_model}"
     opencode["small_model"] = f"kite/{lead_model}"
     opencode["mcp"] = {"kite": {"type": "local", "command": list(kite_command), "enabled": True}}
+    if state_dir is not None:
+        # Gói 5 — merge the owner's enabled, scan-passing MCP entries (helper lives in
+        # connect.py; the per-environment call site is Gói 2's, not this one).
+        from .connect import owner_mcp_entries
+
+        opencode["mcp"].update(owner_mcp_entries(None, Path(state_dir)))
     opencode["provider"]["kite"]["options"]["headers"] = {"X-Kite-Task": "chat"}    # gateway journal source
     # The lead agent runs on the host, outside the sandbox: no edits, no web, nothing outside the chat
     # folder, and every shell command waits for the user's approval (dangerous ones are refused).

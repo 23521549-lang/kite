@@ -45,6 +45,11 @@ web = [
     "psycopg[binary]>=3.2",
     "cryptography>=42",
     "httpx>=0.27",
+    # Gói 5 (Connect): skill scanner — skillshield 1.3.0, chosen by evaluation
+    # (4/4 on the research samples, offline, JSON + exit code). Zero runtime
+    # deps. Argus runs via npx (preinstalled in the image), MCPiranha in its
+    # own venv — neither goes in pyproject (mcp>=2.3 conflicts with Kite's mcp<2).
+    "skillshield==1.3.0",
 ]
 # Node.js for building the web page (web/ → web/dist, `kite web build`): node and npm inside Kite's venv,
 # so no system package is needed. Docker images build the page in their own Node stage instead.

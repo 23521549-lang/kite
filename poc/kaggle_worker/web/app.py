@@ -1163,6 +1163,13 @@ def create_app(ctx: WebContext) -> FastAPI:
         except RuntimeError:
             pass
 
+    # Gói 5 — Connect: the owner's MCP/skill/platform store (routes live in
+    # web/connect.py). Mounted BEFORE the /{path:path} catch-all below, or the
+    # catch-all would 404 every /api/connect/... route.
+    from . import connect as connect_api
+
+    app.include_router(connect_api.build_router(ctx, auth))
+
     # ------------------------------------------------------------------ the page
     @app.get("/kite-mini.js")
     async def mini_js():

@@ -12,6 +12,7 @@ import {
   IconMessages,
   IconMoon,
   IconPlugConnected,
+  IconPuzzle,
   IconSettings,
   IconSun,
   IconUser,
@@ -21,6 +22,7 @@ import { post, setUnauthorizedHandler } from './api'
 import { Dot } from './components/common'
 import Bench from './pages/Bench'
 import Chat from './pages/Chat'
+import Connect from './pages/Connect'
 import Journal from './pages/Journal'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
@@ -41,6 +43,7 @@ const TABS: Tab[] = [
   { path: 'repos', label: 'Repo', icon: IconFolders, page: Repos },
   { path: 'providers', label: 'Provider', icon: IconPlugConnected, page: Providers },
   { path: 'workers', label: 'Worker', icon: IconCpu, page: Workers },
+  { path: 'connect', label: 'Connect', icon: IconPuzzle, page: Connect },
   { path: 'journal', label: 'Nhật ký', icon: IconBook2, page: Journal },
   { path: 'bench', label: 'Bench', icon: IconChartBar, page: Bench },
   { path: 'settings', label: 'Cài đặt', icon: IconSettings, page: Settings },
