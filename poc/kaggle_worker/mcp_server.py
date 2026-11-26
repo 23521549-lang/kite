@@ -255,6 +255,23 @@ def check_network_request(*, state_dir, hosts, ack: bool, bench_root=None,
     return {"mode": "allowlist", "hosts": hosts}
 
 
+def _redact_confirmation_code(value: Any) -> Any:
+    """Replace a ``confirmation_code`` value with a marker, so a still-valid
+    one-time code never lands in journal/actions.jsonl in plaintext.
+
+    Only the key ``confirmation_code`` is redacted, wherever it sits (bound
+    arguments, or nested inside a dict/list under ``args``). An empty/missing
+    code is not a secret, so it stays as-is — the journal still shows whether
+    a code was given at all. Everything else passes through untouched, so the
+    journal keeps working for diagnosis."""
+    if isinstance(value, dict):
+        return {k: ("[redacted]" if k == "confirmation_code" and v else _redact_confirmation_code(v))
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_confirmation_code(v) for v in value]
+    return value
+
+
 class KiteOps:
     """What the MCP tools do. Temporal connection and gateway status are injectable for tests."""
 
@@ -301,7 +318,7 @@ class KiteOps:
         except TypeError:
             bound = {"args": list(args), **kwargs}
         started = self.clock()
-        record: dict[str, Any] = {"tool": tool, "args": short(dict(bound), 2000)}
+        record: dict[str, Any] = {"tool": tool, "args": short(_redact_confirmation_code(dict(bound)), 2000)}
         try:
             result = await method(*args, **kwargs)
         except Exception as exc:
