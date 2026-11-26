@@ -1,6 +1,6 @@
 // Shared state: who is signed in, and what Kite is doing now (the /api/ws events stream).
 import { create } from 'zustand'
-import { get, setCsrf, wsUrl, type Activity, type Me } from './api'
+import { ApiError, get, setCsrf, wsUrl, type Activity, type Me } from './api'
 
 export type LiveEvent = { file: string; record: Record<string, any>; at: number }
 
@@ -27,12 +27,50 @@ export const useKite = create<State>((set) => ({
   events: [],
 }))
 
+let loadMeRun = 0
+
 export async function loadMe(): Promise<void> {
-  try {
-    const me = await get<Me>('/api/auth/me')
-    useKite.getState().setMe(me)
-  } catch {
-    useKite.getState().setMe(null)
+  const run = ++loadMeRun
+  const me = await loadMeWithRetry(
+    () => get<Me>('/api/auth/me'),
+    (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  )
+  // A newer loadMe started while this one was retrying (e.g. the owner just
+  // logged in): its result is fresher, so this stale one must not overwrite it.
+  if (run !== loadMeRun) return
+  useKite.getState().setMe(me)
+}
+
+// How a transient failure is retried before the owner is sent back to the
+// login form: 3 retries, waiting 1s, then 2s, then 4s. A dropped tunnel or a
+// hiccuping server used to show the login form at once; now it shows the
+// loader a few seconds longer instead.
+export const LOAD_ME_RETRIES = 3
+export const LOAD_ME_BACKOFF_MS = [1000, 2000, 4000]
+
+function isRetryableLoadMeError(e: unknown): boolean {
+  // The fetch itself threw (TypeError on a dropped connection, tunnel down,
+  // DNS failure, ...): the server never answered, so this says nothing about
+  // the session. A 5xx is the server failing to answer. Anything else — 401
+  // included — is an answer about the session, not the network.
+  if (e instanceof ApiError) return e.status >= 500
+  return true
+}
+
+/** Pure retry loop behind loadMe: fetchMe until it succeeds, return null on a
+ * non-retryable error, or after `retries` retries on a retryable one. */
+export async function loadMeWithRetry(
+  fetchMe: () => Promise<Me>,
+  sleep: (ms: number) => Promise<void>,
+  retries: number = LOAD_ME_RETRIES,
+): Promise<Me | null> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchMe()
+    } catch (e) {
+      if (!isRetryableLoadMeError(e) || attempt >= retries) return null
+      await sleep(LOAD_ME_BACKOFF_MS[attempt] ?? 4000)
+    }
   }
 }
 
