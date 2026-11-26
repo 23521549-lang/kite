@@ -311,3 +311,42 @@ def test_import_tb_skips_existing_dest(tmp_path):
     assert first.ok, first.reason
     second = bi.import_terminal_bench(src, tmp_path / "out")
     assert second.skipped and "đã tồn tại" in second.reason
+
+
+# ---------------------------------------------------------------- instance input (F5: CLI + web share this)
+def test_parse_swebench_instances_single_object_array_and_jsonl():
+    one = json.dumps({"instance_id": "a__1", "repo": "x/y"})
+    assert bi.parse_swebench_instances(one) == [{"instance_id": "a__1", "repo": "x/y"}]
+    assert bi.parse_swebench_instances(f"[{one}, {json.dumps({'instance_id': 'b__2'})}]")[1]["instance_id"] == "b__2"
+    assert bi.parse_swebench_instances(one + "\n" + json.dumps({"instance_id": "b__2"}) + "\n")[0]["instance_id"] == "a__1"
+
+
+def test_parse_swebench_instances_rejects_bad_input():
+    with pytest.raises(ValueError, match="trống"):
+        bi.parse_swebench_instances("   ")
+    with pytest.raises(ValueError, match="lỗi cú pháp"):
+        bi.parse_swebench_instances("not json at all")
+    with pytest.raises(ValueError, match="JSON object"):
+        bi.parse_swebench_instances(json.dumps(["a", "b"]))
+
+
+def test_pick_swebench_instance_rules():
+    only = [{"instance_id": "a__1"}]
+    assert bi.pick_swebench_instance(only)["instance_id"] == "a__1"
+    two = only + [{"instance_id": "b__2"}]
+    assert bi.pick_swebench_instance(two, "b__2")["instance_id"] == "b__2"
+    with pytest.raises(ValueError, match="--instance-id"):
+        bi.pick_swebench_instance(two)
+    with pytest.raises(ValueError, match="không có instance 'zzz'"):
+        bi.pick_swebench_instance(two, "zzz")
+    with pytest.raises(ValueError, match="không có instance"):
+        bi.pick_swebench_instance([])
+
+
+def test_load_swebench_instance_file_picks_by_id(tmp_path):
+    path = tmp_path / "instances.jsonl"
+    path.write_text(json.dumps({"instance_id": "a__1"}) + "\n" + json.dumps({"instance_id": "b__2"}) + "\n",
+                    encoding="utf-8")
+    assert bi.load_swebench_instance_file(path, "b__2")["instance_id"] == "b__2"
+    with pytest.raises(ValueError, match="không đọc được file instance"):
+        bi.load_swebench_instance_file(tmp_path / "no-such.json")

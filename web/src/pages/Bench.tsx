@@ -1,6 +1,6 @@
-import { Alert, Badge, Button, Card, Checkbox, Code, Group, ScrollArea, Select, Stack, Table, Text, TextInput } from '@mantine/core'
+import { Alert, Badge, Button, Card, Checkbox, Code, Group, NumberInput, ScrollArea, Select, Stack, Table, Text, TextInput, Textarea } from '@mantine/core'
 import { useState } from 'react'
-import { get, post, type BenchHistory, type BenchLevel, type BenchRunRow, type WorkerRow } from '../api'
+import { get, importBenchTask, listBenchTasks, post, type BenchHistory, type BenchImportResult, type BenchLevel, type BenchRunRow, type WorkerRow } from '../api'
 import { Empty, Loading, Page } from '../components/common'
 import RadarChart from '../components/RadarChart'
 import { useLanguage, useT, type DictKey, type Language } from '../i18n'
@@ -37,6 +37,16 @@ export default function Bench() {
   ]
   const history = useLoad(() => get<BenchHistory>('/api/bench/history'), [], 30000)
   const workers = useLoad(() => get<{ workers: WorkerRow[] }>('/api/workers'), [])
+  const tasks = useLoad(() => listBenchTasks(), [], 30000)
+  const [importSource, setImportSource] = useState('terminal-bench')
+  const [importSrc, setImportSrc] = useState('')
+  const [importTaskId, setImportTaskId] = useState('')
+  const [importInstance, setImportInstance] = useState('')
+  const [importInstanceId, setImportInstanceId] = useState('')
+  const [importCheckout, setImportCheckout] = useState('')
+  const [importAgentTimeout, setImportAgentTimeout] = useState<number>(360)
+  const [importTestTimeout, setImportTestTimeout] = useState<number>(60)
+  const [importResult, setImportResult] = useState<BenchImportResult | null>(null)
   const [label, setLabel] = useState('')
   const [suites, setSuites] = useState<string[]>(['code'])
   const [models, setModels] = useState('')
@@ -124,6 +134,170 @@ export default function Bench() {
             </Alert>
           ) : null}
         </Stack>
+      </Card>
+      <Card withBorder>
+        <Text fw={600} mb="xs">
+          {t('bench.import.title')}
+        </Text>
+        <Stack gap="xs">
+          <Select
+            label={t('bench.import.source')}
+            data={[
+              { value: 'terminal-bench', label: t('bench.import.source-tb') },
+              { value: 'swe-bench', label: t('bench.import.source-swe') },
+            ]}
+            value={importSource}
+            onChange={(v) => setImportSource(v ?? 'terminal-bench')}
+          />
+          {importSource === 'terminal-bench' ? (
+            <Group grow align="flex-start">
+              <TextInput
+                label={t('bench.import.src-label')}
+                placeholder={t('bench.import.src-placeholder')}
+                value={importSrc}
+                onChange={(e) => setImportSrc(e.currentTarget.value)}
+              />
+              <TextInput
+                label={t('bench.import.task-id-label')}
+                value={importTaskId}
+                onChange={(e) => setImportTaskId(e.currentTarget.value)}
+              />
+            </Group>
+          ) : (
+            <Stack gap="xs">
+              <Textarea
+                label={t('bench.import.instance-label')}
+                placeholder={t('bench.import.instance-placeholder')}
+                value={importInstance}
+                onChange={(e) => setImportInstance(e.currentTarget.value)}
+                autosize
+                minRows={3}
+              />
+              <Group grow align="flex-start">
+                <TextInput
+                  label={t('bench.import.repo-checkout-label')}
+                  placeholder={t('bench.import.repo-checkout-placeholder')}
+                  value={importCheckout}
+                  onChange={(e) => setImportCheckout(e.currentTarget.value)}
+                />
+                <TextInput
+                  label={t('bench.import.instance-id-label')}
+                  value={importInstanceId}
+                  onChange={(e) => setImportInstanceId(e.currentTarget.value)}
+                />
+              </Group>
+              <Group grow align="flex-start">
+                <NumberInput
+                  label={t('bench.import.agent-timeout-label')}
+                  value={importAgentTimeout}
+                  onChange={(v) => setImportAgentTimeout(Number(v) || 360)}
+                  min={1}
+                />
+                <NumberInput
+                  label={t('bench.import.test-timeout-label')}
+                  value={importTestTimeout}
+                  onChange={(v) => setImportTestTimeout(Number(v) || 60)}
+                  min={1}
+                />
+              </Group>
+            </Stack>
+          )}
+          <Group>
+            <Button
+              disabled={importSource === 'terminal-bench' ? !importSrc.trim() : !importInstance.trim() || !importCheckout.trim()}
+              onClick={async () => {
+                const res = await attempt(() =>
+                  importBenchTask({
+                    source: importSource,
+                    src: importSrc.trim(),
+                    task_id: importTaskId.trim(),
+                    instance_json: importInstance,
+                    instance_id: importInstanceId.trim(),
+                    repo_checkout: importCheckout.trim(),
+                    agent_timeout: importAgentTimeout,
+                    test_timeout: importTestTimeout,
+                  }),
+                )
+                if (res) {
+                  setImportResult(res)
+                  if (res.ok) tasks.reload()
+                }
+              }}
+            >
+              {t('bench.import.run')}
+            </Button>
+          </Group>
+          {importResult ? (
+            <Alert color={importResult.ok ? 'teal' : 'red'}>
+              <Text size="sm">
+                {importResult.ok
+                  ? t('bench.import.ok', { id: importResult.task_id ?? '' })
+                  : t('bench.import.skipped', { reason: importResult.reason ?? '' })}
+              </Text>
+              {importResult.warnings.length ? (
+                <Text size="sm" mt="xs">
+                  {t('bench.import.warnings')}: {importResult.warnings.join('; ')}
+                </Text>
+              ) : null}
+            </Alert>
+          ) : null}
+        </Stack>
+      </Card>
+      <Card withBorder>
+        <Group justify="space-between" mb="xs">
+          <Text fw={600}>{t('bench.tasks.title')}</Text>
+          <Button size="xs" variant="subtle" onClick={tasks.reload}>
+            {t('bench.tasks.refresh')}
+          </Button>
+        </Group>
+        {!tasks.data ? (
+          <Loading error={tasks.error} />
+        ) : tasks.data.tasks.length ? (
+          <ScrollArea type="auto">
+            <Table striped highlightOnHover>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>{t('bench.tasks.id')}</Table.Th>
+                  <Table.Th>{t('bench.tasks.kind')}</Table.Th>
+                  <Table.Th>{t('bench.tasks.source')}</Table.Th>
+                  <Table.Th>{t('bench.tasks.axes')}</Table.Th>
+                  <Table.Th>{t('bench.tasks.difficulty')}</Table.Th>
+                  <Table.Th>{t('bench.tasks.status')}</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {tasks.data.tasks.map((row) => (
+                  <Table.Tr key={row.id}>
+                    <Table.Td>
+                      <Text size="sm">{row.id}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm">{row.kind ?? '—'}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm">{row.source}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm">{row.axes.length ? row.axes.join(', ') : '—'}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm">{row.difficulty != null ? String(row.difficulty) : '—'}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm" c={row.ok ? undefined : 'red'}>
+                        {row.ok
+                          ? t('bench.tasks.status-ok')
+                          : `${t('bench.tasks.status-invalid')}: ${row.errors.map((e) => e.message).join('; ')}`}
+                      </Text>
+                    </Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          </ScrollArea>
+        ) : (
+          <Empty>{t('bench.tasks.empty')}</Empty>
+        )}
       </Card>
       {official ? (
         <Card withBorder>

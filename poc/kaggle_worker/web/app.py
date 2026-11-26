@@ -304,6 +304,23 @@ class BenchIn(BaseModel):
     network_hosts: list[str] = []
 
 
+class BenchImportIn(BaseModel):
+    """One bench import, from the web UI. The same importers the CLI calls
+    (``bench_importers``), so the UI and ``kite bench import`` can never
+    disagree about what an import produces. ``src`` / ``repo_checkout`` are
+    paths on the Kite machine (like repo registration by path); the
+    SWE-bench instance itself arrives as pasted JSON text."""
+
+    source: str = ""
+    src: str = ""
+    task_id: str = ""
+    instance_json: str = ""
+    instance_id: str = ""
+    repo_checkout: str = ""
+    agent_timeout: float = 360.0
+    test_timeout: float = 60.0
+
+
 class RestartIn(BaseModel):
     services: list[str] = ["kite-gateway"]
     force: bool = False
@@ -1431,6 +1448,18 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
                                                          "network_ack": body.network_ack})
         return report
 
+    @app.get("/api/bench/tasks")
+    async def bench_tasks(request: Request):
+        auth(request)
+        return await asyncio.to_thread(_bench_tasks, ctx.state_dir)
+
+    @app.post("/api/bench/import")
+    async def bench_import(body: BenchImportIn, request: Request):
+        session = auth(request)
+        result = await asyncio.to_thread(_bench_import, ctx.state_dir / "bench-tasks", body)
+        audit(session, "bench_import", body.source, result["ok"], {"task_id": result["task_id"]})
+        return result
+
     # ------------------------------------------------------------------ knowledge
     @app.post("/api/knowledge", status_code=201)
     async def knowledge_upload(request: Request, file: UploadFile = File(...), scope: str = Form("global"),
@@ -1948,6 +1977,83 @@ def _auto_click(ctx: WebContext) -> Callable[[str], bool]:
     from ..browser import auto_click_on
 
     return lambda worker: auto_click_on(ctx.state_dir, worker)
+
+
+def _bench_import(dest_root: Path, body: BenchImportIn) -> dict:
+    """One shared import path for the web UI (the CLI calls the same
+    importers directly): validate the request, run the importer, return
+    its result as plain data. A skip is a normal outcome (``ok: false``
+    + ``reason``), not an HTTP error — the UI shows the reason. Only a
+    malformed request (unknown source, missing input, bad JSON, non-positive
+    timeout, repo checkout not a directory) is a 400."""
+    from .. import bench_importers as bi
+
+    source = (body.source or "").strip()
+    if source not in (bi.TB_SOURCE, bi.SWE_SOURCE):
+        raise HTTPException(400, "source phải là 'terminal-bench' hoặc 'swe-bench'")
+    if body.agent_timeout <= 0 or body.test_timeout <= 0:
+        raise HTTPException(400, "timeout phải là số giây dương")
+    if source == bi.TB_SOURCE:
+        if not (body.src or "").strip():
+            raise HTTPException(400, "import Terminal-Bench cần đường dẫn thư mục bài (src)")
+        result = bi.import_terminal_bench(Path(body.src).expanduser(), dest_root,
+                                          task_id=(body.task_id or "").strip() or None)
+    else:
+        if not (body.instance_json or "").strip():
+            raise HTTPException(400, "import SWE-bench cần nội dung JSON của instance (instance_json)")
+        if not (body.repo_checkout or "").strip():
+            raise HTTPException(400, "import SWE-bench cần đường dẫn checkout của repo (repo_checkout)")
+        checkout = Path(body.repo_checkout).expanduser()
+        if not checkout.is_dir():
+            raise HTTPException(400, f"repo_checkout {checkout} không phải thư mục")
+        try:
+            instance = bi.pick_swebench_instance(
+                bi.parse_swebench_instances(body.instance_json),
+                (body.instance_id or "").strip() or None)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        result = bi.import_swebench(
+            instance, dest_root, timeouts={"agent": body.agent_timeout, "test": body.test_timeout},
+            repo_checkout=checkout)
+    return {"ok": result.ok, "task_id": result.task_id,
+            "dest": str(result.dest) if result.dest else None, "source": result.source,
+            "skipped": result.skipped, "reason": result.reason, "warnings": list(result.warnings)}
+
+
+def _bench_tasks(state_dir: Path) -> dict:
+    """Every task folder under ``<state>/bench-tasks``, valid or not (an
+    invalid folder is listed with its errors, not hidden — the owner sees
+    a broken import instead of wondering where it went)."""
+    import yaml
+
+    from .. import bench_loader
+
+    root = Path(state_dir) / "bench-tasks"
+    rows: list[dict] = []
+    for loaded in bench_loader.discover_tasks(root):
+        task = loaded.task
+        source = "kite"
+        if task is not None:
+            try:
+                raw = yaml.safe_load((loaded.task_dir / "task.yaml").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raw = None
+            if isinstance(raw, dict):
+                if "terminal_bench" in raw:
+                    source = "terminal-bench"
+                elif "swe_bench" in raw:
+                    source = "swe-bench"
+        rows.append({
+            "id": task.id if task is not None else loaded.task_dir.name,
+            "kind": task.kind if task is not None else None,
+            "language": task.language if task is not None else None,
+            "axes": list(task.axes) if task is not None else [],
+            "difficulty": task.difficulty if task is not None else None,
+            "source": source,
+            "ok": loaded.ok,
+            "errors": [e.to_dict() for e in loaded.errors],
+        })
+    return {"tasks": rows}
 
 
 def _bench_history_extra(state_dir: Path) -> tuple[dict, dict, list[str]]:

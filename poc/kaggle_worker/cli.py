@@ -424,6 +424,26 @@ def _parser() -> argparse.ArgumentParser:
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
     bench_apply.add_argument("--write", action="store_true", help="write routing.model_skill / chat_only "
                                                                   "into the config (a backup is kept)")
+    bench_import = bench_commands.add_parser("import", help="import an external bench task into <state>/bench-tasks "
+                                                           "(validated against bench-standard v1)")
+    import_commands = bench_import.add_subparsers(dest="import_source", required=True)
+    tb_import = import_commands.add_parser("terminal-bench", help="import one Terminal-Bench task folder")
+    tb_import.add_argument("src", type=Path, help="Terminal-Bench task folder (task.yaml + Dockerfile + tests/)")
+    tb_import.add_argument("--dest-root", type=Path, help="bench task root (default: <state>/bench-tasks)")
+    tb_import.add_argument("--task-id", default=None, help="Kite task id (default: the source folder name)")
+    swe_import = import_commands.add_parser("swe-bench", help="import one SWE-bench instance")
+    swe_import.add_argument("instance_file", type=Path,
+                            help="instance JSON file: one object, a JSON array, or JSONL")
+    swe_import.add_argument("--repo-checkout", type=Path, required=True,
+                            help="local checkout of the instance's repo (to materialise the test patch)")
+    swe_import.add_argument("--instance-id", default=None,
+                            help="pick this instance when the file holds several")
+    swe_import.add_argument("--agent-timeout", type=float, default=360.0,
+                            help="agent timeout seconds (default: 360; SWE-bench carries no timeouts, "
+                                 "the owner decides at import time)")
+    swe_import.add_argument("--test-timeout", type=float, default=60.0,
+                            help="test timeout seconds (default: 60)")
+    swe_import.add_argument("--dest-root", type=Path, help="bench task root (default: <state>/bench-tasks)")
     web = commands.add_parser("web", help="Kite's web page: one owner account with 2FA, an API for every tab")
     web_commands = web.add_subparsers(dest="web_command", required=True)
     web_admin = web_commands.add_parser(
@@ -1994,6 +2014,30 @@ def _bench_command(args: argparse.Namespace) -> int:
         else:
             print(text if rows else f"Chưa có lần đo nào trong {', '.join(str(r) for r in roots)}.")
         return 0
+    if args.bench_command == "import":
+        # No operator config or gateway needed: the importers validate the
+        # produced task against bench-standard v1 themselves, and a skip
+        # (source not expressible in v1) is a reported outcome, not a crash.
+        from . import bench_importers as bi
+
+        dest_root = args.dest_root.expanduser() if args.dest_root else args.config.parent / "bench-tasks"
+        if args.import_source == "terminal-bench":
+            result = bi.import_terminal_bench(args.src.expanduser(), dest_root, task_id=args.task_id)
+        else:
+            for name, value in (("agent-timeout", args.agent_timeout), ("test-timeout", args.test_timeout)):
+                if value <= 0:
+                    raise ConfigError(f"--{name} phải là số giây dương")
+            checkout = args.repo_checkout.expanduser()
+            if not checkout.is_dir():
+                raise ConfigError(f"--repo-checkout {checkout} không phải thư mục")
+            instance = bi.load_swebench_instance_file(args.instance_file.expanduser(), args.instance_id)
+            result = bi.import_swebench(instance, dest_root,
+                                        timeouts={"agent": args.agent_timeout, "test": args.test_timeout},
+                                        repo_checkout=checkout)
+        _emit({"ok": result.ok, "task_id": result.task_id,
+               "dest": str(result.dest) if result.dest else None, "source": result.source,
+               "skipped": result.skipped, "reason": result.reason, "warnings": list(result.warnings)})
+        return 0 if result.ok else 1
     config = _load_operator_config(args)
     if args.bench_command == "apply":
         import yaml
