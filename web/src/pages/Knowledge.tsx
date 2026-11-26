@@ -3,11 +3,14 @@ import { IconTrash, IconUpload } from '@tabler/icons-react'
 import { useEffect, useState } from 'react'
 import {
   deleteKnowledge,
+  envDisplayName,
   getKnowledge,
   getKnowledgeMarkdown,
+  listEnvironments,
   listKnowledge,
   reconvertKnowledge,
   uploadKnowledge,
+  type EnvironmentRow,
   type KnowledgeDoc,
 } from '../api'
 import { ConfirmButton, Empty, KeyValue, Loading, Markdown, Page } from '../components/common'
@@ -121,6 +124,10 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
   const [environmentId, setEnvironmentId] = useState('')
   const [tags, setTags] = useState('')
   const [uploading, setUploading] = useState(false)
+  // Environment list for the scope picker (Gói 2 contract). A failed load
+  // degrades to an empty list — the picker then has nothing to choose and
+  // the validation below still blocks an environment-scoped upload.
+  const { data: envs } = useLoad(() => listEnvironments().catch(() => [] as EnvironmentRow[]), [])
 
   const upload = async () => {
     if (!file) {
@@ -184,12 +191,13 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
           onChange={(v) => setScope(v ?? 'global')}
         />
         {scope === 'environment' ? (
-          <TextInput
+          <Select
             label={t('knowledge.upload.env-id-label')}
-            placeholder={t('knowledge.upload.env-id-placeholder')}
-            description={t('knowledge.upload.env-id-hint')}
-            value={environmentId}
-            onChange={(e) => setEnvironmentId(e.currentTarget.value)}
+            placeholder={t('knowledge.upload.env-select-placeholder')}
+            data={(envs ?? []).map((e) => ({ value: e.id, label: envDisplayName(e) }))}
+            value={environmentId || null}
+            onChange={(v) => setEnvironmentId(v ?? '')}
+            searchable
           />
         ) : null}
         <TextInput label={t('knowledge.upload.tags-label')} placeholder={t('knowledge.upload.tags-placeholder')} value={tags} onChange={(e) => setTags(e.currentTarget.value)} />
