@@ -357,3 +357,42 @@ export async function rerunTask(taskId: string): Promise<{ task_id: string }> {
 export async function dismissApplyError(taskId: string): Promise<unknown> {
   return post(`/api/tasks/${encodeURIComponent(taskId)}/apply-error/dismiss`)
 }
+
+// ---------------------------------------------------------------- Không gian làm việc (Gói 4)
+export type NeedsDecisionItem = {
+  kind: 'patch_awaiting' | 'lesson_pending' | 'quota_near' | 'task_failed' | string
+  title: string
+  detail: string
+  task_id: string | null
+  link: string
+  created_at: number
+  key: string
+}
+
+export type ScheduleRow = {
+  id: string
+  plan_path: string
+  kind: 'once' | 'daily' | 'weekly' | string
+  run_at: string
+  weekdays?: number[] | null
+  next_run?: number | null
+  last_run?: number | null
+  last_run_task_ids?: string[]
+  status: 'enabled' | 'disabled' | 'expired' | string
+  created_at?: number
+}
+
+export type SecretaryReport = { date: string; title: string }
+
+export const getWorkspaceQueue = () => get<{ items: NeedsDecisionItem[] }>('/api/workspace/queue')
+export const getNeedsDecision = () => get<{ items: NeedsDecisionItem[] }>('/api/workspace/needs-decision')
+
+export const getSchedules = () => get<{ schedules: ScheduleRow[] }>('/api/schedules')
+export const createSchedule = (body: Record<string, unknown>) => post<ScheduleRow>('/api/schedules', body)
+export const updateSchedule = (id: string, body: Record<string, unknown>) =>
+  patch<ScheduleRow>(`/api/schedules/${encodeURIComponent(id)}`, body)
+export const deleteSchedule = (id: string) => del(`/api/schedules/${encodeURIComponent(id)}`)
+
+export const getSecretaryReports = () => get<{ reports: SecretaryReport[] }>('/api/secretary/reports')
+export const getSecretaryReport = (date: string) =>
+  get<{ date: string; markdown: string }>(`/api/secretary/reports/${encodeURIComponent(date)}`)

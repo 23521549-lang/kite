@@ -2,6 +2,7 @@ import { ActionIcon, AppShell, Burger, Center, Group, Loader, Menu, NavLink, Seg
 import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
+  IconBriefcase,
   IconChartBar,
   IconCpu,
   IconFolders,
@@ -27,6 +28,7 @@ import Repos from './pages/Repos'
 import Settings from './pages/Settings'
 import Tasks from './pages/Tasks'
 import Workers from './pages/Workers'
+import Workspace from './pages/Workspace'
 import { segments, useRoute } from './router'
 import { loadMe, startLive, stopLive, useKite } from './store'
 
@@ -57,6 +59,7 @@ function Shell() {
   const { language, setLanguage } = useLanguage()
   const TABS: Tab[] = [
     { path: '', label: t('nav.overview'), icon: IconLayoutDashboard, page: Overview },
+    { path: 'workspace', label: t('nav.workspace'), icon: IconBriefcase, page: Workspace },
     { path: 'chat', label: t('nav.chat'), icon: IconMessages, page: Chat },
     { path: 'tasks', label: t('nav.tasks'), icon: IconListCheck, page: Tasks },
     { path: 'environments', label: t('nav.environments'), icon: IconFolders, page: Environments },

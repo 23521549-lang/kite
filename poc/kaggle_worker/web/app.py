@@ -14,6 +14,7 @@ answers carry a strict Content-Security-Policy; there is no /docs. Sensitive act
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hmac
 import json
@@ -342,8 +343,37 @@ def same_origin(request, origin: str | None) -> bool:
     return bool(parts.netloc) and parts.netloc.lower() == (request.headers.get("host") or "").lower()
 
 
-def create_app(ctx: WebContext) -> FastAPI:
-    app = FastAPI(title="Kite", docs_url=None, redoc_url=None, openapi_url=None)
+def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
+    """Build the web app.
+
+    ``start_scheduler`` is True only for the real server (``cli.py`` ``_web_serve``): the
+    Gói 4 scheduler engine (plan schedules + 00:00 secretary report + 5-minute
+    needs-decision scan) runs as a background task of the web process. Tests and other
+    callers get no engine.
+    """
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        task = None
+        if start_scheduler:
+            try:
+                from .scheduler_wiring import start_scheduler_engine
+
+                task = start_scheduler_engine(ctx)
+            except Exception as exc:
+                print(f"kite web: không khởi động được động cơ hẹn giờ ({exc}); lịch sẽ không chạy",
+                      file=sys.stderr, flush=True)
+        try:
+            yield
+        finally:
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    app = FastAPI(title="Kite", docs_url=None, redoc_url=None, openapi_url=None, lifespan=_lifespan)
 
     @app.middleware("http")
     async def headers(request: Request, call_next):
@@ -1604,6 +1634,17 @@ def create_app(ctx: WebContext) -> FastAPI:
             await websocket.close()
         except RuntimeError:
             pass
+
+    # ------------------------------------------------------------------ Gói 4: Workspace
+    # Mounted before the catch-all page route below, like every /api/* route: the page
+    # handler 404s anything under api/ it does not know, so these must come first.
+    from .schedules_api import create_router as create_schedules_router
+    from .secretary_api import create_router as create_secretary_router
+    from .workspace_api import create_router as create_workspace_router
+
+    app.include_router(create_schedules_router(ctx, auth, audit))
+    app.include_router(create_secretary_router(ctx, auth, audit))
+    app.include_router(create_workspace_router(ctx, auth, audit))
 
     # ------------------------------------------------------------------ the page
     @app.get("/kite-mini.js")
