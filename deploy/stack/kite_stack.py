@@ -11,7 +11,10 @@ Releases. CI pushes ghcr.io/<owner>/kite and kite-sandbox for every green commit
 copies the compose files out of the new image into ``releases/<id>`` (so compose files and image always go
 together), pins both images by digest there (images.env), points ``current`` at it and starts it. If a
 Kite service is not healthy within the deadline, ``current`` goes back to the previous release, which
-starts again; that digest is not tried again automatically. Nothing is updated while a task, a bench run
+starts again; that digest is not tried again automatically. A second timer, ``kite-stack-watchdog``
+(every 5 minutes), restarts any service confirmed unhealthy on two ticks in a row, at most 3 restarts
+of one service per hour — Docker's restart policy cannot fix a container that runs but stays unhealthy,
+so the watchdog does. Nothing is updated while a task, a bench run
 or a chat answer is in progress (``kite busy``), unless asked with --force. When stack.env carries
 ``KITE_VERIFY_IMAGE_SIGNATURES=1`` (stamped in at install), both new images must first prove the
 cosign signature of this repository's CI (keyless, GitHub OIDC): an unsigned or wrongly signed image
@@ -48,11 +51,18 @@ LIB = Path("/usr/local/lib/kite-stack")
 BIN = Path("/usr/local/bin/kite-stack")
 UNIT_DIR = Path("/etc/systemd/system")
 UNITS = ("kite-stack-update.service", "kite-stack-update.timer",
-         "kite-stack-requests.service", "kite-stack-requests.path")
+         "kite-stack-requests.service", "kite-stack-requests.path",
+         "kite-stack-watchdog.service", "kite-stack-watchdog.timer")
 DEFAULT_IMAGE = "ghcr.io/23521549-lang/kite"
 KITE_SERVICES = ("gateway", "worker", "web", "opencode")
 INFRA_SERVICES = ("postgres", "temporal", "caddy")
 ONE_SHOT = ("temporal-setup", "web-db")
+WATCHDOG_SERVICES = (*KITE_SERVICES, *INFRA_SERVICES)
+WATCHDOG_INTERVAL = 300.0        # the timer fires every 5 minutes
+WATCHDOG_CONFIRM_TICKS = 2       # bad on 2 ticks in a row before a restart
+WATCHDOG_COOLDOWN = 900.0        # 15 minutes between restarts of the same service
+WATCHDOG_MAX_RESTARTS = 3        # at most 3 restarts of one service...
+WATCHDOG_WINDOW = 3600.0         # ...in a rolling hour
 UID = 1000
 LOCAL_RELEASE = "kite-release"           # local tags that keep the images of kept releases
 SANDBOX_TAG = "kite-sandbox:latest"      # the name Kite's config uses for the task sandbox
@@ -128,6 +138,80 @@ def generated_secrets(env: dict[str, str]) -> dict[str, str]:
     are made here. Temporal's side gets one password per consumer (the server itself, its
     visibility store, the schema setup) plus the web database's, instead of one shared password."""
     return {key: env.get(key) or secrets.token_urlsafe(32) for key in SECRET_KEYS}
+
+
+def watchdog_classify(state: dict) -> str:
+    """One service, one snapshot from services_state(): "good", "bad" or "unknown".
+
+    The rule mirrors wait_healthy's: running and healthy (or no healthcheck) is good; running but
+    unhealthy — or stuck starting, exited, dead, or restarting — is bad. Anything else (created,
+    paused, missing) is unknown: the updater or an operator owns it, and the watchdog must not
+    restart what it cannot see clearly. Docker's own restart policy owns crash loops; the watchdog
+    owns the two states that policy cannot fix: running-but-unhealthy, and exited-and-not-restarted.
+    """
+    st, health = state.get("state", ""), state.get("health", "")
+    if st == "running" and health in ("", "healthy"):
+        return "good"
+    if (st == "running" and health in ("unhealthy", "starting")) or st in ("exited", "dead", "restarting"):
+        return "bad"
+    return "unknown"
+
+
+def watchdog_decide(states: dict[str, dict], history: dict[str, dict], now: float, *,
+                    confirm_ticks: int = WATCHDOG_CONFIRM_TICKS,
+                    cooldown: float = WATCHDOG_COOLDOWN,
+                    max_restarts: int = WATCHDOG_MAX_RESTARTS,
+                    window: float = WATCHDOG_WINDOW) -> tuple[list[dict], dict[str, dict]]:
+    """What the watchdog does this tick, and the history to keep. Pure: no Docker, no restarts.
+
+    history is {"services": {name: {"bad_ticks": int, "last_restart": float | None,
+    "restarts": [float, ...], "alerted": bool}}}. A service restarts only after being bad on
+    confirm_ticks ticks in a row, at least cooldown seconds after its last restart, and fewer than
+    max_restarts successful restarts inside the rolling window. Anything else bad is watched (first
+    ticks) or suppressed (limits hit): suppressed ticks also raise an alert, once per episode.
+    A good tick resets the bad counter and the alert flag; an unknown tick changes nothing.
+    Only successful restarts count towards the limit — a failed restart is retried next tick.
+    Returns (actions, new_history); actions are {"service", "action", "reason"} with action in
+    ("restart", "suppressed", "watch"). The caller records a restart in the history only after
+    it really happened (see Stack.watchdog).
+    """
+    services = history.get("services", {})
+    new_services: dict[str, dict] = {}
+    actions: list[dict] = []
+    for name in WATCHDOG_SERVICES:
+        entry = dict(services.get(name, {}))
+        entry.setdefault("bad_ticks", 0)
+        entry.setdefault("last_restart", None)
+        entry.setdefault("restarts", [])
+        entry.setdefault("alerted", False)
+        entry["restarts"] = [t for t in entry["restarts"] if now - t < window]
+        new_services[name] = entry
+        kind = watchdog_classify(states.get(name, {}))
+        if kind == "good":
+            entry["bad_ticks"] = 0
+            entry["alerted"] = False
+            continue
+        if kind == "unknown":
+            continue
+        entry["bad_ticks"] = int(entry["bad_ticks"]) + 1
+        if entry["bad_ticks"] < confirm_ticks:
+            actions.append({"service": name, "action": "watch",
+                            "reason": f"xấu {entry['bad_ticks']}/{confirm_ticks} lần kiểm liên tiếp"})
+            continue
+        last = entry["last_restart"]
+        if last is not None and now - float(last) < cooldown:
+            actions.append({"service": name, "action": "suppressed",
+                            "reason": f"mới khởi động lại {int(now - float(last))}s trước, "
+                                      f"chờ đủ {int(cooldown // 60)} phút"})
+            continue
+        if len(entry["restarts"]) >= max_restarts:
+            actions.append({"service": name, "action": "suppressed",
+                            "reason": f"đã khởi động lại {len(entry['restarts'])} lần trong "
+                                      f"{int(window // 60)} phút qua (tối đa {max_restarts})"})
+            continue
+        actions.append({"service": name, "action": "restart",
+                        "reason": f"xấu {entry['bad_ticks']} lần kiểm liên tiếp"})
+    return actions, {**history, "services": new_services}
 
 
 class Stack:
@@ -401,6 +485,155 @@ class Stack:
             logs = (done.stdout or "")[-1500:]
         return False, "; ".join(problems) + (f"\n{logs}" if logs else "")
 
+    # ------------------------------------------------------------------ watchdog
+    def watchdog_history(self) -> dict:
+        """The watchdog's memory: per-service bad ticks, restarts and alert flags. Only timestamps
+        and service names — no secrets — so a corrupt file is simply forgotten, not fatal."""
+        try:
+            data = json.loads((self.dir / "watchdog.json").read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _watchdog_save(self, history: dict, now: float) -> None:
+        history["updated"] = now
+        atomic_write(self.dir / "watchdog.json", json.dumps(history, indent=2), 0o644)
+
+    def watchdog_notify(self, title: str, message: str, *, priority: int = 3,
+                        opener: Callable = urllib.request.urlopen) -> bool:
+        """Push one alert through the owner's ntfy topic, if `kite notify setup` was run: the topic
+        URL lives in a 0600 secret file, referenced from the machine's config as file:PATH. Returns
+        False when notifications are not set up or the push fails — never raises, so a dead alert
+        channel cannot kill the watch. (Same JSON publishing as poc notify.send, reimplemented here
+        because this file runs on the host, stdlib only, and cannot import the package.)"""
+        try:
+            config = (self.data / "kite" / "config.yaml").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        match = re.search(r"ntfy:\s*['\"]?file:([^\s'\"},]+)", config)
+        if not match:
+            return False
+        try:
+            url = Path(match.group(1)).read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        parsed = urllib.parse.urlsplit(url)
+        topic = parsed.path.strip("/")
+        if parsed.scheme not in ("https", "http") or not parsed.netloc or not topic or "/" in topic:
+            return False
+        body = json.dumps({"topic": topic, "title": title[:250], "message": message[:3000],
+                           "tags": ["watchdog"], "priority": priority}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(f"{parsed.scheme}://{parsed.netloc}/", data=body, method="POST",
+                                         headers={"Content-Type": "application/json"})
+        try:
+            with opener(request, timeout=10) as response:
+                response.read()
+        except OSError:
+            return False
+        return True
+
+    def watchdog(self, *, check_only: bool = False, notify: Callable[..., bool] | None = None) -> dict:
+        """One watch tick: snapshot every service, restart the ones confirmed unhealthy, within the
+        flap limits. Returns a summary; every decision is also logged (self.out goes to the journal).
+        check_only says what would happen and changes nothing: no restarts, no state file, no alerts.
+        """
+        send = notify or (lambda title, message, priority=3: self.watchdog_notify(title, message,
+                                                                                  priority=priority))
+        history = self.watchdog_history()
+        states = self.services_state()
+        now = self.clock()
+        summary: dict[str, Any] = {"checked_at": now, "restarted": [], "suppressed": [], "watching": [],
+                                   "unknown": [], "would_restart": [], "failed": [], "alerts": 0, "error": ""}
+
+        def alert(title: str, message: str, priority: int) -> bool:
+            sent = send(title, message, priority=priority)
+            summary["alerts"] += 1 if sent else 0
+            if not sent:
+                self.out("watchdog: chưa nối kênh cảnh báo (chạy `kite notify setup` để nhận push)")
+            return sent
+
+        if not states:
+            self.out("watchdog: không đọc được trạng thái container (docker chưa chạy?)")
+            summary["error"] = "không đọc được trạng thái container"
+            if not history.get("alerted_no_states"):
+                alert("Kite: watchdog không đọc được container",
+                      "kite-stack watchdog không lấy được trạng thái dịch vụ — docker có thể đã chết.", 4)
+                history["alerted_no_states"] = True
+            if not check_only:
+                self._watchdog_save(history, now)
+            return summary
+        history["alerted_no_states"] = False
+        actions, history = watchdog_decide(states, history, now)
+        for name in WATCHDOG_SERVICES:
+            kind = watchdog_classify(states.get(name, {}))
+            if kind == "unknown":
+                summary["unknown"].append(name)
+                history["services"][name]["last_result"] = "unknown"
+            elif kind == "good":
+                history["services"][name]["last_result"] = "ok"
+        for action in actions:
+            name, kind = action["service"], action["action"]
+            entry = history["services"][name]
+            if kind == "watch":
+                summary["watching"].append(name)
+                entry["last_result"] = "watching"
+                self.out(f"watchdog: {name} {action['reason']} — theo dõi, chưa khởi động lại")
+            elif kind == "suppressed":
+                summary["suppressed"].append(name)
+                entry["last_result"] = "suppressed"
+                self.out(f"watchdog: {name} {action['reason']} — KHÔNG khởi động lại")
+                if not entry["alerted"]:
+                    alert(f"Kite: watchdog không khởi động lại được {name}",
+                          f"{name} vẫn xấu nhưng {action['reason']}. Cần người xem.", 4)
+                    # One attempt per episode, sent or not: otherwise an unconfigured ntfy would
+                    # log "chưa nối kênh" every 5 minutes for as long as the service stays bad.
+                    # A good tick (or a successful restart) clears the flag for the next episode.
+                    entry["alerted"] = True
+            else:  # restart
+                if check_only:
+                    summary["would_restart"].append(name)
+                    self.out(f"watchdog: {name} {action['reason']} — sẽ khởi động lại (chỉ kiểm tra)")
+                    continue
+                self.out(f"watchdog: {name} {action['reason']} — khởi động lại")
+                try:
+                    report = self.restart([name], allow_infra=True)
+                except (StackError, subprocess.SubprocessError, OSError) as exc:
+                    entry["last_result"] = "failed"
+                    summary["failed"].append(name)
+                    self.out(f"watchdog: khởi động lại {name} lỗi: {exc}")
+                    continue
+                last = report.get("last") or {}
+                if last.get("result") == "restarted":
+                    entry["restarts"].append(now)
+                    entry["last_restart"] = now
+                    entry["bad_ticks"] = 0
+                    entry["alerted"] = False
+                    entry["last_result"] = "restarted"
+                    summary["restarted"].append(name)
+                    alert(f"Kite: đã khởi động lại {name}",
+                          f"watchdog thấy {name} xấu {WATCHDOG_CONFIRM_TICKS} lần kiểm liên tiếp nên đã "
+                          f"khởi động lại.", 3)
+                elif last.get("restarted"):
+                    # The container was restarted but is still not healthy: it counts as a restart
+                    # (cooldown and the hourly limit apply), and the owner is told louder.
+                    entry["restarts"].append(now)
+                    entry["last_restart"] = now
+                    entry["bad_ticks"] = 0
+                    entry["last_result"] = "failed"
+                    summary["failed"].append(name)
+                    self.out(f"watchdog: {name} đã khởi động lại nhưng vẫn chưa khỏe: "
+                             f"{str(last.get('message', ''))[:500]}")
+                    alert(f"Kite: {name} khởi động lại rồi vẫn chưa khỏe",
+                          f"watchdog đã khởi động lại {name} nhưng nó vẫn chưa khỏe. Cần người xem.", 4)
+                else:
+                    # The compose restart itself failed: nothing restarted, retry next tick.
+                    entry["last_result"] = "failed"
+                    summary["failed"].append(name)
+                    self.out(f"watchdog: khởi động lại {name} lỗi: {str(last.get('message', ''))[:500]}")
+        if not check_only:
+            self._watchdog_save(history, now)
+        return summary
+
     def sandbox_network(self) -> str:
         """The tasks' internal network, made before the gateway starts (it also listens on the host's
         address there). An existing one is kept: its address goes into Kite's config."""
@@ -538,20 +771,25 @@ class Stack:
             done.append({"request": path.name, "action": action, "result": (result.get("last") or result)})
         return done
 
-    def restart(self, services: list[str]) -> dict:
-        names = [s for s in services if s in KITE_SERVICES]
+    def restart(self, services: list[str], *, allow_infra: bool = False) -> dict:
+        """Restart services, then wait until they are healthy again. By default only the Kite services:
+        the web's request files must not be able to restart the infrastructure (postgres, Temporal,
+        Caddy) — that stays the watchdog's job, which passes allow_infra=True."""
+        allowed = (*KITE_SERVICES, *INFRA_SERVICES) if allow_infra else KITE_SERVICES
+        names = [s for s in services if s in allowed]
         if not names or len(names) != len(services):
-            raise StackError(f"chỉ khởi động lại được: {', '.join(KITE_SERVICES)}")
+            raise StackError(f"chỉ khởi động lại được: {', '.join(allowed)}")
         if "gateway" in names and "opencode" not in names:
             names.append("opencode")          # the chat reads the workers again (new or changed ones)
         with self.lock(wait=600):
             self.set_status(state="restarting")
             done = self.run(self.compose("restart", *names), timeout=600)
             if done.returncode != 0:
-                return self.finish("restart", "failed", (done.stderr or done.stdout or "").strip()[-800:])
+                return self.finish("restart", "failed", (done.stderr or done.stdout or "").strip()[-800:],
+                                   restarted=False)
             ok, detail = self.wait_healthy(services=tuple(names))
             return self.finish("restart", "restarted" if ok else "failed",
-                               ", ".join(names) + ("" if ok else f": {detail}"))
+                               ", ".join(names) + ("" if ok else f": {detail}"), restarted=True)
 
     # ------------------------------------------------------------------ install
     def install(self, *, access: str, domain: str | None, https_port: int, image: str, sandbox: str | None,
@@ -617,7 +855,7 @@ class Stack:
                 raise StackError("kite stack init lỗi: " + (init.stderr or init.stdout).strip()[-800:])
             ok, detail = self.up()
             self.adopt(release)
-            for unit in ("kite-stack-update.timer", "kite-stack-requests.path"):
+            for unit in ("kite-stack-update.timer", "kite-stack-requests.path", "kite-stack-watchdog.timer"):
                 self.run(["systemctl", "enable", "--now", unit], timeout=60)
             result = self.finish("install", "updated" if ok else "failed", detail if not ok else f"Kite chạy ở {url}")
         return {"url": url, "healthy": ok, "detail": detail, "access": values["KITE_ACCESS"],
@@ -742,6 +980,8 @@ def main(argv: list[str] | None = None) -> int:
     update.add_argument("--check", action="store_true", help="only look for a new image")
     commands.add_parser("requests", help="carry out the web's and the chat's requests (systemd path unit)")
     commands.add_parser("status", help="running release, newest one, last update, containers")
+    watchdog = commands.add_parser("watchdog", help="check every service once; restart the unhealthy ones")
+    watchdog.add_argument("--check", action="store_true", help="only say what would happen, restart nothing")
     restart = commands.add_parser("restart", help="restart Kite services")
     restart.add_argument("services", nargs="*", default=list(KITE_SERVICES))
     logs = commands.add_parser("logs", help="logs of the services")
@@ -790,6 +1030,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "restart":
             report = stack.restart(args.services)
             print(json.dumps(report.get("last", report), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "watchdog":
+            report = stack.watchdog(check_only=args.check)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
             return 0
         if args.command == "logs":
             cmd = stack.compose("logs", "--no-color", "--tail", args.tail, *(["-f"] if args.follow else []),

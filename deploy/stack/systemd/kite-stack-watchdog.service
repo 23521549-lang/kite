@@ -1,0 +1,10 @@
+[Unit]
+Description=Kite: check every service once; restart the unhealthy ones
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kite-stack watchdog
+TimeoutStartSec=20min
