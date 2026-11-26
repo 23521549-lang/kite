@@ -38,6 +38,7 @@ import {
   envTaskCount,
   getExperience,
   getExperienceDiff,
+  getRepoMemory,
   getRepoStatus,
   listChatSessions,
   listEnvironments,
@@ -48,6 +49,7 @@ import {
   type EnvironmentRow,
   type ExperienceDoc,
   type KiteChatSession,
+  type RepoMemory,
   type RepoStatus,
   type SessionMove,
   type TaskRow,
@@ -193,7 +195,8 @@ function EnvCard({ env, sessionCount, taskCount, onChanged }: { env: Environment
             )}
           </Group>
           <Text size="sm" c="dimmed">
-            {t('env.last-sync')}: {envLastSync(env) ? ago(envLastSync(env)) : t('env.never-synced')}
+            {t('env.last-sync')}:{' '}
+            {envLastSync(env) ? ago(envLastSync(env)) : t('env.never-synced')}
           </Text>
           <Text size="sm" c="dimmed">
             {num(shownSessions)} {t('env.sessions')} · {num(shownTasks)} {t('env.tasks')} · {num(envLessonCount(env))}{' '}
@@ -225,7 +228,7 @@ function EnvCard({ env, sessionCount, taskCount, onChanged }: { env: Environment
         <Button size="xs" variant="light" onClick={() => go(`/environments/${encodeURIComponent(env.id)}/sessions`)}>
           {t('env.view-sessions')}
         </Button>
-        <Button size="xs" variant="light" onClick={() => go(`/environments/${encodeURIComponent(env.id)}/sessions`)}>
+        <Button size="xs" variant="light" onClick={() => go(`/tasks?env=${encodeURIComponent(env.id)}`)}>
           {t('env.view-tasks')}
         </Button>
         <Button size="xs" variant="light" onClick={() => go(`/environments/${encodeURIComponent(env.id)}/lessons`)}>
@@ -625,6 +628,16 @@ function EnvLessons({ env }: { env: EnvironmentRow }) {
   const t = useT()
   const repoKey = envRepoLabel(env) ?? env.path ?? env.id
   const exp = useLoad(() => getExperience(repoKey), [repoKey])
+  // The approved lessons + this repo's pending lessons come from
+  // /api/repos/memory (N10): the backend filters pending by repo, so what
+  // shows here belongs to this environment only. No path (Default) → the
+  // call resolves null and the tab falls back to the count.
+  const mem = useLoad(
+    () => (env.path ? getRepoMemory(env.path) : Promise.resolve(null as RepoMemory | null)),
+    [env.path],
+  )
+  const lessons = mem.data?.lessons ?? []
+  const pendingLessons = (mem.data?.pending ?? []).filter((p) => p.kind === 'lesson')
   const [diff, setDiff] = useState<string | null>(null)
   const doc: ExperienceDoc | undefined = exp.data
   return (
@@ -705,8 +718,53 @@ function EnvLessons({ env }: { env: EnvironmentRow }) {
         <Text size="sm" c="dimmed">
           {num(envLessonCount(env))} {t('env.lessons')}
         </Text>
-        {envLessonCount(env) === 0 || envLessonCount(env) === null ? <Empty>{t('env.detail-lessons-none')}</Empty> : null}
+        {mem.loading ? (
+          <Loading />
+        ) : mem.error ? (
+          <Loading error={mem.error} />
+        ) : lessons.length ? (
+          <Stack gap={4} mt="xs">
+            {lessons.map((line, i) => (
+              <Text key={i} size="sm" style={{ whiteSpace: 'pre-wrap' }}>
+                {line}
+              </Text>
+            ))}
+          </Stack>
+        ) : (
+          <Empty>{t('env.detail-lessons-none')}</Empty>
+        )}
       </Card>
+      {env.path ? (
+        <Card withBorder>
+          <Text fw={600} mb="xs">
+            {t('env.detail-lessons-pending')}
+          </Text>
+          {mem.loading ? (
+            <Loading />
+          ) : mem.error ? (
+            <Loading error={mem.error} />
+          ) : pendingLessons.length ? (
+            <Stack gap="xs">
+              {pendingLessons.map((p) => (
+                <div key={p.id}>
+                  <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>
+                    {p.text}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    {p.id}
+                    {p.task_id ? ` · ${p.task_id}` : ''}
+                  </Text>
+                </div>
+              ))}
+              <Text size="xs" c="dimmed">
+                {t('env.detail-lessons-pending-hint')}
+              </Text>
+            </Stack>
+          ) : (
+            <Empty>{t('env.detail-lessons-pending-none')}</Empty>
+          )}
+        </Card>
+      ) : null}
     </Stack>
   )
 }

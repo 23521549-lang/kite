@@ -149,3 +149,28 @@ def test_env_cost_usd_unreadable_journal_is_unknown_not_zero():
             raise OSError("journal gone")
 
     assert env_cost_usd(BrokenJournal(), [], "7") is None
+
+
+def test_env_cost_usd_month_only_counts_current_utc_month():
+    # Fixed "now": 2026-11-23 02:13 UTC (the same NOW as the Gói 2 session
+    # tests). The ledger's month is a UTC month (relay.py _month), so the
+    # filter uses gmtime, not local time.
+    now = 1_795_400_000.0
+    this_month = now - 86400        # 2026-11-22
+    last_month = now - 40 * 86400   # 2026-10-14
+    tasks = [{"task_id": "t1", "environment_id": "7"}]
+    journal = SimpleNamespace(read=lambda name: [
+        {"tag": "t1", "usd": 0.02, "ts": this_month},
+        {"tag": "t1-b2", "usd": 0.01, "ts": this_month},   # branch retry, this month
+        {"tag": "t1", "usd": 1.0, "ts": last_month},       # last month: all-time only
+        {"tag": "t1", "usd": 9.0},                         # no ts: no provable month
+    ])
+    assert env_cost_usd(journal, tasks, "7") == 10.03
+    assert env_cost_usd(journal, tasks, "7", month_only=True, now=now) == 0.03
+    assert env_cost_usd(journal, tasks, "7", month_only=True, now=last_month) == 1.0
+
+    class BrokenJournal:
+        def read(self, name):
+            raise OSError("journal gone")
+
+    assert env_cost_usd(BrokenJournal(), [], "7", month_only=True, now=now) is None

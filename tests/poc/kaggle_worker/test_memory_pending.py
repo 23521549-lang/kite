@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
 from poc.kaggle_worker import memory
+from tests.poc.kaggle_worker.test_mcp_server import FakeClient, make_ops, make_repo
 
 
 def _journal_task(state: Path, task_id: str, repo: Path) -> None:
@@ -57,3 +59,23 @@ def test_propose_note_queues_only_bad_verdicts_with_a_reason(tmp_path):
     assert memory.lessons(state, repo) == []                       # still only queued
     memory.approve_pending(state, entry["id"])
     assert "Quên cập nhật README" in memory.lessons_note(state, repo)
+
+
+def test_memory_show_pending_is_filtered_by_repo(tmp_path):
+    # A repo-scoped memory_show must not leak another repo's pending lessons
+    # (or chat preferences) into that repo's view.
+    repo_a, _ = make_repo(tmp_path, "a")
+    repo_b, _ = make_repo(tmp_path, "b")
+    state = tmp_path / "state"
+    entry_a = memory.propose_lesson(state, repo_a, "t-a", "Bài học của A")
+    entry_b = memory.propose_lesson(state, repo_b, "t-b", "Bài học của B")
+    entry_pref = memory.propose_preference(state, "Trả lời ngắn")
+    ops = make_ops(tmp_path, FakeClient())
+    shown_a = asyncio.run(ops.memory_show(str(repo_a)))
+    assert [e["id"] for e in shown_a["pending"]] == [entry_a["id"]]
+    assert shown_a["pending"][0]["task_id"] == "t-a"
+    shown_b = asyncio.run(ops.memory_show(str(repo_b)))
+    assert [e["id"] for e in shown_b["pending"]] == [entry_b["id"]]
+    shown_all = asyncio.run(ops.memory_show(""))
+    assert [e["id"] for e in shown_all["pending"]] == [
+        entry_a["id"], entry_b["id"], entry_pref["id"]]
