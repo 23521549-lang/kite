@@ -46,6 +46,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path(os.environ.get("KITE_CONFIG") or ".kite/config.yaml"),
                         help="Kite YAML/JSON configuration (default: $KITE_CONFIG, else .kite/config.yaml)")
     commands = parser.add_subparsers(dest="command", required=True)
+    from .improve import register_improve_commands
+    register_improve_commands(commands)
     task = commands.add_parser("task", help="manage queued tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True)
 
@@ -124,6 +126,24 @@ def _parser() -> argparse.ArgumentParser:
     reconvert.add_argument("--lock-token", default=None,
                            help="one-time token of a lock already held by the requester "
                                 "(internal: used by the detached job request_reconvert spawns)")
+    experience_parser = commands.add_parser("experience", help="approved experience documents per repository "
+                                                              "(distilled lessons, versioned)")
+    experience_commands = experience_parser.add_subparsers(dest="experience_command", required=True)
+    experience_distill = experience_commands.add_parser(
+        "distill", help="distill a proposed experience document for one repository (waits for approval)")
+    experience_distill.add_argument("repo", help="path of the repository")
+    experience_show = experience_commands.add_parser(
+        "show", help="the approved experience document for one repository and its pending proposal")
+    experience_show.add_argument("repo", help="path of the repository")
+    experience_approve = experience_commands.add_parser(
+        "approve", help="approve a proposed experience document: it becomes official, the old one is archived")
+    experience_approve.add_argument("entry_id", help="the id shown by `experience show` or `experience distill`")
+    experience_reject = experience_commands.add_parser(
+        "reject", help="reject a proposed experience document (dropped)")
+    experience_reject.add_argument("entry_id", help="the id shown by `experience show` or `experience distill`")
+    experience_diff = experience_commands.add_parser(
+        "diff", help="unified diff between a proposal and the approved document (v1: whole document as additions)")
+    experience_diff.add_argument("entry_id", help="the id shown by `experience show` or `experience distill`")
     tasks = commands.add_parser("tasks", help="owner confirmations for finished tasks")
     tasks_commands = tasks.add_subparsers(dest="tasks_command", required=True)
     tasks_confirm = tasks_commands.add_parser(
@@ -1529,6 +1549,52 @@ def _knowledge_command(args: argparse.Namespace) -> int:
     if result["status"] != "ready":
         raise ConfigError(result["error"])
     _emit(result)
+def _experience_command(args: argparse.Namespace) -> int:
+    from . import experience_store as store
+
+    if args.experience_command in ("approve", "reject"):
+        try:
+            done = (store.approve if args.experience_command == "approve" else store.reject)(
+                args.config.parent, args.entry_id)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        _emit(done)
+        return 0
+    if args.experience_command == "diff":
+        try:
+            diff = store.diff_text(args.config.parent, args.entry_id)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        _emit({"proposal_id": args.entry_id, "diff": diff})
+        return 0
+    if args.experience_command == "distill":
+        from .journal import read_jsonl
+
+        try:
+            from . import experience
+        except ImportError:
+            raise ConfigError("chưng cất tài liệu kinh nghiệm chưa sẵn sàng "
+                              "(module experience của Gói 10 chưa giao)") from None
+        repo = str(Path(args.repo).expanduser().resolve())
+        lessons = store.lesson_dicts(args.config.parent, repo)
+        runs = [r for r in read_jsonl(args.config.parent / "journal" / "tasks.jsonl")
+                if r.get("repo") == repo]
+        task_ids = {r.get("task_id") for r in runs}
+        notes = [{"task_id": n.get("task_id"), "verdict": n.get("verdict"), "text": n.get("text", "")}
+                 for n in read_jsonl(args.config.parent / "journal" / "notes.jsonl")
+                 if n.get("task_id") in task_ids]
+        rules = experience.distill(lessons, notes, runs)
+        try:
+            result = store.propose(args.config.parent, repo, rules)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        entry = result["entry"]
+        _emit({"proposal_id": entry["id"], "version": entry["version"], "diff": result["diff"],
+               "rules_added": entry["rules_added"], "rules_removed": entry["rules_removed"],
+               "rules_changed": entry["rules_changed"],
+               "note": "bản đề xuất đang CHỜ người dùng duyệt; chưa có hiệu lực với các task sau"})
+        return 0
+    _emit(store.show(args.config.parent, args.repo))
     return 0
 
 
@@ -2279,6 +2345,11 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _memory_command(args)
     if args.command == "knowledge":
         return _knowledge_command(args)
+    if args.command == "experience":
+        return _experience_command(args)
+    if args.command == "improve":
+        from .improve import _improve_command
+        return _improve_command(args)
     if args.command == "update":
         return _update_command(args)
     if args.command == "tasks":
@@ -2524,8 +2595,8 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox", "mcp", "chat",
-                        "bench", "journal", "cleanup", "model", "notify", "memory", "knowledge", "update", "web",
-                        "busy", "stack", "tasks"}:
+                        "bench", "journal", "cleanup", "model", "notify", "memory", "knowledge", "experience", "improve",
+                        "update", "web", "busy", "stack", "tasks"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

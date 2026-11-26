@@ -384,7 +384,10 @@ def test_mcp_server_exposes_every_tool(tmp_path):
                      "wait_task", "task_log", "remember", "memory_show", "memory_forget", "repo_config",
                      "doctor", "cleanup", "worker_restart", "update_kite", "bench_start", "bench_history",
                      # Gói 6 (Kiến thức): đọc kho tài liệu qua MCP.
-                     "knowledge_list", "knowledge_read"}
+                     "knowledge_list", "knowledge_read",
+                     # Gói 10: tài liệu kinh nghiệm + vòng tự cải tiến.
+                     "experience_distill", "experience_show", "experience_approve", "experience_reject",
+                     "improve_list", "improve_approve", "improve_reject"}
 
 
 def fake_process(proc: Path, pid: int, argv: list[str], namespace: str = "pid:[1]") -> None:

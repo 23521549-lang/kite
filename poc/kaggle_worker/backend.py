@@ -414,8 +414,13 @@ class SandboxActivityBackend:
         if instruction.strip():
             goal += f"\n\nChỉ dẫn bổ sung của người dùng (ưu tiên làm theo): {instruction.strip()}"
         # What the person said went wrong in earlier tasks on this repository (memory.py).
+        # When an approved experience document exists it replaces the raw lesson lines;
+        # otherwise the raw lessons stay as the fallback (the lessons file is never deleted).
+        from . import experience_store
+
         lessons = memory.lessons_note(self.state_dir, task.repo_path)
-        goal += lessons
+        experience = experience_store.experience_note(self.state_dir, task.repo_path)
+        goal += experience if experience else lessons
 
         graph = await asyncio.to_thread(sbx.code_graph, self.settings, work, root / "graph")
         context = await asyncio.to_thread(sbx.repo_context, work, goal, graph=graph)

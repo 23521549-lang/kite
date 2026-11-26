@@ -274,6 +274,10 @@ class MemoryIn(BaseModel):
     repo: str = ""
 
 
+class ExperienceIn(BaseModel):
+    repo: str
+
+
 class RepoConfigIn(BaseModel):
     repo: str
     config: str = Field(max_length=20000)
@@ -984,6 +988,57 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
         session = auth(request)
         report = await ctx.ops().memory_forget(number, repo)
         audit(session, "memory_forget", repo or "chat", True, {"number": number})
+        return report
+
+    # ------------------------------------------------------- experience documents (Gói 10)
+    @app.get("/api/repos/experience")
+    async def repo_experience(request: Request, repo: str):
+        auth(request)
+        return await ctx.ops().experience_show(repo)
+
+    @app.post("/api/repos/experience/distill")
+    async def repo_experience_distill(body: ExperienceIn, request: Request):
+        session = auth(request)
+        report = await ctx.ops().experience_distill(body.repo)
+        audit(session, "experience_distill", body.repo, True, {"proposal_id": report["proposal_id"]})
+        return report
+
+    @app.post("/api/repos/experience/{proposal_id}/approve")
+    async def repo_experience_approve(proposal_id: str, request: Request):
+        session = auth(request)
+        report = await ctx.ops().experience_approve(proposal_id)
+        audit(session, "experience_approve", proposal_id, True, {"version": report["version"]})
+        return report
+
+    @app.post("/api/repos/experience/{proposal_id}/reject")
+    async def repo_experience_reject(proposal_id: str, request: Request):
+        session = auth(request)
+        report = await ctx.ops().experience_reject(proposal_id)
+        audit(session, "experience_reject", proposal_id)
+        return report
+
+    @app.get("/api/repos/experience/{proposal_id}/diff")
+    async def repo_experience_diff(proposal_id: str, request: Request):
+        auth(request)
+        return await ctx.ops().experience_diff(proposal_id)
+
+    @app.get("/api/repos/experience/improve")
+    async def repo_experience_improve(request: Request):
+        auth(request)
+        return await ctx.ops().improve_list()
+
+    @app.post("/api/repos/experience/improve/{proposal_id}/approve")
+    async def repo_experience_improve_approve(proposal_id: str, request: Request):
+        session = auth(request)
+        report = await ctx.ops().improve_approve(proposal_id)
+        audit(session, "improve_approve", proposal_id)
+        return report
+
+    @app.post("/api/repos/experience/improve/{proposal_id}/reject")
+    async def repo_experience_improve_reject(proposal_id: str, request: Request):
+        session = auth(request)
+        report = await ctx.ops().improve_reject(proposal_id)
+        audit(session, "improve_reject", proposal_id)
         return report
 
     @app.get("/api/repos/config")
