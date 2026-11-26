@@ -183,6 +183,37 @@ def test_tools_list_client_rejects_garbage_and_crashes():
         c.list_tools_stdio(["python3", "-c", "import sys; sys.exit(3)"])
 
 
+def test_tools_list_live_path_exiting_server_never_raises_broken_pipe():
+    """Regression (eye-check 26/11): scanning an MCP whose command exits at
+    once (e.g. ``echo``) returned HTTP 500 on the first scan — BrokenPipeError
+    escaped from ``_list_tools_stdio_live`` when the server died before the
+    handshake flush. A dead server is a failed tools/list, so every scan
+    must raise McpClientError, never a raw BrokenPipeError. 40 parallel
+    scans: the race fired 25-29/40 before the fix on this VM, 0/40 after."""
+    import concurrent.futures
+
+    def one():
+        with pytest.raises(c.McpClientError):
+            c.list_tools_stdio(["echo", "hello"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda _: one(), range(40)))
+
+
+def test_scan_source_exiting_server_returns_fail_report(tmp_path):
+    """Same race one level up: the scan endpoint must answer with a fail
+    report (verdict fail + tools-list-failed finding), not crash — the FE
+    calls scan right after creating an MCP, so a 500 shows a generic error
+    instead of the scan report modal."""
+    tool = _clean_tool(tmp_path)
+    tool["config"]["command"] = ["echo", "hello"]
+    report = c.scan_tool_config(tool, state_dir=tmp_path, now=NOW,
+                                mcpiranha_runner=_mcpiranha_runner([]))
+    assert report.verdict == "fail"
+    assert any(f.rule == "tools-list-failed" and f.severity == "high"
+               for f in report.findings)
+
+
 def test_tools_list_live_path_reliable_against_real_fastmcp_server(tmp_path):
     """Regression: the live path must not flake against a real async MCP server.
     Closing stdin right after writing (subprocess.run(input=...)) let FastMCP
