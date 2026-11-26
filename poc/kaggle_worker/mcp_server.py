@@ -34,6 +34,22 @@ from .session_copies import copy_identity_from_path, copy_path, delete_copy, ens
 from .store import SQLiteSchedulerStore, StoreError
 
 PATCH_PREVIEW_CHARS = 6000
+# Scheduler-store state -> Temporal workflow status, used by task_status when
+# Temporal cannot answer (unreachable, or no workflow for this task): the
+# store is the durable record. LEASED/RUNNING both mean the worker holds the
+# task; QUEUED has no Temporal equivalent, so it is reported as-is (the page
+# shows the waiting text from queue_state). Only three consumers read the
+# workflow value: task_result (== "COMPLETED") and send_instruction/wait_task
+# (== "RUNNING").
+_STORE_STATE_TO_WORKFLOW = {
+    "COMPLETED": "COMPLETED",
+    "FAILED": "FAILED",
+    "CANCELLED": "CANCELLED",
+    "LEASED": "RUNNING",
+    "RUNNING": "RUNNING",
+    "QUEUED": "QUEUED",
+}
+
 TASK_TYPES = ("coding", "analysis", "review", "docs", "vision")
 OUTPUT_CHARS = 8000
 # Not copied into run_command's scratch copy: large, rebuildable, or machine-specific.
@@ -1079,18 +1095,12 @@ class KiteOps:
         from .temporal_workflow import CodingTaskWorkflow
 
         task_id = self.resolve(task_id)
-        handle = await self._handle(task_id)
-        try:
-            description = await handle.describe()
-        except Exception as exc:
-            raise KiteToolError(f"không tìm thấy task {task_id}: {exc}") from exc
-        state = getattr(description.status, "name", "UNKNOWN")
-        result: dict[str, Any] = {"task_id": task_id, "workflow": state}
-        if state == "RUNNING":
-            try:
-                result["step"] = await handle.query(CodingTaskWorkflow.current_status)
-            except Exception:
-                result["step"] = "UNKNOWN"
+        result: dict[str, Any] = {"task_id": task_id}
+        # The scheduler store is read first: it is the durable record, and it is
+        # what the fallback below derives the status from when Temporal cannot
+        # answer (unreachable, or no workflow for this task — seeded/demo tasks,
+        # or a workflow lost when Temporal's data was wiped).
+        row: dict | None = None
         with self._store() as store:
             try:
                 row = store.get_task(task_id)
@@ -1103,6 +1113,25 @@ class KiteOps:
                 result["last_apply_error"] = self._last_apply_error(row)
             except StoreError:
                 pass
+        try:
+            handle = await self._handle(task_id)
+            description = await handle.describe()
+        except Exception as exc:
+            if row is None:
+                raise KiteToolError(f"không tìm thấy task {task_id}: {exc}") from exc
+            # Temporal cannot answer, but the store knows this task: report the
+            # store's state instead of failing the whole detail page. Temporal
+            # stays authoritative whenever it answers (the try branch above).
+            result["workflow"] = _STORE_STATE_TO_WORKFLOW.get(str(row.get("state")), "UNKNOWN")
+            result["temporal_unavailable"] = True
+        else:
+            state = getattr(description.status, "name", "UNKNOWN")
+            result["workflow"] = state
+            if state == "RUNNING":
+                try:
+                    result["step"] = await handle.query(CodingTaskWorkflow.current_status)
+                except Exception:
+                    result["step"] = "UNKNOWN"
         # What it has done so far, step by step (written by the sandbox backend as it goes).
         from .backend import task_progress, task_slug
 
@@ -1131,8 +1160,17 @@ class KiteOps:
         from .backend import task_slug
         from .confirm import patch_sha256
 
-        handle = await self._handle(task_id, typed=True)
-        outcome = await handle.result()
+        try:
+            handle = await self._handle(task_id, typed=True)
+            outcome = await handle.result()
+        except Exception:
+            # Temporal cannot hand back the outcome (unreachable, or the
+            # workflow is gone): rebuild the review result from the task
+            # directory on disk. Without this, GET /api/tasks/{id} would 500
+            # for a completed task exactly when task_status fell back to the
+            # store — the fallback in task_status would break the page it was
+            # meant to save.
+            return self._result_from_disk(task_id, status, patch_offset, patch_chars)
         result: dict[str, Any] = {"task_id": task_id, "ready": True, "status": outcome.status}
         bundle = outcome.review_bundle
         if bundle is not None:
@@ -1154,6 +1192,53 @@ class KiteOps:
         repo_path = None
         if outcome.checkpoint_path and Path(outcome.checkpoint_path).is_file():
             repo_path = json.loads(Path(outcome.checkpoint_path).read_text(encoding="utf-8")).get("repo_path")
+        result["patch_path"] = str(patch_path)
+        result["repo_path"] = repo_path
+        result["apply_with"] = f"git -C {repo_path} apply {patch_path}" if repo_path else f"git apply {patch_path}"
+        return result
+
+    def _result_from_disk(self, task_id: str, status: dict, patch_offset: int,
+                          patch_chars: int) -> dict:
+        """Review result rebuilt from the task directory when Temporal cannot
+        hand back the outcome. The patch file, the checkpoint (repo path) and
+        result.json (worker) are all on disk; only the human summary lives
+        solely in the Temporal outcome, so it is absent here. patch_sha256 is
+        computed over the raw file bytes, exactly the bytes a confirmation
+        code is bound to."""
+        from .backend import task_slug
+        from .confirm import patch_sha256
+
+        result: dict[str, Any] = {"task_id": task_id, "ready": True,
+                                  "status": str(status.get("queue_state") or "COMPLETED"),
+                                  "temporal_unavailable": True}
+        root = self.state_dir / "tasks" / task_slug(task_id)
+        try:
+            result_json = json.loads((root / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            result_json = {}
+        if isinstance(result_json, dict) and result_json.get("worker") is not None:
+            result["worker"] = result_json["worker"]
+        patch_path = root / "result.patch"
+        if patch_path.is_file():
+            raw = patch_path.read_bytes()
+            patch_text = raw.decode("utf-8", errors="replace")
+            total = len(patch_text)
+            offset = max(0, min(int(patch_offset), total))
+            limit = max(1, min(int(patch_chars), 100_000))
+            page = patch_text[offset:offset + limit]
+            remaining = total - (offset + len(page))
+            if remaining > 0:
+                page += (f"\n... (còn {remaining} ký tự, xem tiếp bằng "
+                         f"task_result(patch_offset={offset + len(page)}))")
+            result.update(patch=page, patch_sha256=patch_sha256(raw),
+                          patch_chars_total=total, patch_offset=offset)
+        repo_path = None
+        checkpoint = root / "checkpoint.json"
+        if checkpoint.is_file():
+            try:
+                repo_path = json.loads(checkpoint.read_text(encoding="utf-8")).get("repo_path")
+            except (OSError, ValueError):
+                pass
         result["patch_path"] = str(patch_path)
         result["repo_path"] = repo_path
         result["apply_with"] = f"git -C {repo_path} apply {patch_path}" if repo_path else f"git apply {patch_path}"
