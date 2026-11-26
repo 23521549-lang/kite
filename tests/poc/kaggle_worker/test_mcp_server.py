@@ -307,6 +307,26 @@ def test_apply_result_with_a_wrong_code_fails_without_burning_the_good_code(tmp_
     assert (repo / "calc.py").read_text() == "x = 2\n"
 
 
+def test_logged_never_writes_a_confirmation_code_to_the_journal(tmp_path):
+    repo, _head = make_repo(tmp_path)
+    ops, task_id = _dead_temporal_completed_task(tmp_path, repo, _head)
+    code = owner_code(ops, "apply", task_id)
+    # The exact call the chat MCP tool and the web apply endpoint both make.
+    applied = asyncio.run(ops.logged("apply_result", ops.apply_result, task_id, code))
+    assert applied["files"] == ["calc.py"]
+    # Reusing the same code fails — the error record is written by logged() too.
+    with pytest.raises(KiteToolError, match="đã được dùng"):
+        asyncio.run(ops.logged("apply_result", ops.apply_result, task_id, code))
+    raw = (tmp_path / "state" / "journal" / "actions.jsonl").read_text(encoding="utf-8")
+    assert code not in raw
+    lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    apply_records = [r for r in lines if r["tool"] == "apply_result"]
+    assert len(apply_records) == 2
+    assert all(r["args"]["confirmation_code"] == "[redacted]" for r in apply_records)
+    assert all(r["args"]["task_id"] == task_id for r in apply_records)
+    assert apply_records[0]["ok"] is True and apply_records[1]["ok"] is False
+
+
 def test_apply_result_still_refuses_a_completed_task_without_a_patch(tmp_path):
     from poc.kaggle_worker.backend import task_slug
 
