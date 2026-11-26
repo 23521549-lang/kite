@@ -1108,6 +1108,11 @@ export const vi = {
   "login.password": "Mật khẩu",
   "login.totp": "Mã 2FA",
   "login.submit": "Đăng nhập",
+  "login.recovery-link": "Mất điện thoại? Dùng mã khôi phục",
+  "login.recovery-label": "Mã khôi phục",
+  "login.recovery-placeholder": "XXXX-XXXX-XXXX",
+  "login.recovery-note": "Mỗi mã chỉ dùng được một lần.",
+  "login.back-to-totp": "Quay lại nhập mã 2FA",
 } as const
 
 export type DictKey = keyof typeof vi
