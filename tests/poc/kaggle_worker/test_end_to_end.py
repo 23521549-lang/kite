@@ -17,6 +17,7 @@ import pytest
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker
 
+from conftest import free_loopback_port
 from poc.kaggle_worker.opencode import OpenCodeClient, OpenCodeTaskAdapter
 from poc.kaggle_worker.routing import RoutingRequest, WorkerLoad, select_worker
 from poc.kaggle_worker.protocol import OwnerPolicy, WorkerProfile
@@ -246,7 +247,7 @@ def test_temporal_e2e_routes_runs_opencode_and_returns_review_only_patch(tmp_pat
                    activities.run_opencode, activities.interrupt_opencode,
                    activities.checkpoint_and_stop, activities.build_review_bundle,
                    activities.release_route]
-        async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with await WorkflowEnvironment.start_time_skipping(port=free_loopback_port()) as env:
             async with Worker(env.client, task_queue="kite-e2e", workflows=[CodingTaskWorkflow], activities=methods):
                 outcome = await env.client.execute_workflow(
                     CodingTaskWorkflow.run, task, id=task.task_id, task_queue="kite-e2e",

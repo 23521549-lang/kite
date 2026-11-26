@@ -3,9 +3,29 @@ unless a test asks for them."""
 
 from __future__ import annotations
 
+import socket
+
 import pytest
 
 from poc.kaggle_worker import codemap, sandbox
+
+
+def free_loopback_port() -> int:
+    """A free TCP port on 127.0.0.1 for the Temporal test server.
+
+    temporalio's test server picks its own port with sdk-core's
+    get_free_port("0.0.0.0"), which self-connects to 0.0.0.0 — that
+    loopback self-connect is intercepted by this VM's egress proxy, so
+    start_time_skipping() hangs forever before spawning the server.
+    Passing an explicit port skips get_free_port entirely, and binding
+    on 127.0.0.1 is not intercepted.
+    """
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
 
 
 def pytest_configure(config):
