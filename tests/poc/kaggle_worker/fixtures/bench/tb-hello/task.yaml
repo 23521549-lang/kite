@@ -1,0 +1,13 @@
+instruction: |-
+  Create a file named answer.txt in the working directory containing exactly the text "hello kite".
+author_name: Kite bench sample
+author_email: bench@kite.local
+difficulty: easy
+category: scripting
+tags:
+  - scripting
+  - files
+parser_name: pytest
+max_agent_timeout_sec: 120
+max_test_timeout_sec: 60
+run_tests_in_same_shell: false

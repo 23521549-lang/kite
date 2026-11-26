@@ -1,6 +1,8 @@
 // Calls to Kite's web back end. Every write carries the session's CSRF token; a 401 sends the page back
 // to the login form.
 
+import type { DictKey } from './i18n'
+
 export class ApiError extends Error {
   status: number
   data: unknown
@@ -533,4 +535,47 @@ export function deleteKnowledge(docId: string) {
 
 export function reconvertKnowledge(docId: string) {
   return post<{ doc_id: string; status: string }>(`/api/knowledge/${encodeURIComponent(docId)}/reconvert`)
+}
+
+/** Bench — mở rộng theo schema §9 của docs/bench-standard-v1.md. */
+export type BenchLevel = {
+  level: number
+  name_en: string
+  name_vi: string
+  name_i18n_key: DictKey
+  desc_i18n_key: DictKey
+  range: [number, number]
+}
+
+export type BenchNetwork = { mode: 'offline' | 'allowlist'; hosts: string[] }
+
+export type BenchRadarPoint = { axis: string; key: string; score: number | null }
+
+export type BenchRunRow = Record<string, unknown> & {
+  criteria_version?: string
+  gate_set?: string | null
+  overall?: number | null
+  level?: BenchLevel | null
+  level_unstable?: boolean | null
+  network?: BenchNetwork
+  axes?: Record<string, number | null>
+  radar?: BenchRadarPoint[]
+}
+
+export type BenchOfficial = {
+  criteria_version: string
+  gate_set: string | null
+  overall: number | null
+  official: boolean
+  runs: number
+  excluded_runs: number
+  level: BenchLevel | null
+  level_unstable: boolean
+}
+
+export type BenchHistory = {
+  runs: BenchRunRow[]
+  table: string
+  official?: BenchOfficial
+  declared_network_hosts?: string[]
 }

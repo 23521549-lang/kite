@@ -1,0 +1,23 @@
+id: tb-hello
+goal: Create a file named answer.txt in the working directory containing exactly
+  the text "hello kite".
+kind: terminal
+language: en
+axes:
+- Coding
+difficulty: easy
+timeouts:
+  agent: 120
+  test: 60
+environment:
+  dockerfile: Dockerfile
+terminal_bench:
+  task: tb-hello
+  parser_name: pytest
+  category: scripting
+  tags:
+  - scripting
+  - files
+  author_name: Kite bench sample
+  author_email: bench@kite.local
+  run_tests_in_same_shell: false

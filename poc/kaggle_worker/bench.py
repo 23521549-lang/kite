@@ -28,6 +28,9 @@ from typing import Any, Callable
 import urllib.error
 import urllib.request
 
+from .bench_loader import read_dir_files, read_solution_files, task_dir_of
+from .bench_standard import BenchTask
+
 Post = Callable[[dict], dict]
 VIETNAMESE = set("ăâđêôơưáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ")
 SANDBOX_REPO = "/home/ubuntu/kite-sandbox"
@@ -1288,10 +1291,140 @@ def score_code(task, run: dict) -> dict:
             "prompt_tokens": run.get("prompt_tokens"), "completion_tokens": run.get("completion_tokens")}
 
 
+# --------------------------------------------------------------------------------------- v1 tasks
+# Dispatch for validated v1 tasks (``docs/bench-standard-v1.md``). This is the ONLY place
+# run_bench learns about v1 kinds: every kind reuses an existing runner/scorer — nothing
+# here changes how a task is scored, and a kind with no runnable path fails with an
+# explicit error instead of silently falling back to an old suite.
+#
+# kind -> path (spec §2.3):
+#   code / terminal -> CodeTask (files/ + hidden tests/ + solution.*) -> run_code -> score_code
+#   repo            -> RepoTask (base_commit + hidden tests/)          -> run_code -> score_code
+#   scenario        -> Scenario (the task's scenario: block)           -> run_scenario (REAL lead
+#                      via ``post``; tool results are the scripted ones in the task, so the
+#                      checks stay deterministic) -> score_scenario
+#   qa              -> NO path in v1: pure Q&A bench is outside the first Gói 7 round (decision
+#                      Q9-phụ), and v1 defines no expected-answer field or checker, so a qa
+#                      task cannot be scored. Dispatch returns an explicit error; adding qa
+#                      needs a spec v2 (see the worker (b) report).
+#
+# Repo caveat (read before wiring a runner): v1 carries no fix-commit SHA (SWE-bench has
+# none; ``task.yaml`` has no such field), so ``task_to_repo_task`` sets ``fix`` to the
+# base commit as an EXPLICIT placeholder. ``fix`` is only read by ``reference_lines``
+# (which then reports 0) and by ``hidden_files(task, source)`` — which MUST NOT be
+# called for a v1 repo task, because its hidden tests live in the task folder's
+# ``tests/``, not in git at the fix commit. The dispatch outcome carries those
+# contents in ``hidden_files`` (repo-relative path -> content) so the caller can
+# inject them without git; a ``run_code`` that calls ``hidden_files(task, source)``
+# on a v1 RepoTask will fail on test files the fix commit added.
+
+
+class _CannotDispatch(Exception):
+    """A v1 task with no runnable path: the reason goes into the outcome."""
+
+
+def task_to_code_task(task: BenchTask, task_dir: Path) -> CodeTask:
+    """A v1 ``code``/``terminal`` task as the ``CodeTask`` the existing runner understands:
+    ``files/`` is the starting repo, ``tests/`` the hidden tests, ``solution.*`` the
+    reference fix (only ever used by Kite's own fixture checks)."""
+    task_dir = Path(task_dir)
+    return CodeTask(task.id, task.goal, files=read_dir_files(task_dir / "files"),
+                    solution=read_solution_files(task_dir),
+                    hidden=read_dir_files(task_dir / "tests"))
+
+
+def task_to_scenario(task: BenchTask) -> Scenario:
+    """A v1 ``scenario`` task as the ``Scenario`` ``score_scenario`` understands (same
+    field names as the ``scenario:`` block — the validator and the scorer speak one
+    language)."""
+    data = task.scenario or {}
+    return Scenario(id=task.id, category=data.get("category", ""), prompt=data["prompt"],
+                    expect=set(data.get("expect", [])), args=dict(data.get("args", {})),
+                    results=dict(data.get("results", {})), must=list(data.get("must", [])),
+                    must_not=list(data.get("must_not", [])),
+                    forbid=set(data.get("forbid", [])), count=dict(data.get("count", {})),
+                    need=set(data.get("need", [])), optional=bool(data.get("optional", False)))
+
+
+def task_to_repo_task(task: BenchTask, task_dir: Path) -> RepoTask:
+    """A v1 ``repo`` task as the ``RepoTask`` the existing runner understands: the base
+    commit plus the hidden-test paths (repo-relative, mirroring ``tests/``). See the
+    caveat above for why ``fix`` is the base commit here."""
+    hidden = tuple(sorted(read_dir_files(Path(task_dir) / "tests")))
+    return RepoTask(task.id, task.base_commit, task.base_commit, hidden, task.goal)
+
+
+def dispatch_v1_task(task: BenchTask, *, model: str, post: Post, system: str, tools: list[dict],
+                     run_code: Callable[[CodeTask, str, Path], dict] | None, out: Path,
+                     task_dir: Path | None = None,
+                     log: Callable[[str], None] = print) -> dict:
+    """Run one validated v1 task through the existing runners and score it.
+
+    Returns the scorer's outcome plus ``id``/``kind``/``axes`` (and, for ``repo``,
+    the folder's hidden-test contents in ``hidden_files``). A task that cannot
+    run returns ``{"passed": False, "error": <reason>}`` — never a silent
+    fallback to an old suite, and never an exception out of the driver.
+    ``task_dir`` defaults to the folder the task was loaded from
+    (``task.source_path``); a task built in memory needs it passed in.
+    """
+    outcome: dict[str, Any] = {"id": task.id, "kind": task.kind, "axes": list(task.axes)}
+    try:
+        if task.kind in ("code", "terminal"):
+            if run_code is None:
+                raise _CannotDispatch(
+                    f"kind={task.kind} cần run_code (đường chạy code) mà run_bench không "
+                    f"được truyền run_code")
+            if task_dir is None:
+                task_dir = task_dir_of(task)
+            if task_dir is None:
+                raise _CannotDispatch(
+                    f"bài {task.id} chưa nạp từ thư mục (thiếu source_path) nên không đọc "
+                    f"được files//tests/")
+            code_task = task_to_code_task(task, task_dir)
+            outcome.update(score_code(code_task, run_code(code_task, model, out)))
+        elif task.kind == "repo":
+            if run_code is None:
+                raise _CannotDispatch(
+                    "kind=repo cần run_code (đường chạy RepoTask) mà run_bench không được "
+                    "truyền run_code")
+            if task_dir is None:
+                task_dir = task_dir_of(task)
+            if task_dir is None:
+                raise _CannotDispatch(
+                    f"bài {task.id} chưa nạp từ thư mục (thiếu source_path) nên không đọc "
+                    f"được tests/")
+            repo_task = task_to_repo_task(task, task_dir)
+            outcome["hidden_files"] = read_dir_files(Path(task_dir) / "tests")
+            outcome.update(score_code(repo_task, run_code(repo_task, model, out)))
+        elif task.kind == "scenario":
+            scenario = task_to_scenario(task)
+            scored = run_scenario(post, model, scenario, system=system, tools=tools)
+            outcome.update(scored)
+            # score_scenario scores 0-1 (like the lead suite); the criteria
+            # scale is 0-100 (spec §6.1: score_scenario x 100).
+            outcome["score_100"] = round(scored["score"] * 100, 1)
+        elif task.kind == "qa":
+            raise _CannotDispatch(
+                "kind=qa: bench hỏi-đáp thuần ngoài Gói 7 đợt đầu (quyết định Q9-phụ) — "
+                "v1 không có trường đáp án kỳ vọng hay checker riêng nên bài qa chưa "
+                "dispatch được; cần đặc tả v2 thêm trường/checker")
+        else:
+            raise _CannotDispatch(f"kind={task.kind!r} không có đường chạy trong dispatch v1")
+    except _CannotDispatch as exc:
+        outcome.update({"passed": False, "error": str(exc)})
+    except Exception as exc:  # a runner failed: record it like the code suite does
+        outcome.update({"passed": False, "error": str(exc)})
+    log(f"[{model}] {task.id} ({task.kind}) "
+        f"{'OK' if outcome.get('passed') else 'SAI'}"
+        f"{' | ' + outcome['error'] if outcome.get('error') else ''}")
+    return outcome
+
+
 # --------------------------------------------------------------------------------------- driver
 def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, system: str, tools: list[dict],
               run_code: Callable[[CodeTask, str, Path], dict] | None = None,
               scenarios: list[Scenario] | None = None, code_tasks: list[CodeTask] | None = None,
+              v1_tasks: list[BenchTask] | None = None,
               log: Callable[[str], None] = print, meta: dict | None = None) -> dict:
     scenarios = SCENARIOS if scenarios is None else scenarios
     code_tasks = CODE_TASKS if code_tasks is None else code_tasks
@@ -1327,6 +1460,16 @@ def run_bench(*, models: list[str], suites: list[str], post: Post, out: Path, sy
                     f" (bản {outcome.get('fast_attempts') or 0}, test tái hiện {outcome.get('repro')})"
                     + (f" | polyglot lần {outcome.get('tries')}, pass@1 {outcome.get('pass_1')}"
                        if outcome.get("polyglot") else ""))
+        if v1_tasks:
+            # Validated v1 tasks, dispatched by kind (see dispatch_v1_task). Runs
+            # independently of ``suites``: a v1 list is its own suite. Old callers
+            # pass no v1_tasks and see exactly the old behaviour.
+            entry["v1"] = []
+            for task in v1_tasks:
+                log(f"[{model}] {task.id} ({task.kind}) ...")
+                entry["v1"].append(dispatch_v1_task(
+                    task, model=model, post=post, system=system, tools=tools,
+                    run_code=run_code, out=out, log=log))
         (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     results["finished"] = time.strftime("%Y-%m-%d %H:%M")
     (out / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
