@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import os
+import signal
 import subprocess
 import sys
 
@@ -530,3 +531,80 @@ def test_cli_mcp_serve_session_id_reaches_kiteops():
     args = _parser().parse_args(["--config", "/tmp/x.yaml", "mcp", "serve", "--session-id", "abc"])
     assert args.session_id == "abc"
     assert "session_id" in inspect.signature(KiteOps.__init__).parameters
+
+
+# ------------------------------------------------------------------ web teardown (review (c) 5b)
+
+def _dummy_mcp_process(config_path: Path, session_id: str):
+    """A real process whose argv matches `stale_chat_processes` for this config+session:
+    `kite --config <resolved> mcp serve --session-id <id>` (here `python -c` sleeps
+    instead of serving, but the argv shape is what the teardown matches on)."""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)",
+         "--config", str(config_path.resolve()), "mcp", "serve", "--session-id", session_id],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _wait_dead(proc, timeout: float = 5.0) -> bool:
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def test_delete_session_stops_its_mcp_process(site):
+    headers = signed_in(site)
+    created = make_session(site, headers)
+    sid = created["kite_session_id"]
+    proc = _dummy_mcp_process(site["config"], sid)
+    try:
+        assert site["client"].delete(f"/api/chat/sessions/{sid}", headers=headers).status_code == 200
+        assert _wait_dead(proc), "process MCP của session đã xóa vẫn còn sống"
+        assert proc.returncode == -signal.SIGTERM
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+def test_archive_session_stops_only_its_own_mcp_process(site):
+    headers = signed_in(site)
+    sid = make_session(site, headers)["kite_session_id"]
+    other = make_session(site, headers)["kite_session_id"]
+    mine = _dummy_mcp_process(site["config"], sid)
+    theirs = _dummy_mcp_process(site["config"], other)
+    try:
+        response = site["client"].post(f"/api/chat/sessions/{sid}/archive", headers=headers)
+        assert response.status_code == 200, response.text
+        assert _wait_dead(mine), "process MCP của session đã lưu trữ vẫn còn sống"
+        assert mine.returncode == -signal.SIGTERM
+        assert theirs.poll() is None, "process của session khác bị giết oan"
+    finally:
+        for proc in (mine, theirs):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
+def test_scheduler_engine_registers_mcp_sweep(site, monkeypatch):
+    from poc.kaggle_worker.web.scheduler_wiring import _mcp_sweep_job, build_engine
+
+    engine = build_engine(site["ctx"])
+    assert engine._jobs["mcp_sweep"].interval_seconds == 300
+
+    calls: list[tuple] = []
+    monkeypatch.setattr("poc.kaggle_worker.web.scheduler_wiring.sweep_stale_mcp_processes",
+                        lambda *args: calls.append(args))
+    _mcp_sweep_job(site["ctx"])()
+    assert calls == [(site["ctx"].state_dir, site["ctx"].config_path)]
+
+
+def test_web_startup_sweeps_orphaned_mcp_processes(site, monkeypatch):
+    from poc.kaggle_worker.web import app as appmod
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(appmod, "sweep_stale_mcp_processes", lambda *args: calls.append(args))
+    with TestClient(create_app(site["ctx"], start_scheduler=True), base_url="https://testserver"):
+        pass
+    assert calls == [(site["ctx"].state_dir, site["ctx"].config_path)]

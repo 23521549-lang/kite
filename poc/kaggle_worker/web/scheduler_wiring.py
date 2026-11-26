@@ -19,6 +19,7 @@ import sys
 from typing import Any
 
 from .. import secretary as sec
+from ..mcp_server import sweep_stale_mcp_processes
 from ..needs_decision import notify_new_items
 from ..schedules import SchedulerEngine, ScheduleStore, UrllibOpenCodeStarter, daily_at_bangkok
 from .secretary_api import _make_notifier, _post_report_to_secretary
@@ -48,6 +49,22 @@ def _needs_decision_job(ctx: Any):
         if notifier is None:
             return
         notify_new_items(notifier, items, ctx.state_dir / "needs_decision" / "notified.json")
+
+    return job
+
+
+def _mcp_sweep_job(ctx: Any):
+    """One sweep cycle: SIGTERM orphaned ``kite mcp serve`` processes (Gói 2 teardown).
+
+    A sweep cycle must never kill the engine: errors only print.
+    """
+
+    def job() -> None:
+        try:
+            sweep_stale_mcp_processes(ctx.state_dir, ctx.config_path)
+        except Exception as exc:  # noqa: BLE001 - a sweep cycle must not kill the engine
+            print(f"kite schedules: không quét được process MCP mồ côi ({exc})",
+                  file=sys.stderr, flush=True)
 
     return job
 
@@ -82,6 +99,7 @@ def build_engine(ctx: Any) -> SchedulerEngine:
         starter = None
     engine = SchedulerEngine(store, chat_dir=Path(chat_dir), starter=starter, note=_note_fn(ctx))
     engine.register_builtin("needs_decision_scan", _SCAN_INTERVAL_SECONDS, _needs_decision_job(ctx))
+    engine.register_builtin("mcp_sweep", _SCAN_INTERVAL_SECONDS, _mcp_sweep_job(ctx))
     engine.register_builtin("secretary_daily_report", daily_at_bangkok("00:00"),
                             _daily_report_job(ctx))
     return engine

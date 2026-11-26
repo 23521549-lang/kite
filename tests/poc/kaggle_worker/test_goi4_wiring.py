@@ -34,9 +34,10 @@ def _fake_ctx(tmp_path):
     )
 
 
-def test_build_engine_registers_both_builtins(tmp_path):
+def test_build_engine_registers_builtins(tmp_path):
     engine = build_engine(_fake_ctx(tmp_path))
-    assert set(engine._jobs) == {"needs_decision_scan", "secretary_daily_report"}
+    assert set(engine._jobs) == {"needs_decision_scan", "secretary_daily_report", "mcp_sweep"}
+    assert engine._jobs["mcp_sweep"].interval_seconds == 300
     assert engine.starter is not None  # loopback OpenCode URL, no server needed to build
     assert engine.chat_dir == Path.home() / "kite-chat"  # no chat dir: triggers note + retry
 

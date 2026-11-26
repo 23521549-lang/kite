@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 
 from ..config import ConfigError, load_config
 from ..journal import FILES, Journal, read_jsonl, summarize
-from ..mcp_server import KiteToolError
+from ..mcp_server import KiteToolError, stop_stale_chat_processes, sweep_stale_mcp_processes
 from . import knowledge as know
 from . import security as sec
 from . import workers as wk
@@ -375,6 +375,17 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
                 task = start_scheduler_engine(ctx)
             except Exception as exc:
                 print(f"kite web: không khởi động được động cơ hẹn giờ ({exc}); lịch sẽ không chạy",
+                      file=sys.stderr, flush=True)
+            # One sweep at startup (Gói 2 teardown): sessions archived/deleted while the
+            # web was down left orphaned `kite mcp serve` processes behind.
+            try:
+                swept = await asyncio.to_thread(
+                    sweep_stale_mcp_processes, ctx.state_dir, ctx.config_path)
+                if swept:
+                    print(f"kite web: đã dọn {len(swept)} process MCP mồ côi khi khởi động",
+                          file=sys.stderr, flush=True)
+            except Exception as exc:  # noqa: BLE001 - a failed sweep must not block startup
+                print(f"kite web: không quét được process MCP mồ côi khi khởi động ({exc})",
                       file=sys.stderr, flush=True)
         try:
             yield
@@ -1077,6 +1088,23 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
             out["warning"] = warning
         return out
 
+    async def _stop_session_mcp(kite_session_id: str) -> list[dict]:
+        """Best-effort SIGTERM of this session's ``kite mcp serve`` processes (Gói 2 teardown).
+
+        The status change in the DB is the real action; a failed scan must never
+        break the endpoint — leftovers are caught by the startup/periodic sweeper.
+        Returns what was stopped (empty when nothing was running or on error).
+        """
+        try:
+            stopped = await asyncio.to_thread(
+                stop_stale_chat_processes, ctx.config_path, session_id=kite_session_id)
+        except Exception as exc:  # noqa: BLE001 - teardown must not break the endpoint
+            log.warning("kite web: không dừng được MCP của session %s (%s)", kite_session_id, exc)
+            return []
+        if stopped:
+            log.info("kite web: đã dừng %d process MCP của session %s", len(stopped), kite_session_id)
+        return stopped
+
     def env_rows() -> list[dict[str, Any]]:
         rows = [{"id": "default", "name": "Default", "path": "", "url": "", "kind": "default"}]
         for repo in ctx.store.repo_rows():
@@ -1152,6 +1180,7 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
             if store.get_chat_session(kite_session_id) is None:
                 raise HTTPException(404, "không có session này")
             updated = store.set_chat_session_status(kite_session_id, "archived")
+        await _stop_session_mcp(kite_session_id)
         audit(session, "chat_session_archive", kite_session_id)
         return session_out(updated)
 
@@ -1164,6 +1193,7 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
                 raise HTTPException(404, "không có session này")
             # Only the status changes: the registry row stays, so the trace survives.
             updated = store.set_chat_session_status(kite_session_id, "deleted")
+        await _stop_session_mcp(kite_session_id)
         audit(session, "chat_session_delete", kite_session_id)
         return session_out(updated)
 
