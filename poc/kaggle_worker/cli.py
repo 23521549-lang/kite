@@ -126,6 +126,14 @@ def _parser() -> argparse.ArgumentParser:
     reconvert.add_argument("--lock-token", default=None,
                            help="one-time token of a lock already held by the requester "
                                 "(internal: used by the detached job request_reconvert spawns)")
+    codemap_parser = commands.add_parser("codemap", help="code map of a repository (graphify): rebuild the graph "
+                                                         "an environment's Context tab shows")
+    codemap_commands = codemap_parser.add_subparsers(dest="codemap_command", required=True)
+    codemap_build = codemap_commands.add_parser("build", help="build (or rebuild) one environment's code map")
+    codemap_build.add_argument("env_id", help="environment id (the number shown on the Environments page)")
+    codemap_build.add_argument("--lock-token", default=None,
+                               help="one-time token of a lock already held by the requester "
+                                    "(internal: used by the detached job request_rebuild spawns)")
     experience_parser = commands.add_parser("experience", help="approved experience documents per repository "
                                                               "(distilled lessons, versioned)")
     experience_commands = experience_parser.add_subparsers(dest="experience_command", required=True)
@@ -1538,6 +1546,19 @@ def _memory_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _codemap_command(args: argparse.Namespace) -> int:
+    """Build one environment's code map (F4). The build itself runs in this
+    process; ``request_rebuild`` (web) spawns this command detached. A failed
+    build prints its error and exits 1."""
+    from .web.codemap_job import run_rebuild
+
+    result = run_rebuild(args.config.parent, args.env_id, lock_token=args.lock_token)
+    if result["status"] != "ready":
+        raise ConfigError(result["error"])
+    _emit(result)
+    return 0
+
+
 def _knowledge_command(args: argparse.Namespace) -> int:
     """Reconvert one Knowledge document with Docling (Gói 6). The conversion
     itself runs in this process; ``request_reconvert`` (web) spawns this
@@ -2345,6 +2366,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _memory_command(args)
     if args.command == "knowledge":
         return _knowledge_command(args)
+    if args.command == "codemap":
+        return _codemap_command(args)
     if args.command == "experience":
         return _experience_command(args)
     if args.command == "improve":
@@ -2595,7 +2618,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox", "mcp", "chat",
-                        "bench", "journal", "cleanup", "model", "notify", "memory", "knowledge", "experience", "improve",
+                        "bench", "journal", "cleanup", "model", "notify", "memory", "knowledge", "codemap", "experience", "improve",
                         "update", "web", "busy", "stack", "tasks"}:
         return _operator_command(args)
 
