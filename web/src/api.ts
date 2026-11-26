@@ -319,6 +319,20 @@ export async function getExperienceDiff(id: string): Promise<string> {
   return res.ok ? await res.text() : ''
 }
 
+export type RepoMemoryPending = { id: string; kind: string; repo?: string; task_id?: string; text: string }
+
+export type RepoMemory = {
+  chat?: string[]
+  repo?: string | null
+  lessons?: string[]
+  lessons_file?: string | null
+  pending?: RepoMemoryPending[]
+}
+
+export async function getRepoMemory(repo: string): Promise<RepoMemory> {
+  return get<RepoMemory>(`/api/repos/memory${qs({ repo })}`)
+}
+
 export async function approveExperience(id: string): Promise<unknown> {
   return post(`/api/repos/experience/${encodeURIComponent(id)}/approve`)
 }

@@ -167,7 +167,8 @@ def _session_busy(item: Any) -> bool:
     return isinstance(busy, (int, float)) and (not isinstance(idle, (int, float)) or busy > idle)
 
 
-def env_cost_usd(journal: Any, tasks: list[dict[str, Any]], env_id: str) -> float | None:
+def env_cost_usd(journal: Any, tasks: list[dict[str, Any]], env_id: str, *,
+                 month_only: bool = False, now: float | None = None) -> float | None:
     """USD spent on tasks of one environment (a lower bound, never fabricated).
 
     Journal spend records carry ``tag=<task_id>`` (relay.py records
@@ -176,12 +177,22 @@ def env_cost_usd(journal: Any, tasks: list[dict[str, Any]], env_id: str) -> floa
     pre-Gói-2 spend have no task link and are excluded. Branch retries tag
     ``"<task_id>-b<N>"``: the suffix is stripped. Unreadable journal: None
     (unknown, not zero).
+
+    With ``month_only``, only records dated in the current UTC month count —
+    the same UTC month the spend ledger uses (relay.py ``_month``: "làm mới
+    ngày 1, UTC"), so the number matches the "Chi tháng này" label. A record
+    without a numeric ``ts`` has no provable month and is skipped in that
+    mode (every record the journal itself writes carries ``ts``).
     """
     task_env = {t.get("task_id"): t.get("environment_id") for t in tasks}
     try:
         records = journal.read("spend")
     except Exception:
         return None
+    month: tuple[int, int] | None = None
+    if month_only:
+        current = time.gmtime(now if now is not None else time.time())
+        month = (current.tm_year, current.tm_mon)
     total = 0.0
     for record in records:
         tag = record.get("tag")
@@ -190,6 +201,13 @@ def env_cost_usd(journal: Any, tasks: list[dict[str, Any]], env_id: str) -> floa
         base = re.sub(r"-b\d+$", "", tag)
         if task_env.get(base) != env_id:
             continue
+        if month is not None:
+            ts = record.get("ts")
+            if not isinstance(ts, (int, float)):
+                continue
+            stamp = time.gmtime(float(ts))
+            if (stamp.tm_year, stamp.tm_mon) != month:
+                continue
         usd = record.get("usd")
         if isinstance(usd, (int, float)):
             total += float(usd)
@@ -1184,7 +1202,8 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
         number is a lower bound, never a fabrication."""
         card: dict[str, Any] = {**env, "branch": None, "head": None, "clean": None,
                                 "last_sync": None, "session_count": None, "task_count": None,
-                                "cost_usd": None, "lesson_count": None, "recent_commits": []}
+                                "cost_usd": None, "spend_month_usd": None,
+                                "lesson_count": None, "recent_commits": []}
         if env["path"]:
             try:
                 status = await ctx.ops().repo_status(env["path"])
@@ -1212,6 +1231,12 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
                 card["task_count"] = len([t for t in tasks
                                           if t.get("environment_id") == env["id"]])
                 card["cost_usd"] = env_cost_usd(ctx.journal(), tasks, str(env["id"]))
+                # The card's "Chi tháng này" reads spend_month_usd: the same
+                # task-attributed spend, restricted to the current UTC month
+                # (env_cost_usd month_only). cost_usd stays the all-time
+                # lower bound for any other consumer.
+                card["spend_month_usd"] = env_cost_usd(ctx.journal(), tasks, str(env["id"]),
+                                                        month_only=True, now=ctx.clock())
         except Exception:
             pass
         return card

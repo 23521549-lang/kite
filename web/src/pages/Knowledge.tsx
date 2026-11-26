@@ -3,11 +3,14 @@ import { IconTrash, IconUpload } from '@tabler/icons-react'
 import { useEffect, useState } from 'react'
 import {
   deleteKnowledge,
+  envDisplayName,
   getKnowledge,
   getKnowledgeMarkdown,
+  listEnvironments,
   listKnowledge,
   reconvertKnowledge,
   uploadKnowledge,
+  type EnvironmentRow,
   type KnowledgeDoc,
 } from '../api'
 import { ConfirmButton, Empty, KeyValue, Loading, Markdown, Page } from '../components/common'
@@ -46,6 +49,15 @@ export default function Knowledge({ parts }: { parts: string[] }) {
   )
   const docs = data?.documents ?? []
   const doc = docs.find((d) => d.doc_id === selected) ?? null
+  // Environment names for display (N7): the list + detail show the env's
+  // display name ("shop-api"), not its raw id ("1"). A failed load degrades
+  // to showing the id, exactly as before.
+  const envs = useLoad(() => listEnvironments().catch(() => [] as EnvironmentRow[]), [])
+  const envName = (id: string | null | undefined) => {
+    if (!id) return ''
+    const found = (envs.data ?? []).find((e) => e.id === id)
+    return found ? envDisplayName(found) : id
+  }
   return (
     <Page title={t('knowledge.title')}>
       <Grid>
@@ -89,7 +101,7 @@ export default function Knowledge({ parts }: { parts: string[] }) {
                             {d.filename}
                           </Text>
                           <Text size="xs" c="dimmed">
-                            {d.scope === 'global' ? t('knowledge.scope.global') : `${t('knowledge.scope.environment')}: ${d.environment_id ?? ''}`}
+                            {d.scope === 'global' ? t('knowledge.scope.global') : `${t('knowledge.scope.environment')}: ${envName(d.environment_id)}`}
                             {d.tags.length ? ` · ${d.tags.join(', ')}` : ''}
                           </Text>
                         </Table.Td>
@@ -107,7 +119,7 @@ export default function Knowledge({ parts }: { parts: string[] }) {
           </Stack>
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 7 }}>
-          {doc ? <KnowledgeDetail key={doc.doc_id} doc={doc} onChanged={reload} /> : <Empty>{t('knowledge.detail.pick-doc')}</Empty>}
+          {doc ? <KnowledgeDetail key={doc.doc_id} doc={doc} envName={envName} onChanged={reload} /> : <Empty>{t('knowledge.detail.pick-doc')}</Empty>}
         </Grid.Col>
       </Grid>
     </Page>
@@ -203,7 +215,7 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
   )
 }
 
-function KnowledgeDetail({ doc, onChanged }: { doc: KnowledgeDoc; onChanged: () => void }) {
+function KnowledgeDetail({ doc, envName, onChanged }: { doc: KnowledgeDoc; envName: (id: string | null | undefined) => string; onChanged: () => void }) {
   const t = useT()
   const [converting, setConverting] = useState(doc.status === 'converting')
   // Poll the detail every 3 seconds while converting, until it finishes.
@@ -223,7 +235,7 @@ function KnowledgeDetail({ doc, onChanged }: { doc: KnowledgeDoc; onChanged: () 
         </Group>
         <KeyValue
           rows={[
-            [t('knowledge.detail.scope'), shown.scope === 'global' ? t('knowledge.scope.global') : `${t('knowledge.scope.environment')}: ${shown.environment_id ?? ''}`],
+            [t('knowledge.detail.scope'), shown.scope === 'global' ? t('knowledge.scope.global') : `${t('knowledge.scope.environment')}: ${envName(shown.environment_id)}`],
             [t('knowledge.detail.tags'), shown.tags.length ? shown.tags.join(', ') : t('knowledge.detail.unknown')],
             [t('knowledge.detail.converter'), shown.converter ?? t('knowledge.detail.unknown')],
             [t('knowledge.detail.converted-at'), fmtTime(shown.converted_at)],

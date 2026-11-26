@@ -388,14 +388,24 @@ def test_environments_card_and_detail(site):
         store.enqueue(ScheduledTask(task_id="t-env", role="coder", model_id=None, repo_head="h",
                                     branch="b", payload_json='{"goal":"g"}', estimated_gpu_seconds=60,
                                     priority=1, created_at=100.0, environment_id=env["id"]))
+    # Spend tagged to t-env: 0.5 this month (NOW is 2026-11-23 UTC), 2.0 last
+    # month. The card's cost_usd is the all-time lower bound (2.5) while
+    # spend_month_usd is the current-UTC-month slice (0.5) the card displays.
+    journal_dir = site["path"] / "journal"
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    with (journal_dir / "spend.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"ts": NOW, "tag": "t-env", "usd": 0.5, "worker": "w"}) + "\n")
+        stream.write(json.dumps({"ts": NOW - 40 * 86400, "tag": "t-env", "usd": 2.0,
+                                 "worker": "w"}) + "\n")
     cards = site["client"].get("/api/environments", headers=headers).json()["environments"]
     card = next(e for e in cards if e["id"] == env["id"])
     assert card["branch"] == "main" and card["head"] == heads["main"] and card["clean"] is True
     assert card["last_sync"] == 1_700_000_000.0
     assert card["session_count"] == 1 and card["task_count"] == 1 and card["lesson_count"] == 1
-    # No task-attributed spend recorded yet: 0.0 is a lower bound (the journal
-    # is readable, it simply has no spend for this env's tasks), not "free".
-    assert card["cost_usd"] == 0.0 and card["recent_commits"] and "init" in card["recent_commits"][0]
+    # cost_usd is the all-time lower bound (0.5 this month + 2.0 last month);
+    # spend_month_usd is only the current-UTC-month slice the card displays.
+    assert card["cost_usd"] == 2.5 and card["spend_month_usd"] == 0.5
+    assert card["recent_commits"] and "init" in card["recent_commits"][0]
     default = next(e for e in cards if e["id"] == "default")
     assert default["branch"] is None and default["session_count"] == 0
     detail = site["client"].get(f"/api/environments/{env['id']}", headers=headers).json()

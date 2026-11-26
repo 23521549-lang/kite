@@ -1526,12 +1526,19 @@ class KiteOps:
         and the config Kite uses to install and test it."""
         from . import memory
 
+        pending = memory.list_pending(self.state_dir)
+        path: Any = None
+        if repo.strip():
+            # A repo-scoped query shows only that repo's pending entries:
+            # pending lessons are stored with the repo's resolved absolute
+            # path (memory.py _propose), chat preferences carry repo "".
+            path, _head = self._repo(repo)
+            pending = [e for e in pending if (e.get("repo") or "") == str(path)]
         report: dict[str, Any] = {"chat": [f"{i}. {line[2:]}" for i, line in enumerate(memory.preferences(
             self.state_dir), 1)], "chat_file": str(memory.preferences_path(self.state_dir)),
             "pending": [{"id": e["id"], "kind": e["kind"], "repo": e.get("repo") or "",
-                         "text": e["text"]} for e in memory.list_pending(self.state_dir)]}
-        if repo.strip():
-            path, _head = self._repo(repo)
+                         "task_id": e.get("task_id") or "", "text": e["text"]} for e in pending]}
+        if path is not None:
             report["repo"] = str(path)
             report["lessons"] = [f"{i}. {line[2:]}" for i, line in enumerate(memory.lesson_lines(self.state_dir, path), 1)]
             report["lessons_file"] = str(memory.memory_path(self.state_dir, path))
