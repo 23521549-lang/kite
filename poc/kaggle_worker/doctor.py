@@ -386,7 +386,9 @@ def run_checks(config: KiteConfig, config_path: Path, probes: Probes | None = No
     # ---- tools
     executable = config.opencode_executable
     found = Path(executable).exists() or p.which(executable)
-    add("opencode", OK if found else FAIL, executable, "" if found else "cài OpenCode hoặc sửa opencode.executable")
+    add("opencode", OK if found else FAIL,
+        executable if found else f"không tìm thấy lệnh {executable}",
+        "" if found else "cài OpenCode hoặc sửa opencode.executable")
     journal = state_dir / "journal"
     writable = os.access(journal if journal.exists() else state_dir, os.W_OK)
     add("journal", OK if writable else WARN, str(journal), "" if writable else f"sudo chown -R $USER {state_dir}")
