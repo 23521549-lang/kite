@@ -374,6 +374,37 @@ def test_the_worker_list_merges_config_gateway_and_spend(site):
     assert site["client"].get("/api/workers").json()["gateway_up"] is False
 
 
+def test_task_activity_includes_running_tasks(tmp_path):
+    """A RUNNING row counts as running for the Overview's activity feed.
+
+    RUNNING is not a store state (the store only writes QUEUED -> LEASED ->
+    COMPLETED/FAILED/CANCELLED) but a seeded/demo row may carry it (workflow
+    state written by hand); the feed must show it with its worker and step,
+    like QUEUED/LEASED, and still skip finished tasks.
+    """
+    from types import SimpleNamespace
+
+    from poc.kaggle_worker.backend import task_slug
+    from poc.kaggle_worker.web.app import task_activity
+
+    ctx = SimpleNamespace(state_dir=tmp_path)
+    running_id = "task-20251126-050012-8823"
+    trace_dir = tmp_path / "tasks" / task_slug(running_id)
+    trace_dir.mkdir(parents=True)
+    (trace_dir / "trace.jsonl").write_text(
+        json.dumps({"event": "run_start", "worker": "deepseek-main", "ts": NOW}) + "\n"
+        + json.dumps({"event": "step_start", "step": "setup/agent", "ts": NOW + 10}) + "\n")
+    tasks = [{"task_id": running_id, "state": "RUNNING", "goal": "sửa giỏ hàng"},
+             {"task_id": "task-leased", "state": "LEASED", "goal": "việc đang chạy"},
+             {"task_id": "task-queued", "state": "QUEUED", "goal": "việc đang chờ"},
+             {"task_id": "task-done", "state": "COMPLETED", "goal": "việc xong"}]
+    out = task_activity(ctx, tasks)
+    assert [entry["task_id"] for entry in out] == [running_id, "task-leased", "task-queued"]
+    running = out[0]
+    assert running["state"] == "RUNNING" and running["worker"] == "deepseek-main"
+    assert running["step"] == "setup/agent" and running["goal"] == "sửa giỏ hàng"
+
+
 def test_adding_an_api_worker_keeps_its_key_in_a_private_file_and_out_of_answers(site):
     headers = signed_in(site)
     client = site["client"]

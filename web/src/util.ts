@@ -118,6 +118,19 @@ export function taskState(state: string | undefined | null) {
   return TASK_STATES[state ?? ''] ?? { label: state ?? '?', color: 'gray', key: null as TaskStateKey | null }
 }
 
+/**
+ * States that count as "đang chạy" (the Tasks list 'active' filter and the
+ * Overview activity feed). RUNNING is not written by the store (only
+ * QUEUED -> LEASED -> ...), but a seeded/demo row may carry it (workflow state
+ * written by hand) and the badge already renders it as running, so the
+ * filters must include it too.
+ */
+export const ACTIVE_TASK_STATES: readonly string[] = ['QUEUED', 'LEASED', 'RUNNING']
+
+export function isActiveTask(state: string | undefined | null): boolean {
+  return state !== null && state !== undefined && ACTIVE_TASK_STATES.includes(state)
+}
+
 export type WorkerStateKey = 'disabled' | 'switch-off' | 'stopping' | 'busy' | 'idle' | 'starting' | 'offline'
 
 export function workerState(w: {
