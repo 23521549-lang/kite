@@ -287,6 +287,12 @@ export default function TaskDetail({ taskId, onChanged }: { taskId: string; onCh
                           [t('tasks.detail.self-test'), log.result.verified ? t('tasks.detail.self-test-pass') : t('tasks.detail.self-test-fail')],
                           [t('tasks.detail.duration'), log.result.wall_seconds ? t('tasks.detail.duration-seconds', { seconds: Math.round(log.result.wall_seconds) }) : '—'],
                           [t('tasks.detail.changed-files'), (log.result.changed_files ?? []).join(', ') || '—'],
+                          ...(typeof log.result.patch_added === 'number'
+                            ? ([[t('tasks.detail.lines-added'), `+${log.result.patch_added}`]] as [string, string][])
+                            : []),
+                          ...(typeof log.result.patch_removed === 'number'
+                            ? ([[t('tasks.detail.lines-removed'), `−${log.result.patch_removed}`]] as [string, string][])
+                            : []),
                         ] as [string, string][])
                       : []),
                   ]}

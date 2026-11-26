@@ -666,6 +666,8 @@ export const en: Record<DictKey, string> = {
   "tasks.detail.duration": "Duration",
   "tasks.detail.duration-seconds": "{seconds} seconds",
   "tasks.detail.changed-files": "Changed files",
+  "tasks.detail.lines-added": "Lines added",
+  "tasks.detail.lines-removed": "Lines removed",
   "tasks.detail.not-done": "Task is not done yet.",
   "tasks.detail.no-patch": "No patch yet.",
   "tasks.detail.requests": "Requests to model",

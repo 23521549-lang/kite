@@ -193,7 +193,7 @@ export default function Tasks({ parts }: { parts: string[] }) {
                             </Badge>
                           </Group>
                         </Table.Td>
-                        <Table.Td w={90}>
+                        <Table.Td w={128}>
                           <StateBadge state={t.state} />
                         </Table.Td>
                       </Table.Tr>

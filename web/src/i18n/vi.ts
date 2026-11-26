@@ -665,6 +665,8 @@ export const vi = {
   "tasks.detail.duration": "Thời gian",
   "tasks.detail.duration-seconds": "{seconds} giây",
   "tasks.detail.changed-files": "File đổi",
+  "tasks.detail.lines-added": "Dòng thêm",
+  "tasks.detail.lines-removed": "Dòng xóa",
   "tasks.detail.not-done": "Task chưa xong.",
   "tasks.detail.no-patch": "Chưa có patch.",
   "tasks.detail.requests": "Request tới model",
