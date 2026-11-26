@@ -378,6 +378,14 @@ export async function rejectExperience(id: string): Promise<unknown> {
   return post(`/api/repos/experience/${encodeURIComponent(id)}/reject`)
 }
 
+export async function approvePendingLesson(id: string): Promise<unknown> {
+  return post(`/api/repos/memory/${encodeURIComponent(id)}/approve`)
+}
+
+export async function rejectPendingLesson(id: string): Promise<unknown> {
+  return post(`/api/repos/memory/${encodeURIComponent(id)}/reject`)
+}
+
 // Existing repo-status endpoint, reused for git info on the environment
 // detail page (GET /api/environments itself carries no branch/HEAD).
 export type RepoStatus = {

@@ -1059,6 +1059,35 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
         audit(session, "memory_forget", repo or "chat", True, {"number": number})
         return report
 
+    async def _memory_pending_action(entry_id: str, action: str) -> dict:
+        """Approve/reject one pending lesson through the same functions the CLI
+        uses (`kite memory approve|reject`), so the web and the CLI cannot drift
+        apart. A malformed id can never match a queued entry (ids are 8 hex
+        chars from ``memory._propose``) → 400; a well-formed but unknown id → 404."""
+        from .. import memory
+
+        if not re.fullmatch(r"[0-9a-f]{8}", entry_id):
+            raise HTTPException(400, f"id mục chờ duyệt không đúng định dạng: {entry_id}")
+        act = memory.approve_pending if action == "approve" else memory.reject_pending
+        try:
+            return await asyncio.to_thread(act, ctx.state_dir, entry_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/repos/memory/{entry_id}/approve")
+    async def repo_memory_approve(entry_id: str, request: Request):
+        session = auth(request)
+        report = await _memory_pending_action(entry_id, "approve")
+        audit(session, "memory_approve", entry_id)
+        return report
+
+    @app.post("/api/repos/memory/{entry_id}/reject")
+    async def repo_memory_reject(entry_id: str, request: Request):
+        session = auth(request)
+        report = await _memory_pending_action(entry_id, "reject")
+        audit(session, "memory_reject", entry_id)
+        return report
+
     # ------------------------------------------------------- experience documents (Gói 10)
     @app.get("/api/repos/experience")
     async def repo_experience(request: Request, repo: str):
