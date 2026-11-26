@@ -173,6 +173,79 @@ def test_status_and_result_report_progress_then_the_review_bundle(tmp_path):
         asyncio.run(ops.task_status("unknown-task"))
 
 
+def _kill_temporal(ops: KiteOps) -> None:
+    """Make every later Temporal connect fail, the way a dead server does."""
+
+    async def dead_connect(_endpoint):
+        raise ConnectionRefusedError("127.0.0.1:7233: [Errno 111] Connection refused")
+
+    ops._client = None
+    ops._connect = dead_connect
+
+
+def _set_store_state(tmp_path: Path, task_id: str, state: str) -> None:
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_path / "state" / "scheduler.sqlite3")
+    try:
+        conn.execute("UPDATE tasks SET state=? WHERE task_id=?", (state, task_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_task_status_falls_back_to_store_when_temporal_is_down(tmp_path):
+    import hashlib
+
+    from poc.kaggle_worker.backend import task_slug
+
+    repo, head = make_repo(tmp_path)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    root = tmp_path / "state" / "tasks" / task_slug(task_id)
+    root.mkdir(parents=True, exist_ok=True)
+    patch = "diff --git a/calc.py b/calc.py\n+ x = 2\n"
+    (root / "result.patch").write_text(patch, encoding="utf-8")
+    (root / "checkpoint.json").write_text(json.dumps({"repo_path": str(repo)}), encoding="utf-8")
+    (root / "result.json").write_text(json.dumps({"worker": "kaggle-han"}), encoding="utf-8")
+    _set_store_state(tmp_path, task_id, "COMPLETED")
+    _kill_temporal(ops)
+    status = asyncio.run(ops.task_status(task_id))
+    assert (status["workflow"], status["queue_state"]) == ("COMPLETED", "COMPLETED")
+    assert status["temporal_unavailable"] is True and "error" not in status
+    result = asyncio.run(ops.task_result(task_id))
+    assert result["ready"] is True and result["temporal_unavailable"] is True
+    assert result["patch_sha256"] == hashlib.sha256(patch.encode("utf-8")).hexdigest()
+    assert result["worker"] == "kaggle-han" and result["repo_path"] == str(repo)
+    assert result["apply_with"] == f"git -C {repo} apply {root / 'result.patch'}"
+    assert "summary" not in result      # the summary only lives in the Temporal outcome
+    with pytest.raises(KiteToolError):
+        asyncio.run(ops.task_status("unknown-task"))
+
+
+def test_task_status_falls_back_when_workflow_is_gone_but_store_knows_it(tmp_path):
+    repo, _head = make_repo(tmp_path)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    del client.state[task_id]           # Temporal is up, but no workflow for this task
+    _set_store_state(tmp_path, task_id, "RUNNING")
+    status = asyncio.run(ops.task_status(task_id))
+    assert (status["workflow"], status["queue_state"]) == ("RUNNING", "RUNNING")
+    assert status["temporal_unavailable"] is True and "error" not in status
+
+
+def test_task_status_falls_back_for_a_queued_task_and_keeps_waiting_text(tmp_path):
+    repo, _head = make_repo(tmp_path)
+    ops = make_ops(tmp_path, FakeClient())
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    _kill_temporal(ops)
+    status = asyncio.run(ops.task_status(task_id))
+    assert (status["workflow"], status["queue_state"]) == ("QUEUED", "QUEUED")
+    assert status["waiting_for"].startswith("đang chờ worker")
+
+
 def owner_code(ops: KiteOps, action: str, task_id: str) -> str:
     """A confirmation code the way the owner gets one: `kite tasks confirm` in their own terminal."""
     from poc.kaggle_worker import confirm
