@@ -1233,6 +1233,17 @@ class KiteOps:
                          f"task_result(patch_offset={offset + len(page)}))")
             result.update(patch=page, patch_sha256=patch_sha256(raw),
                           patch_chars_total=total, patch_offset=offset)
+            if raw and result["status"] == "COMPLETED":
+                # The store only reaches COMPLETED on the workflow's success path
+                # (backend.release_route: outcome "COMPLETED" -> store.complete;
+                # the workflow then returns READY_FOR_REVIEW with the review
+                # bundle), so a completed task with a real patch on disk is
+                # exactly the task the live path would report READY_FOR_REVIEW.
+                # Without this, _finished_patch refuses the patch and apply/commit
+                # break precisely when Temporal is down — the case this fallback
+                # exists for. A completed task with no (or an empty) patch keeps
+                # status COMPLETED and is still refused there.
+                result["status"] = "READY_FOR_REVIEW"
         repo_path = None
         checkpoint = root / "checkpoint.json"
         if checkpoint.is_file():
