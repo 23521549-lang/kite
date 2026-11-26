@@ -2355,7 +2355,11 @@ def task_activity(ctx: WebContext, tasks: list[dict]) -> list[dict]:
 
     out = []
     for task in tasks:
-        if task.get("state") not in ("QUEUED", "LEASED"):
+        # RUNNING is not a store state (the store only writes QUEUED -> LEASED ->
+        # COMPLETED/FAILED/CANCELLED) but a seeded/demo row may carry it (workflow
+        # state written by hand); the display layer already renders RUNNING as
+        # running, so the activity feed must include it too.
+        if task.get("state") not in ("QUEUED", "LEASED", "RUNNING"):
             continue
         entry = {"task_id": task["task_id"], "state": task["state"], "goal": task.get("goal", "")[:120],
                  "step": None, "action": None, "phase": None, "since": None, "worker": None}

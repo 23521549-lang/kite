@@ -20,7 +20,7 @@ import { useEffect, useRef, useState } from 'react'
 import { get, post, type TaskRow } from '../api'
 import { Empty, Loading, Page, StateBadge } from '../components/common'
 import { go } from '../router'
-import { attempt, short, useLoad } from '../util'
+import { attempt, isActiveTask, short, useLoad } from '../util'
 import { useT } from '../i18n'
 import TaskDetail from './TaskDetail'
 import TaskJournal from './TaskJournal'
@@ -85,7 +85,7 @@ export default function Tasks({ parts }: { parts: string[] }) {
       (filter === 'all'
         ? true
         : filter === 'active'
-          ? ['QUEUED', 'LEASED'].includes(t.state)
+          ? isActiveTask(t.state)
           : filter === 'done'
             ? t.state === 'COMPLETED'
             : ['FAILED', 'CANCELLED'].includes(t.state)) &&
