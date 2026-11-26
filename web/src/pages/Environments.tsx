@@ -27,6 +27,7 @@ import { IconBrandGithub, IconFolder, IconPlus, IconRefresh, IconTrash } from '@
 import { useEffect, useState } from 'react'
 import {
   approveExperience,
+  approvePendingLesson,
   createChatSession,
   createEnvironment,
   deleteEnvironment,
@@ -47,6 +48,7 @@ import {
   listSessionMoves,
   rebuildCodemap,
   rejectExperience,
+  rejectPendingLesson,
   saveEnvDescription,
   saveEnvironmentPat,
   syncEnvironment,
@@ -937,6 +939,35 @@ function EnvLessons({ env }: { env: EnvironmentRow }) {
                     {p.id}
                     {p.task_id ? ` · ${p.task_id}` : ''}
                   </Text>
+                  <Group gap="xs" mt={4}>
+                    <Button
+                      size="xs"
+                      color="teal"
+                      onClick={async () => {
+                        const res = await attempt(
+                          () => approvePendingLesson(p.id),
+                          t('env.detail-lessons-approved'),
+                        )
+                        if (res !== undefined) mem.reload()
+                      }}
+                    >
+                      {t('env.detail-approve')}
+                    </Button>
+                    <Button
+                      size="xs"
+                      variant="light"
+                      color="red"
+                      onClick={async () => {
+                        const res = await attempt(
+                          () => rejectPendingLesson(p.id),
+                          t('env.detail-lessons-rejected'),
+                        )
+                        if (res !== undefined) mem.reload()
+                      }}
+                    >
+                      {t('env.detail-reject')}
+                    </Button>
+                  </Group>
                 </div>
               ))}
               <Text size="xs" c="dimmed">

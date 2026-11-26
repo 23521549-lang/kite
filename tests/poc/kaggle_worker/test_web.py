@@ -1116,6 +1116,32 @@ def test_the_other_tabs_answer(site):
     assert {"memory_add", "repo_config", "cleanup"} <= {r["action"] for r in site["store"].audit_rows()}
 
 
+def test_pending_lessons_can_be_approved_or_rejected_from_the_web(site):
+    from poc.kaggle_worker import memory
+
+    client = site["client"]
+    repo = "/home/han/app"
+    entry = memory.propose_lesson(site["path"], repo, "task-1", "luôn chạy test trước khi đẩy")
+    assert client.post(f"/api/repos/memory/{entry['id']}/approve").status_code == 401
+    headers = signed_in(site)
+    approved = client.post(f"/api/repos/memory/{entry['id']}/approve", headers=headers)
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["approved"] is True
+    assert memory.list_pending(site["path"]) == []
+    assert any("luôn chạy test trước khi đẩy" in line for line in memory.lessons(site["path"], repo))
+    other = memory.propose_lesson(site["path"], repo, "task-2", "không bao giờ đẩy thẳng lên main")
+    rejected = client.post(f"/api/repos/memory/{other['id']}/reject", headers=headers)
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["approved"] is False
+    assert memory.list_pending(site["path"]) == []
+    assert not any("không bao giờ đẩy thẳng lên main" in line
+                   for line in memory.lessons(site["path"], repo))
+    assert client.post("/api/repos/memory/deadbeef/approve", headers=headers).status_code == 404
+    assert client.post("/api/repos/memory/not-an-id/approve", headers=headers).status_code == 400
+    assert client.post("/api/repos/memory/not-an-id/reject", headers=headers).status_code == 400
+    assert {"memory_approve", "memory_reject"} <= {r["action"] for r in site["store"].audit_rows()}
+
+
 # ---------------------------------------------------------------- phase 6: re-auth, recovery, sealing
 def test_reauth_guesses_lock_the_account_just_like_signin_guesses(site):
     headers = signed_in(site)
