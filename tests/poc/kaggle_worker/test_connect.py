@@ -406,6 +406,55 @@ def test_enable_gate_refuses_unscanned_and_failed_tools():
     assert ok
 
 
+# ---------------------------------------------------------------- public_tool: the flat display fields the web
+# contract promises (F2 fix — the cards read these at the top level).
+
+def test_public_tool_flattens_config_and_derives_status():
+    base = {"id": "tool-1", "kind": "source", "name": "s", "enabled": False,
+            "config": {"path": "/srv/mcp", "command": ["python3", "server.py", "--x"]},
+            "lock": None, "last_scan": None}
+    out = c.public_tool(base)
+    assert out["command"] == "python3"
+    assert out["args"] == ["server.py", "--x"]
+    assert out["source"] == "/srv/mcp"
+    assert out["path"] == "/srv/mcp"
+    assert out["status"] == "pending_scan"
+    # The nested config stays intact for the engine; no secret leaks.
+    assert out["config"]["command"] == ["python3", "server.py", "--x"]
+
+    out = c.public_tool({**base, "enabled": True,
+                         "last_scan": {"verdict": "pass", "findings": []}})
+    assert out["status"] == "enabled"
+
+    out = c.public_tool({**base, "last_scan": {"verdict": "pass", "findings": []}})
+    assert out["status"] == "pending_approval"
+
+    out = c.public_tool({**base, "last_scan": {"verdict": "fail", "findings": []}})
+    assert out["status"] == "disabled"
+
+    remote = {"id": "tool-2", "kind": "remote", "name": "r", "enabled": False,
+              "config": {"url": "https://mcp.example.com/mcp", "auth_secret": "tok-SECRET"},
+              "lock": None, "last_scan": None}
+    out = c.public_tool(remote)
+    assert out["url"] == "https://mcp.example.com/mcp"
+    assert "tok-SECRET" not in json.dumps(out)
+
+    pkg = {"id": "tool-3", "kind": "package", "name": "p", "enabled": False,
+           "config": {"ecosystem": "npm", "package": "some-mcp", "version": "1.0.0"},
+           "lock": None, "last_scan": None}
+    out = c.public_tool(pkg)
+    assert out["package_name"] == "some-mcp"
+    assert out["version"] == "1.0.0"
+    assert out["status"] == "pending_scan"
+
+    skill = {"id": "tool-4", "kind": "skill", "name": "sk", "enabled": True,
+             "config": {"path": "/skills/helper", "scanner": "skillshield+argus"},
+             "lock": None, "last_scan": {"verdict": "pass", "findings": []}}
+    out = c.public_tool(skill)
+    assert out["path"] == "/skills/helper"
+    assert out["status"] == "enabled"
+
+
 # ---------------------------------------------------------------- owner entries: no plaintext auth, gates enforced
 
 def test_owner_entries_only_passing_enabled_tools_and_no_plaintext_token(tmp_path):

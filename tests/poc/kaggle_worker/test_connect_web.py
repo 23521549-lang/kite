@@ -85,6 +85,51 @@ def test_create_mcp_rejects_unpinned_package(site):
     assert "latest" in response.text or "ghim" in response.text
 
 
+def test_create_package_mcp_without_registry_defaults_to_official(site):
+    # F2 fix: the UI form never asks for a registry — a missing one defaults
+    # to the official registry instead of failing, while an explicitly
+    # different registry is still refused.
+    headers = _signed_in(site)
+    response = site["client"].post(
+        "/api/connect/mcp",
+        json={"name": "pkg", "kind": "package",
+              "config": {"ecosystem": "npm", "package": "some-mcp", "version": "1.0.0"}},
+        headers=headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["config"]["registry"] == engine.OFFICIAL_NPM_REGISTRY
+    assert body["package_name"] == "some-mcp"
+    assert body["version"] == "1.0.0"
+    assert body["status"] == "pending_scan"
+    response = site["client"].post(
+        "/api/connect/mcp",
+        json={"name": "pkg2", "kind": "package",
+              "config": {"ecosystem": "npm", "package": "some-mcp", "version": "1.0.0",
+                         "registry": "https://evil.example.com"}},
+        headers=headers)
+    assert response.status_code == 400
+
+
+def test_inventory_returns_flat_display_fields(site):
+    # F2 fix: inventory items carry the flat fields the cards read, plus the
+    # derived status — verified here with the same shapes the live demo seeds.
+    headers = _signed_in(site)
+    created = site["client"].post(
+        "/api/connect/mcp",
+        json={"name": "local", "kind": "source",
+              "config": {"path": str(site["path"]), "command": ["python3", "server.py"]}},
+        headers=headers).json()
+    assert created["command"] == "python3"
+    assert created["args"] == ["server.py"]
+    assert created["source"] == str(site["path"])
+    assert created["status"] == "pending_scan"
+    inventory = site["client"].get("/api/connect/inventory", headers=headers).json()
+    item = inventory["mcp"][0]
+    assert item["command"] == "python3"
+    assert item["args"] == ["server.py"]
+    assert item["status"] == "pending_scan"
+
+
 def test_create_remote_mcp_seals_auth_and_never_returns_it(site):
     headers = _signed_in(site)
     response = site["client"].post(
