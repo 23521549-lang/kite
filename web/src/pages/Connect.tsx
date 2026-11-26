@@ -75,9 +75,20 @@ const VERDICT_KEYS: Record<ScanReport['verdict'], DictKey> = {
 
 const KIND_KEYS: Record<ConnectMcpKind, DictKey> = {
   builtin: 'connect.kind.builtin',
+  local: 'connect.kind.local',
   source: 'connect.kind.source',
   package: 'connect.kind.package',
   remote: 'connect.kind.remote',
+}
+
+const PLATFORM_STATUS_COLOR: Record<ConnectPlatformItem['status'], string> = {
+  configured: 'teal',
+  not_configured: 'gray',
+}
+
+const PLATFORM_STATUS_KEYS: Record<ConnectPlatformItem['status'], DictKey> = {
+  configured: 'connect.status.configured',
+  not_configured: 'connect.status.not-configured',
 }
 
 function verdictColor(v: ScanReport['verdict']): string {
@@ -294,15 +305,31 @@ function ScanLine({ t, item }: { t: T; item: Item }) {
         {t('connect.scan.none')}
       </Text>
     )
+  // N8: a failing scan names its first rule + severity right on the card
+  // (the full findings stay in the scan-report modal).
+  const firstFail = scan.verdict === 'fail' ? scan.findings[0] : undefined
   return (
-    <Group gap="xs">
-      <Badge color={verdictColor(scan.verdict)} variant="light">
-        {t(VERDICT_KEYS[scan.verdict])}
-      </Badge>
-      <Text size="sm" c="dimmed">
-        {t('connect.scan.last')}: {fmtTime(scan.scanned_at)} · {scan.scanner} {scan.scanner_version}
-      </Text>
-    </Group>
+    <Stack gap={2}>
+      <Group gap="xs">
+        <Badge color={verdictColor(scan.verdict)} variant="light">
+          {t(VERDICT_KEYS[scan.verdict])}
+        </Badge>
+        <Text size="sm" c="dimmed">
+          {`${t('connect.scan.last')}: ${fmtTime(scan.scanned_at)} · ${scan.scanner} ${scan.scanner_version}`}
+        </Text>
+      </Group>
+      {firstFail ? (
+        <Group gap="xs">
+          <Code>{firstFail.rule}</Code>
+          <Badge
+            color={firstFail.severity === 'critical' || firstFail.severity === 'high' ? 'red' : firstFail.severity === 'medium' ? 'orange' : 'gray'}
+            variant="light"
+          >
+            {firstFail.severity}
+          </Badge>
+        </Group>
+      ) : null}
+    </Stack>
   )
 }
 
@@ -380,23 +407,17 @@ function McpCard({ t, item, test, isBusy, onScan, onView, onTest, onToggle, onRe
       <Stack gap={2} mt="xs">
         {rows.map(([k, v]) => (
           <Text key={k} size="sm">
-            <Text span c="dimmed">
-              {k}:
-            </Text>{' '}
+            <Text span c="dimmed">{k}: </Text>
             <Code>{v}</Code>
           </Text>
         ))}
         <Text size="sm">
-          <Text span c="dimmed">
-            {t('connect.tools')}:
-          </Text>{' '}
+          <Text span c="dimmed">{t('connect.tools')}: </Text>
           {item.tools?.length ? item.tools.join(', ') : t('connect.tools.none')}
         </Text>
         {item.lock ? (
           <Text size="sm">
-            <Text span c="dimmed">
-              {t('connect.lock')}:
-            </Text>{' '}
+            <Text span c="dimmed">{t('connect.lock')}: </Text>
             {item.lock.version}
             {item.lock_mismatch ? '' : ` · ${t('connect.lock.ok')}`}
           </Text>
@@ -408,7 +429,7 @@ function McpCard({ t, item, test, isBusy, onScan, onView, onTest, onToggle, onRe
           <Text size="sm">{test.detail}</Text>
           {test.tools?.length ? (
             <Text size="xs" mt={4}>
-              {t('connect.tools')}: {test.tools.join(', ')}
+              {`${t('connect.tools')}: ${test.tools.join(', ')}`}
             </Text>
           ) : null}
         </Alert>
@@ -433,9 +454,7 @@ function SkillCard({ t, item, isBusy, onScan, onView, onToggle, onRemove }: Card
       <Stack gap={2} mt="xs">
         {item.path ? (
           <Text size="sm">
-            <Text span c="dimmed">
-              {t('connect.add-skill.path')}:
-            </Text>{' '}
+            <Text span c="dimmed">{t('connect.add-skill.path')}: </Text>
             <Code>{item.path}</Code>
           </Text>
         ) : null}
@@ -457,7 +476,9 @@ function PlatformCard({ t, item }: { t: T; item: ConnectPlatformItem }) {
             {item.kind ? ` · ${item.kind}` : ''}
           </Text>
         </div>
-        <StatusBadge t={t} status={item.status} />
+        <Badge color={PLATFORM_STATUS_COLOR[item.status]} variant="light">
+          {t(PLATFORM_STATUS_KEYS[item.status])}
+        </Badge>
       </Group>
       {item.detail ? (
         <Text size="sm" mt="xs" c="dimmed">

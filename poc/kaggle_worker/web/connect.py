@@ -100,9 +100,18 @@ def build_router(ctx, auth) -> APIRouter:
             if not command or not all(isinstance(p, str) and p for p in command):
                 raise HTTPException(400, "MCP local cần config.command là danh sách lệnh")
         elif kind == "package":
-            engine.validate_package_spec(config.get("ecosystem", "npm"),
+            ecosystem = config.get("ecosystem", "npm")
+            # The UI form never asks for a registry (limit 2: official only) —
+            # a missing one defaults to the official registry of the ecosystem
+            # instead of failing. An explicitly different registry still fails
+            # in validate_package_spec below.
+            registry = config.get("registry") or (
+                engine.OFFICIAL_NPM_REGISTRY if ecosystem == "npm"
+                else engine.OFFICIAL_PYPI_REGISTRY)
+            config["registry"] = registry
+            engine.validate_package_spec(ecosystem,
                                          config.get("package", ""), config.get("version", ""),
-                                         config.get("registry", ""))
+                                         registry)
         elif kind == "remote":
             url = config.get("url", "")
             if not isinstance(url, str) or not url.startswith("https://"):

@@ -262,8 +262,34 @@ def find_tool(registry: dict, collection: str, tool_id: str) -> dict | None:
     return None
 
 
+def tool_status(tool: dict) -> str:
+    """The display status the web contract promises per inventory item
+    (HOP-DONG-GIAO-TIEP.md §Connect): enabled / disabled / pending_scan /
+    pending_approval. Derived from the stored fields only — no network, no scan
+    (the enable gate in ``can_enable`` still re-checks the scan + package lock
+    at the moment that matters)."""
+    if tool.get("enabled"):
+        return "enabled"
+    last = tool.get("last_scan") or {}
+    if not last:
+        return "pending_scan"
+    if last.get("verdict") == "pass":
+        return "pending_approval"
+    return "disabled"
+
+
 def public_tool(tool: dict) -> dict:
-    """What the browser may see: never a secret value, only whether one is stored."""
+    """What the browser may see: never a secret value, only whether one is stored.
+
+    The flat display fields are part of the web contract (HOP-DONG-GIAO-TIEP.md
+    §Connect; the frontend's ``ConnectMcpItem``/``ConnectSkillItem`` types):
+    the stored shape keeps everything nested under ``config`` but the cards
+    read ``command``/``args``/``source``/``url``/``package_name``/``version``/
+    ``path``/``status`` at the top level. Two fields are deliberately NOT
+    flattened here: ``tools`` (listing them spawns the MCP server — the owner
+    gets them from the on-demand test endpoint instead) and ``lock_mismatch``
+    (checking it needs a live registry round-trip per package tool).
+    """
     out = {k: v for k, v in tool.items() if k not in ("auth_secret", "token", "secret")}
     config = dict(tool.get("config", {}))
     for key in ("auth_secret", "token", "secret", "authorization"):
@@ -272,6 +298,18 @@ def public_tool(tool: dict) -> dict:
     out["has_auth"] = bool(tool.get("config", {}).get("auth_secret") or tool.get("has_auth"))
     if tool.get("kind") == "package":
         out["runtime_warning"] = RUNTIME_WARNING
+    # Flat display fields (see docstring): the first command element is the
+    # executable, the rest are its arguments.
+    command = config.get("command")
+    if isinstance(command, list) and command:
+        out["command"] = str(command[0])
+        out["args"] = [str(part) for part in command[1:]]
+    out["source"] = config.get("path")
+    out["path"] = config.get("path")
+    out["url"] = config.get("url")
+    out["package_name"] = config.get("package")
+    out["version"] = config.get("version")
+    out["status"] = tool_status(tool)
     return out
 
 

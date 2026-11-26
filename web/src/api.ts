@@ -403,7 +403,7 @@ export const getSecretaryReport = (date: string) =>
 // Endpoints follow the cross-package contract; the back end (worker (b)) owns
 // the server side. Statuses: enabled / disabled / pending_scan / pending_approval.
 export type ConnectStatus = 'enabled' | 'disabled' | 'pending_scan' | 'pending_approval'
-export type ConnectMcpKind = 'builtin' | 'source' | 'package' | 'remote'
+export type ConnectMcpKind = 'builtin' | 'local' | 'source' | 'package' | 'remote'
 export type ScanVerdict = 'pass' | 'fail' | 'wait'
 
 export type ScanFinding = { rule: string; severity: 'info' | 'low' | 'medium' | 'high' | 'critical'; message: string }
@@ -452,7 +452,7 @@ export type ConnectPlatformItem = {
   id: string
   name: string
   kind?: string | null
-  status: ConnectStatus
+  status: 'configured' | 'not_configured'
   detail?: string | null
 }
 
@@ -469,13 +469,43 @@ export type McpCreateBody = {
   auth_header?: string
 }
 
+/** Map the flat add-MCP form shape to the back end's nested-config payload
+ * (F2 fix: `McpCreateIn` only reads `config` — flat fields are silently
+ * ignored by pydantic, so an unmapped create always failed 400). The command
+ * box holds a full command line (placeholder: "python /opt/mcp/server.py"),
+ * so it is split on whitespace first; the registry is left out — the back
+ * end defaults a missing one to the official registry. */
+export function mcpCreatePayload(body: McpCreateBody): {
+  name: string
+  kind: 'source' | 'package' | 'remote'
+  config: Record<string, unknown>
+  auth_secret?: string
+} {
+  const config: Record<string, unknown> = {}
+  if (body.kind === 'source') {
+    config.command = [...(body.command ?? '').split(/\s+/).filter(Boolean), ...(body.args ?? [])]
+  } else if (body.kind === 'package') {
+    config.package = body.package_name
+    config.version = body.version
+    config.ecosystem = 'npm'
+  } else {
+    config.url = body.url
+  }
+  return {
+    name: body.name,
+    kind: body.kind,
+    config,
+    ...(body.auth_header ? { auth_secret: body.auth_header } : {}),
+  }
+}
+
 export type SkillCreateBody = { name: string; path?: string }
 
 export type McpTestResult = { ok: boolean; detail: string; tools?: string[]; latency_ms?: number | null }
 
 export const getConnectInventory = () => get<ConnectInventory>('/api/connect/inventory')
 export const getConnectPlatforms = () => get<{ platforms: ConnectPlatformItem[] }>('/api/connect/platforms')
-export const createConnectMcp = (body: McpCreateBody) => post<ConnectMcpItem>('/api/connect/mcp', body)
+export const createConnectMcp = (body: McpCreateBody) => post<ConnectMcpItem>('/api/connect/mcp', mcpCreatePayload(body))
 export const scanConnectMcp = (id: string) => post<ScanReport>(`/api/connect/mcp/${encodeURIComponent(id)}/scan`)
 export const getConnectMcpScan = (id: string) => get<ScanReport>(`/api/connect/mcp/${encodeURIComponent(id)}/scan`)
 export const testConnectMcp = (id: string) => post<McpTestResult>(`/api/connect/mcp/${encodeURIComponent(id)}/test`)
