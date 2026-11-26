@@ -22,7 +22,6 @@ from types import SimpleNamespace
 import pytest
 
 from poc.kaggle_worker.mcp_server import KiteToolError
-from poc.kaggle_worker.web.app import env_cost_usd
 from tests.poc.kaggle_worker.test_goi2_copies import (
     FakeClient,
     db_rows,
@@ -124,6 +123,14 @@ def test_locked_session_first_task_proceeds_on_its_registered_repo(tmp_path):
 
 
 # ------------------------------------------------------------------ cost per environment
+
+def env_cost_usd(*args, **kwargs):
+    """The web back end's helper, imported on use: the tests above need no web extra."""
+    pytest.importorskip("fastapi")
+    from poc.kaggle_worker.web.app import env_cost_usd as real
+
+    return real(*args, **kwargs)
+
 
 def test_env_cost_usd_counts_only_task_spend():
     tasks = [{"task_id": "t1", "environment_id": "7"},

@@ -15,6 +15,24 @@ from poc.kaggle_worker import connect as c
 
 NOW = 1_795_400_000.0  # fixed "now" for quarantine tests
 
+ARGUS_CLEAN = json.dumps({"tool": {"name": "mcpscan", "version": "0.2.1"},
+                          "summary": {"findings": 0, "counts": {"critical": 0, "high": 0, "medium": 0,
+                                                                "low": 0, "info": 0}},
+                          "findings": []})
+
+
+@pytest.fixture(autouse=True)
+def _argus_offline(monkeypatch):
+    """A scan also runs Argus over the tools/list dump (`argus`, else `npx` downloading it from npm).
+    A test must not reach npm or run what it downloads, so Argus answers clean here unless a test
+    passes its own runner; Argus itself is covered with fakes in test_connect_skill_scanners.py."""
+    real_init = c.ArgusScanner.__init__
+
+    def init(self, runner=None):
+        real_init(self, runner=runner or (lambda command, timeout: (0, ARGUS_CLEAN, "")))
+
+    monkeypatch.setattr(c.ArgusScanner, "__init__", init)
+
 
 def _sha512_b64(data: bytes) -> str:
     return "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()

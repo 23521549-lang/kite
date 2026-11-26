@@ -13,6 +13,10 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+pytest.importorskip("fastapi")
+
 from poc.kaggle_worker import secretary as sec
 from poc.kaggle_worker.journal import Journal
 from poc.kaggle_worker.relay import SpendLedger

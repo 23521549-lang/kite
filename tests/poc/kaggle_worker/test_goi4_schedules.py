@@ -12,8 +12,6 @@ from pathlib import Path
 import sys
 
 import pytest
-from fastapi import FastAPI, HTTPException
-from fastapi.testclient import TestClient
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -24,7 +22,6 @@ from poc.kaggle_worker.schedules import (
     UrllibOpenCodeStarter, compute_next_run, daily_at_bangkok,
 )
 from poc.kaggle_worker.store import SQLiteSchedulerStore
-from poc.kaggle_worker.web.schedules_api import create_router
 
 
 def bangkok_ts(text: str) -> float:
@@ -457,6 +454,12 @@ class _FakeSession:
 
 
 def _router_client(tmp_path, *, authed=True):
+    pytest.importorskip("fastapi")              # the router tests need the web extra, the engine tests do not
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+
+    from poc.kaggle_worker.web.schedules_api import create_router
+
     store = ScheduleStore(tmp_path / "scheduler.sqlite3")
     audits: list[tuple] = []
 

@@ -28,7 +28,7 @@ from poc.kaggle_worker.protocol import ScheduledTask  # noqa: E402
 from poc.kaggle_worker.store import SQLiteSchedulerStore  # noqa: E402
 from poc.kaggle_worker.web import security as sec  # noqa: E402
 from poc.kaggle_worker.web.app import GatewayDown, WebContext, create_app  # noqa: E402
-from poc.kaggle_worker.web.db import Store, connect, sqlite_url  # noqa: E402
+from poc.kaggle_worker.web.db import SCHEMA_VERSION, Store, connect, sqlite_url  # noqa: E402
 
 from tests.poc.kaggle_worker.test_launcher import raw_config  # noqa: E402
 
@@ -984,13 +984,16 @@ def test_the_tables_work_on_postgres(tmp_path):
     subprocess.run([str(bin_dir / "initdb"), "-D", str(data), "-U", "kite", "--auth=trust"], check=True,
                    capture_output=True)
     port = 55432
-    subprocess.run([str(bin_dir / "pg_ctl"), "-D", str(data), "-o", f"-p {port} -k {sock} -c listen_addresses=''",
-                    "-w", "start"], check=True, capture_output=True)
+    # -l: the server writes its log to a file. Without it the server keeps pg_ctl's stdout open and the
+    # captured run waits for that pipe forever (a hang wherever Postgres binaries exist, e.g. CI runners).
+    subprocess.run([str(bin_dir / "pg_ctl"), "-D", str(data), "-l", str(tmp_path / "pg.log"),
+                    "-o", f"-p {port} -k {sock} -c listen_addresses=''", "-w", "start"],
+                   check=True, capture_output=True, timeout=120)
     try:
         subprocess.run([str(bin_dir / "createdb"), "-h", str(sock), "-p", str(port), "-U", "kite", "kite_web"],
                        check=True, capture_output=True)
         store = Store(connect(f"postgresql+psycopg://kite@/kite_web?host={sock}&port={port}"))
-        assert store.migrate() == 1 and store.migrate() == 1
+        assert store.migrate() == SCHEMA_VERSION and store.migrate() == SCHEMA_VERSION   # twice: idempotent
         uid = store.create_user("han", "h", "s")
         store.add_session("sid", uid, "csrf", "1.2.3.4", "ua")
         store.attempt("1.2.3.4", "han", False)
