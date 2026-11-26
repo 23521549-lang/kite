@@ -11,7 +11,7 @@ import time
 import pytest
 from temporalio.exceptions import ApplicationError
 
-from conftest import free_loopback_port
+from loopback_port import free_loopback_port
 from poc.kaggle_worker import sandbox as sbx
 from poc.kaggle_worker.backend import SandboxActivityBackend, task_slug
 from poc.kaggle_worker.protocol import OwnerPolicy, ScheduledTask, WorkerProfile

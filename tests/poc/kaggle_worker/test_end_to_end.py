@@ -17,7 +17,7 @@ import pytest
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker
 
-from conftest import free_loopback_port
+from loopback_port import free_loopback_port
 from poc.kaggle_worker.opencode import OpenCodeClient, OpenCodeTaskAdapter
 from poc.kaggle_worker.routing import RoutingRequest, WorkerLoad, select_worker
 from poc.kaggle_worker.protocol import OwnerPolicy, WorkerProfile
