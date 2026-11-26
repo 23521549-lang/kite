@@ -771,9 +771,19 @@ def _list_tools_stdio_live(command: list[str], timeout: int) -> list[dict]:
     tools = None
     try:
         assert proc.stdin is not None and proc.stdout is not None
-        for message in mcp_initialize_messages():
-            proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
-        proc.stdin.flush()
+        try:
+            for message in mcp_initialize_messages():
+                proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+        except BrokenPipeError as exc:
+            # The server exited before reading the handshake (e.g. `echo`):
+            # its stdin is gone, so the write has nowhere to go. A dead
+            # server is a failed tools/list, not a scan crash — the caller
+            # turns McpClientError into a `tools-list-failed` finding instead
+            # of the endpoint returning HTTP 500 (measured 26/11: the race
+            # fired ~2/3 of parallel scans of an exiting command).
+            raise McpClientError(
+                "server thoát trước khi nhận handshake (broken pipe)") from exc
         # NOTE: stdin stays open here on purpose (see docstring).
         deadline = time.monotonic() + timeout
         buf = b""
