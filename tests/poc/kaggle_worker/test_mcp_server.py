@@ -255,6 +255,95 @@ def owner_code(ops: KiteOps, action: str, task_id: str) -> str:
     return confirm.issue_code(ops.state_dir, action, task_id, confirm.patch_sha256(patch.read_bytes()))
 
 
+def _dead_temporal_completed_task(tmp_path: Path, repo: Path, head: str) -> tuple[KiteOps, str]:
+    """A COMPLETED task (store) with a real patch on disk, Temporal dead.
+
+    Mirrors what the demo has after the F6 round: the workflow finished, its
+    patch/checkpoint/result.json are on disk, but no Temporal server answers,
+    so task_status/task_result fall back to the store and the disk.
+    """
+    from poc.kaggle_worker.backend import task_slug
+
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    (repo / "calc.py").write_text("x = 2\n")
+    patch = subprocess.run(["git", "-C", str(repo), "diff"], capture_output=True, text=True,
+                           check=True).stdout
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", "calc.py"], check=True)
+    root = tmp_path / "state" / "tasks" / task_slug(task_id)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "result.patch").write_text(patch, encoding="utf-8")
+    (root / "checkpoint.json").write_text(json.dumps({"repo_path": str(repo)}), encoding="utf-8")
+    (root / "result.json").write_text(json.dumps({"worker": "kaggle-han"}), encoding="utf-8")
+    _set_store_state(tmp_path, task_id, "COMPLETED")
+    _kill_temporal(ops)
+    return ops, task_id
+
+
+def test_apply_result_works_through_fallback_when_temporal_is_down(tmp_path):
+    repo, head = make_repo(tmp_path)
+    ops, task_id = _dead_temporal_completed_task(tmp_path, repo, head)
+    result = asyncio.run(ops.task_result(task_id))
+    assert result["status"] == "READY_FOR_REVIEW" and result["temporal_unavailable"] is True
+    code = owner_code(ops, "apply", task_id)
+    applied = asyncio.run(ops.apply_result(task_id, code))
+    assert applied["files"] == ["calc.py"] and applied["committed"] is False
+    assert (repo / "calc.py").read_text() == "x = 2\n"
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() == head
+    with pytest.raises(KiteToolError, match="đã được dùng"):
+        asyncio.run(ops.apply_result(task_id, code))
+
+
+def test_apply_result_with_a_wrong_code_fails_without_burning_the_good_code(tmp_path):
+    repo, _head = make_repo(tmp_path)
+    ops, task_id = _dead_temporal_completed_task(tmp_path, repo, _head)
+    good = owner_code(ops, "apply", task_id)
+    with pytest.raises(KiteToolError, match="không đúng"):
+        asyncio.run(ops.apply_result(task_id, "khong-phai-ma"))
+    applied = asyncio.run(ops.apply_result(task_id, good))
+    assert applied["files"] == ["calc.py"]
+    assert (repo / "calc.py").read_text() == "x = 2\n"
+
+
+def test_apply_result_still_refuses_a_completed_task_without_a_patch(tmp_path):
+    from poc.kaggle_worker.backend import task_slug
+
+    repo, _head = make_repo(tmp_path)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    root = tmp_path / "state" / "tasks" / task_slug(task_id)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "checkpoint.json").write_text(json.dumps({"repo_path": str(repo)}), encoding="utf-8")
+    _set_store_state(tmp_path, task_id, "COMPLETED")
+    _kill_temporal(ops)
+    result = asyncio.run(ops.task_result(task_id))
+    assert result["status"] == "COMPLETED"      # no patch on disk: never READY_FOR_REVIEW
+    with pytest.raises(KiteToolError, match="không có patch"):
+        asyncio.run(ops.apply_result(task_id, "khong-phai-ma"))
+
+
+def test_apply_result_still_refuses_a_completed_task_with_an_empty_patch(tmp_path):
+    from poc.kaggle_worker.backend import task_slug
+
+    repo, _head = make_repo(tmp_path)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = asyncio.run(ops.start_task(str(repo), "Sửa calc.py"))["task_id"]
+    root = tmp_path / "state" / "tasks" / task_slug(task_id)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "result.patch").write_text("", encoding="utf-8")
+    (root / "checkpoint.json").write_text(json.dumps({"repo_path": str(repo)}), encoding="utf-8")
+    _set_store_state(tmp_path, task_id, "COMPLETED")
+    _kill_temporal(ops)
+    result = asyncio.run(ops.task_result(task_id))
+    assert result["status"] == "COMPLETED"      # an empty patch is no patch
+    with pytest.raises(KiteToolError, match="không có patch"):
+        asyncio.run(ops.apply_result(task_id, "khong-phai-ma"))
+
+
 def test_apply_result_applies_the_patch_without_committing(tmp_path):
     from poc.kaggle_worker.backend import task_slug
 
