@@ -81,6 +81,11 @@ for extra in ("codemap", "kaggle", "browser", "web", "docling"):
     wanted += project["optional-dependencies"][extra]
 print("\n".join(wanted))
 PY
+# torch CPU-only: the machine runs CPU-only, no CUDA is needed. Install first from the CPU
+# index so pip sees torch already satisfied when installing docling (docling needs
+# torch>=2.2.2,<3.0.0), avoiding the whole CUDA tree (~2.4 GiB of nvidia/cuda/triton wheels).
+# The +cpu local version matters: a plain torch==2.15.0 pin would make pip fall back to CUDA.
+RUN .venv/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==2.15.0+cpu" "torchvision==0.29.2+cpu"
 RUN .venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 # Gói 5 (Connect) — scan-gate binaries, so the gate does not fail closed in
 # production for a missing binary:
