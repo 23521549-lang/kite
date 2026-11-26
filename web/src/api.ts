@@ -251,6 +251,43 @@ export async function deleteEnvironmentPat(id: string): Promise<unknown> {
   return del(`/api/environments/${encodeURIComponent(id)}/pat`)
 }
 
+// ---------------------------------------------------------------- F4: environment context (Điểm 9). The back end
+// (GET /api/environments/{id}/context, PATCH description, POST codemap
+// rebuild) returns exactly what the agent is loaded with: the owner-written
+// description, the codemap built by graphify, the repo's AGENTS.md, and a
+// preview assembled from existing data (no model call).
+export type EnvCodemap = {
+  status: 'none' | 'not_built' | 'building' | 'ready' | 'failed' | 'unavailable'
+  graphify_available: boolean
+  built_at?: string | number | null
+  error?: string | null
+  files: number
+  symbols: { total: number; modules: number; classes: number; functions: number; methods: number }
+  top_files: { path: string; symbols: number }[]
+}
+
+export type EnvAgentsMd = { present: boolean; chars: number; truncated: boolean; content: string | null }
+
+export type EnvContextData = {
+  env_id: string
+  description?: string | null
+  codemap: EnvCodemap
+  agents_md: EnvAgentsMd
+  preview: string
+}
+
+export async function getEnvContext(id: string): Promise<EnvContextData> {
+  return get<EnvContextData>(`/api/environments/${encodeURIComponent(id)}/context`)
+}
+
+export async function saveEnvDescription(id: string, description: string): Promise<EnvironmentRow> {
+  return patch<EnvironmentRow>(`/api/environments/${encodeURIComponent(id)}`, { description })
+}
+
+export async function rebuildCodemap(id: string): Promise<unknown> {
+  return post(`/api/environments/${encodeURIComponent(id)}/codemap/rebuild`)
+}
+
 export type KiteChatSession = {
   kite_session_id: string
   opencode_session_id?: string | null

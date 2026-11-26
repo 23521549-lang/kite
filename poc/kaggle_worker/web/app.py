@@ -38,6 +38,8 @@ from pydantic import BaseModel, Field
 from ..config import ConfigError, load_config
 from ..journal import FILES, Journal, read_jsonl, summarize
 from ..mcp_server import KiteToolError
+from . import codemap_job
+from . import env_context
 from . import knowledge as know
 from . import security as sec
 from . import workers as wk
@@ -329,6 +331,12 @@ class EnvIn(BaseModel):
     url: str = Field(default="", max_length=500)
     branch: str | None = Field(default=None, max_length=200)
     pat: str | None = Field(default=None, max_length=500)
+
+
+class EnvPatchIn(BaseModel):
+    """F4: the owner's description of what a repo is for (written by the
+    owner, never generated). Empty clears it."""
+    description: str = Field(default="", max_length=2000)
 
 
 class PatIn(BaseModel):
@@ -1078,10 +1086,12 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
         return out
 
     def env_rows() -> list[dict[str, Any]]:
-        rows = [{"id": "default", "name": "Default", "path": "", "url": "", "kind": "default"}]
+        rows = [{"id": "default", "name": "Default", "path": "", "url": "", "kind": "default",
+                 "description": None}]
         for repo in ctx.store.repo_rows():
             rows.append({"id": str(repo["id"]), "name": repo["name"], "path": repo["path"],
-                         "url": repo["url"], "kind": "github" if repo["url"] else "local"})
+                         "url": repo["url"], "kind": "github" if repo["url"] else "local",
+                         "description": repo.get("description") or ""})
         return rows
 
     def require_env(env_id: str) -> dict[str, Any]:
@@ -1377,6 +1387,90 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
             raise HTTPException(404, "môi trường này chưa có PAT") from None
         audit(session, "env_pat_delete", env_id)
         return {"ok": True}
+
+    @app.patch("/api/environments/{env_id}")
+    async def update_environment(env_id: str, body: EnvPatchIn, request: Request):
+        """F4: save the owner's description of a repo. Only the description is
+        editable here — the technical id never changes (Gói 1 rule)."""
+        session = auth(request)
+        env = require_env(env_id)
+        if env_id == "default":
+            raise HTTPException(409, "môi trường Default không có mô tả riêng")
+        description = (body.description or "").strip()
+        if not ctx.store.set_repo_description(int(env_id), description):
+            raise HTTPException(404, "không có môi trường này")
+        audit(session, "env_update", env_id)
+        return await env_card({**env, "description": description})
+
+    @app.get("/api/environments/{env_id}/context")
+    async def environment_context(env_id: str, request: Request):
+        """F4 (Điểm 9): the four parts of the Context tab in one call — the
+        owner's description, the codemap, the repo's AGENTS.md, and the
+        "what Kite sees" preview assembled from the same sources the task
+        pipeline loads (approved experience document, or approved lessons).
+        Every source is best-effort: a missing piece leaves that part empty
+        instead of failing the whole tab."""
+        auth(request)
+        env = require_env(env_id)
+        repo_path = env.get("path") or None
+        description = env.get("description") or None
+        codemap = await asyncio.to_thread(env_context.codemap_status, ctx.state_dir, env_id,
+                                          repo_path,
+                                          building=codemap_job.is_building(ctx.state_dir, env_id))
+        agents_md = await asyncio.to_thread(env_context.read_agents_md, repo_path)
+        experience_text, lessons_text = "", ""
+        if repo_path:
+            from .. import experience_store, memory
+
+            experience_text = await asyncio.to_thread(experience_store.experience_note,
+                                                     ctx.state_dir, repo_path)
+            lessons_text = await asyncio.to_thread(memory.lessons_note, ctx.state_dir, repo_path)
+        try:
+            knowledge_docs = await asyncio.to_thread(know.list_documents, ctx.state_dir,
+                                                     "environment", env_id, None)
+        except Exception:
+            knowledge_docs = []
+        recent_tasks: list[dict[str, Any]] = []
+        try:
+            with scheduler_store() as store:
+                rows = [t for t in store.list_tasks() if t.get("environment_id") == env_id]
+            rows.sort(key=lambda t: t.get("created_at") or 0, reverse=True)
+            for row in rows[:5]:
+                goal = ""
+                try:
+                    goal = str(json.loads(row.get("payload_json") or "{}").get("goal") or "")
+                except (ValueError, AttributeError):
+                    goal = ""
+                recent_tasks.append({"task_id": row.get("task_id"), "state": row.get("state"),
+                                     "goal": goal})
+        except Exception:
+            recent_tasks = []
+        preview = env_context.assemble_preview(
+            env_name=env.get("name") or env_id, description=description,
+            experience_text=experience_text, lessons_text=lessons_text, codemap=codemap,
+            agents_md=agents_md,
+            knowledge_docs=[{"doc_id": d.get("doc_id"),
+                             "title": d.get("title") or d.get("filename") or d.get("doc_id")}
+                            for d in knowledge_docs],
+            recent_tasks=recent_tasks)
+        return {"env_id": env_id, "description": description, "codemap": codemap,
+                "agents_md": agents_md, "preview": preview}
+
+    @app.post("/api/environments/{env_id}/codemap/rebuild")
+    async def rebuild_environment_codemap(env_id: str, request: Request):
+        """F4: start a codemap rebuild in the background (graphify can take
+        minutes on a big repo, so it never runs inline in the request)."""
+        session = auth(request)
+        env = require_env(env_id)
+        try:
+            result = codemap_job.request_rebuild(ctx.state_dir, env_id, env.get("path") or None)
+        except ValueError as exc:
+            text = str(exc)
+            if "chưa cài graphify" in text:
+                raise HTTPException(503, text) from exc
+            raise HTTPException(409, text) from exc
+        audit(session, "env_codemap_rebuild", env_id)
+        return result
 
     # ------------------------------------------------------------------ journal
     @app.get("/api/journal/summary")

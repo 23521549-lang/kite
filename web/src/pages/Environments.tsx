@@ -20,10 +20,11 @@ import {
   Table,
   Tabs,
   Text,
+  Textarea,
   TextInput,
 } from '@mantine/core'
 import { IconBrandGithub, IconFolder, IconPlus, IconRefresh, IconTrash } from '@tabler/icons-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   approveExperience,
   createChatSession,
@@ -36,15 +37,19 @@ import {
   envRepoLabel,
   envSessionCount,
   envTaskCount,
+  getEnvContext,
   getExperience,
   getExperienceDiff,
   getRepoStatus,
   listChatSessions,
   listEnvironments,
   listSessionMoves,
+  rebuildCodemap,
   rejectExperience,
+  saveEnvDescription,
   saveEnvironmentPat,
   syncEnvironment,
+  type EnvContextData,
   type EnvironmentRow,
   type ExperienceDoc,
   type KiteChatSession,
@@ -572,8 +577,159 @@ function EnvContext({ env }: { env: EnvironmentRow }) {
   const exp = useLoad(() => getExperience(repoKey), [repoKey])
   const git = useEnvGit(env)
   const cleanLabel = git.clean === true ? t('env.clean') : git.clean === false ? t('env.dirty') : t('env.clean-unknown')
+  const isDefault = env.id === 'default'
+  // The context endpoint is the single source for the 4 Điểm 9 blocks.
+  // Poll while a codemap rebuild is running (same pattern as Knowledge's
+  // converting poll); the flag lives in state so the interval follows it.
+  const [building, setBuilding] = useState(false)
+  const ctx = useLoad(() => getEnvContext(env.id), [env.id, building], building ? 3000 : undefined)
+  const ctxData: EnvContextData | undefined = ctx.data
+  useEffect(() => {
+    if (ctxData) setBuilding(ctxData.codemap.status === 'building')
+  }, [ctxData])
+  // Description editing: null means "not edited yet" — the shown value then
+  // comes from the server (context endpoint first, env row as fallback).
+  const [desc, setDesc] = useState<string | null>(null)
+  const [descSaved, setDescSaved] = useState(false)
+  const shownDesc = desc ?? ctxData?.description ?? env.description ?? ''
+  const codemap = ctxData?.codemap
+  const agentsMd = ctxData?.agents_md
   return (
     <Stack>
+      {!isDefault ? (
+        <Card withBorder>
+          <Text fw={600} mb="xs">
+            {t('env.context-description')}
+          </Text>
+          <Text size="sm" c="dimmed" mb="xs">
+            {t('env.context-description-hint')}
+          </Text>
+          <Textarea
+            value={shownDesc}
+            onChange={(e) => {
+              setDesc(e.currentTarget.value)
+              setDescSaved(false)
+            }}
+            placeholder={t('env.context-description-placeholder')}
+            autosize
+            minRows={3}
+            maxLength={2000}
+          />
+          <Group gap="xs" mt="xs">
+            <Button
+              size="xs"
+              disabled={shownDesc === (ctxData?.description ?? env.description ?? '')}
+              onClick={async () => {
+                const res = await attempt(() => saveEnvDescription(env.id, shownDesc))
+                if (res !== undefined) {
+                  setDesc(null)
+                  setDescSaved(true)
+                  ctx.reload()
+                }
+              }}
+            >
+              {t('env.context-description-save')}
+            </Button>
+            {descSaved ? (
+              <Text size="xs" c="dimmed">
+                {t('env.context-description-saved')}
+              </Text>
+            ) : null}
+          </Group>
+        </Card>
+      ) : null}
+      <Card withBorder>
+        <Text fw={600} mb="xs">
+          {t('env.context-codemap')}
+        </Text>
+        {!ctxData ? (
+          <Loading error={ctx.error} />
+        ) : !codemap || codemap.status === 'none' ? (
+          <Empty>{t('env.context-codemap-none')}</Empty>
+        ) : codemap.status === 'not_built' ? (
+          <Stack gap="xs">
+            <Text size="sm" c="dimmed">
+              {t('env.context-codemap-not-built')}
+            </Text>
+            <CodemapRebuildButton envId={env.id} building={building} disabled={!codemap.graphify_available} onRebuilt={() => ctx.reload()} />
+            {!codemap.graphify_available ? (
+              <Text size="sm" c="dimmed">
+                {t('env.context-codemap-unavailable')}
+              </Text>
+            ) : null}
+          </Stack>
+        ) : codemap.status === 'building' ? (
+          <Loading label={t('env.context-codemap-building')} />
+        ) : codemap.status === 'failed' ? (
+          <Stack gap="xs">
+            <Text size="sm" c="red">
+              {t('env.context-codemap-failed')} {codemap.error ?? '—'}
+            </Text>
+            <CodemapRebuildButton envId={env.id} building={building} disabled={!codemap.graphify_available} onRebuilt={() => ctx.reload()} />
+          </Stack>
+        ) : codemap.status === 'unavailable' ? (
+          <Text size="sm" c="dimmed">
+            {t('env.context-codemap-unavailable')}
+          </Text>
+        ) : (
+          <Stack gap="xs">
+            <KeyValue
+              rows={[
+                [t('env.context-codemap-files'), String(codemap.files ?? 0)],
+                [t('env.context-codemap-symbols'), String(codemap.symbols.total ?? 0)],
+                [t('env.context-codemap-built-at'), codemap.built_at ? fmtTime(codemap.built_at) : '—'],
+              ]}
+            />
+            {codemap.top_files?.length ? (
+              <div>
+                <Text size="sm" fw={600} mt="xs">
+                  {t('env.context-codemap-top-files')}
+                </Text>
+                <Code block>
+                  {codemap.top_files.map((f) => `${f.path} (${f.symbols})`).join('\n')}
+                </Code>
+              </div>
+            ) : null}
+            <Group gap="xs">
+              <CodemapRebuildButton envId={env.id} building={building} disabled={!codemap.graphify_available} onRebuilt={() => ctx.reload()} />
+            </Group>
+          </Stack>
+        )}
+      </Card>
+      <Card withBorder>
+        <Text fw={600} mb="xs">
+          {t('env.context-agents')}
+        </Text>
+        {!ctxData ? (
+          <Loading error={ctx.error} />
+        ) : !agentsMd?.present ? (
+          <Empty>{t('env.context-agents-none')}</Empty>
+        ) : (
+          <Stack gap="xs">
+            {agentsMd.truncated ? (
+              <Text size="sm" c="dimmed">
+                {t('env.context-agents-truncated', { n: agentsMd.chars })}
+              </Text>
+            ) : null}
+            <Code block>{agentsMd.content}</Code>
+          </Stack>
+        )}
+      </Card>
+      <Card withBorder>
+        <Text fw={600} mb="xs">
+          {t('env.context-preview')}
+        </Text>
+        <Text size="sm" c="dimmed" mb="xs">
+          {t('env.context-preview-hint')}
+        </Text>
+        {!ctxData ? (
+          <Loading error={ctx.error} />
+        ) : (
+          <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>
+            {ctxData.preview}
+          </Text>
+        )}
+      </Card>
       <Card withBorder>
         <Text fw={600} mb="xs">
           {t('env.detail-git-info')}
@@ -618,6 +774,33 @@ function EnvContext({ env }: { env: EnvironmentRow }) {
         )}
       </Card>
     </Stack>
+  )
+}
+
+function CodemapRebuildButton({
+  envId,
+  building,
+  disabled,
+  onRebuilt,
+}: {
+  envId: string
+  building: boolean
+  disabled: boolean
+  onRebuilt: () => void
+}) {
+  const t = useT()
+  return (
+    <Button
+      size="xs"
+      variant="light"
+      disabled={disabled || building}
+      onClick={async () => {
+        const res = await attempt(() => rebuildCodemap(envId))
+        if (res !== undefined) onRebuilt()
+      }}
+    >
+      {building ? t('env.context-codemap-building') : t('env.context-codemap-rebuild')}
+    </Button>
   )
 }
 

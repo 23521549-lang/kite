@@ -13,9 +13,9 @@ import time
 from typing import Any, Callable
 
 from sqlalchemy import (Boolean, Column, Float, Integer, MetaData, String, Table, Text, create_engine, delete,
-                        event, func, insert, select, update)
+                        event, func, insert, select, text, update)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 metadata = MetaData()
 
 users = Table(
@@ -74,6 +74,7 @@ repos = Table(
     Column("name", String(100), unique=True, nullable=False),
     Column("path", Text, nullable=False),                 # folder on this machine (a clone, or the repo itself)
     Column("url", Text, nullable=False, default=""),      # where it comes from (GitHub...), for the owner
+    Column("description", Text, nullable=False, default=""),  # F4: what the repo is for, written by the owner
     Column("created_at", Float, nullable=False),
 )
 settings = Table(
@@ -84,7 +85,12 @@ settings = Table(
 schema_version = Table("schema_version", metadata, Column("version", Integer, nullable=False))
 
 # Each step takes the schema from version N-1 to N; the first is create_all.
-MIGRATIONS: list[Callable[[Any], None]] = []
+def _migrate_v2_add_repo_description(conn) -> None:
+    """v1 -> v2 (F4): the environment description the owner writes for a repo."""
+    conn.execute(text("ALTER TABLE repos ADD COLUMN description TEXT NOT NULL DEFAULT ''"))
+
+
+MIGRATIONS: list[Callable[[Any], None]] = [_migrate_v2_add_repo_description]
 
 
 @dataclass(frozen=True)
@@ -271,7 +277,14 @@ class Store:
     def repo_rows(self) -> list[dict]:
         with self.engine.connect() as conn:
             rows = conn.execute(select(repos).order_by(repos.c.name)).all()
-        return [{"id": r.id, "name": r.name, "path": r.path, "url": r.url, "created_at": r.created_at} for r in rows]
+        return [{"id": r.id, "name": r.name, "path": r.path, "url": r.url,
+                 "description": getattr(r, "description", "") or "", "created_at": r.created_at} for r in rows]
+
+    def set_repo_description(self, repo_id: int, description: str) -> bool:
+        """Save the owner's description for one environment; False when the id is unknown."""
+        with self.engine.begin() as conn:
+            return conn.execute(update(repos).where(repos.c.id == repo_id)
+                                .values(description=description)).rowcount > 0
 
     def add_repo(self, name: str, path: str, url: str = "") -> int:
         with self.engine.begin() as conn:
