@@ -1,5 +1,5 @@
-import { Alert, Badge, Button, Card, Group, SegmentedControl, Stack, Text, TextInput, Textarea } from '@mantine/core'
-import { IconMessageChatbot, IconSend } from '@tabler/icons-react'
+import { ActionIcon, Affix, Alert, Badge, Button, Card, Group, ScrollArea, SegmentedControl, Stack, Text, TextInput, Textarea } from '@mantine/core'
+import { IconMessageChatbot, IconSend, IconX } from '@tabler/icons-react'
 import { useCallback, useEffect, useState } from 'react'
 import {
   createSchedule,
@@ -43,7 +43,7 @@ function messageText(m: OCMessage): string {
 }
 
 /** A small chat against a narrow OpenCode proxy: create session + prompt + list messages. */
-function ProxyChat({ base, title }: { base: string; title: string }) {
+function ProxyChat({ base, title, messageHeight }: { base: string; title: string; messageHeight?: number }) {
   const t = useT()
   const [sessions, setSessions] = useState<OCSession[] | null>(null)
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -100,6 +100,32 @@ function ProxyChat({ base, title }: { base: string; title: string }) {
   }
 
   const list = messages.data?.data ?? []
+  // Extracted so the bubble can cap the message area in a ScrollArea; without
+  // messageHeight the list renders exactly as before (review assistant).
+  const messageList = (
+    <Stack gap="xs">
+      {list.length === 0 ? (
+        <Text size="sm" c="dimmed">
+          {t('workspace.review.empty')}
+        </Text>
+      ) : (
+        list.map((m) => {
+          const text = messageText(m)
+          if (!text) return null
+          return (
+            <Card key={m.id} withBorder p="sm">
+              <Text size="xs" c="dimmed" mb={4}>
+                {m.role ?? m.info?.role ?? 'agent'}
+              </Text>
+              <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>
+                {text}
+              </Text>
+            </Card>
+          )
+        })
+      )}
+    </Stack>
+  )
   return (
     <Stack gap="sm">
       <Group justify="space-between">
@@ -116,28 +142,13 @@ function ProxyChat({ base, title }: { base: string; title: string }) {
         </Text>
       ) : (
         <>
-          <Stack gap="xs">
-            {list.length === 0 ? (
-              <Text size="sm" c="dimmed">
-                {t('workspace.review.empty')}
-              </Text>
-            ) : (
-              list.map((m) => {
-                const text = messageText(m)
-                if (!text) return null
-                return (
-                  <Card key={m.id} withBorder p="sm">
-                    <Text size="xs" c="dimmed" mb={4}>
-                      {m.role ?? m.info?.role ?? 'agent'}
-                    </Text>
-                    <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>
-                      {text}
-                    </Text>
-                  </Card>
-                )
-              })
-            )}
-          </Stack>
+          {messageHeight ? (
+            <ScrollArea h={messageHeight} type="auto">
+              {messageList}
+            </ScrollArea>
+          ) : (
+            messageList
+          )}
           <Group gap="xs" align="flex-end">
             <Textarea
               flex={1}
@@ -174,6 +185,7 @@ export default function Workspace() {
         <Schedules />
         <Secretary />
       </Stack>
+      <SecretaryBubble />
     </Page>
   )
 }
@@ -400,7 +412,6 @@ function Schedules() {
 function Secretary() {
   const t = useT()
   const reports = useLoad(() => getSecretaryReports(), [], 60000)
-  const [open, setOpen] = useState(false)
   const [current, setCurrent] = useState<{ date: string; markdown: string } | null>(null)
   const list = reports.data?.reports ?? []
 
@@ -411,18 +422,9 @@ function Secretary() {
 
   return (
     <Card withBorder>
-      <Group justify="space-between" mb="sm">
-        <Text fw={600}>{t('workspace.secretary.title')}</Text>
-        <Button
-          size="xs"
-          variant="light"
-          leftSection={<IconMessageChatbot size={16} />}
-          onClick={() => setOpen((v) => !v)}
-        >
-          {t('workspace.secretary.open')}
-        </Button>
-      </Group>
-      {open ? <ProxyChat base="/api/secretary/chat" title={t('workspace.secretary.title')} /> : null}
+      <Text fw={600} mb="sm">
+        {t('workspace.secretary.title')}
+      </Text>
       {reports.data ? (
         list.length === 0 ? (
           <Empty>{t('workspace.secretary.empty')}</Empty>
@@ -450,5 +452,42 @@ function Secretary() {
         </Stack>
       ) : null}
     </Card>
+  )
+}
+
+/**
+ * Floating chat bubble for the secretary (Điểm 13, L1): the same "Thư ký"
+ * session through the same ProxyChat — only the presentation floats. The chat
+ * mounts only while the bubble is open, exactly as the old in-card panel did,
+ * so no session/history request is sent while closed.
+ */
+function SecretaryBubble() {
+  const t = useT()
+  const [open, setOpen] = useState(false)
+  return (
+    <Affix position={{ bottom: 20, right: 20 }} zIndex={200}>
+      <Stack align="flex-end" gap="sm">
+        {open ? (
+          <Card withBorder shadow="md" w={380} style={{ maxWidth: 'calc(100vw - 40px)' }}>
+            <Group justify="flex-end">
+              <ActionIcon variant="subtle" onClick={() => setOpen(false)} aria-label={t('workspace.secretary.title')}>
+                <IconX size={16} />
+              </ActionIcon>
+            </Group>
+            <ProxyChat base="/api/secretary/chat" title={t('workspace.secretary.title')} messageHeight={320} />
+          </Card>
+        ) : null}
+        <ActionIcon
+          size="xl"
+          radius="xl"
+          variant="filled"
+          onClick={() => setOpen((v) => !v)}
+          aria-label={t('workspace.secretary.title')}
+          title={open ? t('workspace.secretary.title') : t('workspace.secretary.open')}
+        >
+          {open ? <IconX size={20} /> : <IconMessageChatbot size={20} />}
+        </ActionIcon>
+      </Stack>
+    </Affix>
   )
 }
