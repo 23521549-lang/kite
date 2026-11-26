@@ -73,5 +73,5 @@ variable "image" {
 variable "installer_url" {
   description = "install.sh the machine runs on its first boot (pinned to a commit, not the moving main branch)"
   type        = string
-  default     = "https://raw.githubusercontent.com/23521549-lang/kite/b38a194e3c706b8eaaad0162489065f71a6624c9/deploy/stack/install.sh"
+  default     = "https://raw.githubusercontent.com/23521549-lang/kite/6ac9d7561834a21ad79c1ffe9c45bbd347740036/deploy/stack/install.sh"
 }
