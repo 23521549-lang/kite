@@ -58,7 +58,22 @@ class FakeOps:
         return {"task_id": self.resolve(task_id), "progress": ["xong chạy test"]}
 
     async def task_status(self, task_id=""):
-        return {"task_id": self.resolve(task_id), "workflow": "COMPLETED"}
+        return {"task_id": self.resolve(task_id), "workflow": "COMPLETED",
+                "environment_id": "env-1", "chat_session_id": "sess-1",
+                "last_apply_error": {"code": "apply_conflict", "head": "abc1234", "failed_files": ["a.py"],
+                                     "at": NOW, "task_id": "chat-1"}}
+
+    async def rerun_task(self, task_id=""):
+        if task_id == "missing":
+            raise KiteToolError("không có task missing")
+        self.calls.append(("rerun_task", task_id))
+        return {"task_id": "chat-9"}
+
+    async def dismiss_apply_error(self, task_id=""):
+        if task_id == "missing":
+            raise KiteToolError("không có task missing")
+        self.calls.append(("dismiss_apply_error", task_id))
+        return {"ok": True, "task_id": task_id}
 
     async def task_result(self, task_id=""):
         return {"task_id": "chat-1", "ready": True, "status": "READY_FOR_REVIEW"}
@@ -448,6 +463,71 @@ def test_task_routes_call_kite_and_the_sensitive_ones_are_audited(site):
     audited = [(r["action"], r["ok"]) for r in site["store"].audit_rows()]
     assert ("task_start", True) in audited and ("apply_result", True) in audited
     assert ("commit_result", True) in audited and ("cancel_task", False) in audited
+
+
+def test_task_detail_returns_trace_and_persistent_apply_error(site):
+    headers = signed_in(site)
+    detail = site["client"].get("/api/tasks/chat-1", headers=headers).json()
+    assert detail["environment_id"] == "env-1" and detail["chat_session_id"] == "sess-1"
+    assert detail["last_apply_error"] == {"code": "apply_conflict", "head": "abc1234",
+                                          "failed_files": ["a.py"], "at": NOW, "task_id": "chat-1"}
+
+
+def test_rerun_returns_the_new_task_id_and_is_audited(site):
+    headers = signed_in(site)
+    client = site["client"]
+    rerun = client.post("/api/tasks/chat-1/rerun", headers=headers)
+    assert rerun.json() == {"task_id": "chat-9"}
+    assert ("rerun_task", "chat-1") in site["ops"].calls
+    audited = [(r["action"], r["ok"]) for r in site["store"].audit_rows()]
+    assert ("rerun_task", True) in audited
+    missing = client.post("/api/tasks/missing/rerun", headers=headers)
+    assert missing.status_code == 400 and "missing" in missing.json()["error"]
+    assert ("rerun_task", False) in [(r["action"], r["ok"]) for r in site["store"].audit_rows()]
+
+
+def test_rerun_tolerates_the_fallback_shape(site):
+    # _continue_patch lỗi thì rerun_task (worker (a)) tự rơi về task mới từ đầu; endpoint
+    # chỉ cần trả task_id mới, không quan tâm task mới có phải bản tiếp nối hay không.
+    async def fallback(task_id=""):
+        return {"task_id": "chat-10", "fallback": True,
+                "note": "Lưu ý: patch cũ không gộp được lên HEAD mới nên chạy lại từ đầu."}
+
+    site["ops"].rerun_task = fallback
+    headers = signed_in(site)
+    assert site["client"].post("/api/tasks/chat-1/rerun", headers=headers).json() == {"task_id": "chat-10"}
+
+
+def test_dismiss_apply_error_calls_ops_and_is_audited(site):
+    headers = signed_in(site)
+    client = site["client"]
+    dismissed = client.post("/api/tasks/chat-1/apply-error/dismiss", headers=headers)
+    assert dismissed.json() == {"ok": True, "task_id": "chat-1"}
+    assert ("dismiss_apply_error", "chat-1") in site["ops"].calls
+    audited = [(r["action"], r["ok"]) for r in site["store"].audit_rows()]
+    assert ("dismiss_apply_error", True) in audited
+    missing = client.post("/api/tasks/missing/apply-error/dismiss", headers=headers)
+    assert missing.status_code == 400 and "missing" in missing.json()["error"]
+
+
+def test_structured_tool_error_carries_code_head_and_failed_files(site):
+    # ApplyConflictError (worker (a)) mang 3 thuộc tính cấu trúc; lỗi thường thì không.
+    async def conflict(task_id=""):
+        err = KiteToolError("patch không áp được (repo đã đổi so với lúc chạy task?)")
+        err.code = "apply_conflict"
+        err.head = "abc1234"
+        err.failed_files = ["a.py", "b/c.py"]
+        raise err
+
+    site["ops"].apply_result = conflict
+    headers = signed_in(site)
+    response = site["client"].post("/api/tasks/chat-1/apply", headers=headers)
+    assert response.status_code == 400
+    assert response.json() == {"error": "patch không áp được (repo đã đổi so với lúc chạy task?)",
+                               "code": "apply_conflict", "head": "abc1234",
+                               "failed_files": ["a.py", "b/c.py"]}
+    plain = site["client"].post("/api/tasks/missing/cancel", headers=headers)
+    assert plain.status_code == 400 and set(plain.json()) == {"error"}
 
 
 def test_repos_must_be_git_repositories_inside_the_allowed_folders(site):

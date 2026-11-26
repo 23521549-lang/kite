@@ -2,7 +2,6 @@ import { ActionIcon, AppShell, Burger, Center, Group, Loader, Menu, NavLink, Seg
 import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
-  IconBook2,
   IconChartBar,
   IconCpu,
   IconFolders,
@@ -22,7 +21,6 @@ import { useLanguage, useT } from './i18n'
 import Bench from './pages/Bench'
 import Chat from './pages/Chat'
 import Environments from './pages/Environments'
-import Journal from './pages/Journal'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
 import Repos from './pages/Repos'
@@ -64,7 +62,6 @@ function Shell() {
     { path: 'environments', label: t('nav.environments'), icon: IconFolders, page: Environments },
     { path: 'repos', label: t('nav.repos'), icon: IconFolders, page: Repos, hidden: true },
     { path: 'workers', label: t('nav.workers'), icon: IconCpu, page: Workers },
-    { path: 'journal', label: t('nav.journal'), icon: IconBook2, page: Journal },
     { path: 'bench', label: t('nav.bench'), icon: IconChartBar, page: Bench },
     { path: 'settings', label: t('nav.settings'), icon: IconSettings, page: Settings },
   ]

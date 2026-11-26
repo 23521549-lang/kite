@@ -53,6 +53,7 @@ class SchedulerStore(Protocol):
     def cancel(self, task_id: str, now: float) -> None: ...
     def get_task_state(self, task_id: str) -> str: ...
     def get_task(self, task_id: str) -> dict[str, object]: ...
+    def set_last_apply_error(self, task_id: str, error: dict[str, object] | None) -> None: ...
     def list_tasks(self) -> list[dict[str, object]]: ...
 
 
@@ -362,6 +363,9 @@ class SQLiteSchedulerStore:
 
     @staticmethod
     def _task_from_row(row: sqlite3.Row) -> dict[str, object]:
+        # "main_repo" belongs to Gói 2 (not created here): read it only when the column exists,
+        # so rerun_task can use it once that migration lands without breaking older databases.
+        keys = row.keys()
         return {
             "task_id": row["task_id"], "role": row["role"], "model_id": row["model_id"],
             "repo_head": row["repo_head"], "branch": row["branch"],
@@ -372,8 +376,9 @@ class SQLiteSchedulerStore:
             "required_capabilities": json.loads(row["required_capabilities_json"] or "[]"),
             "chat_session_id": row["chat_session_id"],
             "environment_id": row["environment_id"],
-            "main_repo": row["main_repo"],
+            # Raw JSON string (or None); callers that need the object parse it themselves.
             "last_apply_error": row["last_apply_error"],
+            "main_repo": row["main_repo"] if "main_repo" in keys else None,
         }
 
     @staticmethod
@@ -454,6 +459,20 @@ class SQLiteSchedulerStore:
         if row is None:
             raise StoreError(f"task {task_id} does not exist")
         return self._task_from_row(row)
+
+    def set_last_apply_error(self, task_id: str, error: dict[str, object] | None) -> None:
+        """Persist a structured apply failure (JSON) on a task row, or clear it (None) on success."""
+        try:
+            with self._transaction() as db:
+                cursor = db.execute(
+                    "UPDATE tasks SET last_apply_error=? WHERE task_id=?",
+                    (json.dumps(error, ensure_ascii=False, sort_keys=True) if error is not None else None,
+                     task_id),
+                )
+                if cursor.rowcount == 0:
+                    raise StoreError(f"task {task_id} does not exist")
+        except sqlite3.Error as exc:
+            raise StoreError(f"could not record apply error for task {task_id}: {exc}") from exc
 
     def list_tasks(self) -> list[dict[str, object]]:
         with self._lock:

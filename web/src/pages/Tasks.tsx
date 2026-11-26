@@ -1,5 +1,4 @@
 import {
-  Alert,
   Badge,
   Button,
   Card,
@@ -15,18 +14,44 @@ import {
   Text,
   TextInput,
   Textarea,
-  Timeline,
 } from '@mantine/core'
 import { IconPlus } from '@tabler/icons-react'
-import { useState } from 'react'
-import { dismissApplyError, envDisplayName, get, listEnvironments, post, rerunTask, type ApplyError, type TaskRow } from '../api'
-import { ConfirmButton, DiffView, Empty, JsonView, KeyValue, Loading, Page, StateBadge } from '../components/common'
+import { useEffect, useRef, useState } from 'react'
+import { get, post, type TaskRow } from '../api'
+import { Empty, Loading, Page, StateBadge } from '../components/common'
 import { go } from '../router'
-import { attempt, fmtTime, short, useLoad } from '../util'
+import { attempt, short, useLoad } from '../util'
 import { useT } from '../i18n'
+import TaskDetail from './TaskDetail'
+import TaskJournal from './TaskJournal'
+
+// The "unknown origin" filter value: old tasks were never stamped with a session/environment.
+const UNKNOWN = '__unknown__'
+
+function distinct(values: (string | null | undefined)[]): string[] {
+  return [...new Set(values.filter((v): v is string => !!v))]
+}
+
+function matchOrigin(value: string | null | undefined, filter: string | null): boolean {
+  if (filter === null) return true
+  if (filter === UNKNOWN) return !value
+  return value === filter
+}
+
+function originOptions(values: (string | null | undefined)[], unknownLabel: string): { value: string; label: string }[] {
+  return [
+    { value: UNKNOWN, label: unknownLabel },
+    ...distinct(values).map((v) => ({ value: v, label: short(v, 24) })),
+  ]
+}
 
 export default function Tasks({ parts }: { parts: string[] }) {
   const t = useT()
+  const unknownLabel = t('tasks.origin.unknown')
+  const envLabel = t('tasks.origin.env')
+  const sessionLabel = t('tasks.origin.session')
+  const filterEnvTitle = t('tasks.origin.filter-env')
+  const filterSessionTitle = t('tasks.origin.filter-session')
   const FILTERS = [
     { value: 'all', label: t('tasks.filter.all') },
     { value: 'active', label: t('tasks.filter.active') },
@@ -36,15 +61,36 @@ export default function Tasks({ parts }: { parts: string[] }) {
   const taskId = parts[0] ?? null
   const { data, error, reload } = useLoad(() => get<{ tasks: TaskRow[] }>('/api/tasks?limit=50'), [], 8000)
   const [filter, setFilter] = useState('all')
+  const [tab, setTab] = useState('tasks')
+  // Init from the query (?session=…&env=…) so links from a task detail filter the list.
+  const [sessionFilter, setSessionFilter] = useState<string | null>(() => new URLSearchParams(location.search).get('session'))
+  const [envFilter, setEnvFilter] = useState<string | null>(() => new URLSearchParams(location.search).get('env'))
+  // Re-sync when the route changes inside the SPA: the component does not remount
+  // when going from /tasks/<id> to /tasks?session=…, so the initializer above does not re-run.
+  // Only sync when the query really changed — picking by hand in the Select does not
+  // change the URL, so it is not reset.
+  const lastQuery = useRef(location.search)
+  useEffect(() => {
+    if (location.search !== lastQuery.current) {
+      lastQuery.current = location.search
+      const q = new URLSearchParams(location.search)
+      setSessionFilter(q.get('session'))
+      setEnvFilter(q.get('env'))
+    }
+  })
   const [creating, setCreating] = useState(false)
-  const tasks = (data?.tasks ?? []).filter((t) =>
-    filter === 'all'
-      ? true
-      : filter === 'active'
-        ? ['QUEUED', 'LEASED'].includes(t.state)
-        : filter === 'done'
-          ? t.state === 'COMPLETED'
-          : ['FAILED', 'CANCELLED'].includes(t.state),
+  const allTasks = data?.tasks ?? []
+  const tasks = allTasks.filter(
+    (t) =>
+      (filter === 'all'
+        ? true
+        : filter === 'active'
+          ? ['QUEUED', 'LEASED'].includes(t.state)
+          : filter === 'done'
+            ? t.state === 'COMPLETED'
+            : ['FAILED', 'CANCELLED'].includes(t.state)) &&
+      matchOrigin(t.chat_session_id, sessionFilter) &&
+      matchOrigin(t.environment_id, envFilter),
   )
   return (
     <Page
@@ -64,48 +110,112 @@ export default function Tasks({ parts }: { parts: string[] }) {
           go(`/tasks/${encodeURIComponent(id)}`)
         }}
       />
-      <Grid>
-        <Grid.Col span={{ base: 12, md: taskId ? 4 : 12 }}>
-          <Card withBorder p="xs">
-            <SegmentedControl fullWidth size="xs" data={FILTERS} value={filter} onChange={setFilter} mb="xs" />
-            {!data ? (
-              <Loading error={error} />
-            ) : tasks.length ? (
-              <Table highlightOnHover>
-                <Table.Tbody>
-                  {tasks.map((t) => (
-                    <Table.Tr
-                      key={t.task_id}
-                      className="clickable"
-                      onClick={() => go(`/tasks/${encodeURIComponent(t.task_id)}`)}
-                      style={t.task_id === taskId ? { background: 'var(--mantine-color-default-hover)' } : undefined}
-                    >
-                      <Table.Td>
-                        <Text size="sm" lineClamp={2}>
-                          {t.goal || t.task_id}
-                        </Text>
-                        <Text size="xs" c="dimmed">
-                          {t.task_id} · {t.task_type} · {t.created}
-                        </Text>
-                      </Table.Td>
-                      <Table.Td w={90}>
-                        <StateBadge state={t.state} />
-                      </Table.Td>
-                    </Table.Tr>
-                  ))}
-                </Table.Tbody>
-              </Table>
-            ) : (
-              <Empty>{t('tasks.no-tasks')}</Empty>
-            )}
-          </Card>
-        </Grid.Col>
-        {taskId ? (
-          <Grid.Col span={{ base: 12, md: 8 }}>
-            <TaskDetail key={taskId} taskId={taskId} onChanged={reload} />
+      <Tabs value={tab} onChange={(v) => setTab(v ?? 'tasks')}>
+        <Tabs.List>
+          <Tabs.Tab value="tasks">{t('tasks.tab.tasks')}</Tabs.Tab>
+          <Tabs.Tab value="journal">{t('tasks.tab.journal')}</Tabs.Tab>
+        </Tabs.List>
+        <Tabs.Panel value="tasks" pt="md">
+        <Grid>
+          <Grid.Col span={{ base: 12, md: taskId ? 4 : 12 }}>
+            <Card withBorder p="xs">
+              <SegmentedControl fullWidth size="xs" data={FILTERS} value={filter} onChange={setFilter} mb="xs" />
+              <Group grow mb="xs">
+                <Select
+                  size="xs"
+                  placeholder={t('tasks.filter.env-all')}
+                  data={originOptions(allTasks.map((t) => t.environment_id), unknownLabel)}
+                  value={envFilter}
+                  onChange={setEnvFilter}
+                  clearable
+                />
+                <Select
+                  size="xs"
+                  placeholder={t('tasks.filter.session-all')}
+                  data={originOptions(allTasks.map((t) => t.chat_session_id), unknownLabel)}
+                  value={sessionFilter}
+                  onChange={setSessionFilter}
+                  clearable
+                />
+              </Group>
+              {!data ? (
+                <Loading error={error} />
+              ) : tasks.length ? (
+                <Table highlightOnHover>
+                  <Table.Tbody>
+                    {tasks.map((t) => (
+                      <Table.Tr
+                        key={t.task_id}
+                        className="clickable"
+                        onClick={() => go(`/tasks/${encodeURIComponent(t.task_id)}`)}
+                        style={t.task_id === taskId ? { background: 'var(--mantine-color-default-hover)' } : undefined}
+                      >
+                        <Table.Td>
+                          <Text size="sm" lineClamp={2}>
+                            {t.goal || t.task_id}
+                          </Text>
+                          <Text size="xs" c="dimmed">
+                            {t.task_id} · {t.task_type} · {t.created}
+                          </Text>
+                          <Group gap={4} mt={2}>
+                            <Text size="xs" c="dimmed">
+                              {envLabel}
+                            </Text>
+                            <Badge
+                              size="xs"
+                              variant="light"
+                              style={{ cursor: 'pointer' }}
+                              title={filterEnvTitle}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setEnvFilter(t.environment_id ?? UNKNOWN)
+                              }}
+                            >
+                              {t.environment_id ? short(t.environment_id, 20) : unknownLabel}
+                            </Badge>
+                            <Text size="xs" c="dimmed">
+                              →
+                            </Text>
+                            <Text size="xs" c="dimmed">
+                              {sessionLabel}
+                            </Text>
+                            <Badge
+                              size="xs"
+                              variant="light"
+                              style={{ cursor: 'pointer' }}
+                              title={filterSessionTitle}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setSessionFilter(t.chat_session_id ?? UNKNOWN)
+                              }}
+                            >
+                              {t.chat_session_id ? short(t.chat_session_id, 20) : unknownLabel}
+                            </Badge>
+                          </Group>
+                        </Table.Td>
+                        <Table.Td w={90}>
+                          <StateBadge state={t.state} />
+                        </Table.Td>
+                      </Table.Tr>
+                    ))}
+                  </Table.Tbody>
+                </Table>
+              ) : (
+                <Empty>{t('tasks.no-tasks')}</Empty>
+              )}
+            </Card>
           </Grid.Col>
-        ) : null}
-      </Grid>
+          {taskId ? (
+            <Grid.Col span={{ base: 12, md: 8 }}>
+              <TaskDetail key={taskId} taskId={taskId} onChanged={reload} />
+            </Grid.Col>
+          ) : null}
+        </Grid>
+        </Tabs.Panel>
+        <Tabs.Panel value="journal" pt="md">
+          <TaskJournal tasks={allTasks} />
+        </Tabs.Panel>
+      </Tabs>
     </Page>
   )
 }
@@ -198,337 +308,3 @@ function NewTask({ opened, onClose, onCreated }: { opened: boolean; onClose: () 
   )
 }
 
-type Detail = {
-  log: Record<string, any>
-  status: Record<string, any>
-  result?: Record<string, any>
-  journal: { runs: any[]; trace: any[]; requests: Record<string, any>; actions: any[]; notes: any[] }
-  // Gói 2 (origin stamp) + Gói 3 (durable apply error). The back end may
-  // carry them at the top level or inside `status`; read both.
-  chat_session_id?: string | null
-  environment_id?: string | null
-  main_repo?: string | null
-  last_apply_error?: ApplyError | null
-}
-
-function TaskDetail({ taskId, onChanged }: { taskId: string; onChanged: () => void }) {
-  const t = useT()
-  const [rerunning, setRerunning] = useState(false)
-  const { data, error, reload } = useLoad(
-    () => get<Detail>(`/api/tasks/${encodeURIComponent(taskId)}`),
-    [taskId],
-    6000,
-  )
-  const envs = useLoad(() => listEnvironments().catch(() => []), [taskId])
-  // GET /api/tasks/{id} does not carry the origin stamp or the durable
-  // apply error (worker (a)/(b) + Gói 3 own that endpoint); the list rows
-  // do, so read them from there as well.
-  const listRow = useLoad(() => get<{ tasks: TaskRow[] }>('/api/tasks?limit=50').catch(() => ({ tasks: [] as TaskRow[] })), [taskId])
-  const row = (listRow.data?.tasks ?? []).find((tk) => tk.task_id === taskId)
-  const patchText = useLoad(async () => {
-    try {
-      const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/patch`, { credentials: 'same-origin' })
-      return res.ok ? await res.text() : ''
-    } catch {
-      return ''
-    }
-  }, [taskId, data?.status?.workflow])
-  if (!data) return <Loading error={error} />
-  const s = data.status ?? {}
-  const log = data.log ?? {}
-  const result = data.result ?? {}
-  const running = s.workflow === 'RUNNING'
-  const done = s.workflow === 'COMPLETED'
-  const id = encodeURIComponent(taskId)
-  const act = async (path: string, body: unknown = {}, ok?: string) => {
-    await attempt(() => post(`/api/tasks/${id}/${path}`, body), ok)
-    reload()
-    onChanged()
-  }
-  const patch = patchText.data ?? ''
-  // Gói 2 origin stamp: stamped at creation, never inferred from the
-  // session's current environment (the session may have moved since).
-  const originSession: string | null = row?.chat_session_id ?? data.chat_session_id ?? (s.chat_session_id as string | null) ?? (log.chat_session_id as string | null) ?? null
-  const originEnv: string | null = row?.environment_id ?? data.environment_id ?? (s.environment_id as string | null) ?? (log.environment_id as string | null) ?? null
-  const originEnvRow = (envs.data ?? []).find((e) => e.id === originEnv)
-  const applyError: ApplyError | null = row?.last_apply_error ?? data.last_apply_error ?? (s.last_apply_error as ApplyError | null) ?? null
-  const isApplyConflict = applyError?.code === 'apply_conflict'
-  return (
-    <Stack>
-      <Card withBorder>
-        <Group justify="space-between" align="flex-start">
-          <div style={{ minWidth: 0, flex: 1 }}>
-            <Text fw={600}>{taskId}</Text>
-            <Text size="sm" c="dimmed">
-              {s.now ?? s.step ?? s.waiting_for ?? ''}
-            </Text>
-          </div>
-          <Group gap={6}>
-            {s.queue_state ? <StateBadge state={s.queue_state} /> : null}
-            {s.workflow ? (
-              <Badge variant="outline" size="sm">
-                {s.workflow}
-              </Badge>
-            ) : null}
-          </Group>
-        </Group>
-        <Group gap={4} mt="sm" wrap="wrap">
-          <Text size="sm" c="dimmed">
-            {t('env.origin-session')}:
-          </Text>
-          {originSession ? (
-            <Button size="compact-xs" variant="subtle" onClick={() => go(`/chat/${encodeURIComponent(originSession)}`)}>
-              {originSession}
-            </Button>
-          ) : (
-            <Text size="sm">{t('env.origin-unknown')}</Text>
-          )}
-          <Text size="sm" c="dimmed">
-            · {t('env.origin-environment')}:
-          </Text>
-          {originEnv ? (
-            <Button size="compact-xs" variant="subtle" onClick={() => go(`/environments/${encodeURIComponent(originEnv)}/sessions`)}>
-              {originEnvRow ? envDisplayName(originEnvRow) : originEnv}
-            </Button>
-          ) : (
-            <Text size="sm">{t('env.origin-unknown')}</Text>
-          )}
-          {originEnv ? (
-            <Button size="compact-xs" variant="subtle" onClick={() => go(`/environments/${encodeURIComponent(originEnv)}/sessions`)}>
-              {t('env.origin-timeline')}
-            </Button>
-          ) : null}
-        </Group>
-        {isApplyConflict ? (
-          <Alert color="red" mt="sm" title={t('env.apply-error-title')}>
-            <Stack gap="xs">
-              <Text size="sm">
-                {taskId} · {t('env.head')}: {applyError.head ?? '—'}
-              </Text>
-              {(applyError.failed_files ?? []).length ? (
-                <Text size="sm">
-                  {t('env.apply-error-files')}: {(applyError.failed_files ?? []).join(', ')}
-                </Text>
-              ) : null}
-              <Text size="xs" c="dimmed">
-                {t('env.apply-error-note')}
-              </Text>
-              <Group gap="xs">
-                <Button
-                  size="xs"
-                  color="red"
-                  loading={rerunning}
-                  onClick={async () => {
-                    setRerunning(true)
-                    const res = await attempt(() => rerunTask(taskId), t('env.apply-error-rerun-done'))
-                    setRerunning(false)
-                    if (res?.task_id) go(`/tasks/${encodeURIComponent(res.task_id)}`)
-                  }}
-                >
-                  {t('env.apply-error-rerun')}
-                </Button>
-                <Button
-                  size="xs"
-                  variant="light"
-                  onClick={async () => {
-                    const res = await attempt(() => dismissApplyError(taskId), t('env.apply-error-dismissed'))
-                    if (res !== undefined) reload()
-                  }}
-                >
-                  {t('env.apply-error-dismiss')}
-                </Button>
-                <Text size="sm">
-                  {t('env.apply-error-manual')}: {t('env.apply-error-manual-help')}
-                </Text>
-              </Group>
-            </Stack>
-          </Alert>
-        ) : null}
-        {s.error ? (
-          <Alert color="yellow" mt="sm">
-            {t('tasks.detail.temporal-error', { error: short(s.error, 200) })}
-          </Alert>
-        ) : null}
-        <Group gap="xs" mt="md">
-          {done && patch ? (
-            <ConfirmButton
-              color="teal"
-              size="xs"
-              label={t('tasks.detail.apply-patch')}
-              title={t('tasks.detail.apply-title')}
-              message={<Text size="sm">{t('tasks.detail.apply-message')}</Text>}
-              confirmLabel={t('tasks.detail.apply')}
-              onConfirm={() => act('apply', {}, t('tasks.detail.applied'))}
-            />
-          ) : null}
-          {done && patch ? (
-            <ConfirmButton
-              size="xs"
-              variant="light"
-              label={t('tasks.detail.commit')}
-              title={t('tasks.detail.commit-title')}
-              askText
-              textLabel={t('tasks.detail.commit-label')}
-              confirmLabel={t('tasks.detail.commit-button')}
-              onConfirm={(message) => act('commit', { message }, t('tasks.detail.committed'))}
-            />
-          ) : null}
-          {running ? (
-            <>
-              <Button size="xs" variant="light" onClick={() => act('pause', {}, t('tasks.detail.paused'))}>
-                {t('tasks.detail.pause')}
-              </Button>
-              <Button size="xs" variant="light" onClick={() => act('resume', {}, t('tasks.detail.resumed'))}>
-                {t('tasks.detail.resume')}
-              </Button>
-              <ConfirmButton
-                size="xs"
-                variant="light"
-                label={t('tasks.detail.instruct')}
-                title={t('tasks.detail.instruct-title')}
-                askText
-                textLabel={t('tasks.detail.instruct-label')}
-                confirmLabel={t('tasks.detail.instruct-send')}
-                onConfirm={(text) => act('instruct', { text }, t('tasks.detail.instructed'))}
-              />
-              <ConfirmButton
-                size="xs"
-                color="red"
-                variant="light"
-                label={t('tasks.detail.cancel')}
-                title={t('tasks.detail.cancel-title')}
-                message={t('tasks.detail.cancel-message')}
-                confirmLabel={t('tasks.detail.cancel')}
-                onConfirm={() => act('cancel', {}, t('tasks.detail.cancelled'))}
-              />
-            </>
-          ) : null}
-          {!running ? (
-            <>
-              <ConfirmButton
-                size="xs"
-                variant="subtle"
-                color="teal"
-                label={t('tasks.detail.good')}
-                title={t('tasks.detail.good-title')}
-                askText
-                textLabel={t('tasks.detail.good-reason')}
-                textDefault="ok"
-                confirmLabel={t('tasks.detail.record')}
-                onConfirm={(reason) => act('note', { verdict: 'good', reason }, t('tasks.detail.recorded'))}
-              />
-              <ConfirmButton
-                size="xs"
-                variant="subtle"
-                color="red"
-                label={t('tasks.detail.bad')}
-                title={t('tasks.detail.bad-title')}
-                askText
-                textLabel={t('tasks.detail.bad-reason')}
-                confirmLabel={t('tasks.detail.record')}
-                onConfirm={(reason) => act('note', { verdict: 'bad', reason }, t('tasks.detail.recorded'))}
-              />
-            </>
-          ) : null}
-        </Group>
-      </Card>
-      <Tabs defaultValue="progress" keepMounted={false}>
-        <Tabs.List>
-          <Tabs.Tab value="progress">{t('tasks.detail.tab-progress')}</Tabs.Tab>
-          <Tabs.Tab value="result">{t('tasks.detail.tab-result')}</Tabs.Tab>
-          <Tabs.Tab value="diff">{t('tasks.detail.tab-diff')}</Tabs.Tab>
-          <Tabs.Tab value="journal">{t('tasks.detail.tab-journal')}</Tabs.Tab>
-        </Tabs.List>
-        <Tabs.Panel value="progress" pt="sm">
-          <Card withBorder>
-            <KeyValue
-              rows={[
-                [t('tasks.detail.elapsed'), log.elapsed ?? s.elapsed ?? '—'],
-                [t('tasks.detail.doing'), log.now ?? s.now ?? (running ? s.step : '—') ?? '—'],
-                ...(s.waiting_for ? ([[t('tasks.detail.waiting'), s.waiting_for]] as [string, string][]) : []),
-                ...(log.fast_path ? ([[t('tasks.detail.fast-path'), short(log.fast_path, 200)]] as [string, string][]) : []),
-              ]}
-            />
-            {(log.progress ?? []).length ? (
-              <Timeline active={(log.progress ?? []).length} bulletSize={12} lineWidth={2} mt="md">
-                {(log.progress as string[]).map((line, i) => (
-                  <Timeline.Item key={i}>
-                    <Text size="sm">{line}</Text>
-                  </Timeline.Item>
-                ))}
-              </Timeline>
-            ) : (
-              <Empty>{log.note ?? t('tasks.detail.no-steps')}</Empty>
-            )}
-          </Card>
-        </Tabs.Panel>
-        <Tabs.Panel value="result" pt="sm">
-          <Card withBorder>
-            {done ? (
-              <Stack>
-                <KeyValue
-                  rows={[
-                    [t('tasks.detail.status'), result.status ?? '—'],
-                    [t('tasks.detail.worker'), result.worker ?? '—'],
-                    [t('tasks.detail.repo'), result.repo_path ?? '—'],
-                    ...(log.result
-                      ? ([
-                          [t('tasks.detail.self-test'), log.result.verified ? t('tasks.detail.self-test-pass') : t('tasks.detail.self-test-fail')],
-                          [t('tasks.detail.duration'), log.result.wall_seconds ? t('tasks.detail.duration-seconds', { seconds: Math.round(log.result.wall_seconds) }) : '—'],
-                          [t('tasks.detail.changed-files'), (log.result.changed_files ?? []).join(', ') || '—'],
-                        ] as [string, string][])
-                      : []),
-                  ]}
-                />
-                {result.summary ? (
-                  <Text size="sm" style={{ whiteSpace: 'pre-wrap' }}>
-                    {result.summary}
-                  </Text>
-                ) : null}
-              </Stack>
-            ) : (
-              <Empty>{t('tasks.detail.not-done')}</Empty>
-            )}
-          </Card>
-        </Tabs.Panel>
-        <Tabs.Panel value="diff" pt="sm">
-          <Card withBorder p={0}>
-            {patch ? <DiffView patch={patch} /> : <Empty>{t('tasks.detail.no-patch')}</Empty>}
-          </Card>
-        </Tabs.Panel>
-        <Tabs.Panel value="journal" pt="sm">
-          <Stack>
-            <Card withBorder>
-              <KeyValue
-                rows={[
-                  [t('tasks.detail.requests'), String(data.journal.requests?.count ?? 0)],
-                  [t('tasks.detail.tokens'), `${data.journal.requests?.prompt_tokens ?? 0} / ${data.journal.requests?.completion_tokens ?? 0}`],
-                  [t('tasks.detail.model-time'), t('tasks.detail.model-seconds', { seconds: data.journal.requests?.model_seconds ?? 0 })],
-                  [t('tasks.detail.errors'), (data.journal.requests?.errors ?? []).length ? short((data.journal.requests.errors as string[]).join('; '), 300) : t('tasks.detail.no-errors')],
-                ]}
-              />
-            </Card>
-            {data.journal.notes.length ? (
-              <Card withBorder>
-                <Text fw={600} mb={4}>
-                  {t('tasks.detail.notes')}
-                </Text>
-                {data.journal.notes.map((n, i) => (
-                  <Text key={i} size="sm">
-                    {fmtTime(n.at ?? n.ts)} · {n.verdict}: {n.reason}
-                  </Text>
-                ))}
-              </Card>
-            ) : null}
-            <Card withBorder>
-              <Text fw={600} mb={4}>
-                {t('tasks.detail.runs')}
-              </Text>
-              {data.journal.runs.length ? <JsonView data={data.journal.runs} /> : <Empty>{t('tasks.detail.no-runs')}</Empty>}
-            </Card>
-          </Stack>
-        </Tabs.Panel>
-      </Tabs>
-    </Stack>
-  )
-}

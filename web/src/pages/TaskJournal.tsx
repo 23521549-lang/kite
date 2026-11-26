@@ -1,14 +1,88 @@
-import { Badge, Button, Card, Group, SegmentedControl, SimpleGrid, Stack, Table, Tabs, Text } from '@mantine/core'
+// The "Journal" tab folded into the Tasks page (moved from the deleted Journal.tsx).
+// Journal data and endpoints are UNCHANGED — only the display moved.
+// The client-side session/environment/task filter applies only to the Events tab,
+// where records carry those fields; Summary and Audit show everything.
+import { Badge, Button, Card, Group, SegmentedControl, Select, SimpleGrid, Stack, Table, Tabs, Text } from '@mantine/core'
 import { useState } from 'react'
-import { get, qs } from '../api'
-import { Bars, Empty, JsonView, Loading, Page } from '../components/common'
+import { get, qs, type TaskRow } from '../api'
+import { Bars, Empty, JsonView, Loading } from '../components/common'
 import { fmtTime, num, short, usd, useLoad } from '../util'
 import { useT, type DictKey } from '../i18n'
 
-export default function Journal() {
+// The "unknown origin" filter value: records that carry no session/environment.
+const UNKNOWN = '__unknown__'
+
+function distinct(values: (string | null | undefined)[]): string[] {
+  return [...new Set(values.filter((v): v is string => !!v))]
+}
+
+function originOptions(values: (string | null | undefined)[], unknownLabel: string): { value: string; label: string }[] {
+  return [
+    { value: UNKNOWN, label: unknownLabel },
+    ...distinct(values).map((v) => ({ value: v, label: short(v, 24) })),
+  ]
+}
+
+// A journal record's value in the fields that may carry session/environment/task.
+// A record with none of those fields counts as "unknown origin".
+function recordValue(r: Record<string, any>, fields: string[]): string | null {
+  for (const f of fields) {
+    const v = r[f]
+    if (typeof v === 'string' && v) return v
+    if (typeof v === 'number') return String(v)
+  }
+  return null
+}
+
+function recordMatches(r: Record<string, any>, fields: string[], filter: string | null): boolean {
+  if (filter === null) return true
+  const value = recordValue(r, fields)
+  if (filter === UNKNOWN) return value === null
+  return value === filter
+}
+
+export type JournalFilters = { session: string | null; env: string | null; task: string | null }
+
+export default function TaskJournal({ tasks }: { tasks: TaskRow[] }) {
   const t = useT()
+  const unknownLabel = t('tasks.origin.unknown')
+  const [sessionFilter, setSessionFilter] = useState<string | null>(null)
+  const [envFilter, setEnvFilter] = useState<string | null>(null)
+  const [taskFilter, setTaskFilter] = useState<string | null>(null)
+  const anyFilter = sessionFilter !== null || envFilter !== null || taskFilter !== null
   return (
-    <Page title={t('journal.title')}>
+    <Stack>
+      <Group grow>
+        <Select
+          size="xs"
+          placeholder={t('tasks.filter.env-all')}
+          data={originOptions(tasks.map((t) => t.environment_id), unknownLabel)}
+          value={envFilter}
+          onChange={setEnvFilter}
+          clearable
+        />
+        <Select
+          size="xs"
+          placeholder={t('tasks.filter.session-all')}
+          data={originOptions(tasks.map((t) => t.chat_session_id), unknownLabel)}
+          value={sessionFilter}
+          onChange={setSessionFilter}
+          clearable
+        />
+        <Select
+          size="xs"
+          placeholder={t('tasks.filter.task-all')}
+          data={tasks.map((t) => ({ value: t.task_id, label: short(t.goal || t.task_id, 30) }))}
+          value={taskFilter}
+          onChange={setTaskFilter}
+          clearable
+        />
+      </Group>
+      {anyFilter ? (
+        <Text size="xs" c="dimmed">
+          {t('tasks.journal.filter-note')}
+        </Text>
+      ) : null}
       <Tabs defaultValue="summary" keepMounted={false}>
         <Tabs.List>
           <Tabs.Tab value="summary">{t('journal.tab.summary')}</Tabs.Tab>
@@ -19,13 +93,13 @@ export default function Journal() {
           <Summary />
         </Tabs.Panel>
         <Tabs.Panel value="events" pt="md">
-          <Events />
+          <Events filters={{ session: sessionFilter, env: envFilter, task: taskFilter }} />
         </Tabs.Panel>
         <Tabs.Panel value="audit" pt="md">
           <Audit />
         </Tabs.Panel>
       </Tabs>
-    </Page>
+    </Stack>
   )
 }
 
@@ -198,7 +272,7 @@ function Summary() {
   )
 }
 
-function Events() {
+function Events({ filters }: { filters: JournalFilters }) {
   const t = useT()
   const FILES = Object.entries(FILE_KEYS).map(([value, key]) => ({ value, label: t(key) }))
   const [file, setFile] = useState('gateway')
@@ -207,8 +281,14 @@ function Events() {
     setExtra([])
     return get<{ records: Record<string, any>[] }>(`/api/journal/events${qs({ file, limit: 100 })}`)
   }, [file])
-  const records = [...(data?.records ?? []), ...extra]
-  const last = records[records.length - 1]
+  const allRecords = [...(data?.records ?? []), ...extra]
+  const records = allRecords.filter(
+    (r) =>
+      recordMatches(r, ['task_id', 'tag'], filters.task) &&
+      recordMatches(r, ['chat_session_id', 'session_id'], filters.session) &&
+      recordMatches(r, ['environment_id', 'env_id'], filters.env),
+  )
+  const last = allRecords[allRecords.length - 1]
   return (
     <Stack>
       <SegmentedControl data={FILES} value={file} onChange={setFile} />
@@ -227,7 +307,7 @@ function Events() {
       ) : (
         <Empty>{t('journal.events.no-events')}</Empty>
       )}
-      {records.length >= 100 && last?.ts ? (
+      {allRecords.length >= 100 && last?.ts ? (
         <Group>
           <Button
             variant="light"

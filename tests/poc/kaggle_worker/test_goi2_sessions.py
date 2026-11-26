@@ -266,7 +266,7 @@ def test_rerun_calls_ops_rerun_task(site):
     headers = signed_in(site)
     response = site["client"].post("/api/tasks/task-old/rerun", headers=headers)
     assert response.status_code == 200, response.text
-    assert response.json() == {"task_id": "task-new", "reran_from": "task-old"}
+    assert response.json() == {"task_id": "task-new"}
 
 
 def test_apply_conflict_maps_to_structured_400(site):

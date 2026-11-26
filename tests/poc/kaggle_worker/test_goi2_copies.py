@@ -374,7 +374,7 @@ def test_rerun_continues_from_old_patch_on_new_head(tmp_path):
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "unrelated")
     rerun = asyncio.run(ops.rerun_task(task_id))
-    assert rerun["rerun_of"] == task_id and rerun["fell_back"] is False
+    assert rerun["task_id"] != task_id and "fallback" not in rerun
     assert rerun["task_id"] != task_id
     new_input = client.started[-1][0]
     assert new_input.base_task == task_id and new_input.base_patch != ""
@@ -393,7 +393,7 @@ def test_rerun_falls_back_to_fresh_task_when_continue_patch_fails(tmp_path):
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "conflicting")
     rerun = asyncio.run(ops.rerun_task(task_id))
-    assert rerun["fell_back"] is True and rerun["task_id"] != task_id
+    assert rerun.get("fallback") is True and rerun["task_id"] != task_id
     new_input = client.started[-1][0]
     assert new_input.base_task == "" and new_input.base_patch == ""
     assert "chạy lại từ đầu" in new_input.goal
