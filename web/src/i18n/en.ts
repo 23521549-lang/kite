@@ -1114,4 +1114,9 @@ export const en: Record<DictKey, string> = {
   "login.password": "Password",
   "login.totp": "2FA code",
   "login.submit": "Sign in",
+  "login.recovery-link": "Lost your phone? Use a recovery code",
+  "login.recovery-label": "Recovery code",
+  "login.recovery-placeholder": "XXXX-XXXX-XXXX",
+  "login.recovery-note": "Each code works only once.",
+  "login.back-to-totp": "Back to entering a 2FA code",
 }
