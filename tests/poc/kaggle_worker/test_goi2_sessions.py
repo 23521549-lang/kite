@@ -89,7 +89,7 @@ class FakeOps:
         self.calls.append(("rerun_task", task_id))
         return {"task_id": "task-new", "reran_from": task_id}
 
-    async def apply_result(self, task_id=""):
+    async def apply_result(self, task_id="", confirmation_code=""):
         raise ApplyConflictError(task_id, "deadbeef", ["a.py"], "patch failed: a.py")
 
     async def repo_status(self, repo):
