@@ -140,9 +140,19 @@ export default function TaskDetail({ taskId, onChanged }: { taskId: string; onCh
               size="xs"
               label={t('tasks.detail.apply-patch')}
               title={t('tasks.detail.apply-title')}
-              message={<Text size="sm">{t('tasks.detail.apply-message')}</Text>}
+              message={
+                <Stack gap="xs">
+                  <Text size="sm">{t('tasks.detail.apply-message')}</Text>
+                  <Text size="sm">
+                    {t('tasks.detail.apply-code-hint', { command: `kite tasks confirm ${taskId}` })}
+                  </Text>
+                </Stack>
+              }
+              askCode
+              codeLabel={t('tasks.detail.apply-code-label')}
+              codePlaceholder={t('tasks.detail.apply-code-placeholder')}
               confirmLabel={t('tasks.detail.apply')}
-              onConfirm={() => act('apply', {}, t('tasks.detail.applied'))}
+              onConfirm={(_text, code) => act('apply', { confirmation_code: code ?? '' }, t('tasks.detail.applied'))}
             />
           ) : null}
           {done && patch ? (
@@ -151,10 +161,20 @@ export default function TaskDetail({ taskId, onChanged }: { taskId: string; onCh
               variant="light"
               label={t('tasks.detail.commit')}
               title={t('tasks.detail.commit-title')}
+              message={
+                <Text size="sm">
+                  {t('tasks.detail.commit-code-hint', { command: `kite tasks confirm ${taskId}` })}
+                </Text>
+              }
               askText
               textLabel={t('tasks.detail.commit-label')}
+              askCode
+              codeLabel={t('tasks.detail.commit-code-label')}
+              codePlaceholder={t('tasks.detail.commit-code-placeholder')}
               confirmLabel={t('tasks.detail.commit-button')}
-              onConfirm={(message) => act('commit', { message }, t('tasks.detail.committed'))}
+              onConfirm={(message, code) =>
+                act('commit', { message, confirmation_code: code ?? '' }, t('tasks.detail.committed'))
+              }
             />
           ) : null}
           {running ? (

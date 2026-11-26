@@ -82,12 +82,12 @@ class FakeOps:
         self.calls.append(("start_task", repo, goal))
         return {"task_id": "chat-2", "started": True}
 
-    async def apply_result(self, task_id=""):
-        self.calls.append(("apply_result", task_id))
+    async def apply_result(self, task_id="", confirmation_code=""):
+        self.calls.append(("apply_result", task_id, confirmation_code))
         return {"task_id": "chat-1", "applied": True}
 
-    async def commit_result(self, task_id, message):
-        self.calls.append(("commit_result", task_id, message))
+    async def commit_result(self, task_id, message, confirmation_code=""):
+        self.calls.append(("commit_result", task_id, message, confirmation_code))
         return {"task_id": "chat-1", "committed": True}
 
     async def cancel_task(self, task_id):
@@ -455,15 +455,116 @@ def test_task_routes_call_kite_and_the_sensitive_ones_are_audited(site):
     assert detail["status"]["workflow"] == "COMPLETED" and detail["result"]["ready"]
     started = client.post("/api/tasks", headers=headers, json={"repo": "/home/han/app", "goal": "sửa test"})
     assert started.json()["task_id"] == "chat-2"
-    client.post("/api/tasks/chat-1/apply", headers=headers)
-    client.post("/api/tasks/chat-1/commit", headers=headers, json={"message": "Fix the parser"})
+    client.post("/api/tasks/chat-1/apply", headers=headers, json={"confirmation_code": "ma-ap"})
+    client.post("/api/tasks/chat-1/commit", headers=headers,
+                json={"message": "Fix the parser", "confirmation_code": "ma-commit"})
     client.post("/api/tasks/chat-1/instruct", headers=headers, json={"text": "thêm test"})
     missing = client.post("/api/tasks/missing/cancel", headers=headers)
     assert missing.status_code == 400 and "missing" in missing.json()["error"]
-    assert ("commit_result", "chat-1", "Fix the parser") in site["ops"].calls
+    assert ("apply_result", "chat-1", "ma-ap") in site["ops"].calls
+    assert ("commit_result", "chat-1", "Fix the parser", "ma-commit") in site["ops"].calls
     audited = [(r["action"], r["ok"]) for r in site["store"].audit_rows()]
     assert ("task_start", True) in audited and ("apply_result", True) in audited
     assert ("commit_result", True) in audited and ("cancel_task", False) in audited
+
+
+def test_apply_and_commit_forward_the_code_and_fail_closed_without_it(site):
+    # Endpoint web phải chuyển mã xác nhận xuống ops y nguyên; thiếu mã hoặc mã
+    # sai thì vẫn rớt 400 (fail-closed) thay vì áp/commit. Stub bắt chước đúng
+    # luật kiểm của KiteOps._check_confirmation: mã rỗng → thiếu mã, mã khác
+    # mã đã cấp → không đúng; đường mã thật đã có ở test_mcp_server
+    # (owner_code) và test_aicontrol.
+    async def checked_apply(task_id="", confirmation_code=""):
+        if not confirmation_code:
+            raise KiteToolError("thiếu mã xác nhận")
+        if confirmation_code != "ma-dung":
+            raise KiteToolError("mã xác nhận không đúng")
+        site["ops"].calls.append(("apply_result", task_id, confirmation_code))
+        return {"task_id": task_id, "applied": True}
+
+    async def checked_commit(task_id, message, confirmation_code=""):
+        if not confirmation_code:
+            raise KiteToolError("thiếu mã xác nhận")
+        if confirmation_code != "ma-dung":
+            raise KiteToolError("mã xác nhận không đúng")
+        site["ops"].calls.append(("commit_result", task_id, message, confirmation_code))
+        return {"task_id": task_id, "committed": True}
+
+    site["ops"].apply_result = checked_apply
+    site["ops"].commit_result = checked_commit
+    headers = signed_in(site)
+    client = site["client"]
+    # Không body (đường cũ) và body rỗng đều tới được ops và rớt thiếu mã,
+    # không bị 422 chặn trước.
+    assert client.post("/api/tasks/chat-1/apply", headers=headers).status_code == 400
+    assert "thiếu mã xác nhận" in client.post(
+        "/api/tasks/chat-1/apply", headers=headers, json={}).json()["error"]
+    assert "không đúng" in client.post(
+        "/api/tasks/chat-1/apply", headers=headers, json={"confirmation_code": "ma-sai"}).json()["error"]
+    applied = client.post("/api/tasks/chat-1/apply", headers=headers,
+                          json={"confirmation_code": "ma-dung"})
+    assert applied.status_code == 200 and applied.json()["applied"] is True
+    assert ("apply_result", "chat-1", "ma-dung") in site["ops"].calls
+    # Commit: thiếu mã rớt, mã sai rớt, mã đúng chạy; message vẫn đi kèm.
+    assert "thiếu mã xác nhận" in client.post(
+        "/api/tasks/chat-1/commit", headers=headers, json={"message": "Fix"}).json()["error"]
+    assert "không đúng" in client.post(
+        "/api/tasks/chat-1/commit", headers=headers,
+        json={"message": "Fix", "confirmation_code": "ma-sai"}).json()["error"]
+    committed = client.post("/api/tasks/chat-1/commit", headers=headers,
+                            json={"message": "Fix", "confirmation_code": "ma-dung"})
+    assert committed.status_code == 200 and committed.json()["committed"] is True
+    assert ("commit_result", "chat-1", "Fix", "ma-dung") in site["ops"].calls
+
+
+def test_apply_commit_end_to_end_with_real_codes(tmp_path):
+    """Hợp nhất web + ops thật: mã do `kite tasks confirm` cấp (issue_code)
+    đi qua endpoint web rồi áp/commit được; mã thiếu/sai/dùng lại đều rớt 400.
+    Đây là test duy nhất đi hết đường UI → endpoint → _check_confirmation
+    với mã thật (test trên chỉ bắt chước luật kiểm bằng stub)."""
+    from tests.poc.kaggle_worker.test_mcp_server import FakeClient, finished_task, make_ops, make_repo, owner_code
+
+    repo, head = make_repo(tmp_path)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.com"], check=True)
+    client = FakeClient()
+    ops = make_ops(tmp_path, client)
+    task_id = finished_task(tmp_path, client, ops, repo, head)
+    raw = raw_config(tmp_path, launch={"kernel": "hanle/kite-worker"})
+    (tmp_path / "secrets" / "worker_token_kaggle-han").write_text("w" * 32 + "\n")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(raw))
+    clock = {"now": NOW}
+    store = Store(connect(sqlite_url(tmp_path / "web.sqlite3")), clock=lambda: clock["now"])
+    store.migrate()
+    sealer = sec.Sealer(tmp_path / "secrets" / "web_key")
+    store.create_user("han", sec.hash_password(PASSWORD), sealer.seal(SECRET))
+    ctx = WebContext(config_path, store, sealer, ops_factory=lambda _config: ops,
+                     gateway=FakeGateway(), clock=lambda: clock["now"], events_every=0.05)
+    live = {"client": TestClient(create_app(ctx), base_url="https://testserver"), "clock": clock}
+    headers = signed_in(live)
+    web = live["client"]
+    apply_url = f"/api/tasks/{task_id}/apply"
+    commit_url = f"/api/tasks/{task_id}/commit"
+    # Thiếu mã và mã sai đều rớt 400 qua endpoint web với ops thật.
+    assert web.post(apply_url, headers=headers).status_code == 400
+    wrong = web.post(apply_url, headers=headers, json={"confirmation_code": "sai"})
+    assert wrong.status_code == 400 and "không đúng" in wrong.json()["error"]
+    # Mã thật cấp bằng issue_code (đúng đường `kite tasks confirm`) thì áp được.
+    apply_code = owner_code(ops, "apply", task_id)
+    applied = web.post(apply_url, headers=headers, json={"confirmation_code": apply_code})
+    assert applied.status_code == 200 and applied.json()["applied"] is True
+    assert (repo / "calc.py").read_text() == "x = 2\n"
+    # Mã đã dùng không dùng lại được.
+    reused = web.post(apply_url, headers=headers, json={"confirmation_code": apply_code})
+    assert reused.status_code == 400 and "đã được dùng" in reused.json()["error"]
+    # Mã commit (khác mã áp) thì commit được đúng các file của patch.
+    committed = web.post(commit_url, headers=headers,
+                         json={"message": "Apply calc fix",
+                               "confirmation_code": owner_code(ops, "commit", task_id)})
+    assert committed.status_code == 200 and committed.json()["committed"] is True
+    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip() != head
 
 
 def test_task_detail_returns_trace_and_persistent_apply_error(site):
@@ -513,7 +614,7 @@ def test_dismiss_apply_error_calls_ops_and_is_audited(site):
 
 def test_structured_tool_error_carries_code_head_and_failed_files(site):
     # ApplyConflictError (worker (a)) mang 3 thuộc tính cấu trúc; lỗi thường thì không.
-    async def conflict(task_id=""):
+    async def conflict(task_id="", confirmation_code=""):
         err = KiteToolError("patch không áp được (repo đã đổi so với lúc chạy task?)")
         err.code = "apply_conflict"
         err.head = "abc1234"

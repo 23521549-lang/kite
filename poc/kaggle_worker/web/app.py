@@ -261,6 +261,17 @@ class NoteIn(BaseModel):
 
 class CommitIn(BaseModel):
     message: str = Field(max_length=2000)
+    # Mã một lần cho thao tác commit (khác mã áp patch); do chủ chạy
+    # `kite tasks confirm <task-id>` rồi nhập vào UI. Thiếu mã thì ops vẫn
+    # rớt "thiếu mã xác nhận" như cũ (fail-closed).
+    confirmation_code: str = Field(default="", max_length=500)
+
+
+class CodeIn(BaseModel):
+    """Chỉ mang mã xác nhận một lần cho apply (body tùy chọn để POST không
+    body cũ vẫn tới được ops và rớt fail-closed thay vì 422)."""
+
+    confirmation_code: str = Field(default="", max_length=500)
 
 
 class RepoIn(BaseModel):
@@ -900,8 +911,12 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
         return report
 
     @app.post("/api/tasks/{task_id}/apply")
-    async def task_apply(task_id: str, request: Request):
-        return await task_action(request, task_id, "apply_result", audited=True)
+    async def task_apply(task_id: str, request: Request, body: CodeIn | None = None):
+        # Mã một lần cho thao tác apply; thiếu mã thì apply_result vẫn rớt
+        # "thiếu mã xác nhận" (fail-closed) — body tùy chọn để POST không
+        # body cũ không bị 422 trước khi tới được ops.
+        code = body.confirmation_code if body is not None else ""
+        return await task_action(request, task_id, "apply_result", code, audited=True)
 
     @app.post("/api/tasks/{task_id}/rerun")
     async def task_rerun(task_id: str, request: Request):
@@ -918,7 +933,8 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
 
     @app.post("/api/tasks/{task_id}/commit")
     async def task_commit(task_id: str, body: CommitIn, request: Request):
-        return await task_action(request, task_id, "commit_result", body.message, audited=True)
+        return await task_action(request, task_id, "commit_result", body.message, body.confirmation_code,
+                                audited=True)
 
     @app.post("/api/tasks/{task_id}/cancel")
     async def task_cancel(task_id: str, request: Request):
