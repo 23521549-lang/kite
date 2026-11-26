@@ -50,6 +50,13 @@ web = [
     # deps. Argus runs via npx (preinstalled in the image), MCPiranha in its
     # own venv — neither goes in pyproject (mcp>=2.3 conflicts with Kite's mcp<2).
     "skillshield==1.3.0",
+    "markitdown[pdf,docx,pptx]==0.1.9",
+]
+# Docling fallback for the Knowledge store (web/docling_job.py): OCR + table/column
+# structure for scanned PDFs. Installed only when reconvert is needed; the
+# Docker image installs it via the "docling" extra (see Dockerfile).
+docling = [
+    "docling==2.152.0",
 ]
 # Node.js for building the web page (web/ → web/dist, `kite web build`): node and npm inside Kite's venv,
 # so no system package is needed. Docker images build the page in their own Node stage instead.

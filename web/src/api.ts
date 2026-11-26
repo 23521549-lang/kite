@@ -486,3 +486,51 @@ export const getConnectSkillScan = (id: string) => get<ScanReport>(`/api/connect
 export const enableConnectSkill = (id: string) => post<ConnectSkillItem>(`/api/connect/skills/${encodeURIComponent(id)}/enable`)
 export const disableConnectSkill = (id: string) => post<ConnectSkillItem>(`/api/connect/skills/${encodeURIComponent(id)}/disable`)
 export const deleteConnectSkill = (id: string) => del(`/api/connect/skills/${encodeURIComponent(id)}`)
+
+export type KnowledgeDoc = {
+  doc_id: string
+  filename: string
+  scope: 'global' | 'environment'
+  environment_id: string | null
+  tags: string[]
+  status: 'uploaded' | 'converting' | 'ready' | 'failed'
+  converter: 'markitdown' | 'docling' | 'passthrough' | null
+  converter_version: string | null
+  converted_at: string | null
+  error: string | null
+  size_bytes: number
+}
+
+export function listKnowledge(params: { scope?: string; environment_id?: string; tag?: string } = {}) {
+  return get<{ documents: KnowledgeDoc[] }>(`/api/knowledge${qs(params)}`)
+}
+
+export function getKnowledge(docId: string) {
+  return get<KnowledgeDoc>(`/api/knowledge/${encodeURIComponent(docId)}`)
+}
+
+export function getKnowledgeMarkdown(docId: string) {
+  return get<string>(`/api/knowledge/${encodeURIComponent(docId)}/markdown`)
+}
+
+export async function uploadKnowledge(form: FormData): Promise<KnowledgeDoc> {
+  const res = await fetch('/api/knowledge', {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrf },
+    body: form,
+    credentials: 'same-origin',
+  })
+  if (res.status === 401) onUnauthorized()
+  const type = res.headers.get('content-type') ?? ''
+  const data: unknown = res.status === 204 ? null : type.includes('json') ? await res.json().catch(() => null) : await res.text()
+  if (!res.ok) throw new ApiError(res.status, errorText(data, res.status), data)
+  return data as KnowledgeDoc
+}
+
+export function deleteKnowledge(docId: string) {
+  return del(`/api/knowledge/${encodeURIComponent(docId)}`)
+}
+
+export function reconvertKnowledge(docId: string) {
+  return post<{ doc_id: string; status: string }>(`/api/knowledge/${encodeURIComponent(docId)}/reconvert`)
+}

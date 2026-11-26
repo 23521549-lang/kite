@@ -113,6 +113,17 @@ def _parser() -> argparse.ArgumentParser:
     memory_approve.add_argument("entry_id", help="the id shown by `memory list-pending`")
     memory_reject = memory_commands.add_parser("reject", help="reject one pending memory entry (dropped)")
     memory_reject.add_argument("entry_id", help="the id shown by `memory list-pending`")
+    knowledge_parser = commands.add_parser("knowledge", help="documents in the Knowledge store: convert "
+                                                            "a scanned document again with Docling")
+    knowledge_commands = knowledge_parser.add_subparsers(dest="knowledge_command", required=True)
+    reconvert = knowledge_commands.add_parser("reconvert", help="convert one document again with Docling "
+                                                               "(the fallback for scanned PDFs)")
+    reconvert.add_argument("doc_id", help="document id (the folder name under knowledge/)")
+    reconvert.add_argument("--reason", default="manual", choices=["auto-scan", "manual"],
+                           help="why this reconvert runs (default: manual)")
+    reconvert.add_argument("--lock-token", default=None,
+                           help="one-time token of a lock already held by the requester "
+                                "(internal: used by the detached job request_reconvert spawns)")
     tasks = commands.add_parser("tasks", help="owner confirmations for finished tasks")
     tasks_commands = tasks.add_subparsers(dest="tasks_command", required=True)
     tasks_confirm = tasks_commands.add_parser(
@@ -1494,6 +1505,20 @@ def _memory_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _knowledge_command(args: argparse.Namespace) -> int:
+    """Reconvert one Knowledge document with Docling (Gói 6). The conversion
+    itself runs in this process; ``request_reconvert`` (web) spawns this
+    command detached. A failed reconvert prints its error and exits 1."""
+    from .web.docling_job import run_reconvert
+
+    result = run_reconvert(args.config.parent, args.doc_id, reason=args.reason,
+                           _lock_token=args.lock_token)
+    if result["status"] != "ready":
+        raise ConfigError(result["error"])
+    _emit(result)
+    return 0
+
+
 def _run_workflow_worker(args: argparse.Namespace, config) -> int:
     """Serve the Temporal task queue with the sandbox backend (see deploy/kite-workflow-worker.service)."""
     from .backend import SandboxActivityBackend
@@ -1997,6 +2022,8 @@ def _operator_command(args: argparse.Namespace) -> int:
         return _notify_command(args)
     if args.command == "memory":
         return _memory_command(args)
+    if args.command == "knowledge":
+        return _knowledge_command(args)
     if args.command == "update":
         return _update_command(args)
     if args.command == "tasks":
@@ -2242,8 +2269,8 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command in {"doctor", "setup", "provider", "workflow", "gateway", "worker", "sandbox", "mcp", "chat",
-                        "bench", "journal", "cleanup", "model", "notify", "memory", "update", "web", "busy", "stack",
-                        "tasks"}:
+                        "bench", "journal", "cleanup", "model", "notify", "memory", "knowledge", "update", "web",
+                        "busy", "stack", "tasks"}:
         return _operator_command(args)
 
     with SQLiteSchedulerStore(args.db) as store:

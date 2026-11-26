@@ -3,6 +3,7 @@ import { useDisclosure } from '@mantine/hooks'
 import {
   IconActivity,
   IconBriefcase,
+  IconBooks,
   IconChartBar,
   IconCpu,
   IconFolders,
@@ -24,6 +25,7 @@ import Bench from './pages/Bench'
 import Chat from './pages/Chat'
 import Connect from './pages/Connect'
 import Environments from './pages/Environments'
+import Knowledge from './pages/Knowledge'
 import Login from './pages/Login'
 import Monitor from './pages/Monitor'
 import Overview from './pages/Overview'
@@ -69,6 +71,7 @@ function Shell() {
     { path: 'repos', label: t('nav.repos'), icon: IconFolders, page: Repos, hidden: true },
     { path: 'workers', label: t('nav.workers'), icon: IconCpu, page: Workers },
     { path: 'connect', label: t('nav.connect'), icon: IconPuzzle, page: Connect },
+    { path: 'knowledge', label: t('nav.knowledge'), icon: IconBooks, page: Knowledge },
     { path: 'bench', label: t('nav.bench'), icon: IconChartBar, page: Bench },
     { path: 'giam-sat', label: t('nav.monitor'), icon: IconActivity, page: Monitor },
     { path: 'settings', label: t('nav.settings'), icon: IconSettings, page: Settings },

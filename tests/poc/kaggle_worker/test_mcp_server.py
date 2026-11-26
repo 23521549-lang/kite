@@ -382,7 +382,9 @@ def test_mcp_server_exposes_every_tool(tmp_path):
                      "resume_task", "cancel_task", "list_tasks", "worker_status", "note_task",
                      # Chat-first: nothing the full-test day needed a terminal for is left out.
                      "wait_task", "task_log", "remember", "memory_show", "memory_forget", "repo_config",
-                     "doctor", "cleanup", "worker_restart", "update_kite", "bench_start", "bench_history"}
+                     "doctor", "cleanup", "worker_restart", "update_kite", "bench_start", "bench_history",
+                     # Gói 6 (Kiến thức): đọc kho tài liệu qua MCP.
+                     "knowledge_list", "knowledge_read"}
 
 
 def fake_process(proc: Path, pid: int, argv: list[str], namespace: str = "pid:[1]") -> None:

@@ -77,7 +77,7 @@ RUN python3 -m venv .venv \
 import tomllib
 project = tomllib.load(open("pyproject.toml", "rb"))["project"]
 wanted = list(project["dependencies"])
-for extra in ("codemap", "kaggle", "browser", "web"):
+for extra in ("codemap", "kaggle", "browser", "web", "docling"):
     wanted += project["optional-dependencies"][extra]
 print("\n".join(wanted))
 PY
