@@ -1652,6 +1652,13 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
     app.include_router(create_secretary_router(ctx, auth, audit))
     app.include_router(create_workspace_router(ctx, auth, audit))
 
+    # Gói 5 — Connect: the owner's MCP/skill/platform store (routes live in
+    # web/connect.py). Mounted BEFORE the /{path:path} catch-all below, or the
+    # catch-all would 404 every /api/connect/... route.
+    from . import connect as connect_api
+
+    app.include_router(connect_api.build_router(ctx, auth))
+
     # ------------------------------------------------------------------ the page
     @app.get("/kite-mini.js")
     async def mini_js():

@@ -11,6 +11,7 @@ import {
   IconLogout,
   IconMessages,
   IconMoon,
+  IconPuzzle,
   IconSettings,
   IconSun,
   IconUser,
@@ -21,6 +22,7 @@ import { Dot } from './components/common'
 import { useLanguage, useT } from './i18n'
 import Bench from './pages/Bench'
 import Chat from './pages/Chat'
+import Connect from './pages/Connect'
 import Environments from './pages/Environments'
 import Login from './pages/Login'
 import Monitor from './pages/Monitor'
@@ -66,6 +68,7 @@ function Shell() {
     { path: 'environments', label: t('nav.environments'), icon: IconFolders, page: Environments },
     { path: 'repos', label: t('nav.repos'), icon: IconFolders, page: Repos, hidden: true },
     { path: 'workers', label: t('nav.workers'), icon: IconCpu, page: Workers },
+    { path: 'connect', label: t('nav.connect'), icon: IconPuzzle, page: Connect },
     { path: 'bench', label: t('nav.bench'), icon: IconChartBar, page: Bench },
     { path: 'giam-sat', label: t('nav.monitor'), icon: IconActivity, page: Monitor },
     { path: 'settings', label: t('nav.settings'), icon: IconSettings, page: Settings },

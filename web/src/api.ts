@@ -396,3 +396,93 @@ export const deleteSchedule = (id: string) => del(`/api/schedules/${encodeURICom
 export const getSecretaryReports = () => get<{ reports: SecretaryReport[] }>('/api/secretary/reports')
 export const getSecretaryReport = (date: string) =>
   get<{ date: string; markdown: string }>(`/api/secretary/reports/${encodeURIComponent(date)}`)
+
+// ---------------------------------------------------------------- Connect (Gói 5): MCP + skill + API platforms.
+// Endpoints follow the cross-package contract; the back end (worker (b)) owns
+// the server side. Statuses: enabled / disabled / pending_scan / pending_approval.
+export type ConnectStatus = 'enabled' | 'disabled' | 'pending_scan' | 'pending_approval'
+export type ConnectMcpKind = 'builtin' | 'source' | 'package' | 'remote'
+export type ScanVerdict = 'pass' | 'fail' | 'wait'
+
+export type ScanFinding = { rule: string; severity: 'info' | 'low' | 'medium' | 'high' | 'critical'; message: string }
+
+export type ScanReport = {
+  verdict: ScanVerdict
+  findings: ScanFinding[]
+  scanner: string
+  scanner_version: string
+  scanned_at: string | number | null
+  wait_reason?: string | null
+}
+
+export type ConnectLock = { version: string; integrity_sha512?: string | null; published_at?: string | number | null } | null
+
+export type ConnectMcpItem = {
+  id: string
+  name: string
+  kind: ConnectMcpKind
+  status: ConnectStatus
+  enabled: boolean
+  source?: string | null
+  command?: string | null
+  args?: string[] | null
+  url?: string | null
+  package_name?: string | null
+  version?: string | null
+  tools?: string[] | null
+  lock?: ConnectLock
+  lock_mismatch?: boolean
+  last_scan?: ScanReport | null
+}
+
+export type ConnectSkillItem = {
+  id: string
+  name: string
+  path?: string | null
+  status: ConnectStatus
+  enabled: boolean
+  lock?: ConnectLock
+  lock_mismatch?: boolean
+  last_scan?: ScanReport | null
+}
+
+export type ConnectPlatformItem = {
+  id: string
+  name: string
+  kind?: string | null
+  status: ConnectStatus
+  detail?: string | null
+}
+
+export type ConnectInventory = { mcp: ConnectMcpItem[]; skills: ConnectSkillItem[]; platforms: ConnectPlatformItem[] }
+
+export type McpCreateBody = {
+  name: string
+  kind: 'source' | 'package' | 'remote'
+  command?: string
+  args?: string[]
+  package_name?: string
+  version?: string
+  url?: string
+  auth_header?: string
+}
+
+export type SkillCreateBody = { name: string; path?: string }
+
+export type McpTestResult = { ok: boolean; detail: string; tools?: string[]; latency_ms?: number | null }
+
+export const getConnectInventory = () => get<ConnectInventory>('/api/connect/inventory')
+export const getConnectPlatforms = () => get<{ platforms: ConnectPlatformItem[] }>('/api/connect/platforms')
+export const createConnectMcp = (body: McpCreateBody) => post<ConnectMcpItem>('/api/connect/mcp', body)
+export const scanConnectMcp = (id: string) => post<ScanReport>(`/api/connect/mcp/${encodeURIComponent(id)}/scan`)
+export const getConnectMcpScan = (id: string) => get<ScanReport>(`/api/connect/mcp/${encodeURIComponent(id)}/scan`)
+export const testConnectMcp = (id: string) => post<McpTestResult>(`/api/connect/mcp/${encodeURIComponent(id)}/test`)
+export const enableConnectMcp = (id: string) => post<ConnectMcpItem>(`/api/connect/mcp/${encodeURIComponent(id)}/enable`)
+export const disableConnectMcp = (id: string) => post<ConnectMcpItem>(`/api/connect/mcp/${encodeURIComponent(id)}/disable`)
+export const deleteConnectMcp = (id: string) => del(`/api/connect/mcp/${encodeURIComponent(id)}`)
+export const createConnectSkill = (body: SkillCreateBody) => post<ConnectSkillItem>('/api/connect/skills', body)
+export const scanConnectSkill = (id: string) => post<ScanReport>(`/api/connect/skills/${encodeURIComponent(id)}/scan`)
+export const getConnectSkillScan = (id: string) => get<ScanReport>(`/api/connect/skills/${encodeURIComponent(id)}/scan`)
+export const enableConnectSkill = (id: string) => post<ConnectSkillItem>(`/api/connect/skills/${encodeURIComponent(id)}/enable`)
+export const disableConnectSkill = (id: string) => post<ConnectSkillItem>(`/api/connect/skills/${encodeURIComponent(id)}/disable`)
+export const deleteConnectSkill = (id: string) => del(`/api/connect/skills/${encodeURIComponent(id)}`)

@@ -6,7 +6,7 @@ FROM python:3.12-slim@sha256:a0e2dd78cc679ddfffea960fe45ecfcff9ac2f68d67917a0edf
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates ripgrep nodejs npm \
  && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir "pytest==8.4.2"
+RUN pip install --no-cache-dir "pytest==8.4.2" "uv==0.13.10"
 
 ARG KITE_UID=1000
 RUN useradd --create-home --uid ${KITE_UID} kite \
