@@ -67,6 +67,39 @@ sudo kite-stack kite doctor      # any kite command, in the gateway's container
 sudo kite-stack configure --access private | --domain kite.example.com | --auto-update off
 ```
 
+### Watchdog: a service that stays unhealthy is restarted by itself
+
+Docker's `restart: unless-stopped` only restarts a container whose process exits — a container
+that keeps running while its healthcheck fails (Temporal answering nothing on 7233, for example)
+stays broken until someone notices. A second timer, `kite-stack-watchdog`, closes that gap:
+
+* Every **5 minutes** it takes one snapshot (`docker compose ps`) and classifies each service:
+  running + healthy is good; running + unhealthy (or stuck starting, exited, dead, restarting)
+  is bad; anything else (created, paused, missing) is left alone for the updater or an operator.
+* A service is restarted only after being bad on **2 ticks in a row** — a single snapshot cannot
+  tell "just started" from "stuck". Between restarts of the same service there is a **15-minute
+  cooldown**, and at most **3 restarts per service per rolling hour**. Over either limit the
+  watchdog does not restart again; it logs the reason and sends one ntfy push per episode
+  (restarted services also get one push). A failed restart (compose itself failed) is retried
+  next tick and does not count towards the limit.
+* Only the watchdog may restart the infrastructure (`postgres`, `temporal`, `caddy`):
+  `kite-stack restart` and the web's request files still refuse them, as before.
+
+State lives in `/var/lib/kite/stack/watchdog.json` (timestamps and service names only, no secrets);
+every tick is logged to the journal. Push alerts need `kite notify setup` first — without it the
+watchdog logs `chưa nối kênh cảnh báo` and keeps working.
+
+```sh
+sudo kite-stack watchdog --check   # only say what would happen, restart nothing
+sudo systemctl status kite-stack-watchdog.timer
+sudo journalctl -u kite-stack-watchdog.service --since "1 hour ago"
+sudo systemctl disable --now kite-stack-watchdog.timer   # turn the watch off (services keep running)
+```
+
+A machine installed before this timer existed gets its unit files with the next release, but the
+timer itself only starts after `sudo kite-stack install` is run once (safe to re-run: it repairs
+and keeps data and secrets).
+
 ## Moving from the development machine
 
 On the old machine (it keeps running as the development machine):
