@@ -4,16 +4,21 @@ import { get, post, type WorkerRow } from '../api'
 import { Bars, Dot, Empty, KeyValue, Loading, Page, useWorkerStateLabel } from '../components/common'
 import { useT } from '../i18n'
 import KaggleScreen from '../components/KaggleScreen'
+import { go } from '../router'
 import { attempt, duration, notifyError, notifyOk, short, usd, useLoad, workerState } from '../util'
+import WorkerForm from './WorkerForm'
 
-export default function Workers() {
+export default function Workers({ parts }: { parts: string[] }) {
   const t = useT()
   const { data, error, reload } = useLoad(() => get<{ gateway_up: boolean; workers: WorkerRow[] }>('/api/workers'), [], 5000)
   const spend = useLoad(() => get<{ days: { day: string; usd: number; workers: Record<string, number> }[] }>('/api/spend?days=31'), [], 60000)
   const [screen, setScreen] = useState<string | null>(null)
   if (!data) return <Loading error={error} />
+  if (parts[0] === 'new') return <WorkerForm key="new" mode="new" />
+  const editing = parts[0] ? data.workers.find((w) => w.id === parts[0]) : undefined
+  if (editing) return <WorkerForm key={editing.id} mode="edit" workerId={editing.id} />
   return (
-    <Page title={t('workers.title')}>
+    <Page title={t('workers.title')} actions={<Button onClick={() => go('/workers/new')}>{t('workers.create')}</Button>}>
       {!data.gateway_up ? <Alert color="red">{t('workers.gateway-down')}</Alert> : null}
       {data.workers.length ? (
         <SimpleGrid cols={{ base: 1, lg: 2 }}>
@@ -62,7 +67,7 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
       <Group justify="space-between" wrap="nowrap">
         <Group gap={8} wrap="nowrap">
           <Dot color={st.color} />
-          <Text fw={600}>{w.id}</Text>
+          <Text fw={600}>{w.label || w.id}</Text>
           <Badge variant="outline" size="sm">
             {w.type}
           </Badge>
@@ -71,6 +76,9 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
           {workerStateLabel(st.key)}
         </Badge>
       </Group>
+      <Text size="sm" c="dimmed">
+        {w.brand} · {w.models[0] ?? ''}
+      </Text>
       <Stack gap="xs" mt="sm">
         <KeyValue
           rows={[
@@ -126,6 +134,9 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
           ) : null}
         </Group>
         <Group gap="xs">
+          <Button size="xs" variant="light" onClick={() => go(`/workers/${w.id}`)}>
+            {t('workers.configure')}
+          </Button>
           {!api && !w.alive ? (
             <Button size="xs" loading={starting} onClick={turnOn}>
               {t('workers.start-now')}

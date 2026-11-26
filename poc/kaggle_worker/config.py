@@ -45,6 +45,8 @@ class ProviderConfig:
     launch: "LaunchConfig | None" = None
     # Adapter "relay": Kite calls the provider itself (paid API, a server by URL). See relay.py.
     relay: "RelayConfig | None" = None
+    # Display name shown in the web UI (free to edit); the technical id never changes.
+    label: str | None = None
 
     @property
     def model_ids(self) -> tuple[str, ...]:
@@ -438,7 +440,7 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
     for i, item in enumerate(providers_raw):
         p = _mapping(item, f"providers[{i}]")
         unknown_keys = set(p) - {"id", "adapter", "enabled", "model", "capabilities", "quota", "secrets",
-                                 "owner", "worker_id", "roles", "models", "launch", "relay"}
+                                 "owner", "worker_id", "roles", "models", "launch", "relay", "label"}
         if unknown_keys:
             raise ConfigError(f"providers[{i}] has unsupported fields")
         pid, adapter, model = p.get("id"), p.get("adapter"), p.get("model")
@@ -495,10 +497,15 @@ def validate_config(raw: Any, *, known_adapters: set[str] | None = None) -> Kite
                                     (model, *[m for m in extra_models if m != model]))
         elif p.get("relay") is not None:
             raise ConfigError(f"providers[{i}].relay is only for adapter 'relay'")
+        label = p.get("label")
+        if label is not None:
+            if not isinstance(label, str) or not 1 <= len(label.strip()) <= 100:
+                raise ConfigError(f"providers[{i}].label must be a string of 1-100 characters after stripping")
+            label = label.strip()
         providers.append(ProviderConfig(
             pid, adapter, enabled, model, tuple(caps), seconds, concurrency, dict(secrets),
             owner=owner, worker_id=worker_id, roles=tuple(roles), models=tuple(extra_models), launch=launch,
-            relay=relay,
+            relay=relay, label=label,
         ))
     worker_ids = [p.effective_worker_id for p in providers]
     if len(set(worker_ids)) != len(worker_ids):
