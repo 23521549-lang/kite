@@ -69,7 +69,6 @@ export default function Settings() {
             )}
           </Card>
           <Update />
-          <Doctor />
           <Cleanup />
           <Restart />
         </Stack>
@@ -377,45 +376,6 @@ function StackUpdate({
         />
       </Group>
     </Stack>
-  )
-}
-
-function Doctor() {
-  const t = useT()
-  const doctor = useLoad(() => get<Record<string, any>>('/api/system/doctor'), [])
-  const d = doctor.data
-  return (
-    <Card withBorder>
-      <Group justify="space-between" mb="xs">
-        <Title order={5}>{t('settings.doctor.title')}</Title>
-        <Button size="xs" variant="subtle" onClick={doctor.reload}>
-          {t('settings.doctor.check-again')}
-        </Button>
-      </Group>
-      {!d ? (
-        <Loading error={doctor.error} label={t('settings.doctor.checking')} />
-      ) : (
-        <Stack gap="xs">
-          <Badge color={d.fail ? 'red' : d.warn ? 'yellow' : 'teal'} variant="light">
-            {d.fail ? t('settings.doctor.fail', { count: d.fail }) : d.warn ? t('settings.doctor.warn', { count: d.warn }) : t('settings.doctor.ok')}
-          </Badge>
-          {(d.problems ?? []).map((p: any, i: number) => (
-            <Alert key={i} color={p.status === 'lỗi' ? 'red' : 'yellow'} title={p.check} py={6}> {/* i18n-ignore: p.status là giá trị trạng thái do backend /api/doctor trả về, không phải chuỗi UI — giữ nguyên phép so sánh. */}
-              <Text size="sm">{p.detail}</Text>
-              {p.fix ? (
-                <Text size="xs" mt={4}>
-                  {t('settings.doctor.fix')} <Code>{p.fix}</Code>
-                </Text>
-              ) : null}
-            </Alert>
-          ))}
-          {d.gpu_quota ? <Text size="sm">{t('settings.doctor.gpu-quota', { quota: typeof d.gpu_quota === 'string' ? d.gpu_quota : JSON.stringify(d.gpu_quota) })}</Text> : null}
-          <Text size="xs" c="dimmed">
-            {t('settings.doctor.ok-list', { list: (d.ok ?? []).join(', ') })}
-          </Text>
-        </Stack>
-      )}
-    </Card>
   )
 }
 

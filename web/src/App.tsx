@@ -23,6 +23,7 @@ import Bench from './pages/Bench'
 import Chat from './pages/Chat'
 import Environments from './pages/Environments'
 import Login from './pages/Login'
+import Monitor from './pages/Monitor'
 import Overview from './pages/Overview'
 import Repos from './pages/Repos'
 import Settings from './pages/Settings'
@@ -66,6 +67,7 @@ function Shell() {
     { path: 'repos', label: t('nav.repos'), icon: IconFolders, page: Repos, hidden: true },
     { path: 'workers', label: t('nav.workers'), icon: IconCpu, page: Workers },
     { path: 'bench', label: t('nav.bench'), icon: IconChartBar, page: Bench },
+    { path: 'giam-sat', label: t('nav.monitor'), icon: IconActivity, page: Monitor },
     { path: 'settings', label: t('nav.settings'), icon: IconSettings, page: Settings },
   ]
   const [opened, { toggle, close }] = useDisclosure()
