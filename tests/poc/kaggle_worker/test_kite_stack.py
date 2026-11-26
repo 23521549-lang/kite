@@ -26,6 +26,7 @@ class FakeDocker:
         self.running = None                      # KITE_IMAGE of the last `compose up`
         self.busy = {"busy": False, "tasks": [], "bench": None, "chat": 0}
         self.cosign_ok = True                    # what `cosign verify` says about the new images
+        self.cosign_envs: list[dict | None] = [] # the environment each `cosign verify` ran with
         self.calls: list[list[str]] = []
 
     def done(self, out="", code=0, err=""):
@@ -54,6 +55,7 @@ class FakeDocker:
         if cmd[:2] == ["docker", "compose"]:
             return self.compose(cmd)
         if cmd[0].endswith("cosign"):
+            self.cosign_envs.append(env)
             return self.done(code=0) if self.cosign_ok else self.done(code=1, err="no matching signatures")
         return self.done()                        # create, rm, tag, rmi, image prune
 
@@ -234,6 +236,17 @@ def test_an_update_with_signature_checking_verifies_both_images_by_digest_first(
         assert call[call.index("--certificate-oidc-issuer") + 1] == "https://token.actions.githubusercontent.com"
         identity = call[call.index("--certificate-identity-regexp") + 1]
         assert identity == r"^https://github\.com/han/kite/\.github/workflows/ci\.yml@"
+
+
+def test_cosign_gets_a_home_and_a_trust_root_cache_even_under_systemd(host, monkeypatch):
+    # A systemd unit without User= has no HOME; cosign needs one for Sigstore's trust root cache.
+    stack, docker = host["stack"], host["docker"]
+    require_signatures(host, monkeypatch)
+    monkeypatch.delenv("HOME", raising=False)
+    assert stack.update(force=True)["last"]["result"] == "updated"
+    assert len(docker.cosign_envs) == 2
+    for env in docker.cosign_envs:
+        assert env["HOME"] == "/root" and env["TUF_ROOT"] == str(stack.dir / "sigstore")
 
 
 def test_an_update_whose_signature_fails_is_refused_and_the_running_release_is_untouched(host, monkeypatch):

@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/23521549-lang/kite/main/deploy/stack/install.sh | sudo bash
 #   curl -fsSL .../install.sh | sudo bash -s -- --access private --domain kite.example.com
 #
-# Installs Docker if needed, pulls Kite's stable image, takes kite-stack (deploy/stack/kite_stack.py) out of
+# Installs Docker and cosign if needed, pulls Kite's stable image, takes kite-stack (deploy/stack/kite_stack.py) out of
 # that image and lets it do the rest: secrets made on this machine, default config, every service started
 # and checked, automatic updates. Safe to run again (it repairs, keeps data and secrets).
 # Every option of `kite-stack install --help` can be passed; /var/lib/kite should be a disk of its own.
@@ -67,6 +67,31 @@ EOF
   systemctl enable --now docker
 fi
 command -v python3 >/dev/null || apt-get install -y -q python3
+command -v curl >/dev/null || apt-get install -y -q curl
+
+# cosign: kite-stack runs an image only when it carries this repository's CI signature
+# (KITE_VERIFY_IMAGE_SIGNATURES=1, the default of a new machine). The release CI signs with
+# (sigstore/cosign-installer v3 in ci.yml), checked against its published SHA-256; a test keeps the two
+# versions equal. A cosign already on the machine is kept.
+COSIGN_VERSION="v2.5.2"
+if ! command -v cosign >/dev/null; then
+  arch="$(dpkg --print-architecture)"
+  case "$arch" in
+    amd64) cosign_sha256="bcfeae05557a9f313ee4392d2f335d0ff69ebbfd232019e3736fb04999fe1734" ;;
+    arm64) cosign_sha256="2cbcea1873ad76274c3f241ef175d204654e3aac3e73e6ec4504e5227015cb0a" ;;
+    *) echo "chưa có cosign cho kiến trúc $arch — cài cosign ${COSIGN_VERSION} bằng tay rồi chạy lại" >&2; exit 1 ;;
+  esac
+  echo "== cài cosign ${COSIGN_VERSION}"
+  cosign_tmp="$(mktemp)"
+  curl -fsSL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${arch}" -o "$cosign_tmp"
+  if [[ "$(sha256sum "$cosign_tmp" | cut -d' ' -f1)" != "$cosign_sha256" ]]; then
+    rm -f "$cosign_tmp"
+    echo "cosign tải về không đúng SHA-256 — dừng, không cài" >&2
+    exit 1
+  fi
+  install -m 0755 "$cosign_tmp" /usr/local/bin/cosign
+  rm -f "$cosign_tmp"
+fi
 
 mkdir -p /var/lib/kite
 if [[ -n "$TOKEN_FILE" ]]; then

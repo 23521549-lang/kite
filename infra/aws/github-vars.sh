@@ -15,7 +15,7 @@
 #
 # Knobs (environment): KITE_GH_REPO (default 23521549-lang/kite),
 # KITE_GH_ENV (default aws), KITE_SSH_CIDR, KITE_SSH_PUBLIC_KEY,
-# KITE_SSH_PUBLIC_KEY_FILE (default ~/.ssh/id_ed25519.pub),
+# KITE_SSH_PUBLIC_KEY_FILE (default ~/.ssh/kite.pub, else ~/.ssh/id_ed25519.pub),
 # KITE_ACCESS, KITE_DOMAIN.
 set -euo pipefail
 
@@ -79,8 +79,8 @@ PUBKEY="$(pick KITE_SSH_PUBLIC_KEY)"
 if [ -z "$PUBKEY" ]; then
     PUBKEY_FILE="${KITE_SSH_PUBLIC_KEY_FILE:-}"
     if [ -z "$PUBKEY_FILE" ]; then
-        if [ -f /mnt/d/huynhngocthuan-key/id_ed25519.pub ]; then
-            PUBKEY_FILE=/mnt/d/huynhngocthuan-key/id_ed25519.pub
+        if [ -f "$HOME/.ssh/kite.pub" ]; then
+            PUBKEY_FILE="$HOME/.ssh/kite.pub"
         else
             PUBKEY_FILE="$HOME/.ssh/id_ed25519.pub"
         fi

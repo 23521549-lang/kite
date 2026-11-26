@@ -204,14 +204,14 @@ def test_real_tool_schemas_for_the_lead_agent(tmp_path):
     tools = bench.lead_tools(asyncio.run(build_server(make_ops(tmp_path, FakeClient())).list_tools()))
     names = {t["function"]["name"] for t in tools}
     # 27 gốc + 2 tool Kiến thức của Gói 6 (kite_knowledge_list, kite_knowledge_read)
-    # + 7 công cụ Gói 10 (experience_distill/show/approve/reject, improve_list/approve/reject).
+    # + 5 công cụ Gói 10 (experience_distill/show/reject, improve_list/reject; duyệt là việc của chủ).
     assert ("kite_apply_result" in names and "kite_note_task" in names and "bash" in names
             and "kite_knowledge_list" in names and "kite_knowledge_read" in names
             and "kite_experience_distill" in names and "kite_experience_show" in names
-            and "kite_experience_approve" in names and "kite_experience_reject" in names
-            and "kite_improve_list" in names and "kite_improve_approve" in names
-            and "kite_improve_reject" in names
-            and len(names) == 36)
+            and "kite_experience_reject" in names
+            and "kite_improve_list" in names and "kite_improve_reject" in names
+            and "kite_experience_approve" not in names and "kite_improve_approve" not in names
+            and len(names) == 34)
 
 
 def lead_item(passed, score, seconds, calls):

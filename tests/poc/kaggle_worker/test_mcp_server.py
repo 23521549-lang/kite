@@ -567,9 +567,11 @@ def test_mcp_server_exposes_every_tool(tmp_path):
                      "doctor", "cleanup", "worker_restart", "update_kite", "bench_start", "bench_history",
                      # Gói 6 (Kiến thức): đọc kho tài liệu qua MCP.
                      "knowledge_list", "knowledge_read",
-                     # Gói 10: tài liệu kinh nghiệm + vòng tự cải tiến.
-                     "experience_distill", "experience_show", "experience_approve", "experience_reject",
-                     "improve_list", "improve_approve", "improve_reject"}
+                     # Gói 10: tài liệu kinh nghiệm + vòng tự cải tiến. No approve tools: an approved
+                     # experience document reaches later tasks' goals and an approved proposal starts a
+                     # task, so only the owner approves (web or `kite experience|improve approve`).
+                     "experience_distill", "experience_show", "experience_reject",
+                     "improve_list", "improve_reject"}
 
 
 def fake_process(proc: Path, pid: int, argv: list[str], namespace: str = "pid:[1]") -> None:

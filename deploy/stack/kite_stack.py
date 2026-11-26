@@ -338,6 +338,16 @@ class Stack:
                 "revision": (labels.get("org.opencontainers.image.revision") or "")[:12],
                 "created": labels.get("org.opencontainers.image.created") or info.get("Created", "")}
 
+    def cosign_env(self) -> dict[str, str]:
+        """cosign under systemd: a unit without User= gets no HOME, and cosign needs one (Sigstore's
+        trust root cache, registry logins in ~/.docker). HOME is root's when missing; the trust root
+        cache (public data) sits in the stack folder."""
+        env = dict(os.environ)
+        if not env.get("HOME"):
+            env["HOME"] = "/root"
+        env["TUF_ROOT"] = str(self.dir / "sigstore")
+        return env
+
     def verify_signatures(self, new: dict, env: dict[str, str] | None = None) -> tuple[bool, str]:
         """Both new images must carry this repo's CI signature before either may run. Only when
         stack.env asks for it (``KITE_VERIFY_IMAGE_SIGNATURES=1``): machines installed before CI
@@ -352,10 +362,11 @@ class Stack:
                            "KITE_VERIFY_IMAGE_SIGNATURES trong stack.env")
         kite_repo = new["kite_ref"].rsplit(":", 1)[0]
         sandbox_repo = new["sandbox_ref"].rsplit(":", 1)[0]
+        cosign_env = self.cosign_env()
         for pinned in (f"{kite_repo}@{new['kite_digest']}", f"{sandbox_repo}@{new['sandbox_digest']}"):
             done = self.run([cosign, "verify", "--certificate-identity-regexp",
                              signature_identity(kite_repo),
-                             "--certificate-oidc-issuer", COSIGN_ISSUER, pinned], timeout=300)
+                             "--certificate-oidc-issuer", COSIGN_ISSUER, pinned], timeout=300, env=cosign_env)
             if done.returncode != 0:
                 detail = ((done.stderr or "") + (done.stdout or "")).strip()[-400:]
                 return False, f"{pinned} không đúng chữ ký của CI repo này: {detail}"

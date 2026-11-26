@@ -2105,8 +2105,8 @@ def build_server(ops: KiteOps):
         return await ops.logged("memory_forget", ops.memory_forget, number, repo)
 
     @server.tool(description="Chưng cất các lưu ý/nhận xét/lần chạy trước trên một repo thành bản đề xuất tài liệu "
-                             "kinh nghiệm (quy tắc nên/không nên làm). Bản đề xuất CHƯA có hiệu lực: người dùng "
-                             "phải duyệt (`experience_approve` / `kite experience approve`).")
+                             "kinh nghiệm (quy tắc nên/không nên làm). Bản đề xuất CHƯA có hiệu lực: chỉ người dùng "
+                             "duyệt được, ở tab Bài học của môi trường trên web hoặc `kite experience approve`.")
     async def experience_distill(repo: str) -> dict:
         return await ops.logged("experience_distill", ops.experience_distill, repo)
 
@@ -2114,23 +2114,14 @@ def build_server(ops: KiteOps):
     async def experience_show(repo: str) -> dict:
         return await ops.logged("experience_show", ops.experience_show, repo)
 
-    @server.tool(description="Duyệt một bản đề xuất tài liệu kinh nghiệm (id từ experience_show/experience_distill): "
-                             "bản đó thành chính thức, bản cũ được lưu trữ theo phiên bản.")
-    async def experience_approve(id: str) -> dict:
-        return await ops.logged("experience_approve", ops.experience_approve, id)
-
     @server.tool(description="Từ chối một bản đề xuất tài liệu kinh nghiệm (bỏ đi; tài liệu đã duyệt không đổi).")
     async def experience_reject(id: str) -> dict:
         return await ops.logged("experience_reject", ops.experience_reject, id)
 
-    @server.tool(description="Xem các đề xuất tự cải tiến đang chờ (trục bench yếu nhất + tài liệu kinh nghiệm).")
+    @server.tool(description="Xem các đề xuất tự cải tiến đang chờ (trục bench yếu nhất + tài liệu kinh nghiệm). "
+                             "Chỉ người dùng duyệt được (`kite improve approve` hoặc web).")
     async def improve_list() -> dict:
         return await ops.logged("improve_list", ops.improve_list)
-
-    @server.tool(description="Duyệt một đề xuất tự cải tiến (id từ improve_list): Kite tạo task cho nó trên repo "
-                             "Kite qua đường start_task thường (sandbox, patch chờ duyệt như mọi task).")
-    async def improve_approve(id: str) -> dict:
-        return await ops.logged("improve_approve", ops.improve_approve, id)
 
     @server.tool(description="Từ chối một đề xuất tự cải tiến (bỏ đi; không tạo task).")
     async def improve_reject(id: str) -> dict:
@@ -2200,7 +2191,7 @@ Bạn là agent trưởng của Kite. Luôn trả lời người dùng bằng **
 
 ## Tool
 
-Trong OpenCode, tool của Kite có tiền tố `kite_`: `start_task`, `task_status`, `wait_task`, `task_log`, `task_result`, `apply_result`, `commit_result`, `repo_status`, `run_command`, `send_instruction`, `pause_task`, `resume_task`, `cancel_task`, `list_tasks`, `worker_status`, `note_task`, `remember`, `memory_show`, `memory_forget`, `experience_distill`, `experience_show`, `experience_approve`, `experience_reject`, `improve_list`, `improve_approve`, `improve_reject`, `repo_config`, `doctor`, `cleanup`, `worker_restart`, `update_kite`, `bench_start`, `bench_history`, `knowledge_list`, `knowledge_read`.
+Trong OpenCode, tool của Kite có tiền tố `kite_`: `start_task`, `task_status`, `wait_task`, `task_log`, `task_result`, `apply_result`, `commit_result`, `repo_status`, `run_command`, `send_instruction`, `pause_task`, `resume_task`, `cancel_task`, `list_tasks`, `worker_status`, `note_task`, `remember`, `memory_show`, `memory_forget`, `experience_distill`, `experience_show`, `experience_reject`, `improve_list`, `improve_reject`, `repo_config`, `doctor`, `cleanup`, `worker_restart`, `update_kite`, `bench_start`, `bench_history`, `knowledge_list`, `knowledge_read`.
 
 - Tool báo lỗi thì đọc kỹ lỗi, báo đúng lỗi cho người dùng và làm theo hướng dẫn trong lỗi. KHÔNG BAO GIỜ nói đã làm xong một việc khi tool của việc đó báo lỗi (ví dụ đã hủy, đã áp, đã commit).
 - `task_id`: dùng đúng `task_id` mà tool trả về; ghi 4 ký tự cuối (`short_id`) cũng được; để trống là task mới nhất. Không tự đặt hay đoán ID. Lỗi "không có task" kèm danh sách task gần đây: chọn đúng ID trong đó.

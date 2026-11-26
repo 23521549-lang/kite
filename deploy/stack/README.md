@@ -56,6 +56,14 @@ Packages > kite and kite-sandbox > Package settings > Change visibility > Public
 secret and the machine then needs no token. To keep them private, install with
 `--ghcr-token-file <file with a token that has read:packages>`.
 
+**Signed images.** CI signs both images by digest with cosign (keyless: the identity is this repository's
+`ci.yml` on GitHub, no key to keep). A machine installed from here has `KITE_VERIFY_IMAGE_SIGNATURES=1`
+in `stack.env`, and the installer puts cosign on it (the release CI signs with, checked against its
+SHA-256): before an update — the first install included — `cosign verify` must accept both new images,
+or nothing about the running release changes and the status says why. A fork signs with its own
+workflow, so its machines follow its own signatures. Turning the check off
+(`KITE_VERIFY_IMAGE_SIGNATURES=0` in `stack.env`) is for a machine that pulls unsigned images on purpose.
+
 ## Every day
 
 ```sh
@@ -64,6 +72,8 @@ sudo kite-stack update           # now (also from the web: Settings > Cập nh�
 sudo kite-stack logs web -f
 sudo kite-stack restart gateway  # also from the web after adding a worker (the chat restarts with it)
 sudo kite-stack kite doctor      # any kite command, in the gateway's container
+sudo kite-stack kite tasks confirm <task>   # one-time codes for apply/commit of that task (web or chat)
+sudo kite-stack kite memory list-pending    # what the chat proposed to remember, until you approve it
 sudo kite-stack configure --access private | --domain kite.example.com | --auto-update off
 ```
 

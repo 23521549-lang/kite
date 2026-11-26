@@ -200,6 +200,12 @@ Task, journal, memory và bench giữ chỗ lưu hiện tại trước, sau đó
 - **Terraform AWS**: EC2 Ubuntu 24.04, ổ dữ liệu riêng có `prevent_destroy`, Elastic IP, security group (443, 80 cho chứng chỉ, SSH theo IP chủ), không IAM role cho máy. GitHub Actions đăng nhập AWS bằng OIDC qua role chỉ nhận môi trường `aws` của repo (cả hai dạng `sub`, có và không có id). Chỉ chạy bằng tay (plan rồi apply).
 - CI chỉ gắn `stable` khi test, build trang và kiểm file triển khai đều xanh trên `main`. Lỗi Terraform không chặn image.
 
+**Đã chốt sau P6 (24–27/11):**
+- **Rà soát bảo mật** (`security/remediation`): áp và commit cần mã một lần do chủ lấy bằng `kite tasks confirm` (gắn với task và SHA-256 của patch, 15 phút, dùng một lần); điều chat model đề xuất ghi nhớ phải chờ chủ duyệt; tài liệu kinh nghiệm và đề xuất cải tiến chỉ chủ duyệt (chat không có tool duyệt); sandbox mặc định không mạng, chặn symlink ra ngoài, giới hạn dung lượng; web có mã khôi phục, niêm phong key provider, sao lưu khóa web bằng passphrase; CI ký image bằng cosign, máy kiểm chữ ký trước khi chạy (bộ cài mang cosign theo); Actions ghim theo SHA; Terraform dùng VPC riêng, role chỉ chạm EC2 gắn tag kite, bộ cài ghim theo commit. Image chỉ lên `stable` khi cả Terraform cũng xanh (thay cho dòng trên).
+- **Provider theo hãng:** preset hãng cho relay worker, nút thử kết nối gọi chat thật, chi phí gom theo hãng ở Tổng quan.
+- **Sắp lại giao diện (Gói 0b–10):** VI/EN; tab Provider gộp vào Worker; Nhật ký vào trong Task; thêm Không gian làm việc (cần bạn quyết, trợ lý review, thư ký, lịch), Môi trường (repo, phiên chat, ngữ cảnh, bài học), Connect (cổng quét MCP/skill), Kiến thức, Giám sát; Bench chấm 8 trục theo `docs/bench-standard-v1.md`. Các tab mô tả ở mục 5 là bản P4; bản hiện tại xem `poc/kaggle_worker/README.md` (Web page).
+- **CI:** pull request vào `main` cũng build hai image (không đẩy, không ký) và chạy thử image Kite một lần.
+
 ## 7. Thứ tự làm
 | Đợt | Nội dung | Cần GPU? |
 |---|---|---|

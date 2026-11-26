@@ -25,8 +25,8 @@
 #
 # Knobs (environment): KITE_AWS_PROFILE (default kite),
 # KITE_AWS_REGION (default ap-southeast-1), KITE_SSH_CIDR (skip detection),
-# KITE_SSH_PUBLIC_KEY_FILE (default: /mnt/d/huynhngocthuan-key/id_ed25519.pub
-# when present, else ~/.ssh/id_ed25519.pub).
+# KITE_SSH_PUBLIC_KEY_FILE (default: ~/.ssh/kite.pub when present, else
+# ~/.ssh/id_ed25519.pub).
 set -euo pipefail
 
 PROFILE="${KITE_AWS_PROFILE:-kite}"
@@ -143,8 +143,8 @@ if [ -n "$(get_env_var KITE_SSH_PUBLIC_KEY)" ]; then
 else
     PUBKEY_FILE="${KITE_SSH_PUBLIC_KEY_FILE:-}"
     if [ -z "$PUBKEY_FILE" ]; then
-        if [ -f /mnt/d/huynhngocthuan-key/id_ed25519.pub ]; then
-            PUBKEY_FILE=/mnt/d/huynhngocthuan-key/id_ed25519.pub
+        if [ -f "$HOME/.ssh/kite.pub" ]; then
+            PUBKEY_FILE="$HOME/.ssh/kite.pub"
         else
             PUBKEY_FILE="$HOME/.ssh/id_ed25519.pub"
         fi

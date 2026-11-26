@@ -292,6 +292,27 @@ def test_the_installer_refuses_a_docker_key_with_the_wrong_fingerprint():
     assert check < script.index("docker.sources")                   # and it happens before the repo is used
 
 
+def test_the_installer_puts_the_ci_signers_cosign_release_on_the_machine():
+    # A new machine verifies image signatures from its first release on, so the installer must bring
+    # cosign along: the release CI signs with, checked against its SHA-256 before it is installed.
+    script = (ROOT / "deploy" / "stack" / "install.sh").read_text(encoding="utf-8")
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    version = re.search(r'^COSIGN_VERSION="(v[0-9.]+)"$', script, re.M).group(1)
+    assert re.search(rf"cosign-release:\s*{re.escape(version)}\s*$", ci, re.M)    # signer = verifier
+    for arch in ("amd64", "arm64"):
+        assert re.search(rf'{arch}\) cosign_sha256="[0-9a-f]{{64}}"', script), arch
+    check = script.index('!= "$cosign_sha256"')
+    assert "exit 1" in script[check:check + 300]                    # a wrong download aborts the install
+    assert check < script.index("/usr/local/bin/cosign")            # installed only after the check
+    assert script.index("/usr/local/bin/cosign") < script.index('kite_stack.py" install')
+
+
+def test_a_new_aws_machine_runs_the_installer_from_a_pinned_commit():
+    # The first boot runs install.sh as root: from a fixed commit, never from the moving main branch.
+    variables = (ROOT / "infra" / "aws" / "variables.tf").read_text(encoding="utf-8")
+    assert re.search(r"raw\.githubusercontent\.com/[^/]+/[^/]+/[0-9a-f]{40}/deploy/stack/install\.sh", variables)
+
+
 def test_third_party_images_are_pinned_by_digest_and_temporal_passwords_are_split():
     services = compose()["services"]
     for name in ("postgres", "web-db", "temporal", "temporal-setup", "caddy"):

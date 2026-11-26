@@ -9,6 +9,23 @@ any AWS key: the workflow signs in with GitHub's OIDC token.
 
 ## Once: the state bucket and the role (from your laptop, with your own AWS credentials)
 
+With the AWS CLI v2, Terraform and `gh` (signed in) on the laptop:
+
+```sh
+make bootstrap-infra
+# key elsewhere:  KITE_SSH_PUBLIC_KEY_FILE=/path/to/key.pub make bootstrap-infra
+# other region:   KITE_AWS_REGION=us-east-1 make bootstrap-infra
+```
+
+Three steps, each asking before it changes anything: `aws-profile.sh` checks (or saves) the `kite` AWS
+profile, `terraform-bootstrap.sh` applies `infra/aws/bootstrap` with it and collects the seven variables
+below into `infra/aws/.env` (git-ignored, 0600), `github-vars.sh` sets them on the `aws` environment.
+Knobs: `KITE_AWS_PROFILE` (default `kite`), `KITE_AWS_REGION` (default `ap-southeast-1`),
+`KITE_SSH_PUBLIC_KEY_FILE` (default `~/.ssh/kite.pub`, else `~/.ssh/id_ed25519.pub`), `KITE_SSH_CIDR`.
+Keep `infra/aws/bootstrap/terraform.tfstate`: it is the only record of the bucket and the role.
+
+By hand instead:
+
 ```sh
 terraform -chdir=infra/aws/bootstrap init
 terraform -chdir=infra/aws/bootstrap apply -var region=us-east-1
@@ -49,3 +66,15 @@ sudo kite-stack admin
 
 Replacing the instance keeps the data disk; the new instance installs Kite again on top of it. Removing
 everything needs the disk's `prevent_destroy` taken out first, on purpose.
+
+The first boot runs `install.sh` from a fixed commit (`installer_url` in `variables.tf`), never from the
+moving `main`, so a change pushed later cannot alter what a new machine runs as root. After changing
+`deploy/stack/install.sh`, push it, then pin the new commit:
+
+```sh
+sha=$(git rev-parse HEAD)   # the pushed commit with the new install.sh
+sed -i -E "s#(kite/)[0-9a-f]{40}(/deploy/stack/install.sh)#\1${sha}\2#" infra/aws/variables.tf
+```
+
+The installer installs cosign (the release CI signs with, checked against its SHA-256): a new machine
+runs an image only when it carries this repository's CI signature.
