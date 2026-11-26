@@ -58,7 +58,7 @@ function onPick(pick: Pick) {
   if (pick.kind === 'worker') go('/workers')
   else if (pick.kind === 'task') go(`/tasks/${encodeURIComponent(pick.id)}`)
   else if (pick.kind === 'lead') go('/chat')
-  else if (pick.kind === 'gateway') go('/tasks')
+  else if (pick.kind === 'gateway') go('/giam-sat')
   else go('/tasks')
 }
 
@@ -94,7 +94,7 @@ export default function Overview() {
   return (
     <Page title={t('overview.title')}>
       <SimpleGrid cols={{ base: 2, md: 4 }}>
-        <Stat label={t('overview.stat.gateway')} value={data.gateway_up ? t('overview.stat.gateway-on') : t('overview.stat.gateway-off')} color={data.gateway_up ? 'teal' : 'red'} />
+        <Stat label={t('overview.stat.gateway')} value={data.gateway_up ? t('overview.stat.gateway-on') : t('overview.stat.gateway-off')} color={data.gateway_up ? 'teal' : 'red'} onClick={() => go('/giam-sat')} />
         <Stat label={t('overview.stat.jobs')} value={`${data.queued_jobs} / ${data.running_jobs}`} onClick={() => go('/tasks')} />
         <Stat label={t('overview.stat.spend-today')} value={usd(data.spend.today_usd)} onClick={() => go('/workers')} />
         <Stat label={t('overview.stat.spend-month')} value={usd(data.spend.month_usd)} onClick={() => go('/workers')} />
