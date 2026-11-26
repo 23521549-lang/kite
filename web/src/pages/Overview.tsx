@@ -1,18 +1,15 @@
-import { Badge, Card, Group, SegmentedControl, SimpleGrid, Stack, Table, Text, Title, useComputedColorScheme } from '@mantine/core'
+import { Group, SimpleGrid, Stack, Table, Text, Title, useComputedColorScheme } from '@mantine/core'
 import { useMediaQuery } from '@mantine/hooks'
-import { Suspense, lazy, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { get, type Activity, type Overview as OverviewData, type WorkerRow } from '../api'
-import { Dot, Empty, Loading, Page, StateBadge, useWorkerStateLabel } from '../components/common'
+import { Empty, Loading, Page, StateBadge } from '../components/common'
+import { useLanguage, useT, type TFunction } from '../i18n'
 import type { OfficeState, Pick, WorkerState } from '../office/scene'
 import { go } from '../router'
-import { useLanguage, useT, type DictKey } from '../i18n'
 import { useKite } from '../store'
-import { ago, short, usd, useLoad, workerState, type WorkerStateKey } from '../util'
-
-// three.js is only downloaded when the 3D office is shown.
-const Office3D = lazy(() => import('../office/Office3D'))
-const MODE_KEY = 'kite.overview.mode'
-const PHASES: Record<string, DictKey> = { fast_path: 'overview.phase.fast-path', review: 'overview.phase.review' }
+import { ago, short, usd, useLoad, workerState } from '../util'
+import HubBlock from './overview/HubBlock'
+import OfficePanel from './overview/OfficePanel'
 
 function hasWebGL(): boolean {
   try {
@@ -23,19 +20,12 @@ function hasWebGL(): boolean {
   }
 }
 
-function savedMode(): '3d' | '2d' {
-  try {
-    const value = localStorage.getItem(MODE_KEY)
-    if (value === '2d' || value === '3d') return value
-  } catch {
-    /* no storage: the default */
-  }
-  // Phones start with the cards: five desks on a small screen are hard to read.
-  return window.matchMedia?.('(max-width: 640px)').matches ? '2d' : '3d'
-}
-
-function officeWorker(w: WorkerRow, label: (key: WorkerStateKey) => string): OfficeState['workers'][number] {
+function officeWorker(w: WorkerRow): OfficeState['workers'][number] {
   const st = workerState(w)
+  // Compare the raw state field, never the display label: the `workerState()`
+  // label changes language after the Gói 0(b) migration (comparing labels breaks in EN mode).
+  // This regex matches exactly the condition `workerState()` uses for the starting state.
+  const startPhase = String(w.start?.state ?? w.start?.status ?? w.start?.phase ?? '')
   const state: WorkerState =
     w.start?.state === 'error'
       ? 'error'
@@ -43,25 +33,24 @@ function officeWorker(w: WorkerRow, label: (key: WorkerStateKey) => string): Off
         ? 'busy'
         : w.alive && !w.draining
           ? 'idle'
-          : st.label === 'đang khởi động' || w.draining // i18n-ignore: so sánh với nhãn nội bộ do workerState() trả về (giá trị mã để phân loại trạng thái, không phải chuỗi hiển thị) — giữ nguyên logic so sánh.
+          : /start|queue|wait|boot|launch|running/i.test(startPhase) || w.draining
             ? 'starting'
             : 'off'
   return {
     id: w.id,
     type: w.type,
     state,
-    // stateLabel is UI text shown in the 3D office tooltip (scene.ts):
-    // translate it via the shared worker-state labels, not workerState()'s
-    // Vietnamese fallback label.
-    stateLabel: label(st.key),
+    stateLabel: st.label,
     model: w.loaded_model ?? w.models[0] ?? '',
     running: w.running,
     slots: w.slots ?? w.concurrency,
   }
 }
 
-function officeTask(a: Activity, t: (key: DictKey, vars?: Record<string, string | number>) => string): OfficeState['tasks'][number] {
-  const step = [a.step ? t('overview.activity-step', { step: a.step }) : null, a.action ? t('overview.activity-action', { action: a.action }) : null].filter(Boolean).join(' · ')
+function officeTask(a: Activity, t: TFunction): OfficeState['tasks'][number] {
+  const step = [a.step ? t('overview.task.step', { step: a.step }) : null, a.action ? t('overview.task.action', { action: a.action }) : null]
+    .filter(Boolean)
+    .join(' · ')
   return { id: a.task_id, goal: short(a.goal || a.task_id, 70), worker: a.worker, step: step || null }
 }
 
@@ -69,14 +58,13 @@ function onPick(pick: Pick) {
   if (pick.kind === 'worker') go('/workers')
   else if (pick.kind === 'task') go(`/tasks/${encodeURIComponent(pick.id)}`)
   else if (pick.kind === 'lead') go('/chat')
-  else if (pick.kind === 'gateway') go('/journal')
+  else if (pick.kind === 'gateway') go('/tasks')
   else go('/tasks')
 }
 
 export default function Overview() {
   const t = useT()
   const { language } = useLanguage()
-  const workerStateLabel = useWorkerStateLabel()
   const { data, error } = useLoad(() => get<OverviewData>('/api/overview'), [], 10000)
   const activity = useKite((s) => s.activity)
   const events = useKite((s) => s.events)
@@ -85,12 +73,11 @@ export default function Overview() {
   const dark = useComputedColorScheme('dark') === 'dark'
   const small = useMediaQuery('(max-width: 48em)')
   const [webgl] = useState(hasWebGL)
-  const [mode, setMode] = useState<'3d' | '2d'>(() => (hasWebGL() ? savedMode() : '2d'))
   const office = useMemo<OfficeState | null>(
     () =>
       data
         ? {
-            workers: data.workers.map((w) => officeWorker(w, workerStateLabel)),
+            workers: data.workers.map(officeWorker),
             tasks: activity.map((a) => officeTask(a, t)),
             chatBusy: (chat.data?.busy ?? 0) > 0,
             gatewayUp: gatewayUp ?? data.gateway_up,
@@ -107,102 +94,63 @@ export default function Overview() {
   return (
     <Page title={t('overview.title')}>
       <SimpleGrid cols={{ base: 2, md: 4 }}>
-        <Stat label={t('overview.stat-gateway')} value={data.gateway_up ? t('overview.gateway-running') : t('overview.gateway-off')} color={data.gateway_up ? 'teal' : 'red'} />
-        <Stat label={t('overview.stat-queued-running')} value={`${data.queued_jobs} / ${data.running_jobs}`} />
-        <Stat label={t('overview.stat-spend-today')} value={usd(data.spend.today_usd)} />
-        <Stat label={t('overview.stat-spend-month')} value={usd(data.spend.month_usd)} />
+        <Stat label={t('overview.stat.gateway')} value={data.gateway_up ? t('overview.stat.gateway-on') : t('overview.stat.gateway-off')} color={data.gateway_up ? 'teal' : 'red'} />
+        <Stat label={t('overview.stat.jobs')} value={`${data.queued_jobs} / ${data.running_jobs}`} onClick={() => go('/tasks')} />
+        <Stat label={t('overview.stat.spend-today')} value={usd(data.spend.today_usd)} onClick={() => go('/workers')} />
+        <Stat label={t('overview.stat.spend-month')} value={usd(data.spend.month_usd)} onClick={() => go('/workers')} />
       </SimpleGrid>
       {brandSpend.length ? (
-        <Card withBorder>
-          <Text fw={600} mb={6}>
-            {t('overview.spend-by-brand')}
-          </Text>
+        <HubBlock title={t('overview.brand-spend.title')} onClick={() => go('/workers')}>
           {brandSpend.map(([brand, total]) => (
             <Text key={brand} size="sm">
               <b>{brand}</b>: {usd(total)}
             </Text>
           ))}
-        </Card>
+        </HubBlock>
       ) : null}
       {Object.keys(quota).length ? (
-        <Card withBorder>
-          <Text fw={600} mb={6}>
-            {t('overview.gpu-quota')}
-          </Text>
+        <HubBlock title={t('overview.quota.title')} onClick={() => go('/workers')}>
           {Object.entries(quota).map(([worker, q]) => (
             <Text key={worker} size="sm">
               <b>{worker}</b>: {q.detail}
             </Text>
           ))}
-        </Card>
+        </HubBlock>
       ) : null}
-      <Card withBorder p="xs">
-        <Group justify="space-between" px={6} pb={6}>
-          <Text fw={600}>{t('overview.office')}</Text>
-          <SegmentedControl
-            size="xs"
-            data={[
-              { value: '3d', label: '3D', disabled: !webgl },
-              { value: '2d', label: '2D' },
-            ]}
-            value={mode}
-            onChange={(v) => {
-              const next = v === '3d' ? '3d' : '2d'
-              setMode(next)
-              try {
-                localStorage.setItem(MODE_KEY, next)
-              } catch {
-                /* the choice lasts for this visit only */
-              }
-            }}
-          />
-        </Group>
-        {mode === '3d' ? (
-          <Suspense fallback={<Loading label={t('overview.office-loading')} />}>
-            <Office3D state={office} onPick={onPick} height={small ? 360 : 500} />
-          </Suspense>
-        ) : (
-          <WorkerCards workers={data.workers} />
-        )}
-        {!webgl ? (
-          <Text size="xs" c="dimmed" px={6} pt={6}>
-            {t('overview.office-no-webgl')}
-          </Text>
-        ) : null}
-      </Card>
-      <Title order={4}>{t('overview.doing')}</Title>
+      <OfficePanel office={office} workers={data.workers} webgl={webgl} small={small} onPick={onPick} />
+      <Title order={4}>{t('overview.running.title')}</Title>
       {activity.length ? (
         <Stack gap="xs">
           {activity.map((a) => (
-            <Card key={a.task_id} withBorder p="sm" className="clickable" onClick={() => go(`/tasks/${encodeURIComponent(a.task_id)}`)}>
-              <Group justify="space-between" wrap="nowrap">
-                <Text fw={600} truncate>
-                  {a.goal || a.task_id}
+            <HubBlock key={a.task_id} title={a.goal || a.task_id} onClick={() => go(`/tasks/${encodeURIComponent(a.task_id)}`)}>
+              <Group justify="space-between" wrap="nowrap" align="flex-start">
+                <Text size="sm" c="dimmed" style={{ flex: 1, minWidth: 0 }}>
+                  {[
+                    a.worker ? t('overview.task.worker', { worker: a.worker }) : null,
+                    a.phase
+                      ? a.phase === 'fast_path'
+                        ? t('overview.phase.fast-path')
+                        : a.phase === 'review'
+                          ? t('overview.phase.review')
+                          : a.phase
+                      : null,
+                    a.step ? t('overview.task.step', { step: a.step }) : null,
+                    a.action ? t('overview.task.action', { action: a.action }) : null,
+                    a.since ? t('overview.task.since', { time: ago(a.since) }) : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ') || (a.state === 'QUEUED' ? t('overview.running.queued') : t('overview.running.preparing'))}
                 </Text>
                 <StateBadge state={a.state} />
               </Group>
-              <Text size="sm" c="dimmed">
-                {[
-                  a.worker ? `worker ${a.worker}` : null,
-                  a.phase ? (PHASES[a.phase] ? t(PHASES[a.phase]) : a.phase) : null,
-                  a.step ? t('overview.activity-step', { step: a.step }) : null,
-                  a.action ? t('overview.activity-action', { action: a.action }) : null,
-                  a.since ? t('overview.activity-since', { since: ago(a.since) }) : null,
-                ]
-                  .filter(Boolean)
-                  .join(' · ') || (a.state === 'QUEUED' ? t('overview.activity-waiting') : t('overview.activity-preparing'))}
-              </Text>
-            </Card>
+            </HubBlock>
           ))}
         </Stack>
       ) : (
-        <Empty>{t('overview.no-running-task')}</Empty>
+        <Empty>{t('overview.running.empty')}</Empty>
       )}
       <SimpleGrid cols={{ base: 1, lg: 2 }}>
-        <Card withBorder>
-          <Text fw={600} mb="xs">
-            {t('overview.recent-tasks')}
-          </Text>
+        <HubBlock title={t('overview.recent-tasks.title')}>
           {data.tasks.recent.length ? (
             <Table highlightOnHover>
               <Table.Tbody>
@@ -226,69 +174,36 @@ export default function Overview() {
               </Table.Tbody>
             </Table>
           ) : (
-            <Empty>{t('overview.no-task')}</Empty>
+            <Empty>{t('overview.recent-tasks.empty')}</Empty>
           )}
-        </Card>
-        <Card withBorder>
-          <Text fw={600} mb="xs">
-            {t('overview.recent-events')}
-          </Text>
+        </HubBlock>
+        <HubBlock title={t('overview.recent-events.title')}>
           {events.length ? (
             <Stack gap={4}>
-              {events.slice(0, 14).map((e, i) => (
-                <Text key={i} size="xs" className="mono" lineClamp={1}>
-                  <Text span c="dimmed">
-                    {new Date(e.at).toLocaleTimeString('vi-VN', { hour12: false })} {e.file}
-                  </Text>{' '}
-                  {short(describe(e.record), 160)}
-                </Text>
-              ))}
+              {events.slice(0, 14).map((e, i) => {
+                const taskId = typeof e.record.task_id === 'string' && e.record.task_id ? e.record.task_id : null
+                return (
+                  <Text
+                    key={i}
+                    size="xs"
+                    className="mono clickable"
+                    lineClamp={1}
+                    onClick={() => go(taskId ? `/tasks/${encodeURIComponent(taskId)}` : '/tasks')}
+                  >
+                    <Text span c="dimmed">
+                      {new Date(e.at).toLocaleTimeString('vi-VN', { hour12: false })} {e.file}
+                    </Text>{' '}
+                    {short(describe(e.record), 160)}
+                  </Text>
+                )
+              })}
             </Stack>
           ) : (
-            <Empty>{t('overview.no-events')}</Empty>
+            <Empty>{t('overview.recent-events.empty')}</Empty>
           )}
-        </Card>
+        </HubBlock>
       </SimpleGrid>
     </Page>
-  )
-}
-
-function WorkerCards({ workers }: { workers: WorkerRow[] }) {
-  const t = useT()
-  const workerStateLabel = useWorkerStateLabel()
-  if (!workers.length) return <Empty>{t('overview.no-workers')}</Empty>
-  return (
-    <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} p={6}>
-      {workers.map((w) => {
-        const st = workerState(w)
-        return (
-          <Card key={w.id} withBorder className="clickable" onClick={() => go('/workers')}>
-            <Group justify="space-between">
-              <Group gap={8}>
-                <Dot color={st.color} />
-                <Text fw={600}>{w.id}</Text>
-              </Group>
-              <Badge variant="light" color={st.color}>
-                {workerStateLabel(st.key)}
-              </Badge>
-            </Group>
-            <Text size="sm" c="dimmed" mt={4}>
-              {w.type} · {w.loaded_model ? t('overview.worker-loading-model', { model: w.loaded_model }) : w.models.slice(0, 3).join(', ')}
-            </Text>
-            {w.alive && w.busy ? (
-              <Text size="sm" mt={4}>
-                {t('overview.worker-running', { running: w.running, slots: w.slots ?? w.concurrency })}
-              </Text>
-            ) : null}
-            {w.start?.detail ? (
-              <Text size="xs" c="yellow.9" mt={4}>
-                {short(w.start.detail, 140)}
-              </Text>
-            ) : null}
-          </Card>
-        )
-      })}
-    </SimpleGrid>
   )
 }
 
@@ -298,15 +213,12 @@ function describe(record: Record<string, any>): string {
   return text || JSON.stringify(record)
 }
 
-function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
+function Stat({ label, value, color, onClick }: { label: string; value: string; color?: string; onClick?: () => void }) {
   return (
-    <Card withBorder p="md">
-      <Text size="xs" c="dimmed">
-        {label}
-      </Text>
+    <HubBlock title={label} onClick={onClick}>
       <Text fw={700} size="lg" c={color}>
         {value}
       </Text>
-    </Card>
+    </HubBlock>
   )
 }

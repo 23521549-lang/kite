@@ -5,7 +5,7 @@
 // desk for the chat) to the worker that answered it.
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { getLanguage, translate } from '../i18n'
+import { translate } from '../i18n'
 import { disposeSprite, labelSize, makeLabel, sizeLabel, type Line } from './labels'
 
 export type WorkerState = 'idle' | 'busy' | 'starting' | 'off' | 'error'
@@ -21,7 +21,27 @@ export type WorkerView = {
 export type TaskView = { id: string; goal: string; worker: string | null; step: string | null }
 export type OfficeState = { workers: WorkerView[]; tasks: TaskView[]; chatBusy: boolean; gatewayUp: boolean; dark: boolean }
 export type Pick = { kind: 'worker' | 'task' | 'lead' | 'gateway' | 'queue'; id: string }
-type Handlers = { onPick: (pick: Pick) => void; onHover: (tip: string | null, x: number, y: number) => void }
+// Mọi chuỗi hiển thị trong scene 3D — do component React truyền vào (đã dịch
+// qua `overview.*`); scene không tự hard-code chuỗi UI, không tự đọc ngôn ngữ.
+export type OfficeLabels = {
+  moreTasks: (n: number) => string
+  openTask: string
+  aria: string
+  queueTip: string
+  gatewayTip: string
+  gatewayUp: string
+  gatewayDown: string
+  workerTip: string
+  runningSuffix: (running: number, slots: number) => string
+  leadTip: string
+  leadName: string
+  answering: string
+  waiting: string
+  queueName: string
+  queueWaiting: (n: number) => string
+  queueEmpty: string
+}
+type Handlers = { onPick: (pick: Pick) => void; onHover: (tip: string | null, x: number, y: number) => void; labels: OfficeLabels }
 
 const STATE_COLOR: Record<WorkerState, number> = {
   idle: 0x20c997,
@@ -221,9 +241,10 @@ class Station {
     }
   }
 
-  setCards(tasks: TaskView[], dark: boolean, pickables: THREE.Object3D[]) {
+  setCards(tasks: TaskView[], dark: boolean, pickables: THREE.Object3D[], labels: OfficeLabels) {
     const shown = tasks.slice(0, MAX_CARDS)
-    const key = JSON.stringify([shown, tasks.length, dark])
+    const extra = tasks.length > shown.length ? labels.moreTasks(tasks.length - shown.length) : ''
+    const key = JSON.stringify([shown, tasks.length, dark, extra])
     if (key === this.cardsKey) return
     this.cardsKey = key
     for (const card of this.cards) {
@@ -235,12 +256,12 @@ class Station {
       const lines: Line[] = [{ text: task.goal || task.id, color: '#212529', bold: true, size: 13 }]
       if (task.step) lines.push({ text: task.step, color: '#495057', size: 12 })
       if (i === shown.length - 1 && tasks.length > shown.length)
-        lines.push({ text: translate('overview.office.more-tasks', { count: tasks.length - shown.length }), color: '#868e96', size: 12 })
+        lines.push({ text: extra, color: '#868e96', size: 12 })
       // Thẻ task nền vàng cố định ở cả hai chế độ → luôn dùng chữ đậm (dark: false), không theo theme.
       const card = makeLabel(lines, { bg: '#fff3bf', border: '#fab005', maxWidth: 180, radius: 6, pad: 7, dark: false })
       card.position.set(0, LABEL_Y, -0.4)
       card.userData.pick = { kind: 'task', id: task.id } satisfies Pick
-      card.userData.tip = `${task.goal}${task.step ? ` — ${task.step}` : ''} ${translate('overview.office.task-tip-suffix')}`
+      card.userData.tip = `${task.goal}${task.step ? ` — ${task.step}` : ''} ${labels.openTask}`
       this.group.add(card)
       pickables.push(card)
       return card
@@ -338,14 +359,15 @@ export class OfficeScene {
   private rackLeds: THREE.MeshStandardMaterial[] = []
   private rackPos = new THREE.Vector3(-8, 0, -1.2)
   private rack = new THREE.Group()
-  private rackHit!: THREE.Mesh
   private rackLabel: THREE.Sprite | null = null
   private rackKey = ''
   private queuePos = new THREE.Vector3(6.6, 0, 4.2)
-  private queueHit!: THREE.Mesh
   private queueLabel: THREE.Sprite | null = null
   private queue = new THREE.Group()
   private queueKey = ''
+  private labels: OfficeLabels
+  private queueHit: THREE.Mesh | null = null
+  private gatewayHit: THREE.Mesh | null = null
   private beams = new Map<string, Beam>()
   private beamMat = new THREE.LineDashedMaterial({ color: 0x748ffc, dashSize: 0.25, gapSize: 0.18, transparent: true, opacity: 0.8 })
   private tokenGeo = new THREE.SphereGeometry(0.09, 10, 8)
@@ -374,6 +396,7 @@ export class OfficeScene {
     private container: HTMLElement,
     private handlers: Handlers,
   ) {
+    this.labels = handlers.labels
     const width = container.clientWidth || 800
     this.shadows = width >= 700
     this.still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
@@ -383,6 +406,7 @@ export class OfficeScene {
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
     this.renderer.domElement.style.display = 'block'
     this.renderer.domElement.style.touchAction = 'none'
+    this.renderer.domElement.setAttribute('aria-label', this.labels.aria)
     container.appendChild(this.renderer.domElement)
 
     this.shared = {
@@ -430,10 +454,12 @@ export class OfficeScene {
     rug.rotation.x = -Math.PI / 2
     rug.position.y = 0.01
     this.queue.add(rug)
-    const queueHit = this.queueHit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
+    const queueHit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
     queueHit.scale.set(2.6, 2.5, 2.6)
     queueHit.position.y = 1.2
     queueHit.userData.pick = { kind: 'queue', id: 'queue' } satisfies Pick
+    queueHit.userData.tip = this.labels.queueTip
+    this.queueHit = queueHit
     this.queue.add(queueHit)
     this.pickables.push(queueHit)
 
@@ -475,21 +501,22 @@ export class OfficeScene {
         this.rackLeds.push(led)
       }
     }
-    const hit = this.rackHit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
+    const hit = new THREE.Mesh(this.shared.boxGeo, new THREE.MeshBasicMaterial({ visible: false }))
     hit.scale.set(1.8, 3.2, 1.8)
     hit.position.y = 1.5
     hit.userData.pick = { kind: 'gateway', id: 'gateway' } satisfies Pick
+    hit.userData.tip = this.labels.gatewayTip
+    this.gatewayHit = hit
     group.add(hit)
     this.pickables.push(hit)
     this.scene.add(group)
   }
 
   private updateRackLabel(up: boolean, dark: boolean) {
-    const key = JSON.stringify([up, dark, getLanguage()])
+    const statusText = up ? this.labels.gatewayUp : this.labels.gatewayDown
+    const key = JSON.stringify([up, dark, statusText])
     if (key === this.rackKey) return
     this.rackKey = key
-    // Tooltip dịch theo ngôn ngữ hiện tại (đổi ngôn ngữ làm mới qua memo key).
-    this.rackHit.userData.tip = translate('overview.office.gateway-tip')
     if (this.rackLabel) {
       this.rack.remove(this.rackLabel)
       disposeSprite(this.rackLabel)
@@ -497,7 +524,7 @@ export class OfficeScene {
     this.rackLabel = makeLabel(
       [
         { text: 'Gateway', bold: true, color: dark ? '#f1f3f5' : '#212529' },
-        { text: up ? translate('overview.gateway-running') : translate('overview.office.rack-offline'), color: up ? '#20c997' : '#fa5252', size: 13 },
+        { text: statusText, color: up ? '#20c997' : '#fa5252', size: 13 },
       ],
       { bg: dark ? 'rgba(24,26,32,0.86)' : 'rgba(255,255,255,0.9)', border: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)', dark },
     )
@@ -520,7 +547,11 @@ export class OfficeScene {
     return spots
   }
 
-  update(state: OfficeState) {
+  update(state: OfficeState, labels?: OfficeLabels) {
+    if (labels) this.labels = labels
+    // Tooltip của 2 hit tạo lúc khởi tạo — làm mới theo ngôn ngữ hiện tại.
+    if (this.queueHit) this.queueHit.userData.tip = this.labels.queueTip
+    if (this.gatewayHit) this.gatewayHit.userData.tip = this.labels.gatewayTip
     this.state = state
     this.dirty = true
     const dark = state.dark
@@ -584,26 +615,26 @@ export class OfficeScene {
       const station = this.stations.get(w.id)!
       const tasks = byWorker.get(w.id) ?? []
       const state2: WorkerState = w.state === 'idle' && tasks.length ? 'busy' : w.state
-      station.setState(state2, `${w.id} · ${w.stateLabel}${w.model ? ` · ${w.model}` : ''} ${translate('overview.office.station-hint')}`)
+      station.setState(state2, `${w.id} · ${w.stateLabel}${w.model ? ` · ${w.model}` : ''} ${this.labels.workerTip}`)
       station.setSleeping(state2 === 'off', dark)
       const lines: Line[] = [
         { text: w.id, bold: true, color: dark ? '#f1f3f5' : '#212529' },
         {
-          text: `${w.stateLabel}${w.running ? ` · ${translate('overview.office.running', { running: w.running, slots: w.slots })}` : ''}`,
+          text: `${w.stateLabel}${w.running ? this.labels.runningSuffix(w.running, w.slots) : ''}`,
           color: hex((dark ? STATE_COLOR : STATE_TEXT_LIGHT)[state2]),
           size: 13,
         },
       ]
       if (w.model && !compact) lines.push({ text: w.model, color: dark ? '#adb5bd' : '#495057', size: 12 })
       station.setLabel(lines, dark)
-      station.setCards(compact ? [] : tasks, dark, this.pickables)
+      station.setCards(compact ? [] : tasks, dark, this.pickables, this.labels)
     }
 
-    this.lead.setState(state.chatBusy ? 'busy' : 'idle', translate('overview.office.lead-tooltip'))
+    this.lead.setState(state.chatBusy ? 'busy' : 'idle', this.labels.leadTip)
     this.lead.setLabel(
       [
-        { text: translate('overview.office.lead-title'), bold: true, color: dark ? '#f1f3f5' : '#212529' },
-        { text: state.chatBusy ? translate('overview.office.lead-busy') : translate('overview.office.lead-idle'), color: hex((dark ? STATE_COLOR : STATE_TEXT_LIGHT)[state.chatBusy ? 'busy' : 'idle']), size: 13 },
+        { text: this.labels.leadName, bold: true, color: dark ? '#f1f3f5' : '#212529' },
+        { text: state.chatBusy ? this.labels.answering : this.labels.waiting, color: hex((dark ? STATE_COLOR : STATE_TEXT_LIGHT)[state.chatBusy ? 'busy' : 'idle']), size: 13 },
       ],
       dark,
     )
@@ -615,11 +646,10 @@ export class OfficeScene {
   }
 
   private updateQueue(waiting: TaskView[], dark: boolean) {
-    const key = JSON.stringify([waiting.map((t) => t.id), dark, getLanguage()])
+    const queueText = waiting.length ? this.labels.queueWaiting(waiting.length) : this.labels.queueEmpty
+    const key = JSON.stringify([waiting.map((t) => t.id), dark, this.labels.queueName, queueText])
     if (key === this.queueKey) return
     this.queueKey = key
-    // Tooltip dịch theo ngôn ngữ hiện tại (đổi ngôn ngữ làm mới qua memo key).
-    this.queueHit.userData.tip = translate('overview.office.queue-tip')
     for (const child of [...this.queue.children]) {
       if (child.userData.queueItem) {
         this.queue.remove(child)
@@ -637,8 +667,8 @@ export class OfficeScene {
     })
     const label = makeLabel(
       [
-        { text: translate('overview.office.queue-title'), bold: true, color: dark ? '#f1f3f5' : '#212529' },
-        { text: waiting.length ? translate('overview.office.queue-waiting', { count: waiting.length }) : translate('overview.office.queue-empty'), color: dark ? '#adb5bd' : '#495057', size: 13 },
+        { text: this.labels.queueName, bold: true, color: dark ? '#f1f3f5' : '#212529' },
+        { text: queueText, color: dark ? '#adb5bd' : '#495057', size: 13 },
       ],
       { bg: dark ? 'rgba(24,26,32,0.86)' : 'rgba(255,255,255,0.9)', border: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)', dark },
     )
