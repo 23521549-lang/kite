@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from poc.kaggle_worker import cli  # noqa: E402
 from poc.kaggle_worker.mcp_server import KiteToolError  # noqa: E402
+from poc.kaggle_worker.protocol import ScheduledTask  # noqa: E402
+from poc.kaggle_worker.store import SQLiteSchedulerStore  # noqa: E402
 from poc.kaggle_worker.web import security as sec  # noqa: E402
 from poc.kaggle_worker.web.app import GatewayDown, WebContext, create_app  # noqa: E402
 from poc.kaggle_worker.web.db import Store, connect, sqlite_url  # noqa: E402
@@ -573,6 +576,36 @@ def test_task_detail_returns_trace_and_persistent_apply_error(site):
     assert detail["environment_id"] == "env-1" and detail["chat_session_id"] == "sess-1"
     assert detail["last_apply_error"] == {"code": "apply_conflict", "head": "abc1234",
                                           "failed_files": ["a.py"], "at": NOW, "task_id": "chat-1"}
+
+
+def test_task_detail_parses_the_stored_apply_error_string(site):
+    # Regression (F1): the scheduler store keeps last_apply_error as a JSON string;
+    # the detail endpoint used to hand that raw string over, so the front end's
+    # `.code === 'apply_conflict'` gate never matched and the rerun button never showed.
+    # The previous test stayed green because FakeOps has no scheduler store, so the
+    # row overwrite never ran there.
+    db_path = site["path"] / "scheduler.sqlite3"
+    store = SQLiteSchedulerStore(db_path)
+    store.enqueue(ScheduledTask(task_id="chat-1", role="coding", model_id=None, repo_head="abc1234",
+                                branch="main", payload_json='{"goal": "sửa lỗi"}',
+                                estimated_gpu_seconds=1, priority=0, created_at=NOW,
+                                chat_session_id="sess-1", environment_id="env-1",
+                                main_repo="/home/han/app"))
+    store.set_last_apply_error("chat-1", {"code": "apply_conflict", "head": "abc1234",
+                                          "failed_files": ["a.py"], "at": NOW, "task_id": "chat-1"})
+    store.close()
+    site["ops"]._store = lambda: SQLiteSchedulerStore(db_path)
+    headers = signed_in(site)
+    detail = site["client"].get("/api/tasks/chat-1", headers=headers).json()
+    assert detail["last_apply_error"] == {"code": "apply_conflict", "head": "abc1234",
+                                          "failed_files": ["a.py"], "at": NOW, "task_id": "chat-1"}
+    assert detail["environment_id"] == "env-1" and detail["chat_session_id"] == "sess-1"
+    # A corrupt stored string degrades to None instead of leaking raw text to the UI.
+    con = sqlite3.connect(db_path)
+    con.execute("UPDATE tasks SET last_apply_error=? WHERE task_id=?", ("not-json{", "chat-1"))
+    con.commit()
+    con.close()
+    assert site["client"].get("/api/tasks/chat-1", headers=headers).json()["last_apply_error"] is None
 
 
 def test_rerun_returns_the_new_task_id_and_is_audited(site):

@@ -117,7 +117,7 @@ export function StateBadge({ state }: { state: string }) {
   const s = taskState(state)
   const key = TASK_STATE_KEYS[state]
   return (
-    <Badge color={s.color} variant="light" size="sm">
+    <Badge color={s.color} variant="light" size="sm" style={{ whiteSpace: 'nowrap' }}>
       {key ? t(key) : s.label}
     </Badge>
   )

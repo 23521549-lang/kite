@@ -1096,8 +1096,9 @@ class KiteOps:
                 row = store.get_task(task_id)
                 result["queue_state"] = row["state"]
                 # Origin stamp + persisted apply error: this is the seam through which
-                # GET /api/tasks/{id} (web/app.py, another worker's file) exposes them,
-                # under report["status"]; no change to app.py is needed for that.
+                # GET /api/tasks/{id} (web/app.py, another worker's file) exposes them
+                # under report["status"]. app.py ALSO re-reads the row and must parse
+                # the stored JSON string itself — the store keeps it as text.
                 result["chat_session_id"] = row.get("chat_session_id")
                 result["environment_id"] = row.get("environment_id")
                 result["last_apply_error"] = self._last_apply_error(row)

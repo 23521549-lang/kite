@@ -875,6 +875,16 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
                 report[key] = row.get(key)
         except Exception:
             pass
+        # The store keeps last_apply_error as a JSON string; the front end gates on
+        # `.code`, so hand it over as a dict — None when absent or corrupt, never the
+        # raw text (the row overwrite above would otherwise undo task_status's parse).
+        raw_error = report.get("last_apply_error")
+        if isinstance(raw_error, str):
+            try:
+                parsed = json.loads(raw_error)
+            except ValueError:
+                parsed = None
+            report["last_apply_error"] = parsed if isinstance(parsed, dict) else None
         return report
 
     @app.get("/api/tasks/{task_id}/patch")
