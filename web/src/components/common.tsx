@@ -11,6 +11,7 @@ import {
   Stack,
   Text,
   Textarea,
+  TextInput,
   Title,
   type ButtonProps,
 } from '@mantine/core'
@@ -142,7 +143,9 @@ export function Dot({ color, title }: { color: string; title?: string }) {
   return <span className="dot" title={title} style={{ background: `var(--mantine-color-${color}-6)` }} />
 }
 
-/** A button that asks before it acts. With `askText`, the dialog also takes a text (a commit message...). */
+/** A button that asks before it acts. With `askText`, the dialog also takes a text (a commit message...).
+With `askCode`, it also takes a one-time confirmation code (apply/commit); the code is passed as the
+second argument of `onConfirm` and the confirm button stays disabled until it is filled in. */
 export function ConfirmButton({
   label,
   title,
@@ -152,6 +155,9 @@ export function ConfirmButton({
   askText,
   textLabel,
   textDefault = '',
+  askCode,
+  codeLabel,
+  codePlaceholder,
   color,
   ...props
 }: {
@@ -159,15 +165,19 @@ export function ConfirmButton({
   title: string
   message?: ReactNode
   confirmLabel?: string
-  onConfirm: (text: string) => Promise<unknown> | unknown
+  onConfirm: (text: string, code?: string) => Promise<unknown> | unknown
   askText?: boolean
   textLabel?: string
   textDefault?: string
+  askCode?: boolean
+  codeLabel?: string
+  codePlaceholder?: string
 } & ButtonProps) {
   const t = useT()
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [text, setText] = useState(textDefault)
+  const [code, setCode] = useState('')
   return (
     <>
       <Button
@@ -175,6 +185,7 @@ export function ConfirmButton({
         {...props}
         onClick={() => {
           setText(textDefault)
+          setCode('')
           setOpen(true)
         }}
       >
@@ -186,6 +197,16 @@ export function ConfirmButton({
           {askText ? (
             <Textarea label={textLabel} value={text} onChange={(e) => setText(e.currentTarget.value)} autosize minRows={2} />
           ) : null}
+          {askCode ? (
+            <TextInput
+              label={codeLabel}
+              placeholder={codePlaceholder}
+              value={code}
+              onChange={(e) => setCode(e.currentTarget.value)}
+              autoComplete="off"
+              styles={{ input: { fontFamily: 'monospace' } }}
+            />
+          ) : null}
           <Group justify="flex-end">
             <Button variant="default" onClick={() => setOpen(false)}>
               {t('common.cancel')}
@@ -193,11 +214,11 @@ export function ConfirmButton({
             <Button
               color={color}
               loading={busy}
-              disabled={askText && !text.trim()}
+              disabled={(askText && !text.trim()) || (askCode && !code.trim())}
               onClick={async () => {
                 setBusy(true)
                 try {
-                  await onConfirm(text)
+                  await onConfirm(text, code)
                   setOpen(false)
                 } finally {
                   setBusy(false)
