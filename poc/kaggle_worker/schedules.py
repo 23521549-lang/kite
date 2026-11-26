@@ -638,10 +638,10 @@ class SchedulerEngine:
         """Register a builtin job: ``schedule`` is either an interval in
         seconds or a due function ``now (Bangkok-aware) -> next due time``.
 
-        The two contract builtins are registered by the wiring (agent
+        The contract builtins are registered by the wiring (agent
         trưởng, in ``cli.py``/``app.py``), not here: ``secretary_daily_report``
-        with ``daily_at_bangkok("00:00")`` and ``needs_decision_scan`` with
-        interval 300 — their functions live in the sibling modules of the
+        with ``daily_at_bangkok("00:00")`` and ``needs_decision_scan`` /
+        ``mcp_sweep`` with interval 300 — their functions live in the sibling modules of the
         workers that own them.
         """
         if not name or not isinstance(name, str):
