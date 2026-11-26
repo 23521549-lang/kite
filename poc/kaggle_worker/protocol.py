@@ -152,6 +152,11 @@ class ScheduledTask:
     created_at: float
     task_type: str = "coding"
     required_capabilities: tuple[str, ...] = ()
+    # Gói 2: trace nguồn gốc — session chat và môi trường lúc task được tạo, và bản chính của repo
+    # (bản sao session là nơi task chạy; NULL = "unknown origin", không đoán ngược).
+    chat_session_id: str | None = None
+    environment_id: str | None = None
+    main_repo: str | None = None
 
     def __post_init__(self) -> None:
         _require_text("task_id", self.task_id)
@@ -160,6 +165,12 @@ class ScheduledTask:
         _require_optional_names("required_capabilities", self.required_capabilities)
         if self.model_id is not None:
             _require_text("model_id", self.model_id)
+        if self.chat_session_id is not None:
+            _require_text("chat_session_id", self.chat_session_id)
+        if self.environment_id is not None:
+            _require_text("environment_id", self.environment_id)
+        if self.main_repo is not None:
+            _require_text("main_repo", self.main_repo)
         _require_text("repo_head", self.repo_head)
         _require_text("branch", self.branch)
         if not isinstance(self.payload_json, str):

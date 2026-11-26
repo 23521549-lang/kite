@@ -8,7 +8,9 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+import subprocess
 import threading
+import time
 import uuid
 from typing import Iterator, Protocol
 
@@ -125,6 +127,33 @@ class SQLiteSchedulerStore:
                     ON leases(task_id) WHERE status = 'ACTIVE';
                 CREATE INDEX IF NOT EXISTS leases_by_owner_status ON leases(owner_id, status);
                 CREATE INDEX IF NOT EXISTS tasks_by_state_priority ON tasks(state, priority DESC, created_at, task_id);
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    kite_session_id TEXT PRIMARY KEY,
+                    opencode_session_id TEXT,
+                    title TEXT,
+                    environment_id TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'chat' CHECK (kind IN ('chat', 'review', 'secretary')),
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at INTEGER,
+                    updated_at INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS chat_session_moves (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    from_env TEXT NOT NULL,
+                    to_env TEXT NOT NULL,
+                    moved_at INTEGER NOT NULL,
+                    trigger TEXT NOT NULL CHECK (trigger IN ('picker', 'task')),
+                    note TEXT
+                );
+                CREATE TABLE IF NOT EXISTS session_copies (
+                    session_id TEXT PRIMARY KEY,
+                    env_id TEXT NOT NULL,
+                    copy_path TEXT NOT NULL,
+                    base_head TEXT,
+                    created_at INTEGER,
+                    state TEXT NOT NULL DEFAULT 'active'
+                );
                 """
             )
             # Prototype databases may predate result/error/retry metadata.
@@ -160,6 +189,12 @@ class SQLiteSchedulerStore:
                 "tasks": {
                     "task_type": "TEXT NOT NULL DEFAULT 'coding'",
                     "required_capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+                    # Gói 2: trace nguồn gốc của task (NULL = "unknown origin", không đoán ngược).
+                    "chat_session_id": "TEXT",
+                    "environment_id": "TEXT",
+                    "main_repo": "TEXT",
+                    # Gói 2: lỗi áp ghi bền vững vào bản ghi task (nút chạy lại đọc từ đây).
+                    "last_apply_error": "TEXT",
                 },
             }.items():
                 existing = {
@@ -278,12 +313,14 @@ class SQLiteSchedulerStore:
             task.task_id, task.role, task.model_id, task.repo_head, task.branch,
             task.payload_json, task.estimated_gpu_seconds, task.priority, task.created_at,
             task.task_type, json.dumps(task.required_capabilities),
+            task.chat_session_id, task.environment_id, task.main_repo,
         )
         try:
             with self._transaction() as db:
                 previous = db.execute(
                     "SELECT task_id, role, model_id, repo_head, branch, payload_json, estimated_gpu_seconds, "
-                    "priority, created_at, task_type, required_capabilities_json FROM tasks WHERE task_id = ?",
+                    "priority, created_at, task_type, required_capabilities_json, "
+                    "chat_session_id, environment_id, main_repo FROM tasks WHERE task_id = ?",
                     (task.task_id,),
                 ).fetchone()
                 if previous is not None:
@@ -293,8 +330,9 @@ class SQLiteSchedulerStore:
                 db.execute(
                     """INSERT INTO tasks (
                     task_id, role, model_id, repo_head, branch, payload_json,
-                    estimated_gpu_seconds, priority, created_at, task_type, required_capabilities_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values,
+                    estimated_gpu_seconds, priority, created_at, task_type, required_capabilities_json,
+                    chat_session_id, environment_id, main_repo
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values,
                 )
         except sqlite3.Error as error:
             raise StoreError(f"could not enqueue task {task.task_id}: {error}") from error
@@ -332,7 +370,81 @@ class SQLiteSchedulerStore:
             "state": row["state"], "attempts": row["attempts"], "last_error": row["last_error"],
             "task_type": row["task_type"],
             "required_capabilities": json.loads(row["required_capabilities_json"] or "[]"),
+            "chat_session_id": row["chat_session_id"],
+            "environment_id": row["environment_id"],
+            "main_repo": row["main_repo"],
+            "last_apply_error": row["last_apply_error"],
         }
+
+    @staticmethod
+    def _norm_repo_url(value: str) -> str:
+        """One spelling for a repo URL: ``git@host:owner/repo.git`` and
+        ``https://host/owner/repo`` compare equal; a trailing slash or ``.git`` is noise."""
+        value = value.strip().rstrip("/")
+        if value.endswith(".git"):
+            value = value[:-4]
+        if value.startswith("git@"):
+            host, _, path = value[4:].partition(":")
+            if host and path:
+                return f"https://{host}/{path.strip('/')}"
+        return value
+
+    def environment_for_repo(self, repo_path_or_url: str) -> str | None:
+        """The environment id a repository belongs to, or None when unknown.
+
+        An environment IS a row of the web store's ``repos`` table
+        (``<state_dir>/web.sqlite3`` — the scheduler database's sibling), matched by
+        resolved local path, or by remote origin URL (a local path is also checked
+        against its ``remote.origin.url``). Never raises: no web database (e.g. a
+        Postgres web store), a missing table, or no match all mean None, and the
+        caller falls back to its own lookup."""
+        if not isinstance(repo_path_or_url, str) or not repo_path_or_url.strip():
+            return None
+        value = repo_path_or_url.strip()
+        web_db = self.path.parent / "web.sqlite3"
+        if not web_db.is_file():
+            return None
+        is_url = "://" in value or value.startswith("git@")
+        repo_path: Path | None = None
+        origin_url = ""
+        if not is_url:
+            try:
+                repo_path = Path(value).expanduser().resolve()
+            except (OSError, ValueError):
+                return None
+            try:
+                origin = subprocess.run(
+                    ["git", "-C", str(repo_path), "config", "--get", "remote.origin.url"],
+                    capture_output=True, text=True, timeout=10)
+                if origin.returncode == 0:
+                    origin_url = origin.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                origin_url = ""
+        wanted_url = self._norm_repo_url(value) if is_url else ""
+        if origin_url:
+            wanted_url = self._norm_repo_url(origin_url)
+        try:
+            db = sqlite3.connect(f"file:{web_db}?mode=ro", uri=True, timeout=5.0)
+            try:
+                db.row_factory = sqlite3.Row
+                tables = {row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "repos" not in tables:
+                    return None
+                for row in db.execute("SELECT id, path, url FROM repos").fetchall():
+                    if repo_path is not None and row["path"]:
+                        try:
+                            if Path(row["path"]).expanduser().resolve() == repo_path:
+                                return str(row["id"])
+                        except (OSError, ValueError):
+                            pass
+                    if wanted_url and row["url"] and self._norm_repo_url(row["url"]) == wanted_url:
+                        return str(row["id"])
+            finally:
+                db.close()
+        except sqlite3.Error:
+            return None
+        return None
 
     def get_task(self, task_id: str) -> dict[str, object]:
         with self._lock:
@@ -351,6 +463,150 @@ class SQLiteSchedulerStore:
                 "SELECT * FROM tasks ORDER BY created_at, task_id"
             ).fetchall()
         return [self._task_from_row(row) for row in rows]
+
+    # ------------------------------------------------------------------ chat sessions (Gói 2)
+    # A registry row is never deleted: archive/delete only change `status`, so the
+    # Environment -> Session -> Task trace stays readable after a session is gone.
+    SESSION_KINDS = ("chat", "review", "secretary")
+    SESSION_STATUSES = ("active", "archived", "deleted")
+    MOVE_TRIGGERS = ("picker", "task")
+
+    @staticmethod
+    def _chat_session_from_row(row: sqlite3.Row) -> dict[str, object]:
+        return {
+            "kite_session_id": row["kite_session_id"],
+            "opencode_session_id": row["opencode_session_id"],
+            "title": row["title"],
+            "environment_id": row["environment_id"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _require_session_id(value: str, name: str = "kite_session_id") -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+        return value.strip()
+
+    def create_chat_session(self, kite_session_id: str, opencode_session_id: str | None,
+                            environment_id: str, title: str | None = None,
+                            kind: str = "chat") -> dict[str, object]:
+        kite_session_id = self._require_session_id(kite_session_id)
+        environment_id = self._require_session_id(environment_id, "environment_id")
+        if kind not in self.SESSION_KINDS:
+            raise ValueError(f"kind must be one of {', '.join(self.SESSION_KINDS)}")
+        if title is not None and not isinstance(title, str):
+            raise ValueError("title must be a string or None")
+        now = int(time.time())
+        try:
+            with self._transaction() as db:
+                db.execute(
+                    """INSERT INTO chat_sessions (
+                    kite_session_id, opencode_session_id, title, environment_id, kind,
+                    status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+                    (kite_session_id, opencode_session_id, title, environment_id, kind, now, now),
+                )
+        except sqlite3.IntegrityError as error:
+            raise StoreError(f"chat session {kite_session_id} already exists") from error
+        except sqlite3.Error as error:
+            raise StoreError(f"could not create chat session {kite_session_id}: {error}") from error
+        session = self.get_chat_session(kite_session_id)
+        assert session is not None
+        return session
+
+    def get_chat_session(self, kite_session_id: str) -> dict[str, object] | None:
+        with self._lock:
+            if self._connection is None:
+                raise StoreError("scheduler store is closed")
+            row = self._connection.execute(
+                "SELECT * FROM chat_sessions WHERE kite_session_id = ?",
+                (self._require_session_id(kite_session_id),),
+            ).fetchone()
+        return self._chat_session_from_row(row) if row is not None else None
+
+    def list_chat_sessions(self, *, status: str | None = None,
+                           environment_id: str | None = None) -> list[dict[str, object]]:
+        with self._lock:
+            if self._connection is None:
+                raise StoreError("scheduler store is closed")
+            query = "SELECT * FROM chat_sessions"
+            clauses, params = [], []
+            if status is not None:
+                clauses.append("status = ?")
+                params.append(status)
+            if environment_id is not None:
+                clauses.append("environment_id = ?")
+                params.append(environment_id)
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            rows = self._connection.execute(query + " ORDER BY created_at, kite_session_id",
+                                            params).fetchall()
+        return [self._chat_session_from_row(row) for row in rows]
+
+    def set_chat_session_status(self, kite_session_id: str, status: str) -> dict[str, object]:
+        if status not in self.SESSION_STATUSES:
+            raise ValueError(f"status must be one of {', '.join(self.SESSION_STATUSES)}")
+        with self._transaction() as db:
+            row = db.execute("SELECT * FROM chat_sessions WHERE kite_session_id = ?",
+                             (self._require_session_id(kite_session_id),)).fetchone()
+            if row is None:
+                raise StoreError(f"chat session {kite_session_id} does not exist")
+            db.execute("UPDATE chat_sessions SET status = ?, updated_at = ? WHERE kite_session_id = ?",
+                       (status, int(time.time()), kite_session_id))
+        session = self.get_chat_session(kite_session_id)
+        assert session is not None
+        return session
+
+    def set_session_environment(self, kite_session_id: str, environment_id: str) -> dict[str, object]:
+        environment_id = self._require_session_id(environment_id, "environment_id")
+        with self._transaction() as db:
+            row = db.execute("SELECT * FROM chat_sessions WHERE kite_session_id = ?",
+                             (self._require_session_id(kite_session_id),)).fetchone()
+            if row is None:
+                raise StoreError(f"chat session {kite_session_id} does not exist")
+            db.execute("UPDATE chat_sessions SET environment_id = ?, updated_at = ? WHERE kite_session_id = ?",
+                       (environment_id, int(time.time()), kite_session_id))
+        session = self.get_chat_session(kite_session_id)
+        assert session is not None
+        return session
+
+    def record_session_move(self, kite_session_id: str, from_env: str, to_env: str,
+                            trigger: str, note: str | None = None) -> dict[str, object]:
+        if trigger not in self.MOVE_TRIGGERS:
+            raise ValueError(f"trigger must be one of {', '.join(self.MOVE_TRIGGERS)}")
+        from_env = self._require_session_id(from_env, "from_env")
+        to_env = self._require_session_id(to_env, "to_env")
+        now = int(time.time())
+        with self._transaction() as db:
+            row = db.execute("SELECT * FROM chat_sessions WHERE kite_session_id = ?",
+                             (self._require_session_id(kite_session_id),)).fetchone()
+            if row is None:
+                raise StoreError(f"chat session {kite_session_id} does not exist")
+            cursor = db.execute(
+                "INSERT INTO chat_session_moves (session_id, from_env, to_env, moved_at, trigger, note) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (kite_session_id, from_env, to_env, now, trigger, note),
+            )
+            db.execute("UPDATE chat_sessions SET environment_id = ?, updated_at = ? WHERE kite_session_id = ?",
+                       (to_env, now, kite_session_id))
+            move_id = cursor.lastrowid
+        return {"id": move_id, "session_id": kite_session_id, "from_env": from_env,
+                "to_env": to_env, "moved_at": now, "trigger": trigger, "note": note}
+
+    def list_session_moves(self, kite_session_id: str) -> list[dict[str, object]]:
+        with self._lock:
+            if self._connection is None:
+                raise StoreError("scheduler store is closed")
+            rows = self._connection.execute(
+                "SELECT * FROM chat_session_moves WHERE session_id = ? ORDER BY moved_at, id",
+                (self._require_session_id(kite_session_id),),
+            ).fetchall()
+        return [{"id": row["id"], "session_id": row["session_id"], "from_env": row["from_env"],
+                 "to_env": row["to_env"], "moved_at": row["moved_at"],
+                 "trigger": row["trigger"], "note": row["note"]} for row in rows]
 
     @staticmethod
     def _routing_request(task: sqlite3.Row) -> RoutingRequest:

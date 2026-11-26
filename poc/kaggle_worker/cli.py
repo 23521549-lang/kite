@@ -321,6 +321,9 @@ def _parser() -> argparse.ArgumentParser:
                            help="folder whose Git repositories tasks may use; repeat (default: home)")
     mcp_serve.add_argument("--lead-model", default=None,
                            help="model the chat uses: started on a worker as soon as the chat opens")
+    mcp_serve.add_argument("--session-id", default=None,
+                           help="id of the chat session this server belongs to (Kite generates it first; "
+                                "tasks started here are stamped with it)")
     mcp_serve.add_argument("--chat-dir", type=Path, default=None,
                            help="the chat folder (its AGENTS.md gets what the person asks the chat to remember)")
     chat = commands.add_parser("chat", help="Vietnamese chat with the Kite lead agent (OpenCode)")
@@ -328,8 +331,12 @@ def _parser() -> argparse.ArgumentParser:
     chat_setup = chat_commands.add_parser("setup", help="create a chat folder with opencode.json and AGENTS.md")
     chat_setup.add_argument("--dir", type=Path, default=Path.home() / "kite-chat")
     chat_setup.add_argument("--model", help="lead model (default: qwen3.6-fast when configured)")
+    chat_setup.add_argument("--session-id", default=None,
+                            help="id of the chat session this folder belongs to (written into the MCP "
+                                 "command as --session-id; without it the folder is the legacy single chat)")
     chat_setup.add_argument("--allow-root", action="append", type=Path, default=[],
-                            help="folder whose Git repositories tasks may use; repeat (default: home)")
+                            help="folder whose Git repositories tasks may use; repeat (default: home, "
+                                 "or the session folder itself when --session-id is given)")
     chat_setup.add_argument("--force", action="store_true", help="overwrite opencode.json and AGENTS.md")
     chat_setup.add_argument("--no-reload", action="store_true",
                             help="only write the files (do not stop a running OpenCode: used by kite update)")
@@ -839,6 +846,8 @@ def _chat_setup_again(config_path: Path) -> dict:
             extra += ["--model", command[i + 1]]
         elif value == "--allow-root":
             extra += ["--allow-root", command[i + 1]]
+        elif value == "--session-id":
+            extra += ["--session-id", command[i + 1]]
     done = subprocess.run([*_kite_executable(), "--config", str(config_path), "chat", "setup", "--force",
                            "--no-reload", "--dir", str(chat_dir), *extra], capture_output=True, text=True)
     return {"chat": "đã viết lại opencode.json và AGENTS.md" if done.returncode == 0
@@ -1536,6 +1545,7 @@ def _mcp_command(args: argparse.Namespace) -> int:
     config = _load_operator_config(args)
     ops = KiteOps(config, db_path=_db_path(args), state_dir=args.config.parent,
                   allowed_roots=args.allow_root or [Path.home()], chat_dir=args.chat_dir,
+                  session_id=args.session_id,
                   kite_command=[*_kite_executable(), "--config", str(args.config.resolve())],
                   config_path=args.config.resolve())
     # The chat just opened: start a worker for the lead model now, while the person types.
@@ -1664,8 +1674,14 @@ def _chat_command(args: argparse.Namespace) -> int:
     if lead not in models:
         raise ConfigError(f"model {lead} is not served by the gateway ({', '.join(models)})")
     roots = [Path(root).expanduser().resolve() for root in (args.allow_root or [Path.home()])]
+    if args.session_id and not args.allow_root:
+        # A session folder on its own: the Default session sees only its chat folder, so
+        # start_task on any repo is refused until the session moves to a repo (Gói 2, chặn cứng).
+        roots = [target]
     command = [*_kite_executable(), "--config", str(args.config.resolve()), "mcp", "serve", "--lead-model", lead,
                "--chat-dir", str(target)]
+    if args.session_id:
+        command += ["--session-id", args.session_id]
     for root in roots:
         command += ["--allow-root", str(root)]
     target.mkdir(parents=True, exist_ok=True)
@@ -1679,6 +1695,8 @@ def _chat_command(args: argparse.Namespace) -> int:
     stopped = [] if args.no_reload else stop_stale_chat_processes(args.config)
     report = {"chat_dir": str(target), "lead_model": lead, "allowed_roots": [str(r) for r in roots],
               "stopped": stopped, "next": f"cd {target} && opencode"}
+    if args.session_id:
+        report["session_id"] = args.session_id
     # "Always allow" in OpenCode is saved for every project and outlives opencode.json: check it.
     if args.clear_approvals:
         report["approvals"] = clear_shell_approvals()

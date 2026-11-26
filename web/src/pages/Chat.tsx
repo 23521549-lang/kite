@@ -28,6 +28,7 @@ import {
 import { useMediaQuery } from '@mantine/hooks'
 import {
   IconAlertTriangle,
+  IconArchive,
   IconCheck,
   IconChevronDown,
   IconChevronRight,
@@ -40,7 +41,21 @@ import {
   IconPencil,
 } from '@tabler/icons-react'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { del, get, patch, post, qs } from '../api'
+import {
+  archiveChatSession,
+  createChatSession,
+  del,
+  envDisplayName,
+  get,
+  listChatSessions,
+  listEnvironments,
+  moveChatSession,
+  patch,
+  post,
+  qs,
+  type EnvironmentRow,
+  type KiteChatSession,
+} from '../api'
 import { ConfirmButton, JsonView, Loading, Markdown } from '../components/common'
 import { go } from '../router'
 import { useT, type DictKey, type TFunction } from '../i18n'
@@ -161,10 +176,21 @@ function parseJson(text: string): any {
 // ---------------------------------------------------------------- the page
 export default function Chat({ parts }: { parts: string[] }) {
   const t = useT()
+  // Route param is a Kite session id; legacy OpenCode ids still work because
+  // the conversation falls back to using the id as the OpenCode id directly.
   const sessionId = parts[0] ?? null
   const wide = useMediaQuery('(min-width: 62em)')
   const { data: info, error: infoError, reload: reloadInfo } = useLoad(() => get<ChatInfo>('/api/chat/info'), [], 30000)
+  // Kite session registry (Gói 2 contract). Missing endpoint (worker (a) not
+  // merged yet) degrades to the legacy OpenCode-only list below.
+  const { data: kiteSessions, reload: reloadKite } = useLoad(() => listChatSessions().catch(() => [] as KiteChatSession[]), [])
+  const { data: envs } = useLoad(() => listEnvironments().catch(() => [] as EnvironmentRow[]), [])
   const [sessions, setSessions] = useState<Session[] | null>(null)
+
+  const kiteById = useMemo(() => new Map((kiteSessions ?? []).map((s) => [s.kite_session_id, s])), [kiteSessions])
+  const envById = useMemo(() => new Map((envs ?? []).map((e) => [e.id, e])), [envs])
+  const currentKite = sessionId ? kiteById.get(sessionId) : undefined
+  const opencodeId = currentKite?.opencode_session_id ?? sessionId
 
   const loadSessions = useCallback(async () => {
     if (!info?.chat_dir) return
@@ -177,11 +203,28 @@ export default function Chat({ parts }: { parts: string[] }) {
     }
   }, [info?.chat_dir, t])
 
+  const reloadAll = useCallback(() => {
+    loadSessions()
+    reloadKite()
+  }, [loadSessions, reloadKite])
+
   useEffect(() => {
     if (info?.opencode.reachable && info.ready) loadSessions()
   }, [info?.opencode.reachable, info?.ready, loadSessions])
 
   async function newSession() {
+    // New sessions start in Default; the environment picker (Default only)
+    // can move them to a repo afterwards.
+    try {
+      const created = await createChatSession({ environment_id: 'default' })
+      if (created?.kite_session_id) {
+        await reloadAll()
+        go(`/chat/${created.kite_session_id}`)
+        return
+      }
+    } catch {
+      // Back end not there yet: fall back to a plain OpenCode session.
+    }
     const res = await attempt(() => post<{ data: Session }>(`${OC}/session`, {}))
     if (res) {
       await loadSessions()
@@ -213,9 +256,11 @@ export default function Chat({ parts }: { parts: string[] }) {
   const list = (
     <SessionList
       sessions={sessions}
+      kiteSessions={kiteSessions ?? []}
+      envById={envById}
       current={sessionId}
       onNew={newSession}
-      onChanged={loadSessions}
+      onChanged={reloadAll}
     />
   )
   return (
@@ -231,7 +276,11 @@ export default function Chat({ parts }: { parts: string[] }) {
             <Select
               style={{ flex: 1 }}
               placeholder={t('chat.select-session')}
-              data={(sessions ?? []).map((s) => ({ value: s.id, label: s.title || t('chat.untitled-session') }))}
+              data={(sessions ?? []).map((s) => {
+                const k = kiteById.get(s.id)
+                const envName = k?.environment_id ? (envById.get(k.environment_id)?.display_name ?? envById.get(k.environment_id)?.name ?? k.environment_id) : null
+                return { value: k?.kite_session_id ?? s.id, label: `${s.title || t('chat.untitled')}${envName ? ` · ${envName}` : ''}` }
+              })}
               value={sessionId}
               onChange={(v) => v && go(`/chat/${v}`)}
               searchable
@@ -246,8 +295,16 @@ export default function Chat({ parts }: { parts: string[] }) {
             {versionNote}
           </Alert>
         ) : null}
-        {sessionId ? (
-          <Conversation key={sessionId} sessionId={sessionId} chatDir={info.chat_dir!} onSessionsChanged={loadSessions} />
+        {opencodeId ? (
+          <Conversation
+            key={opencodeId}
+            sessionId={opencodeId}
+            kiteSession={currentKite ?? null}
+            envs={envs ?? []}
+            chatDir={info.chat_dir!}
+            onSessionsChanged={reloadAll}
+            onKiteChanged={reloadKite}
+          />
         ) : (
           <Stack align="center" justify="center" style={{ flex: 1 }} p="xl">
             <Text c="dimmed" ta="center">
@@ -283,18 +340,55 @@ function chatProblem(info: ChatInfo, t: TFunction): ReactNode {
   return null
 }
 
+type SessionRow = {
+  key: string
+  kiteId: string | null
+  ocId: string | null
+  title: string
+  updated: number | null
+  envId: string | null
+}
+
 function SessionList({
   sessions,
+  kiteSessions,
+  envById,
   current,
   onNew,
   onChanged,
 }: {
   sessions: Session[] | null
+  kiteSessions: KiteChatSession[]
+  envById: Map<string, EnvironmentRow>
   current: string | null
   onNew: () => void
   onChanged: () => void
 }) {
   const t = useT()
+  // Union of the Kite registry (source of truth for environment + status)
+  // and the OpenCode list (legacy sessions not in the registry yet).
+  const rows: SessionRow[] = useMemo(() => {
+    const byOc = new Map<string, SessionRow>()
+    const list: SessionRow[] = (kiteSessions ?? [])
+      .filter((k) => k.status !== 'archived')
+      .map((k) => {
+        const row: SessionRow = {
+          key: k.kite_session_id,
+          kiteId: k.kite_session_id,
+          ocId: k.opencode_session_id ?? null,
+          title: k.title || t('chat.untitled'),
+          updated: k.updated_at ? new Date(k.updated_at).getTime() : null,
+          envId: k.environment_id ?? 'default',
+        }
+        if (row.ocId) byOc.set(row.ocId, row)
+        return row
+      })
+    for (const s of sessions ?? []) {
+      if (s.parentID || s.time.archived || byOc.has(s.id)) continue
+      list.push({ key: s.id, kiteId: null, ocId: s.id, title: s.title || t('chat.untitled'), updated: s.time.updated, envId: null })
+    }
+    return list.sort((a, b) => (b.updated ?? 0) - (a.updated ?? 0))
+  }, [sessions, kiteSessions, t])
   return (
     <>
       <Box p="xs">
@@ -303,36 +397,49 @@ function SessionList({
         </Button>
       </Box>
       <ScrollArea style={{ flex: 1 }} px="xs">
-        {sessions === null ? (
+        {sessions === null && kiteSessions.length === 0 ? (
           <Loading />
-        ) : sessions.length === 0 ? (
+        ) : rows.length === 0 ? (
           <Text c="dimmed" size="sm" p="xs">
             {t('chat.no-sessions')}
           </Text>
         ) : (
           <Stack gap={2} pb="md">
-            {sessions.map((s) => (
-              <Group
-                key={s.id}
-                gap={4}
-                wrap="nowrap"
-                px={8}
-                py={6}
-                className="clickable"
-                style={{ borderRadius: 8, background: s.id === current ? 'var(--mantine-color-default-hover)' : undefined }}
-                onClick={() => go(`/chat/${s.id}`)}
-              >
-                <Box style={{ flex: 1, minWidth: 0 }}>
-                  <Text size="sm" truncate fw={s.id === current ? 600 : 400}>
-                    {s.title || t('chat.untitled-session')}
-                  </Text>
-                  <Text size="xs" c="dimmed">
-                    {ago(s.time.updated)}
-                  </Text>
-                </Box>
-                <SessionMenu session={s} onChanged={onChanged} />
-              </Group>
-            ))}
+            {rows.map((s) => {
+              const env = s.envId ? envById.get(s.envId) : undefined
+              const envName = s.envId === 'default' ? t('chat.environment-default') : (env ? envDisplayName(env) : (s.envId ?? ''))
+              return (
+                <Group
+                  key={s.key}
+                  gap={4}
+                  wrap="nowrap"
+                  px={8}
+                  py={6}
+                  className="clickable"
+                  style={{ borderRadius: 8, background: s.key === current ? 'var(--mantine-color-default-hover)' : undefined }}
+                  onClick={() => go(`/chat/${s.key}`)}
+                >
+                  <Box style={{ flex: 1, minWidth: 0 }}>
+                    <Text size="sm" truncate fw={s.key === current ? 600 : 400}>
+                      {s.title}
+                    </Text>
+                    <Group gap={4}>
+                      {s.envId ? (
+                        <Badge size="xs" variant="light" color={s.envId === 'default' ? 'gray' : 'indigo'}>
+                          {envName}
+                        </Badge>
+                      ) : null}
+                      {s.updated ? (
+                        <Text size="xs" c="dimmed">
+                          {ago(s.updated)}
+                        </Text>
+                      ) : null}
+                    </Group>
+                  </Box>
+                  <SessionMenu row={s} onChanged={onChanged} />
+                </Group>
+              )
+            })}
           </Stack>
         )}
       </ScrollArea>
@@ -340,10 +447,10 @@ function SessionList({
   )
 }
 
-function SessionMenu({ session, onChanged }: { session: Session; onChanged: () => void }) {
+function SessionMenu({ row, onChanged }: { row: SessionRow; onChanged: () => void }) {
   const t = useT()
   const [renaming, setRenaming] = useState(false)
-  const [title, setTitle] = useState(session.title ?? '')
+  const [title, setTitle] = useState(row.title)
   if (renaming)
     return (
       <TextInput
@@ -354,8 +461,8 @@ function SessionMenu({ session, onChanged }: { session: Session; onChanged: () =
         onChange={(e) => setTitle(e.currentTarget.value)}
         onBlur={() => setRenaming(false)}
         onKeyDown={async (e) => {
-          if (e.key === 'Enter') {
-            await attempt(() => patch(`${OC}/session/${session.id}`, { title }))
+          if (e.key === 'Enter' && row.ocId) {
+            await attempt(() => patch(`${OC}/session/${row.ocId}`, { title }))
             setRenaming(false)
             onChanged()
           } else if (e.key === 'Escape') setRenaming(false)
@@ -370,29 +477,66 @@ function SessionMenu({ session, onChanged }: { session: Session; onChanged: () =
         </ActionIcon>
       </Menu.Target>
       <Menu.Dropdown onClick={(e) => e.stopPropagation()}>
-        <Menu.Item leftSection={<IconPencil size={14} />} onClick={() => setRenaming(true)}>
-          {t('chat.rename')}
-        </Menu.Item>
-        <Menu.Item
-          leftSection={<IconTrash size={14} />}
-          color="red"
-          onClick={async () => {
-            if (!confirm(t('chat.delete-session-confirm'))) return
-            await attempt(() => del(`${OC}/session/${session.id}`))
-            onChanged()
-            go('/chat')
-          }}
-        >
-          {t('chat.delete')}
-        </Menu.Item>
+        {row.ocId ? (
+          <Menu.Item leftSection={<IconPencil size={14} />} onClick={() => setRenaming(true)}>
+            {t('chat.rename')}
+          </Menu.Item>
+        ) : null}
+        {row.kiteId ? (
+          <Menu.Item
+            leftSection={<IconArchive size={14} />}
+            onClick={async () => {
+              const res = await attempt(() => archiveChatSession(row.kiteId!), t('chat.archived'))
+              if (res !== undefined) {
+                onChanged()
+                go('/chat')
+              }
+            }}
+          >
+            {t('chat.archive')}
+          </Menu.Item>
+        ) : null}
+        {row.ocId ? (
+          <Menu.Item
+            leftSection={<IconTrash size={14} />}
+            color="red"
+            onClick={async () => {
+              if (!confirm(t('chat.delete-session-confirm-oc'))) return
+              await attempt(() => del(`${OC}/session/${row.ocId}`))
+              onChanged()
+              go('/chat')
+            }}
+          >
+            {t('chat.delete')}
+          </Menu.Item>
+        ) : null}
       </Menu.Dropdown>
     </Menu>
   )
 }
 
 // ---------------------------------------------------------------- one conversation
-function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: string; chatDir: string; onSessionsChanged: () => void }) {
+function Conversation({
+  sessionId,
+  kiteSession,
+  envs,
+  chatDir,
+  onSessionsChanged,
+  onKiteChanged,
+}: {
+  sessionId: string
+  kiteSession: KiteChatSession | null
+  envs: EnvironmentRow[]
+  chatDir: string
+  onSessionsChanged: () => void
+  onKiteChanged: () => void
+}) {
   const t = useT()
+  const envId = kiteSession?.environment_id ?? 'default'
+  const env = envs.find((e) => e.id === envId)
+  const isDefault = envId === 'default'
+  const [pickedEnv, setPickedEnv] = useState(envId)
+  useEffect(() => setPickedEnv(envId), [envId])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[] | null>(null)
   const [live, setLive] = useState<Live | null>(null)
@@ -565,13 +709,52 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
     if (ok !== undefined) setPermissions((ps) => ps.filter((x) => x.id !== p.id))
   }
 
+  // Environment picker (Claude-app style): only Default sessions show it.
+  // Picking a repo moves the session there for good (one-way, per contract).
+  async function moveEnv(to: string) {
+    if (!kiteSession || to === envId) return
+    setPickedEnv(to)
+    const res = await attempt(() => moveChatSession(kiteSession.kite_session_id, to))
+    if (res === undefined) setPickedEnv(envId)
+    else onKiteChanged()
+  }
+
+  const envPicker: ReactNode = !kiteSession ? null : isDefault ? (
+    <Stack gap={2} maw={900} mx="auto" mb="xs">
+      <Select
+        size="xs"
+        label={t('chat.picker-label')}
+        description={t('chat.picker-help')}
+        placeholder={t('chat.picker-placeholder')}
+        data={[
+          { value: 'default', label: t('chat.environment-default') },
+          ...envs
+            .filter((e) => e.id !== 'default')
+            .map((e) => ({ value: e.id, label: envDisplayName(e) })),
+        ]}
+        value={pickedEnv}
+        onChange={(v) => v && moveEnv(v)}
+        allowDeselect={false}
+      />
+    </Stack>
+  ) : (
+    <Text size="xs" c="dimmed" maw={900} mx="auto" mb="xs">
+      {t('chat.picker-locked')}
+    </Text>
+  )
+
   return (
     <>
       <Group px="md" py={8} justify="space-between" wrap="nowrap" style={{ borderBottom: '1px solid var(--mantine-color-default-border)' }}>
         <Box style={{ minWidth: 0 }}>
-          <Text fw={600} truncate>
-            {session?.title || t('chat.untitled-session')}
-          </Text>
+          <Group gap="xs" wrap="nowrap">
+            <Text fw={600} truncate>
+              {session?.title || t('chat.untitled')}
+            </Text>
+            <Badge size="sm" variant="light" color={isDefault ? 'gray' : 'indigo'}>
+              {isDefault ? t('chat.environment-default') : env ? envDisplayName(env) : envId}
+            </Badge>
+          </Group>
           {session?.tokens ? (
             <Text size="xs" c="dimmed">
               {t('chat.tokens', { input: session.tokens.input.toLocaleString('vi-VN'), output: session.tokens.output.toLocaleString('vi-VN') })}
@@ -610,7 +793,11 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
       >
         <Stack gap="md" p="md" maw={900} mx="auto">
           {error ? <Alert color="red">{error}</Alert> : null}
-          {messages === null ? <Loading /> : messages.length === 0 && !live ? <Text c="dimmed">{t('chat.empty-start')}</Text> : null}
+          {messages === null ? (
+            <Loading />
+          ) : messages.length === 0 && !live ? (
+            <ContextCard env={env ?? null} envId={envId} isDefault={isDefault} />
+          ) : null}
           {(messages ?? []).map((m) => (
             <MessageView key={m.id} message={m} />
           ))}
@@ -636,8 +823,47 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
           ))}
         </Stack>
       </ScrollArea>
-      <Composer busy={busy} onSend={send} onStop={() => attempt(() => post(`${OC}/session/${sessionId}/interrupt`, {}))} />
+      <Composer
+        busy={busy}
+        envPicker={envPicker}
+        onSend={send}
+        onStop={() => attempt(() => post(`${OC}/session/${sessionId}/interrupt`, {}))}
+      />
     </>
+  )
+}
+
+// Context card shown at the start of a session: which environment this
+// session belongs to, what the agent knows about it, and a link to the
+// environment's Context section.
+function ContextCard({ env, envId, isDefault }: { env: EnvironmentRow | null; envId: string; isDefault: boolean }) {
+  const t = useT()
+  const lessons = env?.lessons ?? env?.lesson_count ?? null
+  return (
+    <Card withBorder>
+      <Text fw={600}>{t('chat.context-title')}</Text>
+      {isDefault ? (
+        <Text size="sm" c="dimmed" mt={4}>
+          {t('chat.context-default')}
+        </Text>
+      ) : (
+        <Stack gap={4} mt={4}>
+          <Text size="sm">
+            <b>{env ? envDisplayName(env) : envId}</b>
+            {env?.description ? ` — ${env.description}` : ''}
+          </Text>
+          <Text size="sm" c="dimmed">
+            {lessons !== null ? `${lessons} ${t('env.lessons')}` : ''}
+            {env?.branch ? ` · ${t('env.branch')}: ${env.branch}` : ''}
+          </Text>
+          <Group>
+            <Button size="xs" variant="light" onClick={() => go(`/environments/${encodeURIComponent(envId)}/context`)}>
+              {t('chat.context-open')}
+            </Button>
+          </Group>
+        </Stack>
+      )}
+    </Card>
   )
 }
 
@@ -975,7 +1201,7 @@ function FormCard({ form, sessionId, onDone }: { form: Form; sessionId: string; 
   )
 }
 
-function Composer({ busy, onSend, onStop }: { busy: boolean; onSend: (text: string) => Promise<boolean>; onStop: () => void }) {
+function Composer({ busy, envPicker, onSend, onStop }: { busy: boolean; envPicker?: ReactNode; onSend: (text: string) => Promise<boolean>; onStop: () => void }) {
   const t = useT()
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
@@ -988,6 +1214,7 @@ function Composer({ busy, onSend, onStop }: { busy: boolean; onSend: (text: stri
   }
   return (
     <Box p="sm" style={{ borderTop: '1px solid var(--mantine-color-default-border)' }}>
+      {envPicker}
       <Group gap="xs" align="flex-end" wrap="nowrap" maw={900} mx="auto">
         <Textarea
           style={{ flex: 1 }}

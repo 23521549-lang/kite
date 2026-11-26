@@ -112,7 +112,17 @@ export type WorkerRow = {
   pod?: { provider: string; id: string; port: number; price_hour?: number | null; idle_minutes: number }
 }
 
-export type TaskRow = { task_id: string; state: string; task_type: string; goal: string; created: string }
+export type TaskRow = {
+  task_id: string
+  state: string
+  task_type: string
+  goal: string
+  created: string
+  chat_session_id?: string | null
+  environment_id?: string | null
+  main_repo?: string | null
+  last_apply_error?: ApplyError | null
+}
 
 export type Activity = {
   task_id: string
@@ -142,4 +152,208 @@ export type ProviderType = {
   fields: string[]
   secrets: string[]
   note: string
+}
+
+// ---------------------------------------------------------------- Gói 2: environments + chat sessions (contract in
+// kite-ui-build/HOP-DONG-GIAO-TIEP.md, section Gói 2). The back end for
+// these endpoints is built by worker (a) in parallel; every field the UI
+// shows is optional so the page still renders when the server returns a
+// subset, and list calls accept either `{items: [...]}` or a bare array.
+export type EnvironmentKind = 'default' | 'github' | 'local' | string
+
+export type EnvironmentRow = {
+  id: string
+  name?: string | null
+  display_name?: string | null
+  kind?: EnvironmentKind
+  owner?: string | null
+  repo?: string | null
+  url?: string | null
+  path?: string | null
+  branch?: string | null
+  head?: string | null
+  clean?: boolean | null
+  last_sync?: number | string | null
+  last_synced_at?: number | string | null
+  sessions?: number | null
+  session_count?: number | null
+  tasks?: number | null
+  task_count?: number | null
+  lessons?: number | null
+  lesson_count?: number | null
+  spend_month_usd?: number | null
+  description?: string | null
+  has_pat?: boolean | null
+  recent_commits?: string | string[] | null
+}
+
+export type EnvironmentList = { environments: EnvironmentRow[] }
+
+export function envDisplayName(e: EnvironmentRow): string {
+  return e.display_name ?? e.name ?? e.repo ?? e.id
+}
+
+export function envRepoLabel(e: EnvironmentRow): string | null {
+  if (e.owner && e.repo) return `${e.owner}/${e.repo}`
+  if (e.repo) return e.repo
+  if (e.url) return e.url.replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$/, '')
+  return null
+}
+
+export function envSessionCount(e: EnvironmentRow): number | null {
+  return e.sessions ?? e.session_count ?? null
+}
+
+export function envTaskCount(e: EnvironmentRow): number | null {
+  return e.tasks ?? e.task_count ?? null
+}
+
+export function envLessonCount(e: EnvironmentRow): number | null {
+  return e.lessons ?? e.lesson_count ?? null
+}
+
+export function envLastSync(e: EnvironmentRow): number | string | null {
+  return e.last_sync ?? e.last_synced_at ?? null
+}
+
+export async function listEnvironments(): Promise<EnvironmentRow[]> {
+  const data = await get<EnvironmentList | EnvironmentRow[]>('/api/environments')
+  if (Array.isArray(data)) return data
+  return data.environments ?? []
+}
+
+export async function createEnvironment(body: {
+  name: string
+  path: string
+  url?: string
+}): Promise<EnvironmentRow> {
+  // Matches the real back end (worker (a)): EnvIn is {name, path, url}.
+  // There is no branch/PAT field at creation; PAT is set afterwards on the
+  // environment detail page (POST /api/environments/{id}/pat).
+  return post<EnvironmentRow>('/api/environments', body)
+}
+
+export async function syncEnvironment(id: string): Promise<unknown> {
+  return post(`/api/environments/${encodeURIComponent(id)}/sync`)
+}
+
+export async function deleteEnvironment(id: string): Promise<unknown> {
+  return del(`/api/environments/${encodeURIComponent(id)}`)
+}
+
+export async function saveEnvironmentPat(id: string, pat: string): Promise<unknown> {
+  return post(`/api/environments/${encodeURIComponent(id)}/pat`, { pat })
+}
+
+export async function deleteEnvironmentPat(id: string): Promise<unknown> {
+  return del(`/api/environments/${encodeURIComponent(id)}/pat`)
+}
+
+export type KiteChatSession = {
+  kite_session_id: string
+  opencode_session_id?: string | null
+  title?: string | null
+  environment_id?: string | null
+  kind?: string | null
+  status?: string | null
+  created_at?: number | string | null
+  updated_at?: number | string | null
+}
+
+export type ChatSessionList = { sessions: KiteChatSession[] }
+
+export async function listChatSessions(): Promise<KiteChatSession[]> {
+  const data = await get<ChatSessionList | KiteChatSession[]>('/api/chat/sessions')
+  if (Array.isArray(data)) return data
+  return data.sessions ?? []
+}
+
+export async function createChatSession(body: { environment_id?: string; title?: string; kind?: string } = {}): Promise<KiteChatSession> {
+  return post<KiteChatSession>('/api/chat/sessions', body)
+}
+
+export async function moveChatSession(id: string, toEnv: string): Promise<unknown> {
+  return post(`/api/chat/sessions/${encodeURIComponent(id)}/move`, { to_env: toEnv })
+}
+
+export async function archiveChatSession(id: string): Promise<unknown> {
+  return post(`/api/chat/sessions/${encodeURIComponent(id)}/archive`)
+}
+
+export async function deleteChatSession(id: string): Promise<unknown> {
+  return del(`/api/chat/sessions/${encodeURIComponent(id)}`)
+}
+
+export type SessionMove = {
+  session_id?: string
+  from_env?: string | null
+  to_env?: string | null
+  moved_at?: number | string | null
+  trigger?: string | null
+}
+
+export async function listSessionMoves(id: string): Promise<SessionMove[]> {
+  const data = await get<{ moves: SessionMove[] } | SessionMove[]>(`/api/chat/sessions/${encodeURIComponent(id)}/moves`)
+  if (Array.isArray(data)) return data
+  return data.moves ?? []
+}
+
+// Gói 10 experience API, consumed by the environment detail page (Gói 2 owns the UI).
+export type ExperienceDoc = {
+  repo?: string
+  version?: number | null
+  updated_at?: string | null
+  content?: string | null
+  has_doc?: boolean | null
+  pending?: { id?: string; version?: number | null; created_at?: string | null } | null
+}
+
+export async function getExperience(repo: string): Promise<ExperienceDoc> {
+  return get<ExperienceDoc>(`/api/repos/experience${qs({ repo })}`)
+}
+
+export async function getExperienceDiff(id: string): Promise<string> {
+  const res = await fetch(`/api/repos/experience/${encodeURIComponent(id)}/diff`, { credentials: 'same-origin' })
+  return res.ok ? await res.text() : ''
+}
+
+export async function approveExperience(id: string): Promise<unknown> {
+  return post(`/api/repos/experience/${encodeURIComponent(id)}/approve`)
+}
+
+export async function rejectExperience(id: string): Promise<unknown> {
+  return post(`/api/repos/experience/${encodeURIComponent(id)}/reject`)
+}
+
+// Existing repo-status endpoint, reused for git info on the environment
+// detail page (GET /api/environments itself carries no branch/HEAD).
+export type RepoStatus = {
+  repo?: string
+  branch?: string | null
+  head?: string | null
+  changes?: string | null
+  diff_stat?: string | null
+  recent_commits?: string | null
+}
+
+export async function getRepoStatus(path: string): Promise<RepoStatus> {
+  return get<RepoStatus>(`/api/repos/status${qs({ repo: path })}`)
+}
+
+// Gói 2/Gói 3: re-run a task whose patch failed to apply (only for
+// `apply_conflict`; see HOP-DONG-GIAO-TIEP.md Gói 2 + Gói 3).
+export type ApplyError = {
+  code?: string
+  head?: string | null
+  failed_files?: string[] | null
+  at?: number | string | null
+  task_id?: string | null
+}
+
+export async function rerunTask(taskId: string): Promise<{ task_id: string }> {
+  return post<{ task_id: string }>(`/api/tasks/${encodeURIComponent(taskId)}/rerun`)
+}
+
+export async function dismissApplyError(taskId: string): Promise<unknown> {
+  return post(`/api/tasks/${encodeURIComponent(taskId)}/apply-error/dismiss`)
 }
