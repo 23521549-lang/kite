@@ -1,18 +1,20 @@
 import { Alert, Badge, Button, Card, Group, Modal, SimpleGrid, Stack, Switch, Text, Title } from '@mantine/core'
 import { useState } from 'react'
 import { get, post, type WorkerRow } from '../api'
-import { Bars, Dot, Empty, KeyValue, Loading, Page } from '../components/common'
+import { Bars, Dot, Empty, KeyValue, Loading, Page, useWorkerStateLabel } from '../components/common'
+import { useT } from '../i18n'
 import KaggleScreen from '../components/KaggleScreen'
 import { attempt, duration, notifyError, notifyOk, short, usd, useLoad, workerState } from '../util'
 
 export default function Workers() {
+  const t = useT()
   const { data, error, reload } = useLoad(() => get<{ gateway_up: boolean; workers: WorkerRow[] }>('/api/workers'), [], 5000)
   const spend = useLoad(() => get<{ days: { day: string; usd: number; workers: Record<string, number> }[] }>('/api/spend?days=31'), [], 60000)
   const [screen, setScreen] = useState<string | null>(null)
   if (!data) return <Loading error={error} />
   return (
-    <Page title="Worker">
-      {!data.gateway_up ? <Alert color="red">Gateway không trả lời: tình trạng worker có thể chưa đúng.</Alert> : null}
+    <Page title={t('workers.title')}>
+      {!data.gateway_up ? <Alert color="red">{t('workers.gateway-down')}</Alert> : null}
       {data.workers.length ? (
         <SimpleGrid cols={{ base: 1, lg: 2 }}>
           {data.workers.map((w) => (
@@ -20,15 +22,15 @@ export default function Workers() {
           ))}
         </SimpleGrid>
       ) : (
-        <Empty>Chưa có worker: thêm ở tab Provider.</Empty>
+        <Empty>{t('workers.no-workers')}</Empty>
       )}
       <Card withBorder>
         <Title order={5} mb="xs">
-          Chi phí 31 ngày
+          {t('workers.spend-31')}
         </Title>
         <Bars items={(spend.data?.days ?? []).map((d) => ({ label: d.day.slice(5), value: d.usd }))} format={(v) => usd(v)} color="teal" />
       </Card>
-      <Modal opened={!!screen} onClose={() => setScreen(null)} title="Trình duyệt Kite (kaggle.com)" size="90%" keepMounted={false}>
+      <Modal opened={!!screen} onClose={() => setScreen(null)} title={t('workers.kaggle-browser')} size="90%" keepMounted={false}>
         {screen ? <KaggleScreen worker={screen} /> : null}
       </Modal>
     </Page>
@@ -36,13 +38,15 @@ export default function Workers() {
 }
 
 function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onChanged: () => void; onScreen: () => void }) {
+  const t = useT()
+  const workerStateLabel = useWorkerStateLabel()
   const [starting, setStarting] = useState(false)
   const st = workerState(w)
   const api = w.type === 'openai' || w.type === 'anthropic'
   const start = w.start ?? null
   async function turnOn() {
     setStarting(true)
-    if (!api) notifyOk('Đang bật worker; Kaggle hoặc máy thuê có thể mất vài phút.')
+    if (!api) notifyOk(t('workers.starting-note'))
     try {
       const res = await post(`/api/workers/${w.id}/start`, {})
       if (res?.state === 'none' || res?.error) notifyError(res.detail ?? res.error)
@@ -64,17 +68,17 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
           </Badge>
         </Group>
         <Badge color={st.color} variant="light">
-          {st.label}
+          {workerStateLabel(st.key)}
         </Badge>
       </Group>
       <Stack gap="xs" mt="sm">
         <KeyValue
           rows={[
-            ['Model', w.loaded_model ? `${w.loaded_model} (đang nạp)` : w.models.join(', ')],
-            ['Việc', w.alive ? `${w.running}/${w.slots ?? w.concurrency} đang chạy` : '—'],
-            ['Tín hiệu gần nhất', w.seconds_since_heartbeat !== null && w.seconds_since_heartbeat !== undefined ? `${duration(w.seconds_since_heartbeat)} trước` : '—'],
-            ['Đã chi', `${usd(w.spend.today_usd)} hôm nay · ${usd(w.spend.month_usd)} tháng này`],
-            ...(w.version ? ([['Phiên bản', w.version]] as [string, string][]) : []),
+            [t('workers.card.model'), w.loaded_model ? t('workers.card.loading-model', { model: w.loaded_model }) : w.models.join(', ')],
+            [t('workers.card.jobs'), w.alive ? t('workers.card.jobs-running', { running: w.running, slots: w.slots ?? w.concurrency }) : '—'],
+            [t('workers.card.last-signal'), w.seconds_since_heartbeat !== null && w.seconds_since_heartbeat !== undefined ? t('workers.card.last-signal-ago', { duration: duration(w.seconds_since_heartbeat) }) : '—'],
+            [t('workers.card.spent'), t('workers.card.spent-value', { today: usd(w.spend.today_usd), month: usd(w.spend.month_usd) })],
+            ...(w.version ? ([[t('workers.card.version'), w.version]] as [string, string][]) : []),
           ]}
         />
         {start ? (
@@ -88,7 +92,7 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
         <Group gap="lg">
           {api ? (
             <Switch
-              label="Bật (nhận việc)"
+              label={t('workers.switch.on')}
               checked={w.switch.on}
               onChange={async (e) => {
                 const on = e.currentTarget.checked
@@ -99,7 +103,7 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
           ) : null}
           {!api ? (
             <Switch
-              label="Tự bật khi tôi chat"
+              label={t('workers.switch.auto')}
               checked={w.switch.auto}
               onChange={async (e) => {
                 const on = e.currentTarget.checked
@@ -110,11 +114,11 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
           ) : null}
           {w.kaggle ? (
             <Switch
-              label="Kite tự bấm"
+              label={t('workers.switch.auto-click')}
               checked={w.kaggle.auto_click}
               onChange={async (e) => {
                 const on = e.currentTarget.checked
-                if (on && !confirm('Bật "Kite tự bấm"? Điều khoản Kaggle cấm thao tác tự động ngoài API; bạn chịu rủi ro tài khoản.')) return
+                if (on && !confirm(t('workers.auto-click-confirm'))) return
                 await attempt(() => post(`/api/workers/${w.id}/auto-click`, { on }))
                 onChanged()
               }}
@@ -124,7 +128,7 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
         <Group gap="xs">
           {!api && !w.alive ? (
             <Button size="xs" loading={starting} onClick={turnOn}>
-              Bật ngay
+              {t('workers.start-now')}
             </Button>
           ) : null}
           {!api && (w.alive || start) ? (
@@ -133,11 +137,11 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
               variant="light"
               color="red"
               onClick={async () => {
-                await attempt(() => post(`/api/workers/${w.id}/stop`, {}), 'Đã yêu cầu dừng')
+                await attempt(() => post(`/api/workers/${w.id}/stop`, {}), t('workers.stop-requested'))
                 onChanged()
               }}
             >
-              Dừng
+              {t('workers.stop')}
             </Button>
           ) : null}
           {w.kaggle ? (
@@ -149,12 +153,12 @@ function WorkerCard({ worker: w, onChanged, onScreen }: { worker: WorkerRow; onC
                 await attempt(() => post(`/api/workers/${w.id}/browser`, {}))
               }}
             >
-              Trình duyệt Kaggle
+              {t('workers.kaggle-browser-btn')}
             </Button>
           ) : null}
           {w.kaggle ? (
             <Button size="xs" variant="subtle" component="a" href={w.kaggle.url} target="_blank" rel="noreferrer">
-              Mở trên Kaggle
+              {t('workers.open-kaggle')}
             </Button>
           ) : null}
         </Group>

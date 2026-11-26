@@ -2,16 +2,17 @@ import { Badge, Card, Group, SegmentedControl, SimpleGrid, Stack, Table, Text, T
 import { useMediaQuery } from '@mantine/hooks'
 import { Suspense, lazy, useMemo, useState } from 'react'
 import { get, type Activity, type Overview as OverviewData, type WorkerRow } from '../api'
-import { Dot, Empty, Loading, Page, StateBadge } from '../components/common'
+import { Dot, Empty, Loading, Page, StateBadge, useWorkerStateLabel } from '../components/common'
 import type { OfficeState, Pick, WorkerState } from '../office/scene'
 import { go } from '../router'
+import { useLanguage, useT, type DictKey } from '../i18n'
 import { useKite } from '../store'
-import { ago, short, usd, useLoad, workerState } from '../util'
+import { ago, short, usd, useLoad, workerState, type WorkerStateKey } from '../util'
 
 // three.js is only downloaded when the 3D office is shown.
 const Office3D = lazy(() => import('../office/Office3D'))
 const MODE_KEY = 'kite.overview.mode'
-const PHASES: Record<string, string> = { fast_path: 'đường nhanh', review: 'rà soát' }
+const PHASES: Record<string, DictKey> = { fast_path: 'overview.phase.fast-path', review: 'overview.phase.review' }
 
 function hasWebGL(): boolean {
   try {
@@ -33,7 +34,7 @@ function savedMode(): '3d' | '2d' {
   return window.matchMedia?.('(max-width: 640px)').matches ? '2d' : '3d'
 }
 
-function officeWorker(w: WorkerRow): OfficeState['workers'][number] {
+function officeWorker(w: WorkerRow, label: (key: WorkerStateKey) => string): OfficeState['workers'][number] {
   const st = workerState(w)
   const state: WorkerState =
     w.start?.state === 'error'
@@ -42,22 +43,25 @@ function officeWorker(w: WorkerRow): OfficeState['workers'][number] {
         ? 'busy'
         : w.alive && !w.draining
           ? 'idle'
-          : st.label === 'đang khởi động' || w.draining
+          : st.label === 'đang khởi động' || w.draining // i18n-ignore: so sánh với nhãn nội bộ do workerState() trả về (giá trị mã để phân loại trạng thái, không phải chuỗi hiển thị) — giữ nguyên logic so sánh.
             ? 'starting'
             : 'off'
   return {
     id: w.id,
     type: w.type,
     state,
-    stateLabel: st.label,
+    // stateLabel is UI text shown in the 3D office tooltip (scene.ts):
+    // translate it via the shared worker-state labels, not workerState()'s
+    // Vietnamese fallback label.
+    stateLabel: label(st.key),
     model: w.loaded_model ?? w.models[0] ?? '',
     running: w.running,
     slots: w.slots ?? w.concurrency,
   }
 }
 
-function officeTask(a: Activity): OfficeState['tasks'][number] {
-  const step = [a.step ? `bước ${a.step}` : null, a.action ? `vừa ${a.action}` : null].filter(Boolean).join(' · ')
+function officeTask(a: Activity, t: (key: DictKey, vars?: Record<string, string | number>) => string): OfficeState['tasks'][number] {
+  const step = [a.step ? t('overview.activity-step', { step: a.step }) : null, a.action ? t('overview.activity-action', { action: a.action }) : null].filter(Boolean).join(' · ')
   return { id: a.task_id, goal: short(a.goal || a.task_id, 70), worker: a.worker, step: step || null }
 }
 
@@ -70,6 +74,9 @@ function onPick(pick: Pick) {
 }
 
 export default function Overview() {
+  const t = useT()
+  const { language } = useLanguage()
+  const workerStateLabel = useWorkerStateLabel()
   const { data, error } = useLoad(() => get<OverviewData>('/api/overview'), [], 10000)
   const activity = useKite((s) => s.activity)
   const events = useKite((s) => s.events)
@@ -83,14 +90,14 @@ export default function Overview() {
     () =>
       data
         ? {
-            workers: data.workers.map(officeWorker),
-            tasks: activity.map(officeTask),
+            workers: data.workers.map((w) => officeWorker(w, workerStateLabel)),
+            tasks: activity.map((a) => officeTask(a, t)),
             chatBusy: (chat.data?.busy ?? 0) > 0,
             gatewayUp: gatewayUp ?? data.gateway_up,
             dark,
           }
         : null,
-    [data, activity, chat.data?.busy, gatewayUp, dark],
+    [data, activity, chat.data?.busy, gatewayUp, dark, language],
   )
   if (!data || !office) return <Loading error={error} />
   const quota = data.gpu_quota ?? {}
@@ -98,17 +105,17 @@ export default function Overview() {
   for (const w of data.workers) brandTotals.set(w.brand, (brandTotals.get(w.brand) ?? 0) + w.spend.month_usd)
   const brandSpend = [...brandTotals.entries()].sort((a, b) => b[1] - a[1])
   return (
-    <Page title="Tổng quan">
+    <Page title={t('overview.title')}>
       <SimpleGrid cols={{ base: 2, md: 4 }}>
-        <Stat label="Gateway" value={data.gateway_up ? 'đang chạy' : 'tắt'} color={data.gateway_up ? 'teal' : 'red'} />
-        <Stat label="Việc đang chờ / đang chạy" value={`${data.queued_jobs} / ${data.running_jobs}`} />
-        <Stat label="Chi hôm nay" value={usd(data.spend.today_usd)} />
-        <Stat label="Chi tháng này" value={usd(data.spend.month_usd)} />
+        <Stat label={t('overview.stat-gateway')} value={data.gateway_up ? t('overview.gateway-running') : t('overview.gateway-off')} color={data.gateway_up ? 'teal' : 'red'} />
+        <Stat label={t('overview.stat-queued-running')} value={`${data.queued_jobs} / ${data.running_jobs}`} />
+        <Stat label={t('overview.stat-spend-today')} value={usd(data.spend.today_usd)} />
+        <Stat label={t('overview.stat-spend-month')} value={usd(data.spend.month_usd)} />
       </SimpleGrid>
       {brandSpend.length ? (
         <Card withBorder>
           <Text fw={600} mb={6}>
-            Chi theo hãng tháng này
+            {t('overview.spend-by-brand')}
           </Text>
           {brandSpend.map(([brand, total]) => (
             <Text key={brand} size="sm">
@@ -120,7 +127,7 @@ export default function Overview() {
       {Object.keys(quota).length ? (
         <Card withBorder>
           <Text fw={600} mb={6}>
-            Quota GPU Kaggle
+            {t('overview.gpu-quota')}
           </Text>
           {Object.entries(quota).map(([worker, q]) => (
             <Text key={worker} size="sm">
@@ -131,7 +138,7 @@ export default function Overview() {
       ) : null}
       <Card withBorder p="xs">
         <Group justify="space-between" px={6} pb={6}>
-          <Text fw={600}>Văn phòng Kite</Text>
+          <Text fw={600}>{t('overview.office')}</Text>
           <SegmentedControl
             size="xs"
             data={[
@@ -151,7 +158,7 @@ export default function Overview() {
           />
         </Group>
         {mode === '3d' ? (
-          <Suspense fallback={<Loading label="Đang tải văn phòng 3D…" />}>
+          <Suspense fallback={<Loading label={t('overview.office-loading')} />}>
             <Office3D state={office} onPick={onPick} height={small ? 360 : 500} />
           </Suspense>
         ) : (
@@ -159,11 +166,11 @@ export default function Overview() {
         )}
         {!webgl ? (
           <Text size="xs" c="dimmed" px={6} pt={6}>
-            Trình duyệt này không có WebGL nên chỉ xem được 2D.
+            {t('overview.office-no-webgl')}
           </Text>
         ) : null}
       </Card>
-      <Title order={4}>Đang làm</Title>
+      <Title order={4}>{t('overview.doing')}</Title>
       {activity.length ? (
         <Stack gap="xs">
           {activity.map((a) => (
@@ -177,24 +184,24 @@ export default function Overview() {
               <Text size="sm" c="dimmed">
                 {[
                   a.worker ? `worker ${a.worker}` : null,
-                  a.phase ? PHASES[a.phase] ?? a.phase : null,
-                  a.step ? `bước ${a.step}` : null,
-                  a.action ? `vừa ${a.action}` : null,
-                  a.since ? `từ ${ago(a.since)}` : null,
+                  a.phase ? (PHASES[a.phase] ? t(PHASES[a.phase]) : a.phase) : null,
+                  a.step ? t('overview.activity-step', { step: a.step }) : null,
+                  a.action ? t('overview.activity-action', { action: a.action }) : null,
+                  a.since ? t('overview.activity-since', { since: ago(a.since) }) : null,
                 ]
                   .filter(Boolean)
-                  .join(' · ') || (a.state === 'QUEUED' ? 'đang chờ worker' : 'đang chuẩn bị')}
+                  .join(' · ') || (a.state === 'QUEUED' ? t('overview.activity-waiting') : t('overview.activity-preparing'))}
               </Text>
             </Card>
           ))}
         </Stack>
       ) : (
-        <Empty>Không có task nào đang chạy.</Empty>
+        <Empty>{t('overview.no-running-task')}</Empty>
       )}
       <SimpleGrid cols={{ base: 1, lg: 2 }}>
         <Card withBorder>
           <Text fw={600} mb="xs">
-            Task gần đây
+            {t('overview.recent-tasks')}
           </Text>
           {data.tasks.recent.length ? (
             <Table highlightOnHover>
@@ -219,12 +226,12 @@ export default function Overview() {
               </Table.Tbody>
             </Table>
           ) : (
-            <Empty>Chưa có task.</Empty>
+            <Empty>{t('overview.no-task')}</Empty>
           )}
         </Card>
         <Card withBorder>
           <Text fw={600} mb="xs">
-            Sự kiện mới
+            {t('overview.recent-events')}
           </Text>
           {events.length ? (
             <Stack gap={4}>
@@ -238,7 +245,7 @@ export default function Overview() {
               ))}
             </Stack>
           ) : (
-            <Empty>Sự kiện mới sẽ hiện ở đây khi Kite làm việc.</Empty>
+            <Empty>{t('overview.no-events')}</Empty>
           )}
         </Card>
       </SimpleGrid>
@@ -247,7 +254,9 @@ export default function Overview() {
 }
 
 function WorkerCards({ workers }: { workers: WorkerRow[] }) {
-  if (!workers.length) return <Empty>Chưa có worker nào: thêm ở tab Provider.</Empty>
+  const t = useT()
+  const workerStateLabel = useWorkerStateLabel()
+  if (!workers.length) return <Empty>{t('overview.no-workers')}</Empty>
   return (
     <SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} p={6}>
       {workers.map((w) => {
@@ -260,19 +269,19 @@ function WorkerCards({ workers }: { workers: WorkerRow[] }) {
                 <Text fw={600}>{w.id}</Text>
               </Group>
               <Badge variant="light" color={st.color}>
-                {st.label}
+                {workerStateLabel(st.key)}
               </Badge>
             </Group>
             <Text size="sm" c="dimmed" mt={4}>
-              {w.type} · {w.loaded_model ? `đang nạp ${w.loaded_model}` : w.models.slice(0, 3).join(', ')}
+              {w.type} · {w.loaded_model ? t('overview.worker-loading-model', { model: w.loaded_model }) : w.models.slice(0, 3).join(', ')}
             </Text>
             {w.alive && w.busy ? (
               <Text size="sm" mt={4}>
-                {w.running}/{w.slots ?? w.concurrency} việc đang chạy
+                {t('overview.worker-running', { running: w.running, slots: w.slots ?? w.concurrency })}
               </Text>
             ) : null}
             {w.start?.detail ? (
-              <Text size="xs" c="yellow" mt={4}>
+              <Text size="xs" c="yellow.9" mt={4}>
                 {short(w.start.detail, 140)}
               </Text>
             ) : null}

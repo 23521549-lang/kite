@@ -4,6 +4,7 @@ import { ActionIcon, Alert, Box, Button, Group, Select, Stack, Switch, Text, Too
 import { IconArrowLeft, IconRefresh } from '@tabler/icons-react'
 import { useEffect, useRef, useState } from 'react'
 import { wsUrl } from '../api'
+import { useT } from '../i18n'
 
 type Status = {
   open: boolean
@@ -18,12 +19,17 @@ type Status = {
 const BUTTONS = ['left', 'middle', 'right']
 
 export default function KaggleScreen({ worker }: { worker?: string }) {
+  const t = useT()
+  // The WebSocket handlers below close over the first render: keep the
+  // current translator in a ref so a language switch also translates later notes.
+  const tRef = useRef(t)
+  tRef.current = t
   const canvas = useRef<HTMLCanvasElement>(null)
   const socket = useRef<WebSocket | null>(null)
   const size = useRef({ w: 1280, h: 800 })
   const lastMove = useRef(0)
   const [status, setStatus] = useState<Status | null>(null)
-  const [note, setNote] = useState('Đăng nhập Kaggle bằng email và mật khẩu. Bật worker: Save Version → Save & Run All → Save.')
+  const [note, setNote] = useState(t('workers.kaggle.login-hint'))
   const [connected, setConnected] = useState(false)
   const [selected, setSelected] = useState<string | null>(worker ?? null)
 
@@ -49,7 +55,7 @@ export default function KaggleScreen({ worker }: { worker?: string }) {
     ws.onopen = () => setConnected(true)
     ws.onclose = (e) => {
       setConnected(false)
-      setNote(e.code === 4502 ? 'Gateway không trả lời: kiểm tra dịch vụ kite-gateway.' : 'Mất kết nối với trình duyệt Kite.')
+      setNote(e.code === 4502 ? tRef.current('workers.kaggle.gateway-down') : tRef.current('workers.kaggle.disconnected'))
     }
     ws.onmessage = (e) => {
       let m: any
@@ -64,7 +70,7 @@ export default function KaggleScreen({ worker }: { worker?: string }) {
       } else if (m.t === 'note') setNote(m.s)
       else if (m.t === 'status') {
         setStatus(m)
-        if (m.blocked) setNote(`Đã chặn trang ngoài kaggle.com: ${m.blocked}`)
+        if (m.blocked) setNote(tRef.current('workers.kaggle.blocked-outside', { blocked: m.blocked }))
         if (m.error) setNote(m.error)
         if (!m.open) {
           const c = canvas.current
@@ -94,12 +100,12 @@ export default function KaggleScreen({ worker }: { worker?: string }) {
   return (
     <Stack gap="xs">
       <Group gap="xs" wrap="wrap">
-        <Tooltip label="Lùi">
+        <Tooltip label={t('workers.kaggle.back')}>
           <ActionIcon variant="default" onClick={() => send({ t: 'nav', a: 'back' })} disabled={!status?.open}>
             <IconArrowLeft size={16} />
           </ActionIcon>
         </Tooltip>
-        <Tooltip label="Tải lại">
+        <Tooltip label={t('workers.kaggle.reload')}>
           <ActionIcon variant="default" onClick={() => send({ t: 'nav', a: 'reload' })} disabled={!status?.open}>
             <IconRefresh size={16} />
           </ActionIcon>
@@ -121,40 +127,40 @@ export default function KaggleScreen({ worker }: { worker?: string }) {
             canvas.current?.focus()
           }}
         >
-          Mở notebook
+          {t('workers.kaggle.open-notebook')}
         </Button>
         <Switch
           size="sm"
-          label="Kite tự bấm"
+          label={t('workers.kaggle.auto-click')}
           disabled={!current}
           checked={!!current?.auto}
           onChange={(e) => {
             const on = e.currentTarget.checked
-            if (on && !confirm('Bật "Kite tự bấm"? Điều khoản Kaggle cấm thao tác tự động ngoài API; bạn chịu rủi ro tài khoản.')) return
+            if (on && !confirm(t('workers.kaggle.auto-click-confirm'))) return
             send({ t: 'auto', worker: selected, on })
           }}
         />
         <Box style={{ flex: 1 }} />
         <Button size="xs" variant="default" disabled={!status?.open} onClick={() => send({ t: 'close' })}>
-          Tắt trình duyệt
+          {t('workers.kaggle.close-browser')}
         </Button>
         <Button
           size="xs"
           variant="subtle"
           color="red"
           onClick={() => {
-            if (confirm('Xóa phiên đăng nhập Kaggle đã lưu trên máy Kite?')) send({ t: 'logout' })
+            if (confirm(t('workers.kaggle.forget-login-confirm'))) send({ t: 'logout' })
           }}
         >
-          Quên đăng nhập
+          {t('workers.kaggle.forget-login')}
         </Button>
       </Group>
       <Text size="xs" c="dimmed" truncate>
         {status?.open
-          ? `${status.busy ? '[Kite đang bấm] ' : ''}${status.title ?? ''} — ${status.url ?? ''}`
+          ? `${status.busy ? `${t('workers.kaggle.clicking')} ` : ''}${status.title ?? ''} — ${status.url ?? ''}`
           : connected
-            ? 'Trình duyệt Kite đang tắt: bấm "Mở notebook"'
-            : 'Đang nối…'}
+            ? t('workers.kaggle.browser-off')
+            : t('workers.kaggle.connecting')}
       </Text>
       {note ? (
         <Alert color="yellow" py={6}>

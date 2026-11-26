@@ -6,6 +6,7 @@ import { Notifications } from '@mantine/notifications'
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
+import { LanguageProvider } from './i18n'
 
 const theme = createTheme({
   primaryColor: 'indigo',
@@ -18,7 +19,9 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <MantineProvider theme={theme} defaultColorScheme="dark">
       <Notifications position="top-right" limit={4} />
-      <App />
+      <LanguageProvider>
+        <App />
+      </LanguageProvider>
     </MantineProvider>
   </StrictMode>,
 )

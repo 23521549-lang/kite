@@ -43,6 +43,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { del, get, patch, post, qs } from '../api'
 import { ConfirmButton, JsonView, Loading, Markdown } from '../components/common'
 import { go } from '../router'
+import { useT, type DictKey, type TFunction } from '../i18n'
 import { ago, attempt, notifyError, short, useLoad } from '../util'
 
 // ---------------------------------------------------------------- OpenCode 2 shapes (the parts used here)
@@ -102,40 +103,44 @@ type Live = { id: string; order: string[]; parts: Record<string, Part> }
 
 const OC = '/api/opencode/api'
 
-const KITE_TOOLS: Record<string, string> = {
-  start_task: 'Giao task',
-  task_status: 'Xem tiến độ task',
-  wait_task: 'Chờ task',
-  task_log: 'Nhật ký task',
-  task_result: 'Kết quả task',
-  apply_result: 'Áp patch',
-  commit_result: 'Commit',
-  repo_status: 'Xem repo',
-  run_command: 'Chạy lệnh trong sandbox',
-  send_instruction: 'Gửi thêm chỉ dẫn',
-  pause_task: 'Tạm dừng task',
-  resume_task: 'Tiếp tục task',
-  cancel_task: 'Hủy task',
-  list_tasks: 'Danh sách task',
-  worker_status: 'Trạng thái worker',
-  note_task: 'Ghi nhận xét',
-  remember: 'Ghi nhớ',
-  memory_show: 'Xem điều đã nhớ',
-  memory_forget: 'Xóa điều đã nhớ',
-  repo_config: 'Cấu hình repo',
-  doctor: 'Kiểm tra sức khỏe',
-  cleanup: 'Dọn ổ đĩa',
-  worker_restart: 'Khởi động lại worker',
-  update_kite: 'Cập nhật Kite',
-  bench_start: 'Chạy bench',
-  bench_history: 'Lịch sử bench',
+const KITE_TOOLS: Record<string, DictKey> = {
+  start_task: 'chat.tool.start-task',
+  task_status: 'chat.tool.task-status',
+  wait_task: 'chat.tool.wait-task',
+  task_log: 'chat.tool.task-log',
+  task_result: 'chat.tool.task-result',
+  apply_result: 'chat.tool.apply-result',
+  commit_result: 'chat.tool.commit-result',
+  repo_status: 'chat.tool.repo-status',
+  run_command: 'chat.tool.run-command',
+  send_instruction: 'chat.tool.send-instruction',
+  pause_task: 'chat.tool.pause-task',
+  resume_task: 'chat.tool.resume-task',
+  cancel_task: 'chat.tool.cancel-task',
+  list_tasks: 'chat.tool.list-tasks',
+  worker_status: 'chat.tool.worker-status',
+  note_task: 'chat.tool.note-task',
+  remember: 'chat.tool.remember',
+  memory_show: 'chat.tool.memory-show',
+  memory_forget: 'chat.tool.memory-forget',
+  repo_config: 'chat.tool.repo-config',
+  doctor: 'chat.tool.doctor',
+  cleanup: 'chat.tool.cleanup',
+  worker_restart: 'chat.tool.worker-restart',
+  update_kite: 'chat.tool.update-kite',
+  bench_start: 'chat.tool.bench-start',
+  bench_history: 'chat.tool.bench-history',
 }
-const OTHER_TOOLS: Record<string, string> = { shell: 'Lệnh shell', question: 'Hỏi bạn', read: 'Đọc file', glob: 'Tìm file', grep: 'Tìm trong file' }
+const OTHER_TOOLS: Record<string, DictKey> = { shell: 'chat.tool.shell', question: 'chat.tool.question', read: 'chat.tool.read', glob: 'chat.tool.glob', grep: 'chat.tool.grep' }
 
-function toolLabel(name: string): string {
+function toolLabel(name: string, t: TFunction): string {
   const kite = name.match(/^kite[_.:-](.+)$/)
-  if (kite) return KITE_TOOLS[kite[1]] ?? kite[1]
-  return OTHER_TOOLS[name] ?? name
+  if (kite) {
+    const key = KITE_TOOLS[kite[1]]
+    return key ? t(key) : kite[1]
+  }
+  const other = OTHER_TOOLS[name]
+  return other ? t(other) : name
 }
 
 function toolOutput(state: ToolState): string {
@@ -155,6 +160,7 @@ function parseJson(text: string): any {
 
 // ---------------------------------------------------------------- the page
 export default function Chat({ parts }: { parts: string[] }) {
+  const t = useT()
   const sessionId = parts[0] ?? null
   const wide = useMediaQuery('(min-width: 62em)')
   const { data: info, error: infoError, reload: reloadInfo } = useLoad(() => get<ChatInfo>('/api/chat/info'), [], 30000)
@@ -166,10 +172,10 @@ export default function Chat({ parts }: { parts: string[] }) {
       const res = await get<{ data: Session[] }>(`${OC}/session${qs({ directory: info.chat_dir, limit: 60 })}`)
       setSessions(res.data.filter((s) => !s.parentID && !s.time.archived).sort((a, b) => b.time.updated - a.time.updated))
     } catch (e) {
-      notifyError(e, 'Không đọc được các phiên chat')
+      notifyError(e, t('chat.sessions-load-error'))
       setSessions([])
     }
-  }, [info?.chat_dir])
+  }, [info?.chat_dir, t])
 
   useEffect(() => {
     if (info?.opencode.reachable && info.ready) loadSessions()
@@ -184,15 +190,15 @@ export default function Chat({ parts }: { parts: string[] }) {
   }
 
   if (!info) return <Box p="md">{<Loading error={infoError} />}</Box>
-  const problem = chatProblem(info)
+  const problem = chatProblem(info, t)
   if (problem)
     return (
       <Box p="md">
-        <Alert color="yellow" title="Chat chưa sẵn sàng" icon={<IconAlertTriangle />}>
+        <Alert color="yellow" title={t('chat.not-ready')} icon={<IconAlertTriangle />}>
           {problem}
           <Group mt="sm">
             <Button size="xs" variant="light" onClick={reloadInfo}>
-              Kiểm tra lại
+              {t('chat.check-again')}
             </Button>
           </Group>
         </Alert>
@@ -201,7 +207,7 @@ export default function Chat({ parts }: { parts: string[] }) {
 
   const versionNote =
     info.opencode.version && info.opencode.version.split('.')[0] !== info.tested_version.split('.')[0]
-      ? `OpenCode ${info.opencode.version} khác bản Kite đã thử (${info.tested_version}); chat có thể lỗi.`
+      ? t('chat.version-mismatch', { version: info.opencode.version, tested: info.tested_version })
       : null
 
   const list = (
@@ -224,13 +230,13 @@ export default function Chat({ parts }: { parts: string[] }) {
           <Group p="xs" gap="xs" wrap="nowrap" style={{ borderBottom: '1px solid var(--mantine-color-default-border)' }}>
             <Select
               style={{ flex: 1 }}
-              placeholder="Chọn phiên chat"
-              data={(sessions ?? []).map((s) => ({ value: s.id, label: s.title || 'Phiên chưa đặt tên' }))}
+              placeholder={t('chat.select-session')}
+              data={(sessions ?? []).map((s) => ({ value: s.id, label: s.title || t('chat.untitled-session') }))}
               value={sessionId}
               onChange={(v) => v && go(`/chat/${v}`)}
               searchable
             />
-            <ActionIcon variant="light" size="lg" onClick={newSession} title="Phiên mới">
+            <ActionIcon variant="light" size="lg" onClick={newSession} title={t('chat.new-session')}>
               <IconPlus size={18} />
             </ActionIcon>
           </Group>
@@ -245,12 +251,12 @@ export default function Chat({ parts }: { parts: string[] }) {
         ) : (
           <Stack align="center" justify="center" style={{ flex: 1 }} p="xl">
             <Text c="dimmed" ta="center">
-              Chat với agent trưởng của Kite bằng tiếng Việt: giao task, hỏi tiến độ, xem kết quả.
+              {t('chat.intro-1')}
               <br />
-              Các phiên ở đây cũng là các phiên của opencode trên terminal.
+              {t('chat.intro-2')}
             </Text>
             <Button leftSection={<IconPlus size={16} />} onClick={newSession}>
-              Phiên chat mới
+              {t('chat.new-session-title')}
             </Button>
           </Stack>
         )}
@@ -259,18 +265,19 @@ export default function Chat({ parts }: { parts: string[] }) {
   )
 }
 
-function chatProblem(info: ChatInfo): ReactNode {
+function chatProblem(info: ChatInfo, t: TFunction): ReactNode {
   if (!info.ready)
     return (
       <Text size="sm">
-        Chưa có thư mục chat của Kite ({info.chat_dir ?? '~/kite-chat'}). Trên máy Kite chạy <Code>kite chat setup</Code>.
+        {t('chat.no-chat-dir-prefix')}
+        {info.chat_dir ?? '~/kite-chat'}). {t('chat.no-chat-dir-suffix')} <Code>kite chat setup</Code>.
       </Text>
     )
   if (!info.opencode.reachable)
     return (
       <Text size="sm">
-        Không nối được OpenCode ({info.opencode.error ?? 'không trả lời'}). Trên máy Kite chạy{' '}
-        <Code>sudo systemctl enable --now kite-opencode</Code>, hoặc mở <Code>opencode</Code> một lần.
+        {t('chat.opencode-unreachable-prefix')}
+        {info.opencode.error ?? t('chat.no-answer')}). {t('chat.opencode-unreachable-middle')} <Code>sudo systemctl enable --now kite-opencode</Code>, {t('chat.opencode-unreachable-after')} <Code>opencode</Code> {t('chat.opencode-unreachable-end')}
       </Text>
     )
   return null
@@ -287,11 +294,12 @@ function SessionList({
   onNew: () => void
   onChanged: () => void
 }) {
+  const t = useT()
   return (
     <>
       <Box p="xs">
         <Button fullWidth leftSection={<IconPlus size={16} />} variant="light" onClick={onNew}>
-          Phiên mới
+          {t('chat.new-session')}
         </Button>
       </Box>
       <ScrollArea style={{ flex: 1 }} px="xs">
@@ -299,7 +307,7 @@ function SessionList({
           <Loading />
         ) : sessions.length === 0 ? (
           <Text c="dimmed" size="sm" p="xs">
-            Chưa có phiên nào.
+            {t('chat.no-sessions')}
           </Text>
         ) : (
           <Stack gap={2} pb="md">
@@ -316,7 +324,7 @@ function SessionList({
               >
                 <Box style={{ flex: 1, minWidth: 0 }}>
                   <Text size="sm" truncate fw={s.id === current ? 600 : 400}>
-                    {s.title || 'Phiên chưa đặt tên'}
+                    {s.title || t('chat.untitled-session')}
                   </Text>
                   <Text size="xs" c="dimmed">
                     {ago(s.time.updated)}
@@ -333,6 +341,7 @@ function SessionList({
 }
 
 function SessionMenu({ session, onChanged }: { session: Session; onChanged: () => void }) {
+  const t = useT()
   const [renaming, setRenaming] = useState(false)
   const [title, setTitle] = useState(session.title ?? '')
   if (renaming)
@@ -362,19 +371,19 @@ function SessionMenu({ session, onChanged }: { session: Session; onChanged: () =
       </Menu.Target>
       <Menu.Dropdown onClick={(e) => e.stopPropagation()}>
         <Menu.Item leftSection={<IconPencil size={14} />} onClick={() => setRenaming(true)}>
-          Đổi tên
+          {t('chat.rename')}
         </Menu.Item>
         <Menu.Item
           leftSection={<IconTrash size={14} />}
           color="red"
           onClick={async () => {
-            if (!confirm('Xóa phiên chat này? (cả trên opencode terminal)')) return
+            if (!confirm(t('chat.delete-session-confirm'))) return
             await attempt(() => del(`${OC}/session/${session.id}`))
             onChanged()
             go('/chat')
           }}
         >
-          Xóa
+          {t('chat.delete')}
         </Menu.Item>
       </Menu.Dropdown>
     </Menu>
@@ -383,6 +392,7 @@ function SessionMenu({ session, onChanged }: { session: Session; onChanged: () =
 
 // ---------------------------------------------------------------- one conversation
 function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: string; chatDir: string; onSessionsChanged: () => void }) {
+  const t = useT()
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[] | null>(null)
   const [live, setLive] = useState<Live | null>(null)
@@ -505,10 +515,10 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
           setLive((l) => putTool(l, d.assistantMessageID, d.id, undefined, { status: 'completed', content: d.content, metadata: d.metadata }))
           break
         case 'session.tool.failed':
-          setLive((l) => putTool(l, d.assistantMessageID, d.id, undefined, { status: 'error', error: d.error ?? { message: 'lỗi' } }))
+          setLive((l) => putTool(l, d.assistantMessageID, d.id, undefined, { status: 'error', error: d.error ?? { message: t('chat.tool-error-fallback') } }))
           break
         case 'session.retry.scheduled':
-          setNotice('Model lỗi tạm thời, OpenCode đang thử lại…')
+          setNotice(t('chat.retry-notice'))
           break
         case 'session.usage.updated':
           setSession((s) => (s ? { ...s, tokens: d.tokens } : s))
@@ -545,7 +555,7 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
       setMessages((m) => [...(m ?? []), { id: `local-${Date.now()}`, type: 'user', text, time: { created: Date.now() } }])
       return true
     } catch (e) {
-      notifyError(e, 'Không gửi được')
+      notifyError(e, t('chat.send-error'))
       return false
     }
   }
@@ -560,11 +570,11 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
       <Group px="md" py={8} justify="space-between" wrap="nowrap" style={{ borderBottom: '1px solid var(--mantine-color-default-border)' }}>
         <Box style={{ minWidth: 0 }}>
           <Text fw={600} truncate>
-            {session?.title || 'Phiên chưa đặt tên'}
+            {session?.title || t('chat.untitled-session')}
           </Text>
           {session?.tokens ? (
             <Text size="xs" c="dimmed">
-              {session.tokens.input.toLocaleString('vi-VN')} token vào · {session.tokens.output.toLocaleString('vi-VN')} token ra
+              {t('chat.tokens', { input: session.tokens.input.toLocaleString('vi-VN'), output: session.tokens.output.toLocaleString('vi-VN') })}
             </Text>
           ) : null}
         </Box>
@@ -585,7 +595,7 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
           ) : null}
           {busy ? (
             <Badge color="blue" variant="light" leftSection={<Loader size={10} />}>
-              đang làm
+              {t('chat.working')}
             </Badge>
           ) : null}
         </Group>
@@ -600,7 +610,7 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
       >
         <Stack gap="md" p="md" maw={900} mx="auto">
           {error ? <Alert color="red">{error}</Alert> : null}
-          {messages === null ? <Loading /> : messages.length === 0 && !live ? <Text c="dimmed">Bắt đầu bằng một câu hỏi hoặc một việc cần làm.</Text> : null}
+          {messages === null ? <Loading /> : messages.length === 0 && !live ? <Text c="dimmed">{t('chat.empty-start')}</Text> : null}
           {(messages ?? []).map((m) => (
             <MessageView key={m.id} message={m} />
           ))}
@@ -610,11 +620,11 @@ function Conversation({ sessionId, chatDir, onSessionsChanged }: { sessionId: st
           {busy && !live ? (
             <Group gap="xs" c="dimmed">
               <Loader size="xs" />
-              <Text size="sm">Agent đang làm… (worker có thể cần vài phút để khởi động)</Text>
+              <Text size="sm">{t('chat.agent-working')}</Text>
             </Group>
           ) : null}
           {notice ? (
-            <Text size="sm" c="yellow">
+            <Text size="sm" c="yellow.9">
               {notice}
             </Text>
           ) : null}
@@ -656,6 +666,7 @@ function putTool(live: Live | null, messageId: string, id: string, name: string 
 
 // ---------------------------------------------------------------- messages
 function MessageView({ message: m }: { message: Message }) {
+  const t = useT()
   switch (m.type) {
     case 'user':
       return (
@@ -668,7 +679,7 @@ function MessageView({ message: m }: { message: Message }) {
         <Stack gap={6}>
           <AssistantParts parts={m.content ?? []} />
           {m.error ? (
-            <Alert color="red" py={6} title="Model lỗi">
+            <Alert color="red" py={6} title={t('chat.model-error')}>
               {m.error.message}
             </Alert>
           ) : null}
@@ -686,38 +697,38 @@ function MessageView({ message: m }: { message: Message }) {
     case 'idle':
       if (m.outcome === 'failed' && m.error)
         return (
-          <Alert color="red" py={6} title="Lượt này lỗi">
+          <Alert color="red" py={6} title={t('chat.turn-error')}>
             {m.error.message}
           </Alert>
         )
       if (m.outcome === 'interrupted')
         return (
           <Text size="xs" c="dimmed" ta="center">
-            đã dừng
+            {t('chat.stopped')}
           </Text>
         )
       return null
     case 'synthetic':
     case 'system':
     case 'skill':
-      return <Fold label={m.description || (m.type === 'skill' ? 'skill' : 'ghi chú hệ thống')} text={m.text ?? ''} />
+      return <Fold label={m.description || (m.type === 'skill' ? 'skill' : t('chat.system-note'))} text={m.text ?? ''} />
     case 'agent-switched':
       return (
         <Text size="xs" c="dimmed" ta="center">
-          đổi agent: {m.agent}
+          {t('chat.agent-switched', { agent: m.agent ?? '' })}
         </Text>
       )
     case 'model-switched':
       return (
         <Text size="xs" c="dimmed" ta="center">
-          đổi model: {m.model?.id}
+          {t('chat.model-switched', { model: m.model?.id ?? '' })}
         </Text>
       )
     default:
       if (m.type.startsWith('compaction'))
         return (
           <Text size="xs" c="dimmed" ta="center">
-            OpenCode đã tóm tắt phần đầu cuộc trò chuyện
+            {t('chat.compaction')}
           </Text>
         )
       return null
@@ -744,17 +755,18 @@ function Fold({ label, text }: { label: string; text: string }) {
 }
 
 function AssistantParts({ parts, streaming }: { parts: Part[]; streaming?: boolean }) {
+  const t = useT()
   return (
     <Stack gap={6}>
       {parts.map((p, i) => {
         if (p.type === 'text') return p.text.trim() ? <Markdown key={i} text={p.text} /> : null
-        if (p.type === 'reasoning') return p.text.trim() ? <Fold key={i} label="suy nghĩ của model" text={p.text} /> : null
+        if (p.type === 'reasoning') return p.text.trim() ? <Fold key={i} label={t('chat.thinking')} text={p.text} /> : null
         return <ToolCard key={p.id} name={p.name} state={p.state} />
       })}
       {streaming && parts.length === 0 ? (
         <Group gap="xs" c="dimmed">
           <Loader size="xs" />
-          <Text size="sm">đang viết…</Text>
+          <Text size="sm">{t('chat.writing')}</Text>
         </Group>
       ) : null}
     </Stack>
@@ -762,6 +774,7 @@ function AssistantParts({ parts, streaming }: { parts: Part[]; streaming?: boole
 }
 
 function ToolCard({ name, state }: { name: string; state: ToolState }) {
+  const t = useT()
   const [open, setOpen] = useState(false)
   const output = toolOutput(state)
   const result = useMemo(() => parseJson(output), [output])
@@ -781,7 +794,7 @@ function ToolCard({ name, state }: { name: string; state: ToolState }) {
         )}
         <IconTool size={14} color="var(--mantine-color-dimmed)" />
         <Text size="sm" fw={600}>
-          {toolLabel(name)}
+          {toolLabel(name, t)}
         </Text>
         <Text size="sm" c="dimmed" truncate style={{ flex: 1 }}>
           {summary}
@@ -799,7 +812,7 @@ function ToolCard({ name, state }: { name: string; state: ToolState }) {
           {state.input !== undefined ? (
             <>
               <Text size="xs" c="dimmed">
-                Đầu vào
+                {t('chat.tool-input')}
               </Text>
               <JsonView data={state.input} maxHeight={220} />
             </>
@@ -807,7 +820,7 @@ function ToolCard({ name, state }: { name: string; state: ToolState }) {
           {output ? (
             <>
               <Text size="xs" c="dimmed">
-                Kết quả
+                {t('chat.tool-output')}
               </Text>
               <JsonView data={result ?? output} maxHeight={320} />
             </>
@@ -830,6 +843,7 @@ function toolSummary(tool: string, input: any): string {
 
 /** Buttons under Kite's tool results: open the task; apply and commit are the owner's clicks. */
 function KiteActions({ tool, result }: { tool: string; result: any }) {
+  const t = useT()
   const taskId: string | undefined = result?.task_id
   if (!taskId) return null
   const ready = tool === 'task_result' && result.ready && result.patch
@@ -837,30 +851,30 @@ function KiteActions({ tool, result }: { tool: string; result: any }) {
   return (
     <Group gap="xs" mt={6}>
       <Button size="compact-xs" variant="light" onClick={() => go(`/tasks/${encodeURIComponent(taskId)}`)}>
-        Mở task
+        {t('chat.open-task')}
       </Button>
       {ready ? (
         <ConfirmButton
           size="compact-xs"
           color="teal"
-          label="Áp vào repo"
-          title="Áp patch vào repo"
-          message={<Text size="sm">Áp patch của task {taskId} vào working tree của repo (chưa commit, không push).</Text>}
-          confirmLabel="Áp"
-          onConfirm={() => attempt(() => post(`/api/tasks/${encodeURIComponent(taskId)}/apply`), 'Đã áp patch')}
+          label={t('chat.apply-patch')}
+          title={t('chat.apply-patch-title')}
+          message={<Text size="sm">{t('chat.apply-patch-message', { task: taskId })}</Text>}
+          confirmLabel={t('chat.apply')}
+          onConfirm={() => attempt(() => post(`/api/tasks/${encodeURIComponent(taskId)}/apply`), t('chat.applied'))}
         />
       ) : null}
       {ready || applied ? (
         <ConfirmButton
           size="compact-xs"
           variant="light"
-          label="Commit…"
-          title="Commit đúng các file của patch"
+          label={t('chat.commit')}
+          title={t('chat.commit-title')}
           askText
-          textLabel="Commit message"
-          message={<Text size="sm">Kite commit đúng các file của patch đã áp (không push).</Text>}
-          confirmLabel="Commit"
-          onConfirm={(message) => attempt(() => post(`/api/tasks/${encodeURIComponent(taskId)}/commit`, { message }), 'Đã commit')}
+          textLabel={t('chat.commit-message-label')}
+          message={<Text size="sm">{t('chat.commit-explain')}</Text>}
+          confirmLabel={t('chat.tool.commit-result')}
+          onConfirm={(message) => attempt(() => post(`/api/tasks/${encodeURIComponent(taskId)}/commit`, { message }), t('chat.committed'))}
         />
       ) : null}
     </Group>
@@ -868,17 +882,18 @@ function KiteActions({ tool, result }: { tool: string; result: any }) {
 }
 
 function PermissionCard({ permission: p, onAnswer }: { permission: Permission; onAnswer: (p: Permission, d: 'once' | 'reject') => void }) {
+  const t = useT()
   return (
-    <Alert color="yellow" title={p.action === 'shell' ? 'Agent muốn chạy lệnh trên máy Kite' : `Agent xin quyền: ${p.action}`}>
+    <Alert color="yellow" title={p.action === 'shell' ? t('chat.permission-shell') : t('chat.permission-other', { action: p.action })}>
       <Stack gap="xs">
         {p.message ? <Text size="sm">{p.message}</Text> : null}
         <Code block>{p.resources.join('\n')}</Code>
         <Group gap="xs">
           <Button size="xs" color="yellow" onClick={() => onAnswer(p, 'once')}>
-            Cho phép lần này
+            {t('chat.allow-once')}
           </Button>
           <Button size="xs" variant="default" onClick={() => onAnswer(p, 'reject')}>
-            Từ chối
+            {t('chat.reject')}
           </Button>
         </Group>
       </Stack>
@@ -887,6 +902,7 @@ function PermissionCard({ permission: p, onAnswer }: { permission: Permission; o
 }
 
 function FormCard({ form, sessionId, onDone }: { form: Form; sessionId: string; onDone: () => void }) {
+  const t = useT()
   const [answer, setAnswer] = useState<Record<string, string | string[]>>({})
   const [custom, setCustom] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
@@ -897,7 +913,7 @@ function FormCard({ form, sessionId, onDone }: { form: Form; sessionId: string; 
   return (
     <Card withBorder>
       <Text fw={600} mb="xs">
-        Agent hỏi bạn
+        {t('chat.agent-asks')}
       </Text>
       <Stack gap="md">
         {form.fields.map((f) => (
@@ -927,7 +943,7 @@ function FormCard({ form, sessionId, onDone }: { form: Form; sessionId: string; 
             {f.custom || !f.options?.length ? (
               <TextInput
                 size="sm"
-                placeholder={f.options?.length ? 'Hoặc tự trả lời…' : 'Câu trả lời'}
+                placeholder={f.options?.length ? t('chat.answer-custom') : t('chat.answer-placeholder')}
                 value={custom[f.key] ?? ''}
                 onChange={(e) => {
                   const value = e.currentTarget.value
@@ -951,7 +967,7 @@ function FormCard({ form, sessionId, onDone }: { form: Form; sessionId: string; 
               if (ok !== undefined) onDone()
             }}
           >
-            Trả lời
+            {t('chat.answer')}
           </Button>
         </Group>
       </Stack>
@@ -960,6 +976,7 @@ function FormCard({ form, sessionId, onDone }: { form: Form; sessionId: string; 
 }
 
 function Composer({ busy, onSend, onStop }: { busy: boolean; onSend: (text: string) => Promise<boolean>; onStop: () => void }) {
+  const t = useT()
   const [text, setText] = useState('')
   const [sending, setSending] = useState(false)
   async function submit() {
@@ -977,7 +994,7 @@ function Composer({ busy, onSend, onStop }: { busy: boolean; onSend: (text: stri
           autosize
           minRows={1}
           maxRows={8}
-          placeholder={busy ? 'Agent đang làm; tin mới sẽ được đưa vào ngay…' : 'Nhắn cho Kite (Enter để gửi, Shift+Enter xuống dòng)'}
+          placeholder={busy ? t('chat.composer-busy') : t('chat.composer-placeholder')}
           value={text}
           onChange={(e) => setText(e.currentTarget.value)}
           onKeyDown={(e) => {
@@ -988,13 +1005,13 @@ function Composer({ busy, onSend, onStop }: { busy: boolean; onSend: (text: stri
           }}
         />
         {busy ? (
-          <Tooltip label="Dừng lượt này">
+          <Tooltip label={t('chat.stop-turn')}>
             <ActionIcon size={36} color="red" variant="light" onClick={onStop}>
               <IconPlayerStopFilled size={18} />
             </ActionIcon>
           </Tooltip>
         ) : null}
-        <ActionIcon size={36} onClick={submit} loading={sending} disabled={!text.trim()} title="Gửi">
+        <ActionIcon size={36} onClick={submit} loading={sending} disabled={!text.trim()} title={t('chat.send')}>
           <IconSend size={18} />
         </ActionIcon>
       </Group>
