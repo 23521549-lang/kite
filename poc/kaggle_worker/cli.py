@@ -489,7 +489,7 @@ def _parser() -> argparse.ArgumentParser:
     verdict = note.add_mutually_exclusive_group(required=True)
     verdict.add_argument("--good", action="store_true", help="the result was right and useful")
     verdict.add_argument("--bad", action="store_true", help="the result was wrong or not usable")
-    note.add_argument("text", nargs="?", default="", help="why (what was wrong, what you had to fix)")
+    note.add_argument("text", help="why (what was wrong, what you had to fix)")
     return parser
 
 
