@@ -1250,3 +1250,68 @@ def test_web_key_export_round_trips_and_a_swapped_key_is_caught(tmp_path, monkey
     with pytest.raises(ConfigError):
         cli._check_sealer_canary(store, sec.Sealer(tmp_path / "secrets" / "web_key"))
     assert cli.main(["--config", str(path), "web", "serve"]) != 0
+
+
+# ---------------------------------------------------------------- bench import (F5)
+def test_bench_import_terminal_bench_via_api_then_listed(site):
+    headers = signed_in(site)
+    client = site["client"]
+    assert client.get("/api/bench/tasks").json() == {"tasks": []}
+    src = Path(__file__).parent / "fixtures" / "bench" / "tb-hello"
+    body = client.post("/api/bench/import", headers=headers,
+                       json={"source": "terminal-bench", "src": str(src)}).json()
+    assert body["ok"] and body["task_id"] == "tb-hello" and body["source"] == "terminal-bench"
+    assert not body["skipped"] and body["reason"] is None
+    assert body["dest"] == str(site["path"] / "bench-tasks" / "tb-hello")
+    tasks = client.get("/api/bench/tasks").json()["tasks"]
+    assert [t["id"] for t in tasks] == ["tb-hello"]
+    row = tasks[0]
+    assert row["kind"] == "terminal" and row["source"] == "terminal-bench"
+    assert row["axes"] == ["Coding"] and row["ok"] and row["errors"] == []
+    again = client.post("/api/bench/import", headers=headers,
+                        json={"source": "terminal-bench", "src": str(src)}).json()
+    assert not again["ok"] and again["skipped"] and "đã tồn tại" in again["reason"]
+
+
+def test_bench_import_swebench_via_api(site, tmp_path):
+    from tests.poc.kaggle_worker.test_bench_importers import load_swe_instance, make_sample_checkout
+
+    headers = signed_in(site)
+    client = site["client"]
+    repo, sha = make_sample_checkout(tmp_path)
+    instance = load_swe_instance(tmp_path, base_commit=sha)
+    body = client.post("/api/bench/import", headers=headers, json={
+        "source": "swe-bench", "instance_json": json.dumps(instance),
+        "repo_checkout": str(repo)}).json()
+    assert body["ok"], body
+    assert body["task_id"] == "sample__calc-1" and body["source"] == "swe-bench"
+    tasks = client.get("/api/bench/tasks").json()["tasks"]
+    assert [t["id"] for t in tasks] == ["sample__calc-1"]
+    row = tasks[0]
+    assert row["kind"] == "repo" and row["source"] == "swe-bench" and row["ok"]
+    assert row["axes"] == ["Coding", "Đúng việc"]
+
+
+def test_bench_import_rejects_bad_requests(site):
+    headers = signed_in(site)
+    client = site["client"]
+    assert client.post("/api/bench/import", headers=headers, json={"source": "nope"}).status_code == 400
+    assert client.post("/api/bench/import", headers=headers,
+                       json={"source": "terminal-bench"}).status_code == 400
+    assert client.post("/api/bench/import", headers=headers, json={
+        "source": "swe-bench", "instance_json": "{nope",
+        "repo_checkout": "/tmp"}).status_code == 400
+    assert client.post("/api/bench/import", headers=headers, json={
+        "source": "swe-bench", "instance_json": json.dumps({"instance_id": "x__1"}),
+        "repo_checkout": "/tmp/no-such-checkout"}).status_code == 400
+
+
+def test_bench_tasks_lists_invalid_folder_with_errors(site):
+    headers = signed_in(site)
+    client = site["client"]
+    bad = site["path"] / "bench-tasks" / "broken-one"
+    bad.mkdir(parents=True)
+    (bad / "task.yaml").write_text("id: broken-one\nkind: bogus\n", encoding="utf-8")
+    tasks = client.get("/api/bench/tasks").json()["tasks"]
+    assert len(tasks) == 1 and tasks[0]["id"] == "broken-one" and not tasks[0]["ok"]
+    assert tasks[0]["errors"] and all("field" in e and "message" in e for e in tasks[0]["errors"])

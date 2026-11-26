@@ -660,3 +660,36 @@ export type BenchHistory = {
   official?: BenchOfficial
   declared_network_hosts?: string[]
 }
+
+/** Bench import (F5): the result of POST /api/bench/import — the same
+ * shape the CLI prints (ImportResult), so UI and CLI never disagree. */
+export type BenchImportResult = {
+  ok: boolean
+  task_id: string | null
+  dest: string | null
+  source: string
+  skipped: boolean
+  reason: string | null
+  warnings: string[]
+}
+
+export type BenchTaskRow = {
+  id: string
+  kind: string | null
+  language: string | null
+  axes: string[]
+  difficulty: string | number | null
+  source: string
+  ok: boolean
+  errors: { field: string; code: string; message: string }[]
+}
+
+export type BenchTasks = { tasks: BenchTaskRow[] }
+
+export function importBenchTask(body: Record<string, unknown>) {
+  return post<BenchImportResult>('/api/bench/import', body)
+}
+
+export function listBenchTasks() {
+  return get<BenchTasks>('/api/bench/tasks')
+}

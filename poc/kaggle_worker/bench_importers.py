@@ -95,6 +95,7 @@ SWE-bench (``import_swebench``; one instance dict from the dataset)::
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -433,3 +434,62 @@ def import_swebench(instance: dict, dest_root: Path | str, *,
     except _SkipImport as exc:
         return ImportResult(task_id=task_id, dest=None, source=SWE_SOURCE,
                             skipped=True, reason=str(exc), warnings=tuple(warnings))
+
+
+# --- instance input (CLI + web share this) -----------------------------------
+
+def parse_swebench_instances(text: str) -> list[dict]:
+    """Parse SWE-bench instance input: one JSON object, a JSON array, or
+    JSONL (one object per line). Returns the instance dicts in order.
+    Raises ValueError with a plain message when the text is not usable."""
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("chưa có dữ liệu instance SWE-bench (JSON trống)")
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        instances: list[dict] = []
+        for line in stripped.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                instances.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"dòng JSON lỗi cú pháp: {exc}") from exc
+        data = instances
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not data:
+        raise ValueError("dữ liệu SWE-bench phải là một instance JSON, một mảng JSON, hoặc JSONL")
+    if not all(isinstance(item, dict) for item in data):
+        raise ValueError("mỗi instance SWE-bench phải là một JSON object")
+    return data
+
+
+def pick_swebench_instance(instances: list[dict], instance_id: str | None = None) -> dict:
+    """Pick one instance: by id when given, the only one when there is
+    exactly one. Raises ValueError when the choice is ambiguous or missing."""
+    if not instances:
+        raise ValueError("không có instance SWE-bench nào để nhập")
+    if instance_id:
+        for item in instances:
+            if item.get("instance_id") == instance_id:
+                return item
+        raise ValueError(f"không có instance {instance_id!r} trong dữ liệu đã nhập")
+    if len(instances) > 1:
+        ids = ", ".join(str(item.get("instance_id") or "?") for item in instances[:10])
+        raise ValueError(
+            f"dữ liệu có {len(instances)} instance ({ids}); chỉ rõ một instance bằng --instance-id")
+    return instances[0]
+
+
+def load_swebench_instance_file(path: Path | str, instance_id: str | None = None) -> dict:
+    """Read a SWE-bench instance file (JSON object / JSON array / JSONL)
+    and pick one instance out of it."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"không đọc được file instance {path}: {exc}") from exc
+    return pick_swebench_instance(parse_swebench_instances(text), instance_id)
