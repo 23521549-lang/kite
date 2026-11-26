@@ -19,7 +19,7 @@ import { useEffect, useState } from 'react'
 import { get, post, qs } from '../api'
 import { ConfirmButton, Empty, JsonView, KeyValue, Loading, Page } from '../components/common'
 import { loadMe, useKite } from '../store'
-import { ago, attempt, fmtTime, notifyOk, useLoad } from '../util'
+import { ago, attempt, fmtTime, notifyError, notifyOk, useLoad } from '../util'
 import { useT, type DictKey } from '../i18n'
 
 export default function Settings() {
@@ -128,12 +128,40 @@ function TwoFactor() {
   const [code, setCode] = useState('')
   const [pending, setPending] = useState<{ secret: string; uri: string } | null>(null)
   const [confirmCode, setConfirmCode] = useState('')
+  // Fresh recovery codes, shown exactly once after a successful 2FA change.
+  // The backend issues them with the confirm response and never shows them again;
+  // dismissing this block loses them for good (a new 2FA change issues new ones).
+  const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null)
   return (
     <Card withBorder>
       <Title order={5}>{t('settings.totp.title')}</Title>
       <Text size="sm" c="dimmed" mb="xs">
         {t('settings.totp.note-prefix')} <Code>kite web admin --reset</Code>.
       </Text>
+      {recoveryCodes ? (
+        <Alert color="yellow" title={t('settings.totp.recovery-title')} mb="sm">
+          <Text size="sm" mb="xs">
+            {t('settings.totp.recovery-note')}
+          </Text>
+          <Stack gap={4}>
+            {recoveryCodes.map((c) => (
+              <Code key={c}>{c}</Code>
+            ))}
+          </Stack>
+          <Group mt="sm">
+            <CopyButton value={recoveryCodes.join('\n')}>
+              {({ copied, copy }) => (
+                <Button size="compact-xs" variant="light" onClick={copy}>
+                  {copied ? t('settings.totp.copied') : t('settings.totp.recovery-copy-all')}
+                </Button>
+              )}
+            </CopyButton>
+            <Button size="compact-xs" variant="default" onClick={() => setRecoveryCodes(null)}>
+              {t('settings.totp.recovery-saved')}
+            </Button>
+          </Group>
+        </Alert>
+      ) : null}
       {!pending ? (
         <Stack gap="xs">
           <PasswordInput label={t('settings.totp.password')} value={password} onChange={(e) => setPassword(e.currentTarget.value)} />
@@ -173,8 +201,11 @@ function TwoFactor() {
             <Button
               disabled={confirmCode.length !== 6}
               onClick={async () => {
-                const res = await attempt(() => post('/api/auth/totp/confirm', { code: confirmCode }), t('settings.totp.confirmed'))
+                const res = await attempt(() =>
+                  post<{ ok: boolean; recovery_codes?: string[] }>('/api/auth/totp/confirm', { code: confirmCode }),
+                t('settings.totp.confirmed'))
                 if (res) {
+                  setRecoveryCodes(Array.isArray(res.recovery_codes) ? res.recovery_codes : [])
                   setPending(null)
                   setConfirmCode('')
                 }
@@ -435,7 +466,15 @@ function Restart() {
   const t = useT()
   const restart = async (services: string[], force = false) => {
     const res = await attempt(() => post<Record<string, any>>('/api/system/restart', { services, force }))
-    if (res) notifyOk(res.queued ? t('settings.restart.requested') : t('settings.restart.done'))
+    if (!res) return
+    if (res.ok === false) {
+      // HTTP 200 with ok:false: systemctl (or the compose queue) refused — show the
+      // backend's error instead of the success toast (the old code toasted success
+      // for any truthy response).
+      notifyError(res.error ?? t('settings.restart.failed'))
+      return
+    }
+    notifyOk(res.queued ? t('settings.restart.requested') : t('settings.restart.done'))
   }
   return (
     <Card withBorder>

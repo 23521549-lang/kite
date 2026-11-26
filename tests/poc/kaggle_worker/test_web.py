@@ -720,6 +720,26 @@ def test_system_routes_restart_only_kite_services_and_not_under_a_running_task(s
     assert {"restart", "update", "bench_start"} <= {r["action"] for r in rows}
 
 
+def test_system_restart_passes_a_failed_run_through_instead_of_pretending_success(site):
+    """A restart runner that fails (e.g. a missing systemd unit) is reported as HTTP 200
+    with ok:false + the runner's error — the UI shows that error instead of a success
+    toast, so the endpoint must keep passing the report through verbatim."""
+    headers = signed_in(site)
+
+    async def restart(services):
+        return {"ok": False, "services": services,
+                "error": "Failed to restart kite-gateway.service: Unit kite-gateway.service not found."}
+
+    site["ctx"].restart = restart
+    res = site["client"].post("/api/system/restart", headers=headers,
+                              json={"services": ["kite-gateway"], "force": True})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is False
+    assert body["services"] == ["kite-gateway"]
+    assert "not found" in body["error"]
+
+
 # ---------------------------------------------------------------- live events and the chat proxy
 def test_the_event_feed_needs_a_session_and_a_same_site_origin(site):
     signed_in(site)
@@ -1202,6 +1222,7 @@ def test_setting_up_2fa_again_hands_out_fresh_recovery_codes(site):
     confirm = site["client"].post("/api/auth/totp/confirm", headers=headers,
                                   json={"code": sec.totp_now(new_secret, site["clock"]["now"])})
     assert confirm.status_code == 200 and len(confirm.json()["recovery_codes"]) == 8
+    assert confirm.json()["ok"] is True
     fresh = TestClient(site["client"].app, base_url="https://testserver")
     ok = fresh.post("/api/auth/login", json={"username": "han", "password": PASSWORD,
                                              "code": confirm.json()["recovery_codes"][0]})
