@@ -66,6 +66,31 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
 
+  # The built page in a real browser (Playwright's Chromium): sign in, open every tab, fail on a JavaScript
+  # error. The back end is the test suite's fake one (tests/poc/kaggle_worker/test_web_pages.py).
+  web-pages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package, Node.js and Chromium
+        run: |
+          python -m pip install -e ".[test,web,browser,ui]" -c requirements.lock
+          python -m playwright install --with-deps chromium
+      - name: Build the page
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Open every tab
+        env:
+          KITE_WEB_PAGES: "1"
+        run: python -m pytest tests/poc/kaggle_worker/test_web_pages.py -q -p no:cacheprovider
+
   # The deployment files: Compose config, shell scripts, Terraform.
   deploy:
     runs-on: ubuntu-latest
@@ -104,7 +129,7 @@ jobs:
   # Images for the Compose deployment, only from main once every check above passed: sha-<commit>, and
   # `stable`, the tag kite-stack on the machines follows.
   images:
-    needs: [tests, web, deploy, terraform]
+    needs: [tests, web, web-pages, deploy, terraform]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -189,7 +214,7 @@ jobs:
   # A pull request builds both images too (nothing is pushed or signed) and starts the Kite image once,
   # so a Dockerfile or dependency change is caught before it reaches main and the stable tag.
   images-check:
-    needs: [tests, web, deploy, terraform]
+    needs: [tests, web, web-pages, deploy, terraform]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
