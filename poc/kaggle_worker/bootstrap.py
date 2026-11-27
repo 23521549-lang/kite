@@ -70,7 +70,8 @@ def bootstrap(repo: Path, data_dir: Path, *, dry_run: bool = False,
         commands.append(["bash", "-lc", f"curl -fsSL {OPENCODE_INSTALLER} | bash"])
     commands.extend([
         [uv, "venv", "--python", python_executable, str(repo / ".venv")],
-        [uv, "pip", "install", "--python", venv_python, "-r", str(repo / "requirements.txt")],
+        [uv, "pip", "install", "--python", venv_python, "-r", str(repo / "requirements.txt"),
+         *(["-c", str(repo / "requirements.lock")] if (repo / "requirements.lock").is_file() else [])],
     ])
     if not (harness_dir / ".git").is_dir():
         commands.extend([

@@ -94,20 +94,30 @@ def test_kite_update_installs_new_libraries_before_the_tests_and_builds_the_page
     python = fake_python(tmp_path)
     calls = []
 
+    saved = tmp_path / "cache" / "libraries.txt"
+
     def failing_install(cmd, **kwargs):
         calls.append(cmd)
-        if "install" in cmd:
+        if "freeze" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "six==1.16.0\n", "")
+        if "install" in cmd and "-r" in cmd and str(saved) not in cmd:
             return subprocess.CompletedProcess(cmd, 1, "", "No solution found")
+        if str(saved) in cmd:                              # putting the old libraries back
+            assert git(clone, "rev-parse", "HEAD") == old  # only once the old code is back
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         return subprocess.run(cmd, **kwargs)
 
-    failed = update.run(clone, python=python, runner=failing_install, restart=False)
+    failed = update.run(clone, python=python, runner=failing_install, restart=False, saved=saved)
     assert failed["updated"] is False and "cài thư viện mới lỗi" in failed["error"]
+    assert failed["libraries"] == "đã cài lại đúng thư viện cũ" and saved.read_text() == "six==1.16.0\n"
     assert git(clone, "rev-parse", "HEAD") == old and not any(c[1:3] == ["-m", "pytest"] for c in calls)
 
     npm = FakeNpm()
     order = []
 
     def passing(cmd, **kwargs):
+        if "freeze" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "six==1.16.0\n", "")
         if "install" in cmd and "-r" in cmd:
             order.append("install")
             return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -119,9 +129,19 @@ def test_kite_update_installs_new_libraries_before_the_tests_and_builds_the_page
             return npm(cmd, **kwargs)
         return subprocess.run(cmd, **kwargs)
 
-    done = update.run(clone, python=python, runner=passing, restart=False)
+    playwright = Path(python).parent / "playwright"          # the venv has Kite's browser: Chromium follows
+    playwright.write_text("#!/bin/sh\n")
+    original = passing
+
+    def passing(cmd, **kwargs):
+        if cmd[0] == str(playwright):
+            order.append("chromium")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return original(cmd, **kwargs)
+
+    done = update.run(clone, python=python, runner=passing, restart=False, saved=saved)
     assert done["updated"] and done["libraries"].startswith("đã cài thư viện mới")
-    assert order == ["install", "tests", "npm ci", "npm run"]
+    assert order == ["install", "chromium", "tests", "npm ci", "npm run"]
     assert done["ui"] == "đã build giao diện mới" and (clone / "web" / "dist" / "index.html").is_file()
 
 
@@ -130,6 +150,51 @@ def test_the_install_command_uses_uv_when_the_venv_has_no_pip(tmp_path, monkeypa
     uv.write_text("#!/bin/sh\n")
     monkeypatch.setattr(update.shutil, "which", lambda name: str(uv) if name == "uv" else None)
     assert update.install_command("/venv/bin/python", tmp_path)[:5] == [str(uv), "pip", "install", "-q", "--python"]
+    assert "-c" not in update.install_command("/venv/bin/python", tmp_path)      # an old checkout: no lock
+    (tmp_path / "requirements.lock").write_text("six==1.16.0\n")
+    assert update.install_command("/venv/bin/python", tmp_path)[-2:] == ["-c", str(tmp_path / "requirements.lock")]
+    assert update.restore_command("/venv/bin/python", tmp_path / "saved.txt")[:3] == [str(uv), "pip", "sync"]
     monkeypatch.setattr(update.shutil, "which", lambda name: None)
     monkeypatch.setattr(update.Path, "home", lambda: tmp_path / "nohome")
     assert update.install_command("/venv/bin/python", tmp_path)[:4] == ["/venv/bin/python", "-m", "pip", "install"]
+    assert update.freeze_command("/venv/bin/python") == ["/venv/bin/python", "-m", "pip", "freeze"]
+
+
+def test_failed_tests_after_new_libraries_put_the_old_libraries_back(tmp_path):
+    origin, _ = make_repo(tmp_path, "origin")
+    (origin / "requirements.txt").write_text("-e .\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-qm", "requirements")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    old = git(clone, "rev-parse", "HEAD")
+    (origin / "requirements.lock").write_text("six==1.17.0\n")
+    git(origin, "add", "-A")
+    git(origin, "commit", "-qm", "lock")
+    saved, restored = tmp_path / "libraries.txt", []
+
+    def runner(cmd, **kwargs):
+        if "freeze" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "six==1.16.0\n", "")
+        if str(saved) in cmd:
+            restored.append(git(clone, "rev-parse", "HEAD"))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "install" in cmd:
+            assert "-c" in cmd                                  # the new lock pins the install
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[1:3] == ["-m", "pytest"]:
+            return subprocess.CompletedProcess(cmd, 1, "E boom\n1 failed\n", "")
+        return subprocess.run(cmd, **kwargs)
+
+    failed = update.run(clone, python=fake_python(tmp_path), runner=runner, restart=False, saved=saved)
+    assert failed["updated"] is False and "quay lại bản cũ" in failed["error"]
+    assert restored == [old] and failed["libraries"] == "đã cài lại đúng thư viện cũ"
+
+    def no_freeze(cmd, **kwargs):
+        if "freeze" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "no python")
+        assert "install" not in cmd                             # nothing installed without a saved list
+        return subprocess.run(cmd, **kwargs)
+
+    refused = update.run(clone, python=fake_python(tmp_path / "b"), runner=no_freeze, restart=False, saved=saved)
+    assert "không lưu được" in refused["error"] and git(clone, "rev-parse", "HEAD") == old

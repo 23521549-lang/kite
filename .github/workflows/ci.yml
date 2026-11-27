@@ -32,6 +32,14 @@ jobs:
       - name: Check bootstrap shell syntax
         run: bash -n poc/kaggle_worker/bootstrap.sh
 
+      # requirements.lock must still be what pyproject.toml resolves to (the same uv as `make lock`).
+      - name: Lock file is current
+        run: |
+          python -m pip install "uv==0.11.32"
+          cp requirements.lock "$RUNNER_TEMP/requirements.lock"
+          make lock LOCK="$RUNNER_TEMP/requirements.lock"
+          diff -u requirements.lock "$RUNNER_TEMP/requirements.lock"
+
       - name: Run test suite
         run: python -m pytest tests/poc/kaggle_worker -q -p no:cacheprovider
 

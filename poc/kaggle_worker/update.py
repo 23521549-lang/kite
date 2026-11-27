@@ -5,8 +5,10 @@ Step 2 of the full-test day: every change meant SSH, ``git pull``, ``pytest``, `
 ``run`` does the EC2 part in one go and refuses to leave a broken Kite behind: the tests run on the
 new code first, and a failure puts the old commit back before anything is restarted.
 
-New libraries (pyproject.toml or requirements.txt changed) are installed before the tests, with uv like
-the bootstrap; the web front end is rebuilt after them when its sources changed (webui.py).
+New libraries (pyproject.toml, requirements.txt or requirements.lock changed) are installed before the
+tests, with uv like the bootstrap, at the versions requirements.lock pins; the web front end is rebuilt
+after them when its sources changed (webui.py). The installed libraries are saved first (``pip freeze``):
+a failed install or failed tests put the old commit and those exact libraries back.
 
 Kite still never pushes: the code reaches GitHub from the person's own machine.
 """
@@ -21,7 +23,7 @@ from typing import Callable
 
 REPO = Path(__file__).resolve().parents[2]
 NOTEBOOK = "poc/kaggle_worker/kaggle_model_worker.ipynb"
-DEPENDENCY_FILES = ("pyproject.toml", "requirements.txt")
+DEPENDENCY_FILES = ("pyproject.toml", "requirements.txt", "requirements.lock")
 SERVICES = ("kite-gateway", "kite-workflow-worker")
 OPTIONAL_SERVICES = ("kite-web",)          # restarted too once installed (/etc/systemd/system/<name>.service)
 UNIT_DIR = Path("/etc/systemd/system")
@@ -37,13 +39,43 @@ def _run(runner: Runner, cmd: list[str], cwd: Path, timeout: int = 120) -> subpr
     return runner(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
 
 
+def _uv() -> str | None:
+    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    return uv if Path(uv).is_file() else None
+
+
 def install_command(python: str, repo: Path) -> list[str]:
     """How the venv gets the project's libraries: uv (as the bootstrap made it, a uv venv has no pip),
-    else pip."""
-    uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
-    if Path(uv).is_file():
-        return [uv, "pip", "install", "-q", "--python", python, "-r", str(repo / "requirements.txt")]
-    return [python, "-m", "pip", "install", "-q", "-r", str(repo / "requirements.txt")]
+    else pip; at the versions requirements.lock pins when the checkout has one (``make lock``)."""
+    lock = repo / "requirements.lock"
+    pins = ["-c", str(lock)] if lock.is_file() else []
+    uv = _uv()
+    if uv:
+        return [uv, "pip", "install", "-q", "--python", python, "-r", str(repo / "requirements.txt"), *pins]
+    return [python, "-m", "pip", "install", "-q", "-r", str(repo / "requirements.txt"), *pins]
+
+
+def freeze_command(python: str) -> list[str]:
+    uv = _uv()
+    return [uv, "pip", "freeze", "--python", python] if uv else [python, "-m", "pip", "freeze"]
+
+
+def restore_command(python: str, saved: Path) -> list[str]:
+    """Back to the libraries saved before the update. uv's sync also removes what the update added
+    (Harness² and other editable installs are in the saved list); pip can only reinstall the old versions."""
+    uv = _uv()
+    if uv:
+        return [uv, "pip", "sync", "-q", "--python", python, str(saved)]
+    return [python, "-m", "pip", "install", "-q", "-r", str(saved)]
+
+
+def _restore(runner: Runner, python: str, saved: Path, repo: Path) -> str:
+    command = restore_command(python, saved)
+    done = _run(runner, command, repo, timeout=1800)
+    if done.returncode == 0:
+        return "đã cài lại đúng thư viện cũ"
+    return ("cài lại thư viện cũ lỗi (" + (done.stderr or done.stdout).strip()[-300:]
+            + "); chạy tay: " + " ".join(command))
 
 
 def plan(repo: Path = REPO, runner: Runner = subprocess.run) -> dict:
@@ -67,9 +99,10 @@ def plan(repo: Path = REPO, runner: Runner = subprocess.run) -> dict:
 
 
 def run(repo: Path = REPO, *, python: str = sys.executable, runner: Runner = subprocess.run,
-        restart: bool = True, after: Callable[[], dict] | None = None) -> dict:
+        restart: bool = True, after: Callable[[], dict] | None = None, saved: Path | None = None) -> dict:
     """Pull the new commits, test them, restart Kite's services. ``after`` runs once the services
-    are back (the chat files are rewritten by the new code there)."""
+    are back (the chat files are rewritten by the new code there). ``saved``: where the libraries
+    installed before the update are listed (outside the repo: a reset must not touch it)."""
     report = plan(repo, runner)
     if report.get("error") or not report["behind"]:
         return {**report, "updated": False, **({} if report.get("error") else {"note": "Kite đã là bản mới nhất"})}
@@ -82,18 +115,38 @@ def run(repo: Path = REPO, *, python: str = sys.executable, runner: Runner = sub
     if pulled.returncode != 0:
         return {**report, "updated": False, "error": "git pull lỗi: " + pulled.stderr.strip()[-300:]}
     changed = git("diff", "--name-only", old, "HEAD", "--", *DEPENDENCY_FILES).stdout.split()
+    libraries: Path | None = None
     if changed and (repo / "requirements.txt").is_file():
+        frozen = _run(runner, freeze_command(python), repo)
+        if frozen.returncode != 0:
+            git("reset", "--hard", "-q", old)
+            return {**report, "updated": False,
+                    "error": "không lưu được danh sách thư viện đang cài nên chưa cập nhật: "
+                             + (frozen.stderr or frozen.stdout).strip()[-300:]}
+        libraries = saved or Path.home() / ".cache" / "kite" / "libraries-before-update.txt"
+        libraries.parent.mkdir(parents=True, exist_ok=True)
+        libraries.write_text(frozen.stdout, encoding="utf-8")
         installed = _run(runner, install_command(python, repo), repo, timeout=1800)
         if installed.returncode != 0:
             git("reset", "--hard", "-q", old)
-            return {**report, "updated": False,
+            return {**report, "updated": False, "libraries": _restore(runner, python, libraries, repo),
                     "error": "cài thư viện mới lỗi nên đã quay lại bản cũ: "
                              + (installed.stderr or installed.stdout).strip()[-600:]}
         report["libraries"] = "đã cài thư viện mới (" + ", ".join(changed) + " đổi)"
+        playwright = Path(python).parent / "playwright"
+        if playwright.is_file():
+            # A pinned Playwright may be another version than before: its Chromium must match it, or
+            # Kite's browser for kaggle.com stops opening. Already there: nothing is downloaded.
+            browser = _run(runner, [str(playwright), "install", "chromium"], repo, timeout=900)
+            if browser.returncode != 0:
+                report["browser_error"] = ("playwright install chromium lỗi: "
+                                           + (browser.stderr or browser.stdout).strip()[-300:])
     tests = _run(runner, [python, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"], repo, timeout=1800)
     summary = (tests.stdout.strip().splitlines() or [""])[-1][-200:]
     if tests.returncode != 0:
         git("reset", "--hard", "-q", old)          # never leave a Kite whose tests fail
+        if libraries is not None:                  # code first: the saved list installs the old checkout
+            report["libraries"] = _restore(runner, python, libraries, repo)
         return {**report, "updated": False, "tests": summary,
                 "error": "test của bản mới lỗi nên đã quay lại bản cũ: " + tests.stdout.strip()[-600:]}
     result = {**report, "updated": True, "tests": summary, "restarted": False}
