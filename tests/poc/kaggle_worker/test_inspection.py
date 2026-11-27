@@ -34,7 +34,6 @@ def make_repo(path: Path) -> tuple[Path, str]:
 def test_inspection_reads_only_orientation_files_and_saves_resume_context(tmp_path):
     from poc.kaggle_worker.checkpoint import load_checkpoint
     from poc.kaggle_worker.cli import main
-    import json
 
     repo, head = make_repo(tmp_path / "repo")
     state = tmp_path / "state"

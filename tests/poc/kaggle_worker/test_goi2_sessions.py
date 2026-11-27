@@ -225,7 +225,7 @@ def test_create_session_writes_uuid_dir_and_mcp_command(site):
 
 def test_move_rules_one_way_default_to_repo(site):
     headers = signed_in(site)
-    repo = make_repo(site["path"] / "sample")
+    make_repo(site["path"] / "sample")
     env = make_env(site, headers, name="demo", path=site["path"] / "sample")
     created = make_session(site, headers)
     sid = created["kite_session_id"]

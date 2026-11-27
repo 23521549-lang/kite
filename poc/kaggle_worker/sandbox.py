@@ -2428,7 +2428,7 @@ def run_task(settings: SandboxSettings, *, repo: Path, goal: str, model: str, mo
                 gateway_asker(settings, model, tag=f"{task_id}-b{i + 2}", pin=other)
                 for i, other in enumerate(idle_helpers(settings, model, exclude=worker_pin))]
             log(f"[{task_id}] đường nhanh: viết test tái hiện, rồi hỏi {model} một lần để có cả bản sửa"
-                + (f" (thêm một bản song song trên worker rảnh)" if helpers else "") + "...")
+                + (" (thêm một bản song song trên worker rảnh)" if helpers else "") + "...")
             fast = fast_path(workspace, goal, graph, ask, test_command=run.test_command, check=run.check_command,
                              template=template, run_tests=run_tests, run_check=run_check, run_one=run_one,
                              helpers=helpers, retries=settings.fast_retries)

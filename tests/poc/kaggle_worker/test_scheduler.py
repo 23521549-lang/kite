@@ -9,8 +9,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 from poc.kaggle_worker import protocol
-from poc.kaggle_worker.protocol import CheckpointRef, ModelRequest, ModelResponse, WorkerStatus
-from poc.kaggle_worker.store import LeaseError, SQLiteSchedulerStore, StoreError
+from poc.kaggle_worker.store import LeaseError, SQLiteSchedulerStore
 try:
     from poc.kaggle_worker.scheduler import WorkerScheduler
 except ModuleNotFoundError:

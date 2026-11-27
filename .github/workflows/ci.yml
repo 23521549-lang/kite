@@ -40,6 +40,12 @@ jobs:
           make lock LOCK="$RUNNER_TEMP/requirements.lock"
           diff -u requirements.lock "$RUNNER_TEMP/requirements.lock"
 
+      # Unused and undefined names, syntax errors (pyproject.toml [tool.ruff]).
+      - name: Ruff
+        run: |
+          python -m pip install "ruff==0.16.9"
+          ruff check .
+
       - name: Run test suite
         run: python -m pytest tests/poc/kaggle_worker -q -p no:cacheprovider
 

@@ -72,6 +72,16 @@ kite-worker = "poc.kaggle_worker.cli:console_main"
 include = ["poc*"]
 namespaces = true
 
+# Ruff for the mistakes that are bugs, not style: pyflakes (F: unused or undefined names, a
+# redefinition that hides another) and syntax errors (E9). Not linted: the benchmark task folders under
+# docs/benchmarks (repositories Kite is graded on, kept as they are) and the worker notebook (its cells
+# run one by one on Kaggle; read as one file they look like re-imports and a late __future__ import).
+[tool.ruff]
+extend-exclude = ["docs/benchmarks", "*.ipynb"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

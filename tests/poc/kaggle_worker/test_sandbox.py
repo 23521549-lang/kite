@@ -1313,7 +1313,6 @@ def test_a_retry_after_a_failed_reproduction_never_shows_the_test(tmp_path):
 
 
 def test_best_of_n_checks_a_second_workers_candidate_when_the_first_fails(tmp_path):
-    from dataclasses import replace
 
     bad = FIX.replace("if xs else 0", "if xs else 1")
     fake = FakeDocker(quick_returncodes=[1, 0],

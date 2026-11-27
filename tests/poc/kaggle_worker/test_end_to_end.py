@@ -12,7 +12,6 @@ import sqlite3
 import threading
 from urllib.parse import urlparse, parse_qs
 
-from temporalio import activity
 import pytest
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
 from temporalio.worker import Worker

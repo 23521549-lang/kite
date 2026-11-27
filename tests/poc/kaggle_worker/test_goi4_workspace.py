@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace

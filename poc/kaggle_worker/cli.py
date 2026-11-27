@@ -19,6 +19,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 from .config import (ConfigError, LIVE_ADAPTERS, gateway_models, gateway_workers, load_config,
                      model_contexts, model_policy_from_config, redact_config, refresh_configured_providers,
@@ -1023,8 +1024,6 @@ def _sealer_canary_write(store, sealer) -> None:
     """Record which web key the sealed data belongs to (its fingerprint + a sealed canary text), so a
     key file that was lost and silently regenerated is caught at startup instead of surfacing as a
     2FA that quietly stops working."""
-    from .web import security as sec
-
     store.set_setting("sealer_canary", {"fingerprint": sealer.fingerprint(),
                                         "check": sealer.seal(_SEALER_CANARY)})
 
@@ -1032,8 +1031,6 @@ def _sealer_canary_write(store, sealer) -> None:
 def _check_sealer_canary(store, sealer) -> None:
     """Refuse to serve when the web key does not open what is already sealed. The first run that
     finds an account adopts the current key — but only after proving it opens the stored 2FA secret."""
-    from .web import security as sec
-
     canary = store.setting("sealer_canary")
     if canary:
         ok = canary.get("fingerprint") == sealer.fingerprint()

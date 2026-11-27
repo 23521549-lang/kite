@@ -1757,7 +1757,7 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
     async def knowledge_reconvert(doc_id: str, request: Request):
         session = auth(request)
         try:
-            meta = await asyncio.to_thread(know.get_document, ctx.state_dir, doc_id)
+            await asyncio.to_thread(know.get_document, ctx.state_dir, doc_id)   # 404 for an unknown id
         except FileNotFoundError:
             raise HTTPException(404, "không có tài liệu này")
         try:

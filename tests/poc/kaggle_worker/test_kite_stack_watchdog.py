@@ -314,7 +314,7 @@ def test_watchdog_failed_restart_retries_next_tick(host):
 
 
 def test_watchdog_restarted_but_still_unhealthy_counts_and_alerts_louder(host):
-    stack, docker, clock = host["stack"], host["docker"], host["clock"]
+    stack, docker = host["stack"], host["docker"]
     docker.states["temporal"] = {"state": "running", "health": "unhealthy", "exit": 0}
     docker.stay_unhealthy.add("temporal")
     stack.dir.joinpath("watchdog.json").write_text(json.dumps(

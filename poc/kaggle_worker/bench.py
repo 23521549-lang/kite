@@ -17,7 +17,7 @@ Results go to ``results.json`` and ``README.md`` in the output folder.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re

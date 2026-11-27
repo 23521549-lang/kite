@@ -18,11 +18,15 @@ from pathlib import Path
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .temporal_workflow import CodingRunResult, CodingTaskInput, RouteLease
+
+if TYPE_CHECKING:
+    from .temporal_state import RecoveryDecision
 
 
 class OpenCodeError(RuntimeError):
@@ -209,7 +213,6 @@ class OpenCodeClient:
             raise ValueError("session_id and text must be non-empty")
         prompt_id = self.message_id_for_key(operation_key)
         session_path = f"/api/session/{quote(session_id, safe='')}"
-        message_path = f"{session_path}/message/{quote(prompt_id, safe='')}"
         try:
             return self.get_message(session_id, prompt_id)
         except OpenCodeError as exc:

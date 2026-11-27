@@ -605,10 +605,8 @@ def test_reload_stops_the_opencode_daemon_and_old_mcp_servers_only(tmp_path):
 
 
 def test_chat_only_models_never_run_tasks(tmp_path):
-    from dataclasses import replace
 
     from poc.kaggle_worker.config import model_policy_from_config, validate_config
-    from poc.kaggle_worker.routing import ModelPolicy
 
     with pytest.raises(Exception):
         validate_config({**_raw_config(tmp_path), "routing": {"chat_only": "devstral"}})

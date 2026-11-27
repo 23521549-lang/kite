@@ -31,7 +31,7 @@ from typing import Any
 
 import yaml
 
-from .bench_criteria import AXES, CRITERIA_VERSION
+from .bench_criteria import AXES
 
 # Maximum hosts in one task's network allowlist (v1 policy).
 MAX_NETWORK_HOSTS = 10

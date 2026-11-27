@@ -29,7 +29,6 @@ from fastapi.responses import StreamingResponse
 
 from ..backend import task_slug
 from ..journal import Journal
-from ..store import StoreError
 from ..needs_decision import PATCH_EXCERPT_CHARS, scan_needs_decision
 
 _SID = r"[A-Za-z0-9_-]{1,80}"          # same session-id shape as app.py

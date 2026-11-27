@@ -319,7 +319,6 @@ def test_v1_hidden_tests_come_from_the_task_folder_not_from_git(tmp_path):
     from poc.kaggle_worker import bench, bench_loader
     from poc.kaggle_worker.cli import v1_hidden_test_files
 
-    task = bench_loader.load_task_or_raise(tmp_path / "bench-tasks" / "r1") if False else None
     task_dir = tmp_path / "bench-tasks" / "r1"
     (task_dir / "tests" / "tests").mkdir(parents=True)
     (task_dir / "files").mkdir(parents=True)

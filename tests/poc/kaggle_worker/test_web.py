@@ -1388,7 +1388,7 @@ def test_bench_import_rejects_bad_requests(site):
 
 
 def test_bench_tasks_lists_invalid_folder_with_errors(site):
-    headers = signed_in(site)
+    signed_in(site)
     client = site["client"]
     bad = site["path"] / "bench-tasks" / "broken-one"
     bad.mkdir(parents=True)

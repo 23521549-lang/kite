@@ -27,7 +27,6 @@ from poc.kaggle_worker.integration import ReviewBundle
 from poc.kaggle_worker.mcp_server import (
     ApplyConflictError,
     KiteOps,
-    KiteToolError,
     stop_stale_chat_processes,
     sweep_stale_mcp_processes,
 )

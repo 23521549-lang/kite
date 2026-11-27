@@ -47,18 +47,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import hmac
-import io
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
-import tarfile
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Protocol
+from typing import Callable, Protocol
 import urllib.error
 import urllib.parse
 import urllib.request

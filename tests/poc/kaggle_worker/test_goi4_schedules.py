@@ -348,8 +348,7 @@ def test_job_error_does_not_kill_engine(store, chat_dir):
     starter = FakeStarter()
     engine, notes = _engine(store, chat_dir, starter)
     engine.register_builtin("boom", 60, lambda: 1 / 0)
-    schedule = store.create(plan_path="plans/a.md", kind="daily", run_at="09:00",
-                            now=bangkok_ts("2026-11-25 08:00"))
+    store.create(plan_path="plans/a.md", kind="daily", run_at="09:00", now=bangkok_ts("2026-11-25 08:00"))
     first = asyncio.run(engine.run_once(now=bangkok_ts("2026-11-25 09:00")))
     assert first["ran"] and first["errors"] == []  # interval job only arms on first tick
     second = asyncio.run(engine.run_once(now=bangkok_ts("2026-11-25 09:01")))
