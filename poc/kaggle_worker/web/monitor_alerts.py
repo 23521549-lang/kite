@@ -1,10 +1,11 @@
-"""Monitor alerts: owner-set thresholds on worker cost and quota, evaluated lazily.
+"""Monitor alerts: owner-set thresholds on worker cost and quota.
 
 A rule watches one worker and one metric (``cost_day_pct``, ``cost_month_pct``,
 ``kaggle_quota_pct`` or ``runpod_month_usd``). There are no default rules: the owner creates
-them in the UI. Evaluation is lazy — on every ``GET /api/monitor`` (see ``web/monitor.py``,
-which calls :func:`evaluate_and_notify` with the values it already computed) and on
-``POST /api/monitor/alerts/check`` — there is deliberately no background loop in v1.
+them in the UI. Evaluation runs every 5 minutes in the web's scheduler (``scheduler_wiring.py``),
+so an alert fires when nobody has the monitor page open, and also on every ``GET /api/monitor`` (see
+``web/monitor.py``, which calls :func:`evaluate_and_notify` with the values it already computed)
+and on ``POST /api/monitor/alerts/check``.
 
 Firing rule: a rule fires only when its value crosses its threshold from below
 (previous evaluated value under the threshold, current value at or above it). Staying
@@ -12,7 +13,7 @@ above the threshold does not fire again; dipping below and rising again fires ag
 Deduplication state lives in ``last_alerted`` inside the state file, one entry per rule.
 
 Storage is ``state_dir/monitor/alerts.json`` — ``{rules, history, last_alerted}`` — written
-atomically (temp file + ``os.replace``, mode 0600, as in ``memory._save_pending``). History
+atomically under a lock (``joblock.updating`` / ``joblock.write_json``, mode 0600). History
 keeps at most 200 records. Alert messages carry only a title and numbers, never code or
 goal text (the ntfy discipline in ``notify.py``); without ntfy configured the firing is
 still recorded in history with ``notified=false`` and nothing crashes.
@@ -24,7 +25,6 @@ import asyncio
 import hmac
 import json
 import math
-import os
 import time
 import uuid
 from pathlib import Path
@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 from fastapi import HTTPException, Request
 
+from .. import joblock
 from ..config import resolve_secret
 from ..journal import iso
 from . import security as sec
@@ -74,46 +75,34 @@ def load_state(state_dir: str | Path) -> dict:
 
 
 def save_state(state_dir: str | Path, state: dict) -> None:
-    """Write the state atomically (temp file + ``os.replace``, mode 0600)."""
-    path = alerts_path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(state, stream, indent=1, ensure_ascii=False)
-        os.chmod(temp, 0o600)  # the mode above only applies when the temp file is new
-        os.replace(temp, path)
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
+    """Write the state atomically (mode 0600); call it inside ``joblock.updating(alerts_path(...))``."""
+    joblock.write_json(alerts_path(state_dir), state, indent=1, ensure_ascii=False)
 
 
 # ------------------------------------------------------------------ rules
 def create_rule(state_dir: str | Path, worker_id: str, metric: str, threshold: float,
                 *, clock: Callable[[], float] = time.time) -> dict:
     """Append a rule (already validated by the caller) and return it."""
-    state = load_state(state_dir)
     rule = {"id": uuid.uuid4().hex[:8], "worker_id": worker_id, "metric": metric,
             "threshold": float(threshold), "enabled": True, "created_at": iso(clock())}
-    state["rules"].append(rule)
-    save_state(state_dir, state)
+    with joblock.updating(alerts_path(state_dir)):
+        state = load_state(state_dir)
+        state["rules"].append(rule)
+        save_state(state_dir, state)
     return rule
 
 
 def delete_rule(state_dir: str | Path, rule_id: str) -> bool:
     """Drop a rule (and its dedup entry); False when there is no such rule."""
-    state = load_state(state_dir)
-    before = len(state["rules"])
-    state["rules"] = [r for r in state["rules"]
-                      if not (isinstance(r, dict) and r.get("id") == rule_id)]
-    if len(state["rules"]) == before:
-        return False
-    state["last_alerted"].pop(rule_id, None)
-    save_state(state_dir, state)
+    with joblock.updating(alerts_path(state_dir)):
+        state = load_state(state_dir)
+        before = len(state["rules"])
+        state["rules"] = [r for r in state["rules"]
+                          if not (isinstance(r, dict) and r.get("id") == rule_id)]
+        if len(state["rules"]) == before:
+            return False
+        state["last_alerted"].pop(rule_id, None)
+        save_state(state_dir, state)
     return True
 
 
@@ -182,52 +171,55 @@ def evaluate_and_notify(ctx: Any, values: dict) -> tuple[list[dict], int]:
     function, so an async caller should run it in a thread (``asyncio.to_thread``).
     """
     state_dir = ctx.state_dir
-    state = load_state(state_dir)
-    rules = state["rules"]
-    if not rules:
-        return [], 0
-    clock = getattr(ctx, "clock", time.time)
-    now = clock() if callable(clock) else time.time()
-    fired: list[dict] = []
-    active = 0
-    for rule in rules:
-        if not isinstance(rule, dict) or not rule.get("enabled", True):
-            continue
-        worker_values = values.get(rule.get("worker_id")) if isinstance(values, dict) else None
-        if not isinstance(worker_values, dict):
-            continue
-        value = worker_values.get(rule.get("metric"))
-        if (isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(value)):
-            continue
-        value = float(value)
-        threshold = rule.get("threshold")
-        if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
-                or not math.isfinite(threshold)):
-            continue
-        threshold = float(threshold)
-        previous = state["last_alerted"].get(rule["id"]) or {}
-        previous_value = previous.get("last_value")
-        if value >= threshold:
-            active += 1
-            if previous_value is None or previous_value < threshold:
-                entry = {"at": iso(now), "worker_id": rule["worker_id"], "metric": rule["metric"],
-                         "value": value, "threshold": threshold,
-                         "message": alert_message(rule, value)[1],
-                         "notified": _send_alert(ctx, rule, value)}
-                state["history"].append(entry)
-                fired.append(entry)
-                state["last_alerted"][rule["id"]] = {
-                    "value": value, "at": iso(now),
-                    "last_value": value, "last_seen_at": iso(now)}
+    # The 5-minute job and an open monitor page evaluate at the same time: one at a time, or
+    # both see the same crossing and send it twice.
+    with joblock.updating(alerts_path(state_dir)):
+        state = load_state(state_dir)
+        rules = state["rules"]
+        if not rules:
+            return [], 0
+        clock = getattr(ctx, "clock", time.time)
+        now = clock() if callable(clock) else time.time()
+        fired: list[dict] = []
+        active = 0
+        for rule in rules:
+            if not isinstance(rule, dict) or not rule.get("enabled", True):
                 continue
-        state["last_alerted"][rule["id"]] = {
-            "value": previous.get("value"), "at": previous.get("at"),
-            "last_value": value, "last_seen_at": iso(now)}
-    if len(state["history"]) > MAX_HISTORY:
-        state["history"] = state["history"][-MAX_HISTORY:]
-    save_state(state_dir, state)
-    return fired, active
+            worker_values = values.get(rule.get("worker_id")) if isinstance(values, dict) else None
+            if not isinstance(worker_values, dict):
+                continue
+            value = worker_values.get(rule.get("metric"))
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)):
+                continue
+            value = float(value)
+            threshold = rule.get("threshold")
+            if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+                    or not math.isfinite(threshold)):
+                continue
+            threshold = float(threshold)
+            previous = state["last_alerted"].get(rule["id"]) or {}
+            previous_value = previous.get("last_value")
+            if value >= threshold:
+                active += 1
+                if previous_value is None or previous_value < threshold:
+                    entry = {"at": iso(now), "worker_id": rule["worker_id"], "metric": rule["metric"],
+                             "value": value, "threshold": threshold,
+                             "message": alert_message(rule, value)[1],
+                             "notified": _send_alert(ctx, rule, value)}
+                    state["history"].append(entry)
+                    fired.append(entry)
+                    state["last_alerted"][rule["id"]] = {
+                        "value": value, "at": iso(now),
+                        "last_value": value, "last_seen_at": iso(now)}
+                    continue
+            state["last_alerted"][rule["id"]] = {
+                "value": previous.get("value"), "at": previous.get("at"),
+                "last_value": value, "last_seen_at": iso(now)}
+        if len(state["history"]) > MAX_HISTORY:
+            state["history"] = state["history"][-MAX_HISTORY:]
+        save_state(state_dir, state)
+        return fired, active
 
 
 # ------------------------------------------------------------------ routes
@@ -288,12 +280,14 @@ def register_monitor_alert_routes(app: Any, ctx: Any, auth: Callable | None = No
         except Exception:
             raise HTTPException(400, "nội dung yêu cầu không phải JSON")
         worker_id, metric, threshold = _validate_rule_body(body)
-        return create_rule(ctx.state_dir, worker_id, metric, threshold, clock=ctx.clock)
+        # In a thread: the 5-minute check holds the alerts lock while it sends ntfy.
+        return await asyncio.to_thread(create_rule, ctx.state_dir, worker_id, metric, threshold,
+                                       clock=ctx.clock)
 
     @app.delete("/api/monitor/alerts/{rule_id}")
     async def delete_alert(request: Request, rule_id: str):
         _write_auth(request)
-        if not delete_rule(ctx.state_dir, rule_id):
+        if not await asyncio.to_thread(delete_rule, ctx.state_dir, rule_id):
             raise HTTPException(404, f"không có rule cảnh báo {rule_id}")
         return {"ok": True, "deleted": rule_id}
 

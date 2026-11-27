@@ -26,6 +26,10 @@ The lock (``reconvert.lock`` in the document folder) follows the bench lock in
 ``O_EXCL``; a lock whose pid is dead is stale and removed. ``request_reconvert``
 owns the lock while it spawns the child and hands the child a one-time token,
 so the child releases exactly the lock its requester created.
+
+A second lock, ``docling.lock`` in the state folder (a kernel file lock), lets only one
+conversion run at a time on the machine: a reconvert started while another document converts
+waits for it instead of loading a second copy of the models.
 """
 
 from __future__ import annotations
@@ -38,16 +42,19 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
 
 # Meta helpers live in the sibling module (knowledge.py): atomic .tmp +
 # os.replace, mode 0600. Imported directly — the parallel-work fallback was
 # removed at integration (knowledge.py exists; dead code is not kept).
+from .. import joblock
 from .knowledge import load_meta as _load_meta
 from .knowledge import write_meta as _write_meta
 
 
 LOCK_NAME = "reconvert.lock"
+DOCLING_LOCK_NAME = "docling.lock"          # in the state folder: one Docling run at a time
+DOCLING_WAIT_SECONDS = 3600                 # how long a reconvert waits for its turn
+DOCLING_WAIT_POLL_SECONDS = 5
 _DOC_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _REASONS = ("auto-scan", "manual")
 
@@ -58,42 +65,9 @@ def _doc_dir(state_dir: Path, doc_id: str) -> Path:
     return Path(state_dir) / "knowledge" / doc_id
 
 
-def _pid_alive(pid) -> bool:
-    """True when ``pid`` is a live process. A zombie counts as dead: a detached
-    child the spawner never reaps (``start_new_session=True`` does not reap)
-    would otherwise keep its lock "live" forever after a crash — the exact
-    case a stale lock must clean up. Falls back to ``os.kill(pid, 0)`` when
-    ``/proc`` is unavailable."""
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
-            state = stream.read().rsplit(")", 1)[1].split()[0]
-        return state != "Z"
-    except (OSError, IndexError, ValueError):
-        pass
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _read_lock(doc_dir: Path) -> dict | None:
-    """The lock record, or None when there is no (live) lock. A stale lock — pid
-    dead, or an unreadable/corrupt record — is removed."""
-    path = doc_dir / LOCK_NAME
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        path.unlink(missing_ok=True)  # unreadable/corrupt: not a live lock
-        return None
-    if not isinstance(record, dict) or not _pid_alive(record.get("pid")):
-        path.unlink(missing_ok=True)
-        return None
-    return record
+    """The lock record, or None when there is no live lock (a stale one is removed)."""
+    return joblock.read(doc_dir / LOCK_NAME)
 
 
 def is_converting(state_dir: str | Path, doc_id: str) -> bool:
@@ -108,46 +82,16 @@ def is_converting(state_dir: str | Path, doc_id: str) -> bool:
 
 
 def _acquire_lock(doc_dir: Path, *, pid: int | None = None) -> tuple[Path, str]:
-    """Create the lock atomically. Returns (lock path, token). Raises ValueError
-    when another live reconvert holds it."""
-    path = doc_dir / LOCK_NAME
-    token = uuid.uuid4().hex
-    record = json.dumps({"pid": pid if pid is not None else os.getpid(),
-                         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                         "token": token})
-    for _ in range(3):
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            break
-        except FileExistsError:
-            held = _read_lock(doc_dir)  # removes a stale lock, if that is what it is
-            if held is not None:
-                raise ValueError(
-                    f"tài liệu {doc_dir.name} đang được chuyển lại bằng Docling "
-                    f"(pid {held.get('pid')}, từ {held.get('started_at')}); chờ nó xong rồi thử lại"
-                ) from None
-            continue
-    else:
-        raise ValueError(f"không tạo được lock {path}")
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(record)
-    return path, token
+    """Create the lock atomically; returns (lock path, token). Raises ValueError when another live
+    job holds it."""
+    return joblock.acquire(doc_dir / LOCK_NAME, lambda held: (
+        f"tài liệu {doc_dir.name} đang được chuyển lại bằng Docling "
+        f"(pid {held.get('pid')}, từ {held.get('started_at')}); chờ nó xong rồi thử lại"), pid=pid)
 
 
 def _release_lock(doc_dir: Path, *, pid: int | None = None, token: str | None = None) -> None:
-    """Remove the lock, but only when it is still ours (same pid, or same
-    one-time token handed to the spawned child)."""
-    path = doc_dir / LOCK_NAME
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(record, dict):
-        return
-    if token is not None and record.get("token") == token:
-        path.unlink(missing_ok=True)
-    elif pid is not None and record.get("pid") == pid:
-        path.unlink(missing_ok=True)
+    """Remove the lock, but only when it is still ours (same pid, or the child's token)."""
+    joblock.release(doc_dir / LOCK_NAME, pid=pid, token=token)
 
 
 def _now_iso() -> str:
@@ -350,10 +294,20 @@ def run_reconvert(state_dir: str | Path, doc_id: str, reason: str = "manual",
         if original is None or not original.is_file():
             return _fail(meta, doc_dir, doc_id, reason,
                          "không còn file gốc của tài liệu nên không chuyển lại được")
+        # One Docling at a time on the machine, whichever document (each run takes GBs of RAM):
+        # later runs wait their turn, still shown as "converting" -- not forever behind a stuck one.
+        deadline = time.monotonic() + DOCLING_WAIT_SECONDS
+        while (turn := joblock.hold(state_dir / DOCLING_LOCK_NAME, {"doc_id": doc_id, "pid": os.getpid()})) is None:
+            if time.monotonic() > deadline:
+                return _fail(meta, doc_dir, doc_id, reason,
+                             "chờ lượt Docling quá lâu: một tài liệu khác đang chuyển chưa xong; thử lại sau")
+            time.sleep(DOCLING_WAIT_POLL_SECONDS)
         try:
             markdown, version = convert_with_docling(original)
         except Exception as exc:
             return _fail(meta, doc_dir, doc_id, reason, str(exc))
+        finally:
+            turn.close()
         if not markdown.strip():
             return _fail(meta, doc_dir, doc_id, reason,
                          "Docling chuyển xong nhưng không đọc được nội dung nào "

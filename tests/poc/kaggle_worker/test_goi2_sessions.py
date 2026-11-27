@@ -338,6 +338,12 @@ def test_add_environment_clone_file_url_and_branch(site):
     assert git("rev-parse", "--abbrev-ref", "HEAD", path=dest).stdout.strip() == "feature-x"
     assert site["client"].post("/api/environments", json={"name": "bad", "url": "ssh://x/y"},
                                headers=headers).status_code == 400
+    # A local repository only from the folders a path may be added from; no option-like branch.
+    outside = site["client"].post("/api/environments", json={"name": "bad", "url": "file:///outside/repo"},
+                                  headers=headers)
+    assert outside.status_code == 400 and "ngoài" in outside.text
+    assert site["client"].post("/api/environments", json={"name": "bad", "url": url, "branch": "--orphan"},
+                               headers=headers).status_code == 400
     assert site["client"].post("/api/environments", json={"name": "bad"},
                                headers=headers).status_code == 400
     assert site["client"].post("/api/environments", json={"name": "bad", "pat": "x"},

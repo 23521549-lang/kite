@@ -13,12 +13,11 @@ only reads, it never sends.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import time
 from typing import Any
 
-from . import memory
+from . import joblock, memory
 from .backend import task_slug
 from .journal import Journal
 
@@ -179,13 +178,7 @@ def _load_notified(path: Path) -> dict[str, float]:
 
 
 def _save_notified(path: Path, data: dict[str, float]) -> None:
-    """Atomic write, like ``memory._save_pending`` (``memory.py:185-205``): temp file + replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump(data, stream, indent=1, ensure_ascii=False)
-    os.replace(temp, path)
+    joblock.write_json(path, data, indent=1, ensure_ascii=False)
 
 
 def notify_new_items(notifier: Any, items: list[dict], state_path: str | Path, *,
@@ -201,22 +194,23 @@ def notify_new_items(notifier: Any, items: list[dict], state_path: str | Path, *
     if notifier is None:
         return []
     path = _notified_path(state_path)
-    notified = _load_notified(path)
-    now = clock()
     sent: list[dict] = []
-    for item in items:
-        key = item["key"]
-        if key in notified:
-            continue
-        label = NOTIFY_LABELS.get(item["kind"], "cần bạn quyết")
-        task_id = item.get("task_id")
-        message = (f"{task_id}\n{label}" if task_id else label)
-        try:
-            notifier("Kite: cần bạn quyết", message, tags=("warning",), priority=4)
-        except Exception:
-            continue
-        notified[key] = now
-        sent.append(item)
-    if sent:
-        _save_notified(path, notified)
+    with joblock.updating(path):            # two scans at once would each send the same item
+        notified = _load_notified(path)
+        now = clock()
+        for item in items:
+            key = item["key"]
+            if key in notified:
+                continue
+            label = NOTIFY_LABELS.get(item["kind"], "cần bạn quyết")
+            task_id = item.get("task_id")
+            message = (f"{task_id}\n{label}" if task_id else label)
+            try:
+                notifier("Kite: cần bạn quyết", message, tags=("warning",), priority=4)
+            except Exception:
+                continue
+            notified[key] = now
+            sent.append(item)
+        if sent:
+            _save_notified(path, notified)
     return sent

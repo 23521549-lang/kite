@@ -1,7 +1,8 @@
 """Start the Gói 4 scheduler engine inside the web process (agent trưởng).
 
-The engine is a periodic scan loop (``schedules.py``): due plan schedules plus two builtin
-jobs — the 00:00 Asia/Bangkok secretary report and the 5-minute "Cần bạn quyết" scan.
+The engine is a periodic scan loop (``schedules.py``): due plan schedules plus the builtin
+jobs — the 00:00 secretary report, and every 5 minutes the "Cần bạn quyết" scan, the sweep of
+orphaned MCP servers and the owner's monitor alerts.
 It lives in the web process on purpose: schedules must still fire when Temporal is down,
 and the triggers only need the SQLite store plus the OpenCode HTTP API.
 
@@ -22,6 +23,8 @@ from .. import secretary as sec
 from ..mcp_server import sweep_stale_mcp_processes
 from ..needs_decision import notify_new_items
 from ..schedules import SchedulerEngine, ScheduleStore, UrllibOpenCodeStarter, daily_at_bangkok
+from .monitor import metric_values
+from .monitor_alerts import evaluate_and_notify, load_state
 from .secretary_api import _make_notifier, _post_report_to_secretary
 from .workspace_api import _scan
 
@@ -69,6 +72,20 @@ def _mcp_sweep_job(ctx: Any):
     return job
 
 
+def _monitor_alerts_job(ctx: Any):
+    """The owner's monitor thresholds, checked even when nobody has the monitor page open. In a
+    thread: it reads the spend files and sends ntfy."""
+
+    def check() -> None:
+        if load_state(ctx.state_dir)["rules"]:          # no rules: nothing to read
+            evaluate_and_notify(ctx, metric_values(ctx))
+
+    async def job() -> None:
+        await asyncio.to_thread(check)
+
+    return job
+
+
 def _daily_report_job(ctx: Any):
     """The 00:00 Asia/Bangkok secretary report: build, save, ntfy once, post to the bubble."""
 
@@ -100,6 +117,7 @@ def build_engine(ctx: Any) -> SchedulerEngine:
     engine = SchedulerEngine(store, chat_dir=Path(chat_dir), starter=starter, note=_note_fn(ctx))
     engine.register_builtin("needs_decision_scan", _SCAN_INTERVAL_SECONDS, _needs_decision_job(ctx))
     engine.register_builtin("mcp_sweep", _SCAN_INTERVAL_SECONDS, _mcp_sweep_job(ctx))
+    engine.register_builtin("monitor_alerts", _SCAN_INTERVAL_SECONDS, _monitor_alerts_job(ctx))
     engine.register_builtin("secretary_daily_report", daily_at_bangkok("00:00"),
                             _daily_report_job(ctx))
     return engine

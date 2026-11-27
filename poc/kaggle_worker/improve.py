@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import time
 import uuid
 from typing import Any, Callable
 
+from . import joblock
 from .memory import repo_key
 
 # Repo Kite mặc định để tạo task: thư mục làm việc hiện tại (checkout chứa
@@ -312,15 +312,8 @@ def _load_proposals(state_dir: Path) -> list[dict]:
 
 
 def _save_queue(state_dir: Path, entries: list[dict]) -> None:
-    """Ghi hàng chờ nguyên tử, cùng mẫu memory._save_pending: file .tmp +
-    os.replace, mode 0600 (không bao giờ ghi đè trực tiếp)."""
-    path = _queue_path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump(entries, stream, indent=1, ensure_ascii=False)
-    os.replace(temp, path)
+    """Ghi hàng chờ nguyên tử (mode 0600); gọi trong ``joblock.updating`` của file này."""
+    joblock.write_json(_queue_path(state_dir), entries, indent=1, ensure_ascii=False)
 
 
 def list_proposals(state_dir: Path) -> list[dict]:
@@ -338,24 +331,25 @@ def save_proposals(state_dir: Path, proposals: list[dict],
     repo Kite (thư mục làm việc hiện tại, REPO_ROOT). Trả các entry mới.
     """
     state_dir = Path(state_dir)
-    entries = _load_proposals(state_dir)
-    new_entries: list[dict] = []
-    for proposal in proposals:
-        entry = {
-            "id": uuid.uuid4().hex[:8],
-            "repo": str(proposal.get("repo") or REPO_ROOT),
-            "axis": proposal.get("axis"),
-            "score": proposal.get("score"),
-            "criteria_version": proposal.get("criteria_version"),
-            "proposal": proposal.get("proposal"),
-            "created_at": clock(),
-            "status": "pending",
-            "task_id": None,
-        }
-        entries.append(entry)
-        new_entries.append(dict(entry))
-    _save_queue(state_dir, entries)
-    return new_entries
+    with joblock.updating(_queue_path(state_dir)):
+        entries = _load_proposals(state_dir)
+        new_entries: list[dict] = []
+        for proposal in proposals:
+            entry = {
+                "id": uuid.uuid4().hex[:8],
+                "repo": str(proposal.get("repo") or REPO_ROOT),
+                "axis": proposal.get("axis"),
+                "score": proposal.get("score"),
+                "criteria_version": proposal.get("criteria_version"),
+                "proposal": proposal.get("proposal"),
+                "created_at": clock(),
+                "status": "pending",
+                "task_id": None,
+            }
+            entries.append(entry)
+            new_entries.append(dict(entry))
+        _save_queue(state_dir, entries)
+        return new_entries
 
 
 def _find_proposal(entries: list[dict], proposal_id: str) -> dict:
@@ -369,11 +363,12 @@ def reject_proposal(state_dir: Path, proposal_id: str) -> dict:
     """Bỏ một đề xuất: entry chuyển trạng thái "rejected" (giữ lại bản ghi,
     không xóa khỏi file — trạng thái này nằm trong hợp đồng Gói 10)."""
     state_dir = Path(state_dir)
-    entries = _load_proposals(state_dir)
-    entry = _find_proposal(entries, proposal_id)
-    entry["status"] = "rejected"
-    _save_queue(state_dir, entries)
-    return dict(entry)
+    with joblock.updating(_queue_path(state_dir)):
+        entries = _load_proposals(state_dir)
+        entry = _find_proposal(entries, proposal_id)
+        entry["status"] = "rejected"
+        _save_queue(state_dir, entries)
+        return dict(entry)
 
 
 def _enqueue_task(state_dir: Path, repo: str | Path, goal: str,
@@ -440,24 +435,25 @@ def approve_proposal(state_dir: Path, proposal_id: str, *,
     chạy task, KHÔNG tự áp/commit — task chạy qua pipeline thường.
     """
     state_dir = Path(state_dir)
-    entries = _load_proposals(state_dir)
-    entry = _find_proposal(entries, proposal_id)
-    if entry.get("status") != "pending":
-        raise ValueError(
-            f"đề xuất {proposal_id} đã ở trạng thái {entry.get('status')}, không duyệt được")
-    label = AXIS_LABELS.get(str(entry.get("axis")), str(entry.get("axis")))
-    goal = (f"{entry.get('proposal')}\n\n(Nguồn: trục bench {label} "
-            f"{entry.get('score')}/100, criteria {entry.get('criteria_version')}; "
-            f"đề xuất cải tiến đã duyệt.)")
-    create_task = _resolve_create_task(ops, state_dir, clock)
-    result = create_task(str(entry.get("repo")), goal)
-    task_id = result.get("task_id") if isinstance(result, dict) else result
-    if not task_id or not isinstance(task_id, str):
-        raise ValueError("create_task phải trả {'task_id': ...}")
-    entry["status"] = "task_created"
-    entry["task_id"] = task_id
-    _save_queue(state_dir, entries)
-    return dict(entry)
+    with joblock.updating(_queue_path(state_dir)):      # approving twice would make two tasks
+        entries = _load_proposals(state_dir)
+        entry = _find_proposal(entries, proposal_id)
+        if entry.get("status") != "pending":
+            raise ValueError(
+                f"đề xuất {proposal_id} đã ở trạng thái {entry.get('status')}, không duyệt được")
+        label = AXIS_LABELS.get(str(entry.get("axis")), str(entry.get("axis")))
+        goal = (f"{entry.get('proposal')}\n\n(Nguồn: trục bench {label} "
+                f"{entry.get('score')}/100, criteria {entry.get('criteria_version')}; "
+                f"đề xuất cải tiến đã duyệt.)")
+        create_task = _resolve_create_task(ops, state_dir, clock)
+        result = create_task(str(entry.get("repo")), goal)
+        task_id = result.get("task_id") if isinstance(result, dict) else result
+        if not task_id or not isinstance(task_id, str):
+            raise ValueError("create_task phải trả {'task_id': ...}")
+        entry["status"] = "task_created"
+        entry["task_id"] = task_id
+        _save_queue(state_dir, entries)
+        return dict(entry)
 
 
 

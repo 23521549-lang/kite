@@ -136,6 +136,6 @@ LABEL org.opencontainers.image.title="kite" \
 
 USER 1000:1000
 WORKDIR /var/lib/kite/home
-# -s: with the host's process space (compose.yaml: pid: host) tini is not PID 1 and must ask to reap.
+# -s: in a shared process space (compose.yaml: the worker's pid: host, the chat's pid: service:web) tini is not PID 1 and must ask to reap.
 ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["kite", "--help"]

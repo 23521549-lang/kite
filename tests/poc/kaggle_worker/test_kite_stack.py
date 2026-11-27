@@ -194,6 +194,9 @@ def test_requests_from_the_web_restart_the_chat_with_the_gateway_and_ignore_the_
     assert restarts[0][-2:] == ["gateway", "opencode"] and len(restarts) == 1
     assert done[2]["result"]["result"] == "failed"
     assert [p.name for p in stack.requests_dir.iterdir()] == [".4-update.tmp"]
+    stack.restart(["web"])                   # the chat runs in the web's process space
+    restarts = [c for c in docker.calls if c[:2] == ["docker", "compose"] and "restart" in c]
+    assert restarts[-1][-2:] == ["web", "opencode"]
 
 
 def test_compose_always_gets_the_machines_settings_and_the_releases_pinned_images(host):

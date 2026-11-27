@@ -491,6 +491,30 @@ def test_a_second_measurement_run_is_refused_while_one_is_going(tmp_path):
     bench.release_lock(bench.acquire_lock(tmp_path, label="v7", out=tmp_path / "v7"))
 
 
+def test_the_bench_lock_is_held_across_processes_and_freed_when_the_holder_dies(tmp_path):
+    # The web, worker and CLI each run in their own container (own PID
+    # namespace), so the lock is the kernel's flock, not a recorded pid.
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, time; from pathlib import Path; from poc.kaggle_worker import bench;"
+        "bench.acquire_lock(Path(sys.argv[1]), label='other', out=Path(sys.argv[1]));"
+        "print('held', flush=True); time.sleep(60)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code, str(tmp_path)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "held"
+        assert bench.running_bench(tmp_path)["label"] == "other"
+        with pytest.raises(bench.BenchBusy, match="other"):
+            bench.acquire_lock(tmp_path, label="v8", out=tmp_path / "v8")
+    finally:
+        child.kill()
+        child.wait()
+    assert bench.running_bench(tmp_path) is None
+    bench.release_lock(bench.acquire_lock(tmp_path, label="v8", out=tmp_path / "v8"))
+
+
 def test_attempts_lost_to_the_machines_are_told_apart_from_the_models_failures():
     records = [
         {"outcome": "ok"},

@@ -50,3 +50,36 @@ def test_patch_sha256_matches_file_bytes(tmp_path):
     patch = tmp_path / "result.patch"
     patch.write_text("diff --git a/x b/x\n", encoding="utf-8")
     assert confirm.patch_sha256(patch.read_bytes()) == confirm.patch_sha256("diff --git a/x b/x\n")
+
+
+def test_a_code_is_burnt_once_even_when_two_callers_use_it_at_the_same_time(tmp_path, monkeypatch):
+    # Both callers check before either writes "used": the check and the burn share one lock.
+    import threading
+
+    code = confirm.issue_code(tmp_path, "apply", "task-1", "hash-a", clock=lambda: 1000.0)
+    checked = threading.Barrier(2, timeout=0.5)
+    real_check = confirm.check_code
+
+    def slow_check(*args, **kwargs):
+        real_check(*args, **kwargs)
+        try:
+            checked.wait()          # without the lock both callers get here before either burns it
+        except threading.BrokenBarrierError:
+            pass
+
+    monkeypatch.setattr(confirm, "check_code", slow_check)
+    results = []
+
+    def use():
+        try:
+            confirm.consume_code(tmp_path, "apply", "task-1", "hash-a", code, clock=lambda: 1001.0)
+            results.append("ok")
+        except confirm.ConfirmError:
+            results.append("refused")
+
+    threads = [threading.Thread(target=use) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(results) == ["ok", "refused"]

@@ -270,6 +270,25 @@ def test_upload_list_get_markdown_delete_via_api(site):
     assert client.get("/api/knowledge", headers=headers).json()["documents"] == []
 
 
+def test_a_timed_out_upload_removes_only_its_own_folder(site, monkeypatch):
+    # Another upload converting at the same time has no meta.json yet either: it must survive.
+    headers = signed_in(site)
+    other = site["path"] / "knowledge" / ("b" * 32)
+    other.mkdir(parents=True)
+    mine = []
+
+    def slow(state_dir, filename, data, scope, environment_id, tags, *, doc_id):
+        mine.append(doc_id)
+        (Path(state_dir) / "knowledge" / doc_id).mkdir()
+        raise TimeoutError                      # what wait_for raises after 120 s
+
+    monkeypatch.setattr(know, "ingest_document", slow)
+    resp = site["client"].post("/api/knowledge", files={"file": ("a.md", b"# a\n", "text/markdown")},
+                               data={"scope": "global"}, headers=headers)
+    assert resp.status_code == 504
+    assert _doc_dirs(site["path"]) == {"b" * 32} and mine and mine[0] != "b" * 32
+
+
 def test_knowledge_routes_need_a_session(site):
     client = site["client"]
     assert client.get("/api/knowledge").status_code == 401

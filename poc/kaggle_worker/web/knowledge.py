@@ -169,11 +169,12 @@ def _normalise_tags(tags) -> list[str]:
 
 
 def ingest_document(state_dir: str | Path, filename: str, data: bytes, scope: str = "global",
-                    environment_id: str | None = None, tags=None) -> dict:
+                    environment_id: str | None = None, tags=None, *, doc_id: str | None = None) -> dict:
     """Store one uploaded document and convert it to Markdown; returns its metadata.
 
     On any failure (bad format, oversize, unconvertible file) nothing is left behind:
-    the document directory is removed and a ``ValueError`` explains the problem.
+    the document directory is removed and a ``ValueError`` explains the problem. ``doc_id``
+    lets the caller name the folder up front (the web removes it alone after a timeout).
     """
     if scope not in ("global", "environment"):
         raise ValueError("scope phải là 'global' hoặc 'environment'")
@@ -187,7 +188,7 @@ def ingest_document(state_dir: str | Path, filename: str, data: bytes, scope: st
         raise ValueError(f"định dạng {suffix or '(không có đuôi)'} không được nhận; "
                          f"chỉ nhận: {', '.join(sorted(KNOWLEDGE_FORMATS))}")
     _check_magic(suffix, data)
-    doc_id = uuid.uuid4().hex
+    doc_id = doc_id or uuid.uuid4().hex
     doc_dir = Path(state_dir) / "knowledge" / doc_id
     doc_dir.mkdir(parents=True, exist_ok=False)
     try:

@@ -24,9 +24,11 @@ code). A machine installed from here runs Kite from images instead, and keeps it
 | `opencode` | the chat's OpenCode 2 server (lead agent) | loopback, for the web's Chat tab |
 | `temporal`, `postgres` | workflows; Temporal's and the web's databases | 127.0.0.1:7233, 127.0.0.1:5432 |
 
-Kite's services share the host's network and process space, run as uid 1000 and see `/var/lib/kite` at
-the same path as the host, so they behave like the development machine: loopback addresses, the
-sandboxes' bind mounts, a bench run's lock. Only the worker gets the Docker socket. `/v1/*` and `/kite/*`
+Kite's services share the host's network, run as uid 1000 and see `/var/lib/kite` at the same path as
+the host, so they behave like the development machine: loopback addresses, the sandboxes' bind mounts,
+a bench run's lock (a kernel file lock, so it holds across containers). Only the worker sees the host's
+processes and gets the Docker socket; the chat runs in the web's process space so the web can stop the
+MCP servers of closed sessions. `/v1/*` and `/kite/*`
 of the gateway are never published.
 
 Everything Kite keeps is under `/var/lib/kite` (put a disk of its own there): `kite/` (config, secrets

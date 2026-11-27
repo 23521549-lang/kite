@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import time
 import uuid
 
+from . import joblock
 from .journal import read_jsonl
 
 MEMORY_LINES = 10            # the newest lines that go into a task
@@ -195,20 +195,15 @@ def _load_pending(state_dir: Path) -> list[dict]:
 
 
 def _save_pending(state_dir: Path, entries: list[dict]) -> None:
-    path = pending_path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump(entries, stream, indent=1, ensure_ascii=False)
-    os.replace(temp, path)
+    joblock.write_json(pending_path(state_dir), entries, indent=1, ensure_ascii=False)
 
 
 def _propose(state_dir: Path, entry: dict, *, clock=time.time) -> dict:
-    entries = _load_pending(state_dir)
-    entry = {**entry, "id": uuid.uuid4().hex[:8], "created_at": clock()}
-    entries.append(entry)
-    _save_pending(state_dir, entries)
+    with joblock.updating(pending_path(state_dir)):      # every chat session's MCP server proposes
+        entries = _load_pending(state_dir)
+        entry = {**entry, "id": uuid.uuid4().hex[:8], "created_at": clock()}
+        entries.append(entry)
+        _save_pending(state_dir, entries)
     return entry
 
 
@@ -241,12 +236,13 @@ def list_pending(state_dir: Path) -> list[dict]:
 
 
 def _take_pending(state_dir: Path, entry_id: str) -> dict:
-    entries = _load_pending(state_dir)
-    for index, entry in enumerate(entries):
-        if entry.get("id") == entry_id:
-            entries.pop(index)
-            _save_pending(state_dir, entries)
-            return entry
+    with joblock.updating(pending_path(state_dir)):
+        entries = _load_pending(state_dir)
+        for index, entry in enumerate(entries):
+            if entry.get("id") == entry_id:
+                entries.pop(index)
+                _save_pending(state_dir, entries)
+                return entry
     raise ValueError(f"không có mục chờ duyệt '{entry_id}'; xem danh sách bằng `kite memory list-pending`")
 
 

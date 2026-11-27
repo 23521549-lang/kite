@@ -238,6 +238,16 @@ def test_watchdog_restarts_after_two_ticks_and_records_history(host):
     assert [title for title, _p in alerts] == ["Kite: đã khởi động lại temporal"]
 
 
+def test_watchdog_skips_a_tick_while_an_update_or_restart_holds_the_lock(host):
+    stack, docker = host["stack"], host["docker"]
+    docker.states["temporal"] = {"state": "running", "health": "unhealthy", "exit": 0}
+    with stack.lock():
+        report = stack.watchdog(notify=lambda *a, **k: True)
+    assert report["skipped"] and report["watching"] == [] and restarts_of(docker) == []
+    assert not (stack.dir / "watchdog.json").exists()      # no bad tick counted
+    assert stack.watchdog(notify=lambda *a, **k: True)["watching"] == ["temporal"]
+
+
 def test_watchdog_check_only_changes_nothing(host):
     stack, docker = host["stack"], host["docker"]
     docker.states["temporal"] = {"state": "running", "health": "unhealthy", "exit": 0}

@@ -8,7 +8,9 @@
 # 127.0.0.1:4096) and the gateway additionally binds the host's address on the sandbox network in
 # process, which port publishing cannot replace — but they no longer share the host's process
 # space: only the worker keeps `pid: host` (its activities spawn OpenCode sessions and share
-# PID-based locks with the chat processes; the other services have no reason to see host PIDs).
+# PID-based locks with the chat processes). The chat (opencode) runs in the web's process space:
+# the web stops the `kite mcp serve` processes of closed or reloaded chat sessions, which it
+# could not see from its own. The gateway sees neither.
 # Only Caddy faces the Internet: /worker/* for the Kaggle notebooks, and the web page unless the
 # machine was installed with --access private.
 name: kite
@@ -162,6 +164,7 @@ services:
   opencode:
     <<: *kite
     command: ["kite", "stack", "opencode"]
+    pid: "service:web"         # see the header; restarting the web restarts the chat too
     depends_on:
       gateway:
         condition: service_started

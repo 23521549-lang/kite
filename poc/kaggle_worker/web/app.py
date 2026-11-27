@@ -28,7 +28,7 @@ import sys
 import time
 import uuid
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -1372,7 +1372,8 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
         path = (body.path or "").strip()
         branch = (body.branch or "").strip() or None
         pat = (body.pat or "").strip() or None
-        if branch is not None and not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch):
+        # First character not '-': the branch goes on git's command line.
+        if branch is not None and not re.fullmatch(r"[A-Za-z0-9._][A-Za-z0-9._/-]{0,199}", branch):
             raise HTTPException(400, "tên branch không hợp lệ")
         if branch is not None and not url:
             raise HTTPException(400, "branch chỉ dùng khi clone từ URL")
@@ -1402,6 +1403,10 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
             from ..github_env import GitHubEnvError, clone_with_pat
         except ImportError:
             raise HTTPException(501, "clone từ URL chưa sẵn sàng (module github_env của worker (b))") from None
+        local = urlsplit(url)
+        if local.scheme == "file":
+            # A repository on this machine: only from the folders a path may be added from.
+            await ctx.ops().repo_status(unquote(local.path))
         dest = ctx.state_dir / "envs" / f"clone-{uuid.uuid4().hex[:12]}" / "repo"
         if dest.exists():
             raise HTTPException(409, "thư mục đích đã tồn tại; thử lại")
@@ -1425,7 +1430,7 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
                 raise HTTPException(400, str(exc)) from exc
             raise
         if branch is not None:
-            done = subprocess.run(["git", "-C", str(dest), "checkout", branch],
+            done = subprocess.run(["git", "-C", str(dest), "checkout", branch, "--"],
                                   capture_output=True, text=True)
             if done.returncode != 0:
                 ctx.store.drop_repo(repo_id)
@@ -1678,17 +1683,16 @@ def create_app(ctx: WebContext, *, start_scheduler: bool = False) -> FastAPI:
         if len(data) > know.MAX_FILE_BYTES:
             raise HTTPException(413, "file quá lớn; tối đa 20 MB")
         tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
-        root = ctx.state_dir / "knowledge"
-        before = {path.name for path in root.iterdir()} if root.is_dir() else set()
+        doc_id = uuid.uuid4().hex
         try:
             # Conversion runs off the event loop and must finish within 120 seconds; a
-            # timeout leaves no half-saved document behind (see _drop_orphan_knowledge_dirs).
+            # timeout leaves no half-saved document behind (see _drop_orphan_knowledge_dir).
             meta = await asyncio.wait_for(
                 asyncio.to_thread(know.ingest_document, ctx.state_dir, file.filename or "", data, scope,
-                                  environment_id, tag_list),
+                                  environment_id, tag_list, doc_id=doc_id),
                 timeout=120)
         except asyncio.TimeoutError:
-            _drop_orphan_knowledge_dirs(ctx.state_dir, before)
+            _drop_orphan_knowledge_dir(ctx.state_dir, doc_id)
             audit(session, "knowledge_upload", "", False, {"error": "timeout 120s",
                                                            "filename": file.filename or ""})
             raise HTTPException(504, "chuyển đổi quá lâu (quá 120 giây); thử lại sau")
@@ -2145,19 +2149,17 @@ def _write_session_files(ctx: WebContext, kite_session_id: str, directory: Path)
 log = logging.getLogger(__name__)
 
 
-def _drop_orphan_knowledge_dirs(state_dir: Path, before: set[str]) -> None:
-    """Remove knowledge directories created by a timed-out upload that never wrote meta.json.
+def _drop_orphan_knowledge_dir(state_dir: Path, doc_id: str) -> None:
+    """Remove the folder of a timed-out upload when it never wrote meta.json — only that upload's:
+    another upload converting at the same time has no meta.json yet either.
 
     Best effort only: the conversion thread may still be running after the 120 s timeout
     (``asyncio.wait_for`` cannot stop it), so a directory it finishes later would keep its
     own meta.json and stay visible — it is a complete document then, not a half-saved one.
     """
-    root = Path(state_dir) / "knowledge"
-    if not root.is_dir():
-        return
-    for path in root.iterdir():
-        if path.name not in before and path.is_dir() and not (path / "meta.json").is_file():
-            shutil.rmtree(path, ignore_errors=True)
+    path = Path(state_dir) / "knowledge" / doc_id
+    if path.is_dir() and not (path / "meta.json").is_file():
+        shutil.rmtree(path, ignore_errors=True)
 
 
 async def _json(request: Request) -> dict:

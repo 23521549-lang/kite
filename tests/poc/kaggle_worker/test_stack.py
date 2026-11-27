@@ -94,14 +94,67 @@ def test_busy_lists_running_tasks_and_a_bench_run(tmp_path, capsys):
     stack.init_config(config, public=None, home=tmp_path / "home")
     assert cli.main(["--config", str(config), "busy"]) == 0
     assert json.loads(capsys.readouterr().out) == {"busy": False, "tasks": [], "chat": 0, "bench": None}
-    import os
-
     from poc.kaggle_worker import bench
 
-    (tmp_path / bench.LOCK_NAME).write_text(json.dumps({"pid": os.getpid(), "label": "v7", "started": "x"}))
+    # A lock file left by a bench that died is not a running bench.
+    (tmp_path / bench.LOCK_NAME).write_text(json.dumps({"pid": 1, "label": "dead", "started": "x"}))
     assert cli.main(["--config", str(config), "busy"]) == 0
-    report = json.loads(capsys.readouterr().out)
+    assert json.loads(capsys.readouterr().out)["bench"] is None
+    lock = bench.acquire_lock(tmp_path, label="v7", out=tmp_path / "v7")
+    try:
+        assert cli.main(["--config", str(config), "busy"]) == 0
+        report = json.loads(capsys.readouterr().out)
+    finally:
+        bench.release_lock(lock)
     assert report["busy"] and report["bench"]["label"] == "v7"
+
+
+def test_busy_counts_chat_sessions_in_every_chat_folder(tmp_path, monkeypatch, capsys):
+    # Each chat session, the secretary and each patch review run in their own folder: a reply
+    # being written in any of them must hold an update back, not only the old ~/kite-chat.
+    pytest.importorskip("fastapi")
+    from poc.kaggle_worker.store import SQLiteSchedulerStore
+
+    config = tmp_path / "config.yaml"
+    stack.init_config(config, public=None, home=tmp_path / "home")
+    with SQLiteSchedulerStore(tmp_path / "scheduler.sqlite3") as store:
+        store.create_chat_session("s1", "oc1", "default")
+        store.create_chat_session("s2", "oc2", "default")
+        store.set_chat_session_status("s2", "archived")
+    for folder in ("chat-sessions/s1", "chat-sessions/s2", "review/t1"):
+        (tmp_path / folder).mkdir(parents=True)
+    asked = []
+
+    class Sessions(BaseHTTPRequestHandler):
+        def do_GET(self):
+            from urllib.parse import parse_qs, urlsplit
+
+            folder = parse_qs(urlsplit(self.path).query)["directory"][0]
+            asked.append(Path(folder).name)
+            busy = folder.endswith(("chat-sessions/s1", "review/t1"))
+            body = json.dumps({"data": [{"id": "x", "time": {"busy": 2, "idle": 1}}] if busy else []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Sessions)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    home = tmp_path / "userhome"
+    (home / ".local" / "state" / "opencode").mkdir(parents=True)
+    (home / ".local" / "state" / "opencode" / "service.json").write_text(
+        json.dumps({"url": f"http://127.0.0.1:{server.server_address[1]}", "password": "pw"}))
+    monkeypatch.setenv("HOME", str(home))
+    try:
+        assert cli.main(["--config", str(config), "busy"]) == 0
+    finally:
+        server.shutdown()
+    report = json.loads(capsys.readouterr().out)
+    assert report["busy"] and report["chat"] == 2
+    assert sorted(asked) == ["s1", "t1"]      # the archived session's folder is not asked
 
 
 # ---------------------------------------------------------------- health checks
@@ -255,8 +308,9 @@ def test_kite_services_run_like_on_the_development_machine_and_only_caddy_faces_
         svc = services[name]
         assert svc["network_mode"] == "host" and svc["user"] == "1000:1000"
         # Only the worker shares the host's process space (its activities share PID-based
-        # state with the chat processes); the others must not see host PIDs.
-        assert svc.get("pid") == ("host" if name == "worker" else None)
+        # state with the chat processes); the chat runs in the web's, so the web can stop the
+        # MCP servers of closed sessions; the gateway sees neither.
+        assert svc.get("pid") == {"worker": "host", "opencode": "service:web"}.get(name)
         assert "ports" not in svc and svc["image"].startswith("${KITE_IMAGE")
         assert "/var/lib/kite:/var/lib/kite" in svc["volumes"]
         assert svc["healthcheck"]["test"] == ["CMD", "kite", "stack", "health", name]
@@ -305,6 +359,14 @@ def test_the_installer_puts_the_ci_signers_cosign_release_on_the_machine():
     assert "exit 1" in script[check:check + 300]                    # a wrong download aborts the install
     assert check < script.index("/usr/local/bin/cosign")            # installed only after the check
     assert script.index("/usr/local/bin/cosign") < script.index('kite_stack.py" install')
+
+
+def test_ci_moves_the_stable_tag_only_after_signing():
+    # Machines pull :stable and refuse an unsigned image: stable must never point at one.
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    images = ci[ci.index("\n  images:"):ci.index("\n  images-check:")]
+    assert images.index("cosign sign") < images.index(":stable")
+    assert "imagetools inspect" in images                    # the tag still names the signed digest
 
 
 def test_a_new_aws_machine_runs_the_installer_from_a_pinned_commit():

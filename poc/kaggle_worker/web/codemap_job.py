@@ -36,50 +36,16 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
 
-from .. import codemap as codemap_mod
+from .. import codemap as codemap_mod, joblock
 from .env_context import codemap_dir, read_codemap_meta, write_codemap_meta
 
 LOCK_NAME = "rebuild.lock"
 
 
-def _pid_alive(pid) -> bool:
-    """True when ``pid`` is a live process. A zombie counts as dead: a detached
-    child the spawner never reaps (``start_new_session=True`` does not reap)
-    would otherwise keep its lock "live" forever after a crash — the exact
-    case a stale lock must clean up. Falls back to ``os.kill(pid, 0)`` when
-    ``/proc`` is unavailable."""
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
-            state = stream.read().rsplit(")", 1)[1].split()[0]
-        return state != "Z"
-    except (OSError, IndexError, ValueError):
-        pass
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _read_lock(codemap_path: Path) -> dict | None:
-    """The lock record, or None when there is no (live) lock. A stale lock —
-    pid dead, or an unreadable/corrupt record — is removed."""
-    path = codemap_path / LOCK_NAME
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        path.unlink(missing_ok=True)  # unreadable/corrupt: not a live lock
-        return None
-    if not isinstance(record, dict) or not _pid_alive(record.get("pid")):
-        path.unlink(missing_ok=True)
-        return None
-    return record
+    """The lock record, or None when there is no live lock (a stale one is removed)."""
+    return joblock.read(codemap_path / LOCK_NAME)
 
 
 def is_building(state_dir: str | Path, env_id: str) -> bool:
@@ -95,47 +61,16 @@ def is_building(state_dir: str | Path, env_id: str) -> bool:
 
 
 def _acquire_lock(codemap_path: Path) -> tuple[Path, str]:
-    """Create the lock atomically. Returns (lock path, token). Raises ValueError
-    when another live rebuild holds it."""
-    path = codemap_path / LOCK_NAME
-    codemap_path.mkdir(parents=True, exist_ok=True)
-    token = uuid.uuid4().hex
-    record = json.dumps({"pid": os.getpid(),
-                         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                         "token": token})
-    for _ in range(3):
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            break
-        except FileExistsError:
-            held = _read_lock(codemap_path)  # removes a stale lock, if that is what it is
-            if held is not None:
-                raise ValueError(
-                    "bản đồ code đang được tạo lại "
-                    f"(pid {held.get('pid')}, từ {held.get('started_at')}); chờ nó xong rồi thử lại"
-                ) from None
-            continue
-    else:
-        raise ValueError(f"không tạo được lock {path}")
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(record)
-    return path, token
+    """Create the lock atomically; returns (lock path, token). Raises ValueError when another live
+    job holds it."""
+    return joblock.acquire(codemap_path / LOCK_NAME, lambda held: (
+        "bản đồ code đang được tạo lại "
+        f"(pid {held.get('pid')}, từ {held.get('started_at')}); chờ nó xong rồi thử lại"))
 
 
 def _release_lock(codemap_path: Path, *, pid: int | None = None, token: str | None = None) -> None:
-    """Remove the lock, but only when it is still ours (same pid, or same
-    one-time token handed to the spawned child)."""
-    path = codemap_path / LOCK_NAME
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(record, dict):
-        return
-    if token is not None and record.get("token") == token:
-        path.unlink(missing_ok=True)
-    elif pid is not None and record.get("pid") == pid:
-        path.unlink(missing_ok=True)
+    """Remove the lock, but only when it is still ours (same pid, or the child's token)."""
+    joblock.release(codemap_path / LOCK_NAME, pid=pid, token=token)
 
 
 def _now_epoch() -> float:

@@ -28,6 +28,7 @@ from typing import Any, Callable
 import urllib.error
 import urllib.request
 
+from . import joblock
 from .bench_loader import read_dir_files, read_solution_files, task_dir_of
 from .bench_standard import BenchTask
 
@@ -46,27 +47,13 @@ class BenchBusy(RuntimeError):
     pass
 
 
-def _pid_alive(pid: Any) -> bool:
-    import os
-
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+_HELD: dict[Path, Any] = {}             # lock path -> open handle that holds the flock for this run
 
 
 def running_bench(state_dir: Path) -> dict | None:
-    """The measurement run that holds the lock and is still alive, or None."""
-    try:
-        held = json.loads((Path(state_dir) / LOCK_NAME).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return held if isinstance(held, dict) and _pid_alive(held.get("pid")) else None
+    """The measurement run that holds the lock right now, or None. The run holds an flock for its
+    whole life (joblock.hold), so this is right from any container and after a crash."""
+    return joblock.holder(Path(state_dir) / LOCK_NAME)
 
 
 def acquire_lock(state_dir: Path, *, label: str, out: Path) -> Path:
@@ -75,33 +62,25 @@ def acquire_lock(state_dir: Path, *, label: str, out: Path) -> Path:
     import os
 
     path = Path(state_dir) / LOCK_NAME
-    record = json.dumps({"pid": os.getpid(), "label": label, "out": str(out),
-                         "started": time.strftime("%Y-%m-%d %H:%M")})
-    for _ in range(2):
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            held = running_bench(state_dir)
-            if held is not None:
-                raise BenchBusy(f"đang có một lần đo chạy: {held.get('label') or held.get('out')} "
-                                f"(pid {held.get('pid')}, từ {held.get('started')}); chờ nó xong, hoặc dừng: "
-                                f"kill {held.get('pid')}") from None
-            path.unlink(missing_ok=True)          # left by a run that died
-            continue
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(record)
-        return path
-    raise BenchBusy(f"không tạo được {path}")
+    record = {"pid": os.getpid(), "label": label, "out": str(out), "started": time.strftime("%Y-%m-%d %H:%M")}
+    for _ in range(3):                       # a holder() check that holds the lock for an instant
+        handle = joblock.hold(path, record)
+        if handle is not None:
+            _HELD[path] = handle
+            return path
+        held = running_bench(state_dir)
+        if held is not None:
+            raise BenchBusy(f"đang có một lần đo chạy: {held.get('label') or held.get('out')} "
+                            f"(từ {held.get('started')}); chờ nó xong rồi đo tiếp")
+        time.sleep(0.05)
+    raise BenchBusy(f"không lấy được {path}")
 
 
 def release_lock(path: Path) -> None:
-    import os
-
-    try:
-        if json.loads(path.read_text(encoding="utf-8")).get("pid") == os.getpid():
-            path.unlink()
-    except (OSError, json.JSONDecodeError):
-        pass
+    handle = _HELD.pop(Path(path), None)
+    if handle is not None:
+        handle.truncate(0)
+        handle.close()                        # closing drops the flock
 
 
 # Gateway errors that come from the machines, not from the model's work: an attempt that failed with

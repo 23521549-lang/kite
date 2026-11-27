@@ -40,8 +40,10 @@ def _fake_ctx(tmp_path):
 
 def test_build_engine_registers_builtins(tmp_path):
     engine = build_engine(_fake_ctx(tmp_path))
-    assert set(engine._jobs) == {"needs_decision_scan", "secretary_daily_report", "mcp_sweep"}
+    assert set(engine._jobs) == {"needs_decision_scan", "secretary_daily_report", "mcp_sweep",
+                                 "monitor_alerts"}
     assert engine._jobs["mcp_sweep"].interval_seconds == 300
+    assert engine._jobs["monitor_alerts"].interval_seconds == 300
     assert engine.starter is not None  # loopback OpenCode URL, no server needed to build
     assert engine.chat_dir == Path.home() / "kite-chat"  # no chat dir: triggers note + retry
 
@@ -66,3 +68,20 @@ def test_report_job_builds_report_and_fails_post_gracefully(tmp_path):
     path = tmp_path / "secretary" / "reports" / f"{day.isoformat()}.md"
     assert path.is_file()
     assert path.read_text(encoding="utf-8").startswith("# Báo cáo ngày")
+
+
+def test_monitor_alerts_fire_from_the_scheduler_without_the_page_open(tmp_path, monkeypatch):
+    from poc.kaggle_worker.web import scheduler_wiring
+    from poc.kaggle_worker.web.monitor_alerts import create_rule, load_state
+
+    ctx = _fake_ctx(tmp_path)
+    ctx.clock = lambda: 1_790_000_000.0
+    engine = build_engine(ctx)
+    asked = []
+    monkeypatch.setattr(scheduler_wiring, "metric_values", lambda c: asked.append(c) or {"w1": {"cost_day_pct": 95.0}})
+    asyncio.run(engine._jobs["monitor_alerts"].func())
+    assert asked == []                                    # no rules: the spend is not even read
+    create_rule(tmp_path, "w1", "cost_day_pct", 80.0)
+    asyncio.run(engine._jobs["monitor_alerts"].func())
+    history = load_state(tmp_path)["history"]
+    assert len(history) == 1 and history[0]["worker_id"] == "w1" and history[0]["notified"] is False

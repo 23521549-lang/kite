@@ -550,11 +550,20 @@ class Stack:
         """
         send = notify or (lambda title, message, priority=3: self.watchdog_notify(title, message,
                                                                                   priority=priority))
-        history = self.watchdog_history()
-        states = self.services_state()
         now = self.clock()
         summary: dict[str, Any] = {"checked_at": now, "restarted": [], "suppressed": [], "watching": [],
                                    "unknown": [], "would_restart": [], "failed": [], "alerts": 0, "error": ""}
+        try:
+            with self.lock():
+                pass
+        except StackError:
+            # An update, a rollback or a restart is running: its services are down on purpose, and
+            # a bad tick counted now would restart a freshly updated service on the next one.
+            self.out("watchdog: kite-stack khác đang chạy (cập nhật hoặc khởi động lại) — bỏ qua lần kiểm này")
+            summary["skipped"] = "kite-stack khác đang chạy"
+            return summary
+        history = self.watchdog_history()
+        states = self.services_state()
 
         def alert(title: str, message: str, priority: int) -> bool:
             sent = send(title, message, priority=priority)
@@ -790,8 +799,9 @@ class Stack:
         names = [s for s in services if s in allowed]
         if not names or len(names) != len(services):
             raise StackError(f"chỉ khởi động lại được: {', '.join(allowed)}")
-        if "gateway" in names and "opencode" not in names:
-            names.append("opencode")          # the chat reads the workers again (new or changed ones)
+        if ("gateway" in names or "web" in names) and "opencode" not in names:
+            # the chat reads the workers again (new or changed ones) / lives in the web's process space
+            names.append("opencode")
         with self.lock(wait=600):
             self.set_status(state="restarting")
             done = self.run(self.compose("restart", *names), timeout=600)

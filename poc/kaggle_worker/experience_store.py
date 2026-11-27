@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import difflib
 import json
-import os
 from pathlib import Path
 import re
 import time
 import uuid
 
+from . import joblock
 from .memory import repo_key
 
 _MARKER = re.compile(r"<!-- kite:experience version=(\d+) updated=([0-9-]+) -->")
@@ -63,13 +63,7 @@ def _load_pending(state_dir: Path) -> list[dict]:
 
 
 def _save_pending(state_dir: Path, entries: list[dict]) -> None:
-    path = pending_path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump(entries, stream, indent=1, ensure_ascii=False)
-    os.replace(temp, path)
+    joblock.write_json(pending_path(state_dir), entries, indent=1, ensure_ascii=False)
 
 
 def _parse_version(text: str) -> tuple[int, str | None]:
@@ -194,25 +188,26 @@ def propose(state_dir: Path, repo: str | Path, rules: list[dict], *, clock=time.
     from .experience import render_document  # worker (a); imported here so this module loads without it
 
     state_dir = Path(state_dir)
-    if any(e.get("repo") == str(Path(repo).expanduser().resolve()) and e.get("status") == "pending"
-           for e in _load_pending(state_dir)):
-        raise ValueError(f"đã có bản đề xuất tài liệu kinh nghiệm đang chờ duyệt cho {repo}; "
-                         "duyệt hoặc từ chối bản đó trước rồi mới chưng cất bản mới")
-    version = current_version(state_dir, repo) + 1
-    updated = _date(clock)
-    content = render_document(repo, rules, version=version, updated=updated, clock=clock)
-    old_rules = _rule_lines(_read_doc(state_dir, repo))
-    added, removed, changed = _rule_counts(old_rules, rules)
-    entry = {"id": uuid.uuid4().hex[:8], "repo": str(Path(repo).expanduser().resolve()),
-             "version": version, "created_at": clock(), "rules_added": added,
-             "rules_removed": removed, "rules_changed": changed, "status": "pending"}
-    path = proposed_path(state_dir, repo)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    entries = _load_pending(state_dir)
-    entries.append(entry)
-    _save_pending(state_dir, entries)
-    return {"entry": entry, "diff": diff_text(state_dir, entry["id"])}
+    with joblock.updating(pending_path(state_dir)):      # one proposal per repo, even when two race
+        if any(e.get("repo") == str(Path(repo).expanduser().resolve()) and e.get("status") == "pending"
+               for e in _load_pending(state_dir)):
+            raise ValueError(f"đã có bản đề xuất tài liệu kinh nghiệm đang chờ duyệt cho {repo}; "
+                             "duyệt hoặc từ chối bản đó trước rồi mới chưng cất bản mới")
+        version = current_version(state_dir, repo) + 1
+        updated = _date(clock)
+        content = render_document(repo, rules, version=version, updated=updated, clock=clock)
+        old_rules = _rule_lines(_read_doc(state_dir, repo))
+        added, removed, changed = _rule_counts(old_rules, rules)
+        entry = {"id": uuid.uuid4().hex[:8], "repo": str(Path(repo).expanduser().resolve()),
+                 "version": version, "created_at": clock(), "rules_added": added,
+                 "rules_removed": removed, "rules_changed": changed, "status": "pending"}
+        path = proposed_path(state_dir, repo)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        entries = _load_pending(state_dir)
+        entries.append(entry)
+        _save_pending(state_dir, entries)
+        return {"entry": entry, "diff": diff_text(state_dir, entry["id"])}
 
 
 def _find_entry(state_dir: Path, entry_id: str) -> tuple[list[dict], dict]:
@@ -232,40 +227,42 @@ def approve(state_dir: Path, entry_id: str, *, clock=time.time) -> dict:
     bump the version twice. Approving an already decided entry raises ValueError.
     """
     state_dir = Path(state_dir)
-    entries, entry = _find_entry(state_dir, entry_id)
-    if entry.get("status") != "pending":
-        raise ValueError(f"đề xuất '{entry_id}' đã {entry.get('status')}; không duyệt lại được")
-    proposed = proposed_path(state_dir, entry["repo"])
-    try:
-        content = proposed.read_text(encoding="utf-8")
-    except OSError:
-        raise ValueError(f"không còn file đề xuất cho '{entry_id}'") from None
-    old_version = current_version(state_dir, entry["repo"])
-    official = experience_path(state_dir, entry["repo"])
-    if old_version:
-        archive = archive_path(state_dir, entry["repo"], old_version)
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        archive.write_text(official.read_text(encoding="utf-8"), encoding="utf-8")
-    new_version = old_version + 1
-    official.parent.mkdir(parents=True, exist_ok=True)
-    official.write_text(_restamp(content, new_version, _date(clock)), encoding="utf-8")
-    proposed.unlink(missing_ok=True)
-    entry["status"] = "approved"
-    entry["version"] = new_version
-    _save_pending(state_dir, entries)
-    return {**entry, "file": str(official)}
+    with joblock.updating(pending_path(state_dir)):
+        entries, entry = _find_entry(state_dir, entry_id)
+        if entry.get("status") != "pending":
+            raise ValueError(f"đề xuất '{entry_id}' đã {entry.get('status')}; không duyệt lại được")
+        proposed = proposed_path(state_dir, entry["repo"])
+        try:
+            content = proposed.read_text(encoding="utf-8")
+        except OSError:
+            raise ValueError(f"không còn file đề xuất cho '{entry_id}'") from None
+        old_version = current_version(state_dir, entry["repo"])
+        official = experience_path(state_dir, entry["repo"])
+        if old_version:
+            archive = archive_path(state_dir, entry["repo"], old_version)
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_text(official.read_text(encoding="utf-8"), encoding="utf-8")
+        new_version = old_version + 1
+        official.parent.mkdir(parents=True, exist_ok=True)
+        official.write_text(_restamp(content, new_version, _date(clock)), encoding="utf-8")
+        proposed.unlink(missing_ok=True)
+        entry["status"] = "approved"
+        entry["version"] = new_version
+        _save_pending(state_dir, entries)
+        return {**entry, "file": str(official)}
 
 
 def reject(state_dir: Path, entry_id: str) -> dict:
     """Drop a pending proposal: its file and its queue entry are removed."""
     state_dir = Path(state_dir)
-    entries, entry = _find_entry(state_dir, entry_id)
-    if entry.get("status") != "pending":
-        raise ValueError(f"đề xuất '{entry_id}' đã {entry.get('status')}; không từ chối lại được")
-    proposed_path(state_dir, entry["repo"]).unlink(missing_ok=True)
-    entries.remove(entry)
-    _save_pending(state_dir, entries)
-    return {**entry, "status": "rejected"}
+    with joblock.updating(pending_path(state_dir)):
+        entries, entry = _find_entry(state_dir, entry_id)
+        if entry.get("status") != "pending":
+            raise ValueError(f"đề xuất '{entry_id}' đã {entry.get('status')}; không từ chối lại được")
+        proposed_path(state_dir, entry["repo"]).unlink(missing_ok=True)
+        entries.remove(entry)
+        _save_pending(state_dir, entries)
+        return {**entry, "status": "rejected"}
 
 
 def list_pending(state_dir: Path) -> list[dict]:

@@ -1708,20 +1708,29 @@ def _kite_executable() -> list[str]:
 def _busy_command(args: argparse.Namespace) -> int:
     """Running tasks and a bench run: what kite-stack must not cut off with an update."""
     from . import bench
+    from .secretary import secretary_dir
 
+    state_dir = args.config.parent
     tasks = []
+    # Every folder OpenCode runs a chat in: the old single chat, the secretary, each open chat
+    # session and each patch review.
+    folders = [Path.home() / "kite-chat", secretary_dir(state_dir)]
     if args.db.exists():
         with SQLiteSchedulerStore(args.db) as store:
             tasks = [str(t["task_id"]) for t in store.list_tasks() if t["state"] == "LEASED"]
-    running = bench.running_bench(args.config.parent)
-    chat = _chat_sessions_busy(Path.home())
+            folders += [state_dir / "chat-sessions" / str(row["kite_session_id"])
+                        for row in store.list_chat_sessions(status="active")]
+    folders += sorted((state_dir / "review").glob("*"))
+    running = bench.running_bench(state_dir)
+    chat = _chat_sessions_busy(Path.home(), [folder for folder in folders if folder.is_dir()])
     _emit({"busy": bool(tasks or running or chat), "tasks": tasks, "chat": chat,
            "bench": {"label": running.get("label"), "started": running.get("started")} if running else None})
     return 0
 
 
-def _chat_sessions_busy(home: Path) -> int:
-    """Chat sessions answering right now (OpenCode's background server); 0 when it cannot be asked."""
+def _chat_sessions_busy(home: Path, folders: list[Path]) -> int:
+    """Chat sessions answering right now in these folders (OpenCode's background server); 0 when it
+    cannot be asked."""
     import base64
     import urllib.parse
     import urllib.request
@@ -1730,18 +1739,22 @@ def _chat_sessions_busy(home: Path) -> int:
         from .web.app import _session_busy, find_opencode
 
         url, password = find_opencode(home, "", None)
-        if not url:
-            return 0
-        query = urllib.parse.urlencode({"directory": str(home / "kite-chat"), "limit": "30"})
+    except Exception:               # no web extra: nothing to wait for
+        return 0
+    busy = 0
+    for folder in folders if url else []:
+        query = urllib.parse.urlencode({"directory": str(folder), "limit": "30"})
         request = urllib.request.Request(f"{url}/api/session?{query}")
         if password:
             request.add_header("Authorization", "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode())
-        with urllib.request.urlopen(request, timeout=5) as response:
-            data = json.loads(response.read().decode())
-    except Exception:               # no server, no web extra, an old server: nothing to wait for
-        return 0
-    items = data.get("data") if isinstance(data, dict) else None
-    return sum(1 for item in items if _session_busy(item)) if isinstance(items, list) else 0
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode())
+        except Exception:           # no server, an old server: stop asking, keep what was counted
+            break
+        items = data.get("data") if isinstance(data, dict) else None
+        busy += sum(1 for item in items if _session_busy(item)) if isinstance(items, list) else 0
+    return busy
 
 
 def _stack_command(args: argparse.Namespace) -> int:

@@ -79,3 +79,18 @@ def test_memory_show_pending_is_filtered_by_repo(tmp_path):
     shown_all = asyncio.run(ops.memory_show(""))
     assert [e["id"] for e in shown_all["pending"]] == [
         entry_a["id"], entry_b["id"], entry_pref["id"]]
+
+
+def test_proposals_from_several_processes_at_once_are_all_kept(tmp_path):
+    # Every chat session has its own MCP server process, and the web and the worker write the
+    # queue too: without a lock around read-modify-write they lost each other's entries
+    # (4 x 50 proposals at once kept a few dozen).
+    import subprocess
+    import sys
+
+    code = ("import sys; from pathlib import Path; from poc.kaggle_worker import memory\n"
+            "for i in range(50): memory.propose_preference(Path(sys.argv[1]), f'{sys.argv[2]}-{i}')")
+    children = [subprocess.Popen([sys.executable, "-c", code, str(tmp_path), str(n)]) for n in range(4)]
+    assert [child.wait(timeout=120) for child in children] == [0, 0, 0, 0]
+    assert len({entry["text"] for entry in memory.list_pending(tmp_path)}) == 200
+    assert not list((tmp_path / "memory").glob("*.tmp"))

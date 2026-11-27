@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import secrets
 import time
+
+from . import joblock
 
 CODE_TTL_SECONDS = 900          # 15 minutes
 ACTIONS = ("apply", "commit")
@@ -48,13 +49,7 @@ def _load(state_dir: Path) -> dict:
 
 
 def _save(state_dir: Path, records: dict) -> None:
-    path = _path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump(records, stream, indent=1, sort_keys=True)
-    os.replace(temp, path)
+    joblock.write_json(_path(state_dir), records, indent=1, sort_keys=True)
 
 
 def issue_code(state_dir: Path, action: str, task_id: str, patch_hash: str, *,
@@ -64,12 +59,13 @@ def issue_code(state_dir: Path, action: str, task_id: str, patch_hash: str, *,
     if action not in ACTIONS:
         raise ConfirmError(f"action phải là một trong: {', '.join(ACTIONS)}")
     now = clock()
-    records = {d: r for d, r in _load(state_dir).items()
-               if isinstance(r, dict) and not r.get("used") and r.get("expires_at", 0) > now}
     code = secrets.token_urlsafe(18)
-    records[_digest(code)] = {"action": action, "task_id": task_id, "patch_sha256": patch_hash,
-                              "created_at": now, "expires_at": now + CODE_TTL_SECONDS, "used": False}
-    _save(state_dir, records)
+    with joblock.updating(_path(state_dir)):
+        records = {d: r for d, r in _load(state_dir).items()
+                   if isinstance(r, dict) and not r.get("used") and r.get("expires_at", 0) > now}
+        records[_digest(code)] = {"action": action, "task_id": task_id, "patch_sha256": patch_hash,
+                                  "created_at": now, "expires_at": now + CODE_TTL_SECONDS, "used": False}
+        _save(state_dir, records)
     return code
 
 
@@ -100,8 +96,10 @@ def check_code(state_dir: Path, action: str, task_id: str, patch_hash: str, code
 
 def consume_code(state_dir: Path, action: str, task_id: str, patch_hash: str, code: str, *,
                  clock=time.time) -> None:
-    """Validate and burn a code after the action it guards has succeeded."""
-    check_code(state_dir, action, task_id, patch_hash, code, clock=clock)
-    records = _load(state_dir)
-    records[_digest(code)]["used"] = True
-    _save(state_dir, records)
+    """Validate and burn a code after the action it guards has succeeded. Under the lock, so two
+    callers with the same code cannot both pass the check before either burns it."""
+    with joblock.updating(_path(state_dir)):
+        check_code(state_dir, action, task_id, patch_hash, code, clock=clock)
+        records = _load(state_dir)
+        records[_digest(code)]["used"] = True
+        _save(state_dir, records)

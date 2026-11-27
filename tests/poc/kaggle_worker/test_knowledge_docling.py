@@ -17,6 +17,7 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("docling")
 
+from poc.kaggle_worker import joblock
 from poc.kaggle_worker.web import docling_job
 
 
@@ -118,7 +119,7 @@ def test_stale_lock_is_cleaned_and_reconvert_proceeds(tmp_path, monkeypatch):
     (doc_dir / "reconvert.lock").write_text(
         json.dumps({"pid": dead_pid, "started_at": "2026-11-25 00:00:00",
                     "token": "stale"}), encoding="utf-8")
-    assert not docling_job._pid_alive(dead_pid)
+    assert not joblock.pid_alive(dead_pid)
     monkeypatch.setattr(docling_job, "convert_with_docling",
                         lambda path: ("# moi\n", "2.152.0"))
     result = docling_job.run_reconvert(state_dir, "doc-scan", reason="manual")
@@ -151,9 +152,9 @@ def test_request_reconvert_spawns_detached_job(tmp_path):
     lock = json.loads((state_dir / "knowledge" / "doc-scan" / "reconvert.lock")
                       .read_text(encoding="utf-8"))
     deadline = time.monotonic() + 10
-    while docling_job._pid_alive(lock["pid"]) and time.monotonic() < deadline:
+    while joblock.pid_alive(lock["pid"]) and time.monotonic() < deadline:
         time.sleep(0.05)
-    assert not docling_job._pid_alive(lock["pid"])
+    assert not joblock.pid_alive(lock["pid"])
     result2 = docling_job.request_reconvert(state_dir, "doc-scan", reason="manual",
                                             kite_command=[str(fake_kite)])
     assert result2["status"] == "converting"
