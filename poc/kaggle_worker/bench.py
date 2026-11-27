@@ -28,7 +28,7 @@ from typing import Any, Callable
 import urllib.error
 import urllib.request
 
-from . import joblock
+from . import bench_stats, joblock
 from .bench_loader import read_dir_files, read_solution_files, task_dir_of
 from .bench_standard import BenchTask
 
@@ -1464,6 +1464,12 @@ def _median(values: list[float]) -> float | None:
     return round(values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2, 1)
 
 
+def rate_ci(passed: int, total: int) -> str:
+    """"12/34 (21–53%)": the 95% interval (bench_stats.wilson) shows how much of a rate is noise."""
+    interval = bench_stats.wilson(passed, total)
+    return f"{passed}/{total} ({interval[0] * 100:.0f}–{interval[1] * 100:.0f}%)" if interval else "-"
+
+
 def summarize(entry: dict) -> dict:
     lead, code, speed = entry.get("lead") or [], entry.get("code") or [], entry.get("speed") or {}
     by_category: dict[str, list[float]] = {}
@@ -1506,7 +1512,7 @@ def render_report(results: dict) -> str:
         s = summarize(entry)
         categories |= set(s["categories"])
         lines.append(f"| `{model}` | {s['lead_passed']}/{s['lead_total']} | {s['lead_score']} | {s['shell_used']} "
-                     f"| {s['lead_seconds']} | {s['code_passed']}/{s['code_total']} | {s['code_fix_rounds']} "
+                     f"| {s['lead_seconds']} | {rate_ci(s['code_passed'], s['code_total'])} | {s['code_fix_rounds']} "
                      f"| {s['code_hidden_failed']} | {s['code_seconds']} | {s['code_wall_median']} "
                      f"| {s['gen_tps']} | {s['prompt_tps']} | {s['swap_seconds']} |")
     if categories:
@@ -1520,12 +1526,14 @@ def render_report(results: dict) -> str:
     polyglot = {model: s for model, s in polyglot.items() if s["polyglot_total"]}
     if polyglot:
         def rate(n, total):
-            return f"{n}/{total} ({100 * n / total:.1f}%)"
+            interval = bench_stats.wilson(n, total)
+            return f"{n}/{total} ({100 * n / total:.1f}%, CI 95% {interval[0] * 100:.0f}–{interval[1] * 100:.0f}%)"
 
         lines += ["", "## Aider polyglot (Python)", "",
                   "Cùng giao thức với bảng xếp hạng Aider: model nhận hướng dẫn của bài và file khung, không thấy "
                   "test; lần 2 nhận lỗi test của lần 1. Chỉ phần Python (34 bài), nên không so thẳng với điểm "
-                  "6 ngôn ngữ (225 bài) trên bảng xếp hạng.", "",
+                  "6 ngôn ngữ (225 bài) trên bảng xếp hạng. CI 95%: khoảng Wilson; hai cấu hình chỉ khác nhau "
+                  "thật khi `kite bench compare` nói vậy.", "",
                   "| Model | pass@1 (lần 1) | pass@2 (sau lần 2) | s tổng/bài (trung vị) |", "|---|---|---|---|"]
         for model, s in polyglot.items():
             items = [i for i in results["models"][model].get("code") or [] if i.get("polyglot")]
@@ -1632,6 +1640,7 @@ def history(root: Path | list[Path]) -> tuple[str, list[dict]]:
                 "started": results.get("started"), "model": model, "harness": results.get("harness") or "",
                 "lead": f"{s['lead_passed']}/{s['lead_total']}" if s["lead_total"] else "",
                 "code": f"{s['code_passed']}/{s['code_total']}" if s["code_total"] else "",
+                "code_ci": rate_ci(s["code_passed"], s["code_total"]) if s["code_total"] else "",
                 "tasks": ",".join(item.get("id", "?") for item in code),
                 "failed": ",".join(item.get("id", "?") for item in code if not item.get("passed")),
                 "wall_median": s["code_wall_median"],
@@ -1641,8 +1650,8 @@ def history(root: Path | list[Path]) -> tuple[str, list[dict]]:
                 "reproduced": sum(item.get("repro") == "reproduced" for item in code),
                 "one_call_review": sum(item.get("review_mode") == "one_call" for item in code),
                 "hidden_failed": s["code_hidden_failed"],
-                "polyglot": (f"{s['polyglot_pass_1']}/{s['polyglot_total']} → {s['polyglot_pass_2']}/"
-                             f"{s['polyglot_total']}" if s["polyglot_total"] else ""),
+                "polyglot": (f"{rate_ci(s['polyglot_pass_1'], s['polyglot_total'])} → "
+                             f"{rate_ci(s['polyglot_pass_2'], s['polyglot_total'])}" if s["polyglot_total"] else ""),
                 "gen_tps": s["gen_tps"], "gpu_minutes_median": s["code_gpu_minutes_median"],
                 "tool_calls": s["code_tool_calls"] if code else None,
                 "repeat_reads": s["code_repeat_reads"] if code else None,
@@ -1650,14 +1659,15 @@ def history(root: Path | list[Path]) -> tuple[str, list[dict]]:
     runs.sort(key=lambda r: (r["started"] or "", r["folder"]))
     lines = ["# Kite bench: các lần đo", "",
              "Mỗi dòng là một model trong một lần đo (`kite bench run`), cũ trước. Số liệu lấy từ `results.json` "
-             "của từng thư mục.", "",
+             "của từng thư mục. Trong ngoặc: khoảng tin cậy 95% của tỷ lệ qua; so hai lần đo theo từng bài bằng "
+             "`kite bench compare`.", "",
              "| Lần đo | Bắt đầu | Model | Code đạt | Task trượt | s/task (trung vị) | s tổng | Phút GPU/task (trung vị) "
              "| Đường nhanh qua | Tái hiện ✓ | Rà soát 1 lần gọi | Trượt test ẩn | Gọi tool (đọc lại) | Dòng patch "
              "| Agent trưởng | Polyglot pass@1 → @2 | Sinh tok/s |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in runs:
         calls = f"{r['tool_calls']} ({r['repeat_reads']})" if r["tool_calls"] else "-"
-        lines.append(f"| {r['run']} | {r['started']} | `{r['model']}` | {r['code'] or '-'} | {r['failed'] or '-'} "
+        lines.append(f"| {r['run']} | {r['started']} | `{r['model']}` | {r['code_ci'] or '-'} | {r['failed'] or '-'} "
                      f"| {r['wall_median'] if r['wall_median'] is not None else '-'} "
                      f"| {r['wall_total'] if r['wall_total'] is not None else '-'} "
                      f"| {r['gpu_minutes_median'] if r['gpu_minutes_median'] is not None else '-'} "
@@ -1672,6 +1682,60 @@ def history(root: Path | list[Path]) -> tuple[str, list[dict]]:
     lines += ["", "## Task và harness của từng lần đo", ""]
     lines += [f"- **{run}**: task {tasks or '-'}; harness {harness or '?'}" for run, (tasks, harness) in harnesses.items()]
     return "\n".join(lines) + "\n", runs
+
+
+def _run_entries(paths: list[Path], model: str | None) -> tuple[list[dict], list[str], str]:
+    """The model's entries in each run (a folder with results.json, or the file itself)."""
+    entries, labels, chosen = [], [], model
+    for path in paths:
+        path = Path(path)
+        file = path / "results.json" if path.is_dir() else path
+        results = json.loads(file.read_text(encoding="utf-8"))
+        models = results.get("models") or {}
+        name = chosen or (next(iter(models)) if len(models) == 1 else None)
+        if name not in models:
+            raise ValueError(f"{file}: chọn model bằng --model-a/--model-b, có: {', '.join(models) or 'không có'}")
+        chosen = name
+        entries.append(models[name])
+        labels.append(str(results.get("label") or file.parent.name))
+    return entries, labels, chosen
+
+
+def compare(a: list[Path], b: list[Path], *, model_a: str | None = None, model_b: str | None = None,
+            metric: str = "passed") -> tuple[str, dict]:
+    """Two configurations task by task (bench_stats.paired). Each side may be several runs of the same
+    configuration: that is how a task is repeated. Old runs work as they are: nothing is rerun."""
+    entries_a, labels_a, name_a = _run_entries(a, model_a)
+    entries_b, labels_b, name_b = _run_entries(b, model_b)
+    result = bench_stats.paired(bench_stats.task_rates(entries_a, metric=metric),
+                                bench_stats.task_rates(entries_b, metric=metric))
+    result.update(a={"runs": labels_a, "model": name_a}, b={"runs": labels_b, "model": name_b}, metric=metric)
+
+    def pct(value):
+        return "-" if value is None else f"{value * 100:.1f}%"
+
+    def tasks(names):
+        return f"{len(names)}" + (f" ({', '.join(names[:12])}{', ...' if len(names) > 12 else ''})" if names else "")
+
+    ci = result["diff_ci95"]
+    diff = "-" if result["diff"] is None else f"{result['diff'] * 100:+.1f} điểm"
+    lines = ["# Kite bench: so sánh ghép cặp theo từng bài", "",
+             f"A: {', '.join(labels_a)} (`{name_a}`) · B: {', '.join(labels_b)} (`{name_b}`) · chỉ số `{metric}` "
+             f"· {result['tasks']} bài cả hai cùng chạy", "",
+             "| | |", "|---|---|",
+             f"| Tỷ lệ qua A | {pct(result['rate_a'])} |", f"| Tỷ lệ qua B | {pct(result['rate_b'])} |",
+             f"| Chênh B − A | {diff}" + (f" (CI 95%: {ci[0] * 100:+.1f} đến {ci[1] * 100:+.1f})" if ci else "") + " |",
+             f"| Bài A tốt hơn | {tasks(result['a_better'])} |", f"| Bài B tốt hơn | {tasks(result['b_better'])} |"]
+    if result["mcnemar_p"] is not None:
+        lines.append(f"| McNemar chính xác (hai phía) | p = {result['mcnemar_p']:.3f} |")
+    if result["only_in_a"] or result["only_in_b"]:
+        lines.append(f"| Bài chỉ một bên chạy (không tính) | A: {tasks(result['only_in_a'])}; "
+                     f"B: {tasks(result['only_in_b'])} |")
+    better = "B tốt hơn A" if (result["diff"] or 0) > 0 else "A tốt hơn B"
+    lines += ["", ("**Kết luận: " + better + " có ý nghĩa (mức 0,05).**") if result["significant"]
+              else "**Kết luận: chưa đủ để nói hai cấu hình khác nhau.** Chạy lại mỗi bên thêm 1-2 lần "
+                   "(`kite bench run` với nhãn khác) rồi so tất cả các lần.", ""]
+    return "\n".join(lines), result
 
 
 # --------------------------------------------------------------------------------------- apply

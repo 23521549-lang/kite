@@ -428,6 +428,19 @@ def _parser() -> argparse.ArgumentParser:
     bench_history.add_argument("--root", type=Path, help="folder of bench runs (default: <state>/bench and the "
                                                          "home folder)")
     bench_history.add_argument("--json", action="store_true", help="the rows as JSON instead")
+    bench_compare = bench_commands.add_parser(
+        "compare", help="two configurations task by task: which tasks only one passes, the difference with its "
+                        "95%% interval, McNemar's exact test; works on old runs as they are")
+    bench_compare.add_argument("a", nargs="+", type=Path,
+                               help="run(s) of configuration A: folders with results.json (several = the tasks "
+                                    "repeated; a task's rate is its mean over them)")
+    bench_compare.add_argument("--vs", nargs="+", type=Path, required=True, metavar="B",
+                               help="run(s) of configuration B")
+    bench_compare.add_argument("--model-a", default=None, help="model of A (needed when a run has several)")
+    bench_compare.add_argument("--model-b", default=None, help="model of B (default: as A, or the run's only one)")
+    bench_compare.add_argument("--metric", choices=("passed", "pass_1"), default="passed",
+                               help="passed (default; pass@2 for polyglot) or pass_1 (polyglot's first try)")
+    bench_compare.add_argument("--json", action="store_true", help="the numbers as JSON instead")
     bench_apply = bench_commands.add_parser("apply", help="turn bench results into routing scores (dry run "
                                                           "unless --write)")
     bench_apply.add_argument("results", nargs="+", type=Path, help="results.json files (lead, code...)")
@@ -1907,7 +1920,7 @@ def write_bench_criteria(results: dict, out: Path, *, state_dir: Path, network: 
     mixes it into the gate set. The official summary spans every run under
     ``<state>/bench``, not just this file. Returns the ``criteria`` dict.
     """
-    from . import bench, bench_criteria as bc
+    from . import bench, bench_criteria as bc, bench_stats
 
     v1_tasks = v1_tasks or {}
     previous: list[dict] = []
@@ -1977,6 +1990,9 @@ def write_bench_criteria(results: dict, out: Path, *, state_dir: Path, network: 
                 task_record["scores_by_axis"] = scores_by_axis
             task_records.append(task_record)
         axis_scores = {axis: bc.axis_score(per_axis[axis]) for axis in bc.AXES}
+        # Standard error of each axis over its tasks: how far one run's axis score is from noise.
+        axis_errors = {axis: bench_stats.mean_se(stability if axis == "Ổn định" else per_axis[axis])[1]
+                       for axis in bc.AXES}
         cost_basis = median(gpu_minutes)
         if gate_set is not None and cost_basis:
             same = [r for r in previous
@@ -1998,6 +2014,7 @@ def write_bench_criteria(results: dict, out: Path, *, state_dir: Path, network: 
         record["started"] = results.get("started")
         record["tasks"] = task_records
         record["cost_basis_gpu_minutes_median"] = cost_basis
+        record["axes_se"] = {axis: None if se is None else bc.round_score(se) for axis, se in axis_errors.items()}
         records.append(record)
     annotated, official = bc.annotate_runs(previous + records, gate_set="gate-v1")
     new_ids = {r["run_id"] for r in records}
@@ -2044,6 +2061,17 @@ def _bench_command(args: argparse.Namespace) -> int:
             _emit({"roots": [str(r) for r in roots], "runs": rows})
         else:
             print(text if rows else f"Chưa có lần đo nào trong {', '.join(str(r) for r in roots)}.")
+        return 0
+    if args.bench_command == "compare":
+        try:
+            text, result = bench.compare(args.a, args.vs, model_a=args.model_a,
+                                         model_b=args.model_b or args.model_a, metric=args.metric)
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"bench compare: {exc}") from exc
+        if args.json:
+            _emit(result)
+        else:
+            print(text)
         return 0
     if args.bench_command == "import":
         # No operator config or gateway needed: the importers validate the

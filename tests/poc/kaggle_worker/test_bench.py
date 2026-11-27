@@ -386,7 +386,8 @@ def test_polyglot_scores_like_aider_and_reports_pass_at_1_and_2(tmp_path):
     summary = bench.summarize(results["models"]["qwen3.6"])
     assert (summary["polyglot_total"], summary["polyglot_pass_1"], summary["polyglot_pass_2"]) == (2, 0, 1)
     report = (tmp_path / "o" / "README.md").read_text(encoding="utf-8")
-    assert "## Aider polyglot (Python)" in report and "| `qwen3.6` | 0/2 (0.0%) | 1/2 (50.0%) | 30.0 |" in report
+    assert "## Aider polyglot (Python)" in report
+    assert "| `qwen3.6` | 0/2 (0.0%, CI 95% 0–66%) | 1/2 (50.0%, CI 95% 9–91%) | 30.0 |" in report
 
 
 def test_polyglot_second_try_starts_from_the_first_and_sees_the_test_errors(tmp_path):
@@ -437,7 +438,8 @@ def test_history_puts_every_run_in_one_table_oldest_first(tmp_path, capsys):
     assert rows[1]["code"] == "1/2" and rows[1]["failed"] == "R2" and rows[1]["wall_total"] == 1300.0
     assert (rows[1]["fast_passed"], rows[1]["reproduced"], rows[1]["one_call_review"], rows[1]["hidden_failed"]) \
         == (1, 1, 1, 1)
-    assert "| v5 | 2026-11-21 09:00 | `qwen3.6` | 1/2 | R2 | 650.0 | 1300.0 | - | 1 | 1 | 1 | 1 | - | - | - | - | - |" in text
+    assert ("| v5 | 2026-11-21 09:00 | `qwen3.6` | 1/2 (9–91%) | R2 | 650.0 | 1300.0 | - | 1 | 1 | 1 | 1 | - | - | - "
+            "| - | - |") in text
     assert "- **v5**: task R1,R2; harness bật" in text
 
     from poc.kaggle_worker import cli

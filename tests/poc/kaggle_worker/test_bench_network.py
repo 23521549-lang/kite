@@ -482,6 +482,8 @@ def test_write_bench_criteria_stamps_overall_and_excludes_network_runs(tmp_path)
     assert record["axes"]["Chi phí"] is None          # first run of the gate set: no baseline
     assert record["overall"] is None                  # ...so no overall yet (spec §6.2)
     assert record["cost_basis_gpu_minutes_median"] == 1.0
+    # One task per axis here: no standard error yet; Ổn định has its three sandbox tasks.
+    assert record["axes_se"]["Coding"] is None and record["axes_se"]["Ổn định"] == 0.0
     assert first["official"]["official"] is False     # fewer than 3 runs
     # Second run: the first run is the cost baseline (1.0 min/task vs 1.0) -> Chi phí 100.
     out2 = state / "bench" / "run2"

@@ -335,6 +335,7 @@ Every task, sandbox run and bench run keeps a clone of the repository, its insta
 - `kite notify setup` picks a random ntfy topic (the only key to it), keeps it in a 0600 secret file and turns on one push message per finished or failed task: task id, outcome, minutes, GPU minutes; never code or the goal. Subscribe to the printed topic in the ntfy app, restart `kite-workflow-worker`, then `kite notify test`. `--off` turns it off.
 - A `bad` note on a task (chat `note_task`, or `kite journal note TASK --bad "why"`) becomes a line in `<state>/memory/<repo>.md`; later tasks on the same repository get the newest lines in their goal. `kite memory show <repo>` prints them; edit or delete lines in that file freely.
 - Each task's `result.json`, summary and journal line carry its cost: model calls, GPU seconds on the workers (Kaggle's quota), tokens, the agent's turns, tool calls and re-reads of something it had already read, and the patch size. `kite bench` reports them per task (patch size next to the real fix's) and `kite bench history` per run.
+- Pass rates carry their 95% interval (34 polyglot exercises move several points from noise alone). `kite bench compare <run A>... --vs <run B>...` compares two configurations task by task: the tasks only one of them passes, the difference with its interval, McNemar's exact test, and a verdict. It reads old runs as they are; several runs on a side are the tasks repeated (run `kite bench run` again with another label), and a task's rate is then its mean over them.
 
 ### Everything from the chat
 
