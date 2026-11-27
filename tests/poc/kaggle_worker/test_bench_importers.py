@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 import shutil
 import subprocess
+import sys
 
 import pytest
 import yaml
@@ -123,7 +124,7 @@ def test_imported_swebench_sample_passes_with_gold_patch(tmp_path):
         patch_file = tmp_path / name
         patch_file.write_text((result.dest / name).read_text(encoding="utf-8"), encoding="utf-8")
         _git("apply", str(patch_file), cwd=work)
-    run = subprocess.run(["python", "-m", "pytest", "-q", "tests"],
+    run = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests"],
                          cwd=work, capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
 
@@ -227,7 +228,7 @@ def test_imported_tb_task_passes_with_reference_solution(tmp_path):
     work = tmp_path / "work"
     work.mkdir()
     subprocess.run(["sh", str(src / "solution.sh")], cwd=work, check=True)
-    run = subprocess.run(["python", "-m", "pytest", "-q",
+    run = subprocess.run([sys.executable, "-m", "pytest", "-q",
                           str(result.dest / "tests" / "test_outputs.py")],
                          cwd=work, capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
