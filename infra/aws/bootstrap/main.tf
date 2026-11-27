@@ -4,7 +4,8 @@
 #     lock file in the bucket, no DynamoDB table);
 #   * GitHub's OIDC identity provider (skip with create_oidc_provider=false if the account has it);
 #   * a role GitHub Actions assumes from this repository's "aws" environment only: no AWS key is ever
-#     stored in GitHub.
+#     stored in GitHub;
+#   * daily snapshots of Kite's data disk (Data Lifecycle Manager, newest 7 kept).
 #
 #   terraform -chdir=infra/aws/bootstrap init
 #   terraform -chdir=infra/aws/bootstrap apply -var region=us-east-1
@@ -288,6 +289,75 @@ resource "aws_iam_role_policy" "infra" {
   name   = "kite-infra-scoped"
   role   = aws_iam_role.infra.id
   policy = data.aws_iam_policy_document.infra.json
+}
+
+# Daily snapshots of Kite's data disk: Data Lifecycle Manager snapshots every volume tagged
+# Backup = kite-daily (infra/aws tags the data disk) at 19:00 UTC and keeps the newest 7. The policy
+# and the role DLM acts with live here, made with the owner's credentials, so the infra role still
+# gets no IAM permission. Restore: infra/aws/README.md.
+data "aws_iam_policy_document" "dlm_trust" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["dlm.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "dlm" {
+  name               = "kite-dlm"
+  assume_role_policy = data.aws_iam_policy_document.dlm_trust.json
+}
+
+data "aws_iam_policy_document" "dlm" {
+  statement {
+    actions = [
+      "ec2:CreateSnapshot",
+      "ec2:CreateSnapshots",
+      "ec2:DeleteSnapshot",
+      "ec2:DescribeInstances",
+      "ec2:DescribeSnapshots",
+      "ec2:DescribeVolumes",
+    ]
+    resources = ["*"]
+  }
+  statement {
+    actions   = ["ec2:CreateTags"]
+    resources = ["arn:aws:ec2:*::snapshot/*"]
+  }
+}
+
+resource "aws_iam_role_policy" "dlm" {
+  name   = "kite-dlm-snapshots"
+  role   = aws_iam_role.dlm.id
+  policy = data.aws_iam_policy_document.dlm.json
+}
+
+resource "aws_dlm_lifecycle_policy" "data" {
+  description        = "Kite data disk daily snapshots keep 7"
+  execution_role_arn = aws_iam_role.dlm.arn
+  state              = "ENABLED"
+
+  policy_details {
+    resource_types = ["VOLUME"]
+    target_tags    = { Backup = "kite-daily" }
+
+    schedule {
+      name      = "daily keep 7"
+      copy_tags = true
+
+      create_rule {
+        interval      = 24
+        interval_unit = "HOURS"
+        times         = ["19:00"]
+      }
+
+      retain_rule {
+        count = 7
+      }
+    }
+  }
 }
 
 output "AWS_ROLE_ARN" {

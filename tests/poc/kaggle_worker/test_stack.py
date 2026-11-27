@@ -375,6 +375,19 @@ def test_a_new_aws_machine_runs_the_installer_from_a_pinned_commit():
     assert re.search(r"raw\.githubusercontent\.com/[^/]+/[^/]+/[0-9a-f]{40}/deploy/stack/install\.sh", variables)
 
 
+def test_the_data_disk_carries_the_tag_the_daily_snapshots_target():
+    # The DLM policy (bootstrap) and the disk (infra/aws) live in two Terraform roots: a renamed tag on
+    # either side would silently stop the backups.
+    bootstrap = (ROOT / "infra" / "aws" / "bootstrap" / "main.tf").read_text(encoding="utf-8")
+    disk = (ROOT / "infra" / "aws" / "main.tf").read_text(encoding="utf-8")
+    target = re.search(r"target_tags\s*=\s*\{\s*(\w+)\s*=\s*\"([^\"]+)\"\s*\}", bootstrap)
+    assert target, "no target_tags in the DLM policy"
+    volume = disk[disk.index('resource "aws_ebs_volume" "data"'):]
+    volume = volume[:volume.index("\n}\n")]
+    assert re.search(rf'{target.group(1)}\s*=\s*"{re.escape(target.group(2))}"', volume)
+    assert re.search(r"retain_rule\s*\{\s*count\s*=\s*7\s*\}", bootstrap)
+
+
 def test_third_party_images_are_pinned_by_digest_and_temporal_passwords_are_split():
     services = compose()["services"]
     for name in ("postgres", "web-db", "temporal", "temporal-setup", "caddy"):

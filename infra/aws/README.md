@@ -78,3 +78,71 @@ sed -i -E "s#(kite/)[0-9a-f]{40}(/deploy/stack/install.sh)#\1${sha}\2#" infra/aw
 
 The installer installs cosign (the release CI signs with, checked against its SHA-256): a new machine
 runs an image only when it carries this repository's CI signature.
+
+## Backups: daily snapshots of the data disk
+
+The bootstrap makes a Data Lifecycle Manager policy: every day at 19:00 UTC AWS snapshots the volume
+tagged `Backup = kite-daily` (the data disk, `/var/lib/kite`) and keeps the newest 7. The policy and the
+role DLM uses live in `infra/aws/bootstrap`, so a machine made before this needs the bootstrap applied
+again (`bash infra/aws/terraform-bootstrap.sh`) and one Infra `apply` for the tag. The snapshots are
+encrypted like the disk and cost EBS snapshot storage (incremental after the first). A snapshot is
+crash-consistent: Postgres recovers from it the way it does after a power cut.
+
+The snapshots so far (newest last):
+
+```sh
+aws ec2 describe-snapshots --profile kite --owner-ids self --filters Name=tag:Backup,Values=kite-daily \
+  --query 'sort_by(Snapshots,&StartTime)[].[SnapshotId,StartTime,State]' --output table
+```
+
+### Restore drill (once, then after big changes)
+
+A copy of the newest snapshot is attached to the running machine next to the real disk, read, and
+deleted; Kite keeps running. From the laptop:
+
+```sh
+snap=$(aws ec2 describe-snapshots --profile kite --owner-ids self --filters Name=tag:Backup,Values=kite-daily \
+  --query 'sort_by(Snapshots,&StartTime)[-1].SnapshotId' --output text)
+id=$(aws ec2 describe-instances --profile kite --filters Name=tag:Name,Values=kite \
+  Name=instance-state-name,Values=running --query 'Reservations[0].Instances[0].InstanceId' --output text)
+az=$(aws ec2 describe-instances --profile kite --instance-ids "$id" \
+  --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+vol=$(aws ec2 create-volume --profile kite --snapshot-id "$snap" --availability-zone "$az" --volume-type gp3 \
+  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=kite-restore-drill}]' --query VolumeId --output text)
+aws ec2 wait volume-available --profile kite --volume-ids "$vol"
+aws ec2 attach-volume --profile kite --volume-id "$vol" --instance-id "$id" --device /dev/sdg
+echo "$vol"
+```
+
+The copy carries no `Backup` tag, so DLM never snapshots it. It has the same filesystem id as the real
+disk: mount it by its device path as below, and never reboot the machine with it attached. On the
+machine (`vol-0abc...` is the id printed above):
+
+```sh
+dev=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$(echo vol-0abc... | tr -d -)
+sudo mkdir -p /mnt/restore && sudo mount "$dev" /mnt/restore
+sudo ls /mnt/restore/kite /mnt/restore/postgres          # config.yaml, secrets/, journal/, PG_VERSION ...
+sudo du -sh /mnt/restore /var/lib/kite                   # about the same size as the live disk
+sudo umount /mnt/restore
+```
+
+Then from the laptop: `aws ec2 detach-volume --profile kite --volume-id "$vol"`,
+`aws ec2 wait volume-available --profile kite --volume-ids "$vol"`,
+`aws ec2 delete-volume --profile kite --volume-id "$vol"`.
+
+### Real restore (the data disk is damaged or files are lost)
+
+Same first steps (copy of the chosen snapshot, attached, mounted at `/mnt/restore`), then on the
+machine, with Kite stopped so nothing writes while the files come back:
+
+```sh
+sudo systemctl stop kite-stack-update.timer kite-stack-watchdog.timer
+sudo kite-stack down
+sudo rsync -aHAX --delete --exclude /lost+found /mnt/restore/ /var/lib/kite/
+sudo umount /mnt/restore
+sudo kite-stack up && sudo kite-stack status
+sudo systemctl start kite-stack-update.timer kite-stack-watchdog.timer
+```
+
+The Terraform disk stays the same volume (its `prevent_destroy` is untouched); only its files go back
+to the snapshot's day. Detach and delete the copy as in the drill.

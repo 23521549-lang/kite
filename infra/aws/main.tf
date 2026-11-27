@@ -108,7 +108,7 @@ resource "aws_ebs_volume" "data" {
   size              = var.data_volume_gb
   type              = "gp3"
   encrypted         = true
-  tags              = { Name = "${var.name}-data" }
+  tags              = { Name = "${var.name}-data", Backup = "kite-daily" } # Backup: daily snapshots (bootstrap)
   lifecycle {
     prevent_destroy = true # the state of Kite: never removed by a plan
   }
