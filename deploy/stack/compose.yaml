@@ -69,7 +69,7 @@ services:
     environment:
       POSTGRES_SEEDS: postgres
       POSTGRES_USER: temporal
-      POSTGRES_PWD: ${TEMPORAL_SETUP_POSTGRES_PASSWORD:?set in stack.env}
+      POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
       DB_PORT: "5432"
     volumes:
       - ./temporal-setup.sh:/temporal-setup.sh:ro
@@ -77,6 +77,8 @@ services:
     restart: "no"
     logging: *logging
 
+  # Temporal's server, its visibility store and the schema setup all sign in as the one Postgres role
+  # the postgres service creates (temporal): a role has one password, so they share it.
   temporal:
     image: temporalio/server:1.32.2@sha256:7bf69188a6232fea14869b9cef3d94aa82a1601d99517f7e86c71f22da4e0670
     depends_on:
@@ -90,7 +92,7 @@ services:
       POSTGRES_PWD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
       POSTGRES_SEEDS: postgres
       SQL_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
-      VISIBILITY_SQL_PASSWORD: ${TEMPORAL_VISIBILITY_POSTGRES_PASSWORD:?set in stack.env}
+      VISIBILITY_SQL_PASSWORD: ${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}
       BIND_ON_IP: 0.0.0.0
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
     volumes:

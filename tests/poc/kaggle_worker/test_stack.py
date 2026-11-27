@@ -388,16 +388,18 @@ def test_the_data_disk_carries_the_tag_the_daily_snapshots_target():
     assert re.search(r"retain_rule\s*\{\s*count\s*=\s*7\s*\}", bootstrap)
 
 
-def test_third_party_images_are_pinned_by_digest_and_temporal_passwords_are_split():
+def test_third_party_images_are_pinned_by_digest_and_temporal_signs_in_with_its_role_password():
     services = compose()["services"]
     for name in ("postgres", "web-db", "temporal", "temporal-setup", "caddy"):
         assert "@sha256:" in services[name]["image"], name
-    setup_env = services["temporal-setup"]["environment"]
-    assert "TEMPORAL_SETUP_POSTGRES_PASSWORD" in setup_env["POSTGRES_PWD"]
-    temporal_env = services["temporal"]["environment"]
-    assert "TEMPORAL_POSTGRES_PASSWORD" in temporal_env["SQL_PASSWORD"]
-    assert "TEMPORAL_VISIBILITY_POSTGRES_PASSWORD" in temporal_env["VISIBILITY_SQL_PASSWORD"]
-    assert "TEMPORAL_POSTGRES_PASSWORD" in services["postgres"]["environment"]["POSTGRES_PASSWORD"]
+    # The postgres service makes one role, temporal, with one password: every Temporal part signs in as
+    # that role, so a second password would be refused (a fresh machine's schema setup failed that way).
+    role = services["postgres"]["environment"]
+    assert role["POSTGRES_USER"] == "temporal" and "TEMPORAL_POSTGRES_PASSWORD" in role["POSTGRES_PASSWORD"]
+    temporal_env, setup_env = services["temporal"]["environment"], services["temporal-setup"]["environment"]
+    assert temporal_env["POSTGRES_USER"] == setup_env["POSTGRES_USER"] == "temporal"
+    for password in (setup_env["POSTGRES_PWD"], temporal_env["SQL_PASSWORD"], temporal_env["VISIBILITY_SQL_PASSWORD"]):
+        assert password == "${TEMPORAL_POSTGRES_PASSWORD:?set in stack.env}"
 
 
 def test_pinned_versions_agree_across_the_image_and_the_code():

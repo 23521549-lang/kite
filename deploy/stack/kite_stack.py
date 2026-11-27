@@ -117,8 +117,7 @@ def short(digest: str) -> str:
 
 
 COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
-SECRET_KEYS = ("TEMPORAL_POSTGRES_PASSWORD", "TEMPORAL_VISIBILITY_POSTGRES_PASSWORD",
-               "TEMPORAL_SETUP_POSTGRES_PASSWORD", "KITE_WEB_DB_PASSWORD")
+SECRET_KEYS = ("TEMPORAL_POSTGRES_PASSWORD", "KITE_WEB_DB_PASSWORD")
 
 
 def find_cosign() -> str | None:
@@ -135,8 +134,8 @@ def signature_identity(image_repo: str) -> str:
 
 def generated_secrets(env: dict[str, str]) -> dict[str, str]:
     """The machine's passwords: the ones it already has are kept word for word, the missing ones
-    are made here. Temporal's side gets one password per consumer (the server itself, its
-    visibility store, the schema setup) plus the web database's, instead of one shared password."""
+    are made here. One for the Postgres role Temporal signs in with (server, visibility store and
+    schema setup are the same role, so one password), one for the web database's own role."""
     return {key: env.get(key) or secrets.token_urlsafe(32) for key in SECRET_KEYS}
 
 

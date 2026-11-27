@@ -101,7 +101,6 @@ jobs:
         run: |
           printf 'KITE_IMAGE=kite:test\n' > /tmp/images.env
           printf '%s\n' KITE_DOMAIN=example.invalid TEMPORAL_POSTGRES_PASSWORD=x KITE_WEB_DB_PASSWORD=y \
-            TEMPORAL_VISIBILITY_POSTGRES_PASSWORD=z TEMPORAL_SETUP_POSTGRES_PASSWORD=w \
             DOCKER_GID=999 KITE_ACCESS=public > /tmp/stack.env
           docker compose -p kite --project-directory deploy/stack --env-file /tmp/stack.env \
             --env-file /tmp/images.env -f deploy/stack/compose.yaml config --quiet
@@ -110,6 +109,53 @@ jobs:
           shellcheck -x deploy/stack/install.sh deploy/stack/temporal-setup.sh deploy/stack/web-db.sh \
             deploy/sandbox/context.sh infra/aws/*.sh
           python3 -m py_compile deploy/stack/kite_stack.py
+
+  # The whole Compose stack once, from the Kite image this commit builds (nothing pulled from GHCR), the
+  # way kite-stack install starts it: config from `kite stack init`, every service up and healthy
+  # (`docker compose up --wait`, which also waits for the one-shot setups to finish), then the web's
+  # /api/health. Throwaway passwords, private access, Caddy on localhost:8443.
+  compose-smoke:
+    needs: [tests, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      COMPOSE_PROJECT_NAME: kite
+      COMPOSE_FILE: deploy/stack/compose.yaml
+      COMPOSE_ENV_FILES: /tmp/kite-smoke/stack.env,/tmp/kite-smoke/images.env
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Kite image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: kite:smoke
+          cache-from: type=gha,scope=kite
+      - name: State folder and env files
+        run: |
+          sudo mkdir -p /var/lib/kite/kite /var/lib/kite/home /var/lib/kite/postgres /var/lib/kite/caddy \
+            /var/lib/kite/stack/requests
+          sudo chown 1000:1000 /var/lib/kite/kite /var/lib/kite/home /var/lib/kite/stack/requests
+          mkdir -p /tmp/kite-smoke
+          printf 'KITE_IMAGE=kite:smoke\n' > /tmp/kite-smoke/images.env
+          printf '%s\n' KITE_DOMAIN=localhost KITE_HTTPS_PORT=8443 KITE_ACCESS=private TZ=UTC \
+            "TEMPORAL_POSTGRES_PASSWORD=$(openssl rand -hex 16)" "KITE_WEB_DB_PASSWORD=$(openssl rand -hex 16)" \
+            "DOCKER_GID=$(getent group docker | cut -d: -f3)" > /tmp/kite-smoke/stack.env
+      - name: Stack starts and is healthy
+        run: |
+          docker compose run --rm --no-deps -T gateway kite stack init --public-url https://localhost:8443
+          docker compose up -d --wait --wait-timeout 900
+          curl -fsS http://127.0.0.1:8790/api/health
+      - name: Logs of a failed start
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail 200
+      - name: Stop
+        if: always()
+        run: docker compose down -v
 
   # Terraform of the AWS machine (infra/aws): checked here, applied by the infra workflow by hand.
   terraform:
@@ -129,7 +175,7 @@ jobs:
   # Images for the Compose deployment, only from main once every check above passed: sha-<commit>, and
   # `stable`, the tag kite-stack on the machines follows.
   images:
-    needs: [tests, web, web-pages, deploy, terraform]
+    needs: [tests, web, web-pages, deploy, terraform, compose-smoke]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -214,7 +260,7 @@ jobs:
   # A pull request builds both images too (nothing is pushed or signed) and starts the Kite image once,
   # so a Dockerfile or dependency change is caught before it reaches main and the stable tag.
   images-check:
-    needs: [tests, web, web-pages, deploy, terraform]
+    needs: [tests, web, web-pages, deploy, terraform, compose-smoke]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
